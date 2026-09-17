@@ -30,6 +30,7 @@ from trading_backtest.metrics import (
     MAX_SIMULATIONS,
     PERCENTILE_LABELS,
     RANDOM_ENTRY_VARIANT,
+    SERIALISED_SIMULATIONS,
     RandomEntryResult,
     compute_metrics,
     random_entry_benchmark,
@@ -466,6 +467,30 @@ def test_to_dict_key_order_is_frozen() -> None:
     assert payload["final_balances"] == outcome.final_balances
     assert_json_native(payload)
     assert json.loads(json.dumps(payload, sort_keys=True))["percentile"] == outcome.percentile
+
+
+def test_to_dict_caps_the_raw_arrays_like_monte_carlo() -> None:
+    """The serialised payload truncates the raw arrays, keeping every scalar.
+
+    Same convention as ``MonteCarloResult.to_dict``: dumping one float per
+    simulation into a markdown report is unreadable, so the arrays are capped at
+    ``SERIALISED_SIMULATIONS`` while the scalars stay complete.
+    """
+    frame = wiggle_frame(40)
+    result = make_result(frame, np.full(40, 10_000.0), n_trades=4, duration_minutes=60.0)
+    n = SERIALISED_SIMULATIONS + 5
+    outcome = random_entry_benchmark(result, frame, n_simulations=n, holding_periods=1)
+    assert len(outcome.returns) == n == len(outcome.final_balances)
+
+    payload = outcome.to_dict()
+    assert len(payload["returns"]) == SERIALISED_SIMULATIONS
+    assert len(payload["final_balances"]) == SERIALISED_SIMULATIONS
+    assert payload["returns"] == outcome.returns[:SERIALISED_SIMULATIONS]
+    assert payload["n_simulations"] == n
+    assert payload["mean_return"] == pytest.approx(outcome.mean_return)
+    assert payload["percentile"] == pytest.approx(outcome.percentile)
+    assert payload["p_value"] == pytest.approx(outcome.p_value)
+    assert_json_native(payload)
 
 
 def test_percentiles_are_the_expected_quantiles_of_the_returns() -> None:

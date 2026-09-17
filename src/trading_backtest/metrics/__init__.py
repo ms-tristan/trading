@@ -58,6 +58,7 @@ from trading_backtest.metrics.random_entry import (
     MAX_SIMULATIONS,
     PERCENTILE_LABELS,
     RANDOM_ENTRY_VARIANT,
+    SERIALISED_SIMULATIONS,
     RandomEntryResult,
     random_entry_benchmark,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "MIN_RETURNS_FOR_BETA",
     "PERCENTILE_LABELS",
     "RANDOM_ENTRY_VARIANT",
+    "SERIALISED_SIMULATIONS",
     "TRADE_METRIC_NAMES",
     "BenchmarkComparison",
     "BenchmarkResult",

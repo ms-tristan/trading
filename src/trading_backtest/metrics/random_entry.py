@@ -64,6 +64,7 @@ __all__ = [
     "MAX_SIMULATIONS",
     "PERCENTILE_LABELS",
     "RANDOM_ENTRY_VARIANT",
+    "SERIALISED_SIMULATIONS",
     "RandomEntryResult",
     "random_entry_benchmark",
 ]
@@ -80,6 +81,16 @@ MAX_SIMULATIONS: int = 10_000
 #: Percentile labels exposed by :attr:`RandomEntryResult.percentiles`.
 PERCENTILE_LABELS: tuple[str, ...] = ("p05", "p25", "p50", "p75", "p95")
 
+#: How many per-simulation entries :meth:`RandomEntryResult.to_dict` keeps.
+#:
+#: Mirrors :data:`trading_backtest.validation.monte_carlo.SERIALISED_SIMULATIONS`
+#: so the two simulation-based reports stay the same size: the raw arrays are
+#: capped in the serialised payload (they are an implementation detail, and
+#: dumping 10 000 floats into a markdown report is unreadable), while every
+#: scalar -- mean, median, std, percentiles, percentile, p-value -- is always
+#: reported in full.
+SERIALISED_SIMULATIONS: int = 1000
+
 #: Canonical name of the variant, as it appears in configuration and reports.
 RANDOM_ENTRY_VARIANT: str = "random_entry"
 
@@ -88,10 +99,13 @@ RANDOM_ENTRY_VARIANT: str = "random_entry"
 class RandomEntryResult:
     """Outcome of a random-entry benchmark over one backtest result.
 
-    Every per-simulation value is kept in full -- ``returns`` and
-    ``final_balances`` both have exactly ``n_simulations`` entries -- because a
-    new dataclass carries no frozen-payload constraint and the histogram of the
-    distribution is part of the contract.
+    Every per-simulation value is kept in full on the instance --
+    ``returns`` and ``final_balances`` both have exactly ``n_simulations``
+    entries -- while :meth:`to_dict` caps the raw arrays at
+    :data:`SERIALISED_SIMULATIONS` entries, exactly like
+    :class:`~trading_backtest.validation.monte_carlo.MonteCarloResult`, so a
+    markdown report stays readable.  Every scalar (mean, median, std,
+    percentiles, percentile, p-value) is always serialised in full.
 
     Reading guide:
 
@@ -141,8 +155,10 @@ class RandomEntryResult:
             "initial_balance": float(self.initial_balance),
             "timeframe": str(self.timeframe),
             "strategy_total_return": float(self.strategy_total_return),
-            "returns": [float(value) for value in self.returns],
-            "final_balances": [float(value) for value in self.final_balances],
+            "returns": [float(value) for value in self.returns[:SERIALISED_SIMULATIONS]],
+            "final_balances": [
+                float(value) for value in self.final_balances[:SERIALISED_SIMULATIONS]
+            ],
             "mean_return": float(self.mean_return),
             "median_return": float(self.median_return),
             "std_return": float(self.std_return),
