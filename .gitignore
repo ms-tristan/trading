@@ -27,7 +27,7 @@ ENV/
 env/
 
 # ---- Freqtrade ----
-user_data/
+user_data/*
 !user_data/README.md
 *.log
 logs/
@@ -52,10 +52,20 @@ hyperopt_results/
 *.parquet
 
 # ---- Data ----
-data/
+/data/
 *.csv
+!tests/fixtures/*.csv
 *.json.gz
 !config/*.json
+
+# ---- Tooling caches (uv/dsh) ----
+.uv-cache/
+.uv/
+.scratch/
+.cache/
+
+# ---- Reports (generated) ----
+reports/
 
 # ---- Testing / coverage ----
 .pytest_cache/

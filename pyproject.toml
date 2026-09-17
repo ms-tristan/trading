@@ -1,0 +1,176 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trading-backtest"
+version = "0.1.0"
+description = "Modular, robust and scalable backtesting skeleton for trading strategies (Freqtrade-compatible)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Trading Backtest Team" }]
+keywords = ["trading", "backtesting", "freqtrade", "walk-forward", "monte-carlo", "quant"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Financial and Insurance Industry",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "pandas>=2.1",
+  "numpy>=1.26",
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "typer>=0.12",
+  "rich>=13.7",
+  "pyarrow>=15.0",
+]
+
+[project.optional-dependencies]
+# Freqtrade itself is OPTIONAL on purpose: it is a heavy dependency (ccxt, TA-Lib)
+# and the whole test suite must stay runnable offline without it.
+freqtrade = ["freqtrade>=2024.4"]
+exchange = ["ccxt>=4.2.0", "requests>=2.31"]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "coverage[toml]>=7.5",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "pandas-stubs>=2.1",
+  "types-requests>=2.31",
+]
+all = [
+  "freqtrade>=2024.4",
+  "ccxt>=4.2.0",
+  "requests>=2.31",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "coverage[toml]>=7.5",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "pandas-stubs>=2.1",
+  "types-requests>=2.31",
+]
+
+[project.scripts]
+trading-backtest = "trading_backtest.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/example/trading"
+Repository = "https://github.com/example/trading"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trading_backtest"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers --strict-config --cov-fail-under=85"
+markers = [
+  "network: test needs real network access (skipped unless --run-network is given)",
+  "slow: long-running test (deselect with '-m \"not slow\"')",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+# ---------------------------------------------------------------------------
+# coverage -- the mechanical gate is fail_under = 85 (see docs/testing-policy.md)
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["trading_backtest"]
+branch = false
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = false
+precision = 2
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if typing.TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "def __repr__",
+  "if __name__ == .__main__.:",
+  "@overload",
+]
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.coverage.paths]
+source = ["src", "*/site-packages"]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "N",   # pep8-naming
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+  "A",   # flake8-builtins
+  "C4",  # flake8-comprehensions
+  "SIM", # flake8-simplify
+  "RET", # flake8-return
+  "PTH", # flake8-use-pathlib
+  "T20", # flake8-print
+  "RUF", # ruff-specific rules
+]
+ignore = [
+  "E501",    # line length handled by the formatter
+  "B008",    # typer uses function calls in argument defaults
+  "RUF001",  # ambiguous unicode characters (report text)
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20", "S101", "PLR2004"]
+"src/trading_backtest/cli.py" = ["T20"]  # rich console output is the CLI contract
+
+[tool.ruff.lint.isort]
+known-first-party = ["trading_backtest"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+files = ["src/trading_backtest"]
+strict = true
+warn_unused_ignores = false
+warn_unused_configs = true
+ignore_missing_imports = true
+namespace_packages = true
+explicit_package_bases = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
+warn_return_any = false
