@@ -1,0 +1,8 @@
+# Optional execution stack: the backtest engine never imports Freqtrade.
+#
+# Freqtrade is a heavy dependency (ccxt, TA-Lib, ...) needed only to *run* a
+# validated strategy on a real or paper account, using the configurations in
+# config/freqtrade_config.json and config/freqtrade_dryrun.json.
+# It mirrors the "freqtrade" extra of pyproject.toml.
+-r requirements.txt
+freqtrade>=2024.4

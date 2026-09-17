@@ -1,0 +1,62 @@
+{
+  "api_server": {
+    "CORS_origins": [],
+    "enable_openapi": false,
+    "enabled": false,
+    "jwt_secret_key": "",
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "password": "",
+    "username": "",
+    "verbosity": "error"
+  },
+  "dry_run": true,
+  "dry_run_wallet": 1000.0,
+  "entry_pricing": {
+    "check_depth_of_market": {
+      "bids_to_ask_delta": 1,
+      "enabled": false
+    },
+    "order_book_top": 1,
+    "price_last_balance": 0.0,
+    "price_side": "same",
+    "use_order_book": true
+  },
+  "exchange": {
+    "key": "",
+    "name": "binance",
+    "pair_blacklist": [],
+    "pair_whitelist": [
+      "BTC/USDT"
+    ],
+    "secret": ""
+  },
+  "exit_pricing": {
+    "order_book_top": 1,
+    "price_side": "same",
+    "use_order_book": true
+  },
+  "fiat_display_currency": "USD",
+  "max_open_trades": 1,
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "stake_amount": 100.0,
+  "stake_currency": "USDT",
+  "strategy": "BasicStrategy",
+  "telegram": {
+    "chat_id": "",
+    "enabled": false,
+    "token": ""
+  },
+  "timeframe": "1h",
+  "tradable_balance_ratio": 0.99,
+  "unfilledtimeout": {
+    "entry": 10,
+    "exit": 10,
+    "exit_timeout_count": 0,
+    "unit": "minutes"
+  }
+}

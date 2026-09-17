@@ -1,0 +1,13 @@
+# Runtime dependencies of the trading-backtest package.
+#
+# This file mirrors [project].dependencies of pyproject.toml (same names, same
+# ">=" floors) and exists for environments that install from a plain
+# requirements file -- most notably the Docker image (see Dockerfile).
+# tests/test_packaging.py enforces the consistency with pyproject.toml.
+pandas>=2.1
+numpy>=1.26
+pydantic>=2.6
+pydantic-settings>=2.2
+typer>=0.12
+rich>=13.7
+pyarrow>=15.0

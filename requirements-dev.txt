@@ -1,0 +1,12 @@
+# Development / CI dependencies: identical to the "dev" extra of pyproject.toml.
+#
+# Deliberately free of freqtrade and ccxt: the whole test-suite and the coverage
+# gate must stay green offline with this file alone (docs/testing-policy.md §1).
+-r requirements.txt
+pytest>=8.0
+pytest-cov>=5.0
+coverage[toml]>=7.5
+ruff>=0.5
+mypy>=1.10
+pandas-stubs>=2.1
+types-requests>=2.31
