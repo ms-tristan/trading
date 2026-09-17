@@ -20,6 +20,11 @@ Every command supports ``--json``, which prints exactly one
 ``json.dumps(payload, indent=2, sort_keys=True, default=str)`` object on stdout
 with the keys ``command, ok, symbol, timeframe, config_path, metrics, run,
 reports, data_quality``.
+
+The optional buy & hold benchmark (:data:`_BENCHMARK_HELP`) never adds a payload
+key: the gate travels *inside* ``run`` (under ``run["benchmark"]``) and as a
+dedicated ``Benchmark`` section of the written report, exactly like the other
+validation payloads.
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     import pandas as pd
 
     from trading_backtest.metrics import MetricSet
+    from trading_backtest.validation import BenchmarkGateResult
 
 __all__ = ["app", "config_app", "data_app", "main"]
 
@@ -239,6 +245,15 @@ def _print_human(payload: Mapping[str, Any]) -> None:
     for key in HIGHLIGHT_KEYS.get(command, ()):
         if key in run_mapping:
             console.print(f"  {key}: {_format_value(run_mapping[key])}", highlight=False)
+
+    benchmark = run_mapping.get("benchmark")
+    if isinstance(benchmark, Mapping):
+        console.print(f"  benchmark: {benchmark.get('variant')}", highlight=False)
+        for key in ("alpha", "beta", "correlation", "strategy_beats_benchmark"):
+            value = benchmark.get(key)
+            if value is not None:
+                console.print(f"  {key}: {_format_value(value)}", highlight=False)
+
     trades = run_mapping.get("trades")
     if isinstance(trades, list):
         console.print(f"  n_trades: {len(trades)}", highlight=False)
@@ -471,6 +486,44 @@ def _compute_metrics(result: BacktestResult, *, timeframe: str) -> MetricSet:
     return compute_metrics(result, timeframe=timeframe)
 
 
+def _resolve_benchmark_variant(cfg: AppConfig, *, enabled: bool | None) -> str:
+    """Return the effective benchmark variant; ``'none'`` means: do not compute any benchmark.
+
+    ``enabled`` is the tri-state ``--benchmark/--no-benchmark`` flag: ``None``
+    follows ``benchmark.enabled``, ``True``/``False`` force the benchmark on/off.
+    ``variant='none'`` in the configuration always wins over ``--benchmark``, and
+    ``--no-benchmark`` disables the benchmark whatever the configured variant.
+    """
+    active = cfg.benchmark.enabled if enabled is None else bool(enabled)
+    return str(cfg.benchmark.variant) if active else "none"
+
+
+def _benchmark_gate(
+    result: BacktestResult,
+    frame: pd.DataFrame,
+    *,
+    variant: str,
+    cfg: AppConfig,
+) -> BenchmarkGateResult | None:
+    """Gate ``result`` against its ``variant`` benchmark (lazy validation import).
+
+    Returns ``None`` when no benchmark is requested (``variant == 'none'``), so a
+    disabled benchmark costs nothing -- not even an import.
+    """
+    if variant == "none":
+        return None
+
+    from trading_backtest.validation import validate_benchmark
+
+    return validate_benchmark(
+        result,
+        frame,
+        variant=variant,
+        fee_rate=cfg.exchange.fee_rate,
+        slippage=cfg.exchange.slippage,
+    )
+
+
 def _parse_formats(value: str | None, cfg: AppConfig) -> list[str]:
     """Resolve the report formats: ``--formats`` wins, ``reporting.formats`` is the default."""
     if value is None:
@@ -540,8 +593,14 @@ def _write_and_emit(
     output_dir: Path | None,
     formats: str | None,
     json_output: bool,
+    benchmark: BenchmarkGateResult | None = None,
 ) -> None:
-    """Build the report, write it through ``write_report`` and emit the payload."""
+    """Build the report, write it through ``write_report`` and emit the payload.
+
+    ``benchmark`` is the optional buy & hold gate: its three side-by-side rows
+    become the ``Benchmark`` report section and its scalars travel inside the
+    ``run`` payload (never as a new top-level payload key).
+    """
     from trading_backtest.reporting import build_report, write_report
 
     report = build_report(
@@ -552,6 +611,7 @@ def _write_and_emit(
         config_echo=cfg.model_dump(mode="json"),
         include_trades=cfg.reporting.include_trades,
         trade_limit=cfg.reporting.trade_limit,
+        benchmark=None if benchmark is None else benchmark.comparison.comparison_rows(),
     )
     directory = Path(output_dir) if output_dir is not None else Path(cfg.reporting.output_dir)
     written = write_report(
@@ -560,6 +620,9 @@ def _write_and_emit(
         formats=_parse_formats(formats, cfg),
         basename=cfg.reporting.basename,
     )
+    run_payload = dict(run)
+    if benchmark is not None:
+        run_payload["benchmark"] = benchmark.to_dict()
     _emit(
         _payload(
             command=command,
@@ -568,7 +631,7 @@ def _write_and_emit(
             timeframe=timeframe,
             config_path=str(config_path),
             metrics=metrics.to_dict(),
-            run=run,
+            run=run_payload,
             reports=[str(path) for path in written],
             data_quality=quality.to_dict(),
         ),
@@ -607,6 +670,7 @@ _DATA_FILE_HELP = "Local OHLCV csv: used instead of the cache, never touches the
 _OUTPUT_DIR_HELP = "Report directory (defaults to reporting.output_dir)."
 _FORMATS_HELP = "Comma separated report formats (markdown,json). Default: reporting.formats."
 _NO_NETWORK_HELP = "Never download: a cache miss is a hard error."
+_BENCHMARK_HELP = "Compare the strategy to a buy & hold benchmark. Default: benchmark.enabled."
 _JSON_HELP = "Print one JSON object on stdout instead of the human summary."
 
 
@@ -641,6 +705,7 @@ def backtest(
     output_dir: Path | None = typer.Option(None, "--output-dir", help=_OUTPUT_DIR_HELP),
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
+    benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Backtest the configured strategy over one data window."""
@@ -660,6 +725,9 @@ def backtest(
         quality = _quality(frame, cfg, timeframe=resolved_timeframe)
         result = _make_runner(cfg, symbol=resolved_symbol)(frame, None)
         metrics = _compute_metrics(result, timeframe=resolved_timeframe)
+        gate = _benchmark_gate(
+            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        )
         _write_and_emit(
             "backtest",
             cfg=cfg,
@@ -674,6 +742,7 @@ def backtest(
             output_dir=output_dir,
             formats=formats,
             json_output=json_output,
+            benchmark=gate,
         )
 
 
@@ -694,6 +763,7 @@ def walk_forward_command(
     output_dir: Path | None = typer.Option(None, "--output-dir", help=_OUTPUT_DIR_HELP),
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
+    benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Walk-forward analysis: in-sample / out-of-sample stability over time."""
@@ -716,6 +786,9 @@ def walk_forward_command(
         runner = _make_runner(cfg, symbol=resolved_symbol)
         result = runner(frame, None)
         metrics = _compute_metrics(result, timeframe=resolved_timeframe)
+        gate = _benchmark_gate(
+            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        )
         analysis = walk_forward(
             runner,
             frame,
@@ -741,6 +814,7 @@ def walk_forward_command(
             output_dir=output_dir,
             formats=formats,
             json_output=json_output,
+            benchmark=gate,
         )
 
 
@@ -757,6 +831,7 @@ def robustness(
     output_dir: Path | None = typer.Option(None, "--output-dir", help=_OUTPUT_DIR_HELP),
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
+    benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Parametric robustness: sweep a grid and summarise its stability."""
@@ -785,6 +860,9 @@ def robustness(
         runner = _make_runner(cfg, symbol=resolved_symbol)
         result = runner(frame, None)
         metrics = _compute_metrics(result, timeframe=resolved_timeframe)
+        gate = _benchmark_gate(
+            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        )
         sweep = parameter_sweep(
             runner,
             frame,
@@ -809,6 +887,7 @@ def robustness(
             output_dir=output_dir,
             formats=formats,
             json_output=json_output,
+            benchmark=gate,
         )
 
 
@@ -827,6 +906,7 @@ def monte_carlo_command(
     seed: int | None = typer.Option(None, "--seed", help="Random seed (determinism)."),
     output_dir: Path | None = typer.Option(None, "--output-dir", help=_OUTPUT_DIR_HELP),
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
+    benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Monte Carlo simulation of the trades produced by one backtest."""
@@ -848,6 +928,9 @@ def monte_carlo_command(
         quality = _quality(frame, cfg, timeframe=resolved_timeframe)
         result = _make_runner(cfg, symbol=resolved_symbol)(frame, None)
         metrics = _compute_metrics(result, timeframe=resolved_timeframe)
+        gate = _benchmark_gate(
+            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        )
         simulation = monte_carlo(
             result,
             n_simulations=(
@@ -875,6 +958,7 @@ def monte_carlo_command(
             output_dir=output_dir,
             formats=formats,
             json_output=json_output,
+            benchmark=gate,
         )
 
 

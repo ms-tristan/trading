@@ -16,6 +16,7 @@ from trading_backtest.config.loader import (
 from trading_backtest.config.models import (
     AppConfig,
     BacktestConfig,
+    BenchmarkConfig,
     DataConfig,
     ExchangeConfig,
     ReportingConfig,
@@ -26,6 +27,7 @@ from trading_backtest.config.models import (
 __all__ = [
     "AppConfig",
     "BacktestConfig",
+    "BenchmarkConfig",
     "DataConfig",
     "ExchangeConfig",
     "ReportingConfig",

@@ -435,3 +435,164 @@ Conséquence méthodologique :
 Chaque étape peut invalider la précédente. L'objectif du squelette n'est pas de
 produire un chiffre rassurant : c'est de rendre **difficile** de se raconter une
 histoire fausse.
+
+---
+
+## 11. Le benchmark buy & hold
+
+### 11.1 La question à laquelle aucune stratégie n'échappe
+
+Un backtest qui affiche un rendement positif ne dit **rien** tant qu'il n'est pas
+comparé à ce qu'aurait donné l'inaction : acheter l'actif à la première bougie de
+la fenêtre et le conserver jusqu'à la dernière.
+
+> **La seule question qui compte : « la stratégie bat-elle le fait de ne rien
+> faire ? »**
+
+Sur un actif structurellement haussier, une stratégie *long-only* paraît rentable
+par construction : BTC a fait environ **+471 % sur 2023-2025**. Une stratégie qui
+rend **+20 %** sur la même fenêtre n'est pas un succès, c'est une **destruction de
+valeur** : l'inaction rapportait 4,51 fois plus (`alpha = 0.20 − 4.71 = −4.51`,
+soit **−451 points de pourcentage**), et le compte de la stratégie termine à
+environ **un cinquième** du capital qu'aurait produit le buy & hold. Elle a pris
+le risque du marché, payé des frais et manqué l'essentiel du mouvement. Sans
+benchmark, ce chiffre se lit comme une victoire ; avec lui, il se lit comme un
+échec.
+
+Le benchmark n'est donc pas une option de confort : c'est la **référence minimale
+qu'une stratégie active doit battre** pour justifier son coût (frais, slippage,
+complexité, maintenance). Sans elle, sur un actif qui monte, n'importe quel
+squelette long-only semble rentable.
+
+### 11.2 Comment il est calculé
+
+Le benchmark n'est **pas** un backtest parallèle : c'est le **même actif**, sur la
+**même fenêtre OHLCV** (les mêmes bougies, les mêmes timestamps), avec le **même
+capital initial** (`backtest.initial_balance`) et le **même modèle de frais** que
+le moteur (§7) :
+
+1. **Entrée unique** : tout le capital entre sur la **clôture de la première
+   bougie** de la fenêtre, slippage d'entrée compris ;
+2. **Taille** : `size = initial_balance / (entry_fill × (1 + fee_rate))`, avec
+   `entry_fill = close[0] × (1 + slippage)` — les frais d'entrée sont prélevés sur
+   le capital, jamais ajoutés après coup ;
+3. **Mark-to-market** : l'equity du benchmark est réévaluée à **chaque clôture**
+   (`size × close[t]`), ce qui produit sa courbe d'equity et ses drawdowns ;
+4. **Sortie unique** : sur la **dernière bougie** de la fenêtre, et là seulement —
+   frais de sortie et slippage de sortie appliqués une fois, comme la clôture
+   `end_of_data` du moteur (§7, point 6) ;
+5. **Annualisation identique** : le timeframe du run (`data.timeframe`) sert à
+   passer des rendements par bougie au CAGR, à la volatilité annualisée et aux
+   ratios ajustés du risque — mêmes conventions que les métriques de la
+   stratégie, sinon la comparaison serait biaisée.
+
+Métriques produites (mêmes noms que ceux du run, pour une comparaison ligne à
+ligne) :
+
+| Métrique | Sens |
+| --- | --- |
+| `total_return` | rendement total de la fenêtre, net de frais |
+| `cagr` | rendement annualisé composé |
+| `volatility` | volatilité annualisée des rendements par bougie |
+| `sharpe_ratio` | rendement excédentaire rapporté à la volatilité |
+| `sortino_ratio` | idem, mais seule la volatilité baissière est pénalisée |
+| `max_drawdown` | pire baisse depuis un sommet d'equity |
+| `max_drawdown_duration` | durée du plus long drawdown |
+| `final_balance` | capital final du benchmark |
+
+### 11.3 Comment le lire
+
+**Alpha** — la ligne qui tranche :
+
+```
+alpha = total_return(stratégie) − total_return(benchmark)
+```
+
+`alpha` est exprimé en **fraction**, pas en pourcentage : `alpha = 0.12` signifie
+12 points de pourcentage d'avance, à multiplier par 100 pour l'afficher en points.
+Encore une fois : les deux rendements sont **nets de frais** et calculés sur la
+même fenêtre, sinon l'écart ne veut rien dire.
+
+**Beta et corrélation** — la sensibilité au marché, estimée sur les rendements par
+bougie de la stratégie et du benchmark **appariés sur les mêmes timestamps** :
+
+- `beta ≈ 1` : la stratégie suit le marché ; `beta ≈ 0` : elle en est décorrélée ;
+  `beta > 1` : elle amplifie les mouvements (à la hausse comme à la baisse) ;
+- une corrélation proche de 1 signifie que la stratégie **est** le marché, avec
+  des frais en plus — et donc, mécaniquement, un alpha négatif.
+
+Ces deux indicateurs sont facultatifs **par nature** : ils sont `null` dans le
+rapport JSON et remplacés par la mention « non calculable » (*not computable*)
+dans le résumé humain — la ligne est alors simplement passée — lorsque
+
+- moins de **3 rendements** appariables sont disponibles (trop peu de points
+  communs pour qu'une régression ait un sens), ou
+- la **variance du benchmark est nulle** : c'est le cas de la variante `cash`,
+  dont tous les rendements valent `0.0`.
+
+Ni l'un ni l'autre n'est une erreur : l'absence de beta ou de corrélation
+n'invalide pas l'alpha. Le rapport est aussi exposé côte à côte (stratégie,
+benchmark, écart) dans le rapport markdown et sous `run.benchmark` en JSON — voir
+[`docs/usage.md`](usage.md).
+
+### 11.4 Les trois variantes (`benchmark.variant`)
+
+| Variante | Ce qu'elle représente | Quand l'utiliser |
+| --- | --- | --- |
+| `buy_and_hold` | achat au premier close, conservation jusqu'au dernier close, frais et slippage du moteur | **défaut** : la référence à battre sur un actif directionnel |
+| `cash` | capital laissé en cash : rendement `0.0`, aucune exposition, aucune volatilité | la référence « ne rien faire du tout », utile pour juger une stratégie peu exposée ou un marché baissier |
+| `none` | aucune référence : le benchmark n'est ni calculé ni rapporté | runs techniques, tests, ou comparaison volontairement hors sujet |
+
+`benchmark.enabled` (défaut `true`) active le calcul et l'exposition du benchmark ;
+`variant: "none"` le désactive **même quand** `enabled` vaut `true`. Les deux clés
+se surchargent par l'environnement (`TB_BENCHMARK__ENABLED`,
+`TB_BENCHMARK__VARIANT`) ou par le drapeau CLI `--benchmark` / `--no-benchmark`
+([`docs/usage.md`](usage.md)).
+
+### 11.5 Le gate `strategy_beats_benchmark`
+
+Le verdict est un booléen, exposé au même niveau que `is_robust` (§5) et
+`is_consistent` (§4.4) :
+
+```
+strategy_beats_benchmark  =  alpha > MIN_ALPHA        avec  MIN_ALPHA = 0.0
+```
+
+`MIN_ALPHA = 0.0` est défini dans la couche `validation`. Conséquences directes :
+
+- une **égalité n'est pas une victoire** : `alpha = 0.0` donne
+  `strategy_beats_benchmark = false` — une stratégie qui reproduit exactement le
+  buy & hold a payé des frais et du slippage pour ne rien apporter ;
+- `alpha < 0` : la stratégie **détruit** de la valeur par rapport à l'inaction et
+  doit être rejetée, quel que soit son `total_return` absolu ;
+- le gate porte sur le **rendement total net**, pas sur le Sharpe : une stratégie
+  peut afficher un meilleur Sharpe et un alpha négatif (moins de volatilité, mais
+  moins de performance) ; les deux lectures se complètent, elles ne se remplacent
+  pas ;
+- le gate juge la **variante active** : en `cash`, il demande de faire mieux que
+  zéro ; en `buy_and_hold`, de battre l'actif.
+
+### 11.6 Le piège du biais haussier
+
+> **Un `total_return` positif n'est jamais une preuve de compétence sur un actif
+> haussier.**
+
+Trois manifestations du même piège :
+
+1. **Long-only sur un actif qui monte** : être exposé suffit à gagner. Le chiffre
+   mesure le marché, pas la stratégie.
+2. **Fenêtre choisie** : sur BTC 2023-2025, le buy & hold est presque imbattable ;
+   la même stratégie sur une fenêtre baissière afficherait des pertes. L'alpha se
+   lit **fenêtre par fenêtre** (walk-forward, §4), pas seulement sur l'historique
+   complet.
+3. **Stratégie peu exposée** : une stratégie qui reste en cash 90 % du temps a
+   mécaniquement un alpha négatif dans un marché haussier — ce n'est pas
+   nécessairement un défaut, mais cela doit être **écrit** dans la décision, pas
+   découvert après coup.
+
+Conclusion pratique :
+
+> Les deux seuls benchmarks qui comptent sont le **buy & hold** (battre l'actif)
+> et le **cash** (battre l'inaction). Un backtest présenté sans l'un des deux
+> n'est pas une preuve, c'est une opinion — et sur un actif haussier, une opinion
+> flatteuse.
