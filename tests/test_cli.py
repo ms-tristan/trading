@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,10 +50,25 @@ OFFLINE_FLAGGED_COMMANDS = ("backtest", "walk-forward", "robustness")
 
 runner = CliRunner()
 
+#: ANSI SGR escape sequences emitted by rich when the CLI runs in a colour-forcing
+#: environment (CI sets ``FORCE_COLOR``/``TERM``).  Rich styles *inside* tokens --
+#: ``--config`` comes out as ``\x1b[1m-\x1b[0m\x1b[1m-config\x1b[0m`` -- so a raw
+#: substring check would only pass on a non-colourised local run.  The captured
+#: streams are therefore de-colourised, never the assertions relaxed.
+_ANSI_SGR = re.compile(rb"\x1b\[[0-9;]*m")
+
 
 def invoke(*args: str):
-    """Invoke the CLI in the isolated CliRunner environment."""
-    return runner.invoke(app, list(args))
+    """Invoke the CLI in the isolated CliRunner environment, without ANSI styling.
+
+    Stripping the styling keeps the run deterministic (docs/testing-policy.md §1.3)
+    whatever the colour environment of the machine running the suite.
+    """
+    result = runner.invoke(app, list(args))
+    result.stdout_bytes = _ANSI_SGR.sub(b"", result.stdout_bytes)
+    result.stderr_bytes = _ANSI_SGR.sub(b"", result.stderr_bytes)
+    result.output_bytes = _ANSI_SGR.sub(b"", result.output_bytes)
+    return result
 
 
 def json_payload(result) -> dict:
@@ -125,7 +141,8 @@ def test_missing_required_option_is_a_usage_error() -> None:
     result = invoke("backtest")
 
     assert result.exit_code == 2
-    assert "--config" in result.stderr
+    # de-colourised and unwrapped: rich may style or fold the option name on CI
+    assert "--config" in result.stderr.replace("\n", "")
 
 
 def test_invalid_enum_choice_is_a_usage_error() -> None:
