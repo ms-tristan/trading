@@ -1,0 +1,80 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---- Virtualenv ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Freqtrade ----
+user_data/
+!user_data/README.md
+*.log
+logs/
+freqtrade-*.log
+
+# ---- Secrets (NEVER commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+config_private*.json
+
+# ---- Backtest artifacts ----
+backtest_results/
+hyperopt_results/
+*.pkl
+*.pickle
+*.h5
+*.feather
+*.parquet
+
+# ---- Data ----
+data/
+*.csv
+*.json.gz
+!config/*.json
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Notebooks ----
+.ipynb_checkpoints/
