@@ -5,7 +5,7 @@
     "fee_rate": 0.001,
     "initial_balance": 10000.0,
     "max_open_trades": 1,
-    "slippage": 0.0,
+    "slippage": 0.0005,
     "stake_amount": null
   },
   "benchmark": {
@@ -13,14 +13,14 @@
     "variant": "buy_and_hold"
   },
   "data": {
-    "allow_network": true,
+    "allow_network": false,
     "cache_dir": "data/cache",
     "data_dir": "data",
-    "end": null,
+    "end": "2025-01-01T00:00:00Z",
     "format": "parquet",
     "max_gap_factor": 3.0,
-    "max_missing_ratio": 0.0,
-    "start": null,
+    "max_missing_ratio": 0.001,
+    "start": "2023-01-01T00:00:00Z",
     "timeframe": "1h",
     "validate": true
   },
@@ -30,19 +30,19 @@
     "name": "binance",
     "quote_currency": "USDT",
     "rate_limit_ms": 200,
-    "slippage": 0.0
+    "slippage": 0.0005
   },
   "log_level": "INFO",
   "project_name": "trading-backtest",
   "reporting": {
-    "basename": "report",
+    "basename": "e2e_benchmark",
     "formats": [
       "markdown",
       "json"
     ],
     "include_trades": true,
-    "output_dir": "reports",
-    "title": "Backtest Report",
+    "output_dir": "reports/e2e_benchmark",
+    "title": "BTC/USDT 2023-2025 buy & hold benchmark",
     "trade_limit": 50
   },
   "strategy": {

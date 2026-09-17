@@ -39,6 +39,9 @@ TRADES_SECTION_TITLE = "Trades"
 EQUITY_SECTION_TITLE = "Equity curve"
 NOTES_SECTION_TITLE = "Notes"
 
+#: Title of the section comparing the strategy against its benchmark.
+BENCHMARK_SECTION_TITLE = "Benchmark"
+
 
 def _jsonify(value: Any) -> Any:
     """Recursively coerce ``value`` into JSON-native Python types.
@@ -243,6 +246,27 @@ class ReportBuilder:
         self.sections.append(ReportSection(title=EQUITY_SECTION_TITLE, body=body))
         return self
 
+    def add_benchmark(
+        self,
+        body: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+        *,
+        level: int = 2,
+    ) -> ReportBuilder:
+        """Add the ``Benchmark`` section with an opaque benchmark payload.
+
+        ``body`` is deliberately opaque data: a mapping (rendered as bullets) or a
+        sequence of row mappings (rendered as a table, typically one row per
+        variant plus the strategy/buy-and-hold gap).  The reporting layer never
+        imports the metrics/benchmark layer, exactly like the opaque validation
+        payloads handled by :meth:`add_validation`.
+        """
+        self.sections.append(
+            ReportSection(
+                title=BENCHMARK_SECTION_TITLE, level=int(level), body=_normalise_body(body)
+            )
+        )
+        return self
+
     def add_validation(self, name: str, payload: Mapping[str, Any]) -> ReportBuilder:
         """Add an opaque validation payload (walk-forward, robustness, ...)."""
         return self.add_section(name, payload)
@@ -302,6 +326,7 @@ def build_report(
     include_trades: bool = True,
     trade_limit: int = 50,
     include_equity: bool = True,
+    benchmark: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
 ) -> Report:
     """Assemble the complete report of one backtest run (one-stop entry point).
 
@@ -309,6 +334,15 @@ def build_report(
     when ``metrics`` is not supplied, using the timeframe of ``result``.  ``extras``
     payloads (typically the ``to_dict()`` output of the validation layer) each
     become a section titled exactly like their key, in sorted-key order.
+
+    ``benchmark`` is an optional opaque payload (mapping or sequence of row
+    mappings) added as a :data:`BENCHMARK_SECTION_TITLE` section when it is not
+    ``None``.  It is inserted after the sorted ``extras`` sections and before the
+    ``Trades``/``Equity curve`` sections, giving ``[sorted extras..., 'Benchmark',
+    'Trades', 'Equity curve']``.  Because it accepts a sequence of rows it is a
+    dedicated parameter and is never routed through ``extras`` (whose values are
+    mappings and are titled after their key).  Leaving it at ``None`` produces a
+    report byte-identical to the previous behaviour.
     """
     from trading_backtest.metrics import compute_metrics
 
@@ -320,6 +354,8 @@ def build_report(
     payloads = extras or {}
     for name in sorted(payloads):
         builder.add_validation(name, payloads[name])
+    if benchmark is not None:
+        builder.add_benchmark(benchmark)
     if include_trades:
         builder.add_trades(builder.trades, limit=trade_limit)
     if include_equity:

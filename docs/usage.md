@@ -239,6 +239,10 @@ la CLI utiliser `BasicStrategy.PARAM_SPACE`.
     "allow_short": false,
     "compute_metrics": true
   },
+  "benchmark": {
+    "enabled": true,
+    "variant": "buy_and_hold"
+  },
   "validation": {
     "n_windows": 5,
     "in_sample_ratio": 0.7,
@@ -265,12 +269,38 @@ la CLI utiliser `BasicStrategy.PARAM_SPACE`.
 Toute clé absente de ce fichier reprend la valeur par défaut du tableau
 correspondant : un fichier minimal `{"data": {"timeframe": "4h"}}` est valide.
 
+### 3.9 `benchmark` — la référence à battre
+
+| Clé | Défaut | Sens |
+| --- | --- | --- |
+| `enabled` | `true` | calcule et expose le benchmark (même fenêtre, même capital, mêmes frais que le run) ; `false` supprime tout le calcul |
+| `variant` | `"buy_and_hold"` | variante comparée : `buy_and_hold`, `cash` ou `none` |
+
+Sens des trois valeurs de `variant` :
+
+- `buy_and_hold` (**défaut**) — achat de l'actif sur la clôture de la première
+  bougie de la fenêtre, conservation jusqu'à la dernière, avec le modèle de frais
+  et de slippage du moteur : c'est la référence à battre ;
+- `cash` — capital laissé en cash : rendement `0.0`, aucune exposition. C'est la
+  référence « ne rien faire du tout », et le seul cas où la volatilité du
+  benchmark est nulle (beta et corrélation deviennent alors « non calculables ») ;
+- `none` — **désactive le benchmark même quand `enabled` vaut `true`** : rien
+  n'est quantifié, aucune section `Benchmark` n'est écrite dans le rapport et
+  `run.benchmark` est absent du payload JSON. `enabled: false` et
+  `variant: "none"` ont donc le même effet pratique ; le second sert à garder la
+  variante choisie sous la main.
+
+Les deux clés se surchargent par l'environnement — `TB_BENCHMARK__ENABLED` et
+`TB_BENCHMARK__VARIANT` — ou, pour un run ponctuel, par le drapeau
+`--benchmark/--no-benchmark` de la CLI (§4). Méthodologie complète, lecture de
+l'alpha et biais haussier : [`docs/backtesting-methodology.md`](backtesting-methodology.md).
+
 ---
 
 ## 4. Exemples CLI
 
 Toutes les commandes acceptent `--help` et `--json` (un unique objet JSON sur
-stdout, au lieu du résumé humain). Trois options structurent tous les exemples :
+stdout, au lieu du résumé humain). Quatre options structurent tous les exemples :
 
 - `--config CHEMIN` (`-c`) — le fichier JSON de configuration (**obligatoire**
   pour toutes les commandes) ;
@@ -279,6 +309,14 @@ stdout, au lieu du résumé humain). Trois options structurent tous les exemples
   reproduire un résultat ;
 - `--no-network` — interdit tout téléchargement : un défaut de cache devient une
   erreur dure (`InsufficientDataError`). `monte-carlo` ne l'expose pas.
+- `--benchmark/--no-benchmark` — force (`--benchmark`) ou coupe
+  (`--no-benchmark`) le benchmark buy & hold **pour ce run**, sans modifier le
+  fichier de configuration.
+
+Le drapeau est accepté par `backtest`, `walk-forward`, `robustness` et
+`monte-carlo` ; omis, il laisse la main à `benchmark.enabled` de la configuration
+(§3.9), et `--no-benchmark` retire à la fois la section `Benchmark` du rapport et
+`run.benchmark` du payload JSON.
 
 Les autres réglages ont chacun une option dédiée plutôt qu'une surcharge `TB_` :
 `--symbol`, `--timeframe`, `--start`, `--end`, `--output-dir`, `--formats`
@@ -332,6 +370,16 @@ python -m trading_backtest.cli backtest \
 TB_DATA__TIMEFRAME=4h TB_STRATEGY__TIMEFRAME=4h \
     python -m trading_backtest.cli backtest \
     --config config/backtest_default.json --data-file btc.csv
+
+# comparer explicitement le run au buy & hold de la même fenêtre
+python -m trading_backtest.cli backtest \
+    --config config/backtest_default.json --data-file btc.csv --no-network \
+    --benchmark
+
+# désactiver le benchmark : plus de section « Benchmark », plus de run.benchmark
+python -m trading_backtest.cli backtest \
+    --config config/backtest_default.json --data-file btc.csv --no-network \
+    --no-benchmark
 ```
 
 Affiche le tableau des métriques, puis `strategy_name`, `initial_balance`,
@@ -508,6 +556,20 @@ Le document est un objet `Report` rendu par `Report.to_markdown()` :
    `exit_reason`, `duration_minutes`), limité à `reporting.trade_limit` lignes.
 6. **`## Equity curve`** — `timestamps` et `values`, sous-échantillonnés à
    200 points.
+7. **`## Benchmark`** — présent dès que le benchmark est actif (§3.9) : la
+   comparaison stratégie vs référence, avec l'écart métrique par métrique.
+
+La section **`Benchmark`** est un tableau à **trois lignes** : `strategy` (les
+métriques du run), `buy_and_hold` — ou `cash` selon `benchmark.variant` — et
+`gap = strategy − benchmark` pour **chaque** métrique. Le `gap` le plus important
+est `alpha`, l'écart des `total_return` : il est exprimé en **fraction**, donc
+`0.12` signifie 12 points de pourcentage d'avance sur le fait de ne rien faire.
+L'équivalent machine se trouve sous `run.benchmark` (dans la sortie `--json` et
+dans `report.json`) avec `strategy_beats_benchmark`, `alpha`, `beta` et
+`correlation` — ces deux derniers valant `null` (mention « non calculable »)
+quand les rendements ne sont pas appariables en nombre suffisant ou que la
+variance du benchmark est nulle. `--no-benchmark` (§4) supprime à la fois cette
+section et cette clé.
 
 ### 5.2 Payload JSON
 
@@ -531,6 +593,7 @@ séries des listes).
 | WFE | section walk-forward | < 0.5 |
 | VaR / CVaR 95 % | section Monte Carlo | queue plus profonde que le drawdown observé |
 | Probabilité de profit | section Monte Carlo | < 60 % |
+| Verdict vs benchmark (`strategy_beats_benchmark`) | section Benchmark | `false`, c'est-à-dire `alpha <= 0` : la stratégie ne bat pas le fait de ne rien faire |
 
 Détail des seuils et de leur justification :
 [`docs/backtesting-methodology.md`](backtesting-methodology.md).

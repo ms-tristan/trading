@@ -29,6 +29,7 @@ from trading_backtest.core.constants import (
 __all__ = [
     "AppConfig",
     "BacktestConfig",
+    "BenchmarkConfig",
     "DataConfig",
     "ExchangeConfig",
     "ReportingConfig",
@@ -113,6 +114,15 @@ class BacktestConfig(BaseModel):
     compute_metrics: bool = True
 
 
+class BenchmarkConfig(BaseModel):
+    """Buy and hold benchmark settings."""
+
+    model_config = {"extra": "forbid"}
+
+    enabled: bool = True
+    variant: Literal["buy_and_hold", "cash", "none"] = "buy_and_hold"
+
+
 class ValidationConfig(BaseModel):
     """Statistical validation layer settings (walk-forward, Monte Carlo, robustness)."""
 
@@ -164,6 +174,7 @@ class AppConfig(BaseSettings):
     data: DataConfig = Field(default_factory=DataConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
 
