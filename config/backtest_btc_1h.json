@@ -1,0 +1,61 @@
+{
+  "backtest": {
+    "allow_short": false,
+    "compute_metrics": true,
+    "fee_rate": 0.001,
+    "initial_balance": 10000.0,
+    "max_open_trades": 1,
+    "slippage": 0.0005,
+    "stake_amount": null
+  },
+  "data": {
+    "allow_network": true,
+    "cache_dir": "data/cache",
+    "data_dir": "data",
+    "end": "2025-01-01T00:00:00Z",
+    "format": "parquet",
+    "max_gap_factor": 3.0,
+    "max_missing_ratio": 0.001,
+    "start": "2023-01-01T00:00:00Z",
+    "timeframe": "1h",
+    "validate": true
+  },
+  "exchange": {
+    "fee_rate": 0.001,
+    "market": "spot",
+    "name": "binance",
+    "quote_currency": "USDT",
+    "rate_limit_ms": 200,
+    "slippage": 0.0005
+  },
+  "log_level": "INFO",
+  "project_name": "trading-backtest",
+  "reporting": {
+    "basename": "report",
+    "formats": [
+      "markdown",
+      "json"
+    ],
+    "include_trades": true,
+    "output_dir": "reports",
+    "title": "Backtest Report",
+    "trade_limit": 50
+  },
+  "strategy": {
+    "name": "basic",
+    "params": {},
+    "timeframe": "1h"
+  },
+  "validation": {
+    "in_sample_ratio": 0.7,
+    "mode": "rolling",
+    "monte_carlo_method": "trade_resample",
+    "n_monte_carlo": 2000,
+    "n_windows": 8,
+    "purge_candles": 0,
+    "random_seed": 42,
+    "robustness_grid": {},
+    "robustness_max_combinations": 512,
+    "robustness_metric": "sharpe_ratio"
+  }
+}
