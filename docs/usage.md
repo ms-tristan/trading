@@ -241,7 +241,10 @@ la CLI utiliser `BasicStrategy.PARAM_SPACE`.
   },
   "benchmark": {
     "enabled": true,
-    "variant": "buy_and_hold"
+    "variant": "buy_and_hold",
+    "risk_free_rate": 0.0,
+    "n_random_simulations": 1000,
+    "random_entry_seed": 42
   },
   "validation": {
     "n_windows": 5,
@@ -274,33 +277,56 @@ correspondant : un fichier minimal `{"data": {"timeframe": "4h"}}` est valide.
 | Clé | Défaut | Sens |
 | --- | --- | --- |
 | `enabled` | `true` | calcule et expose le benchmark (même fenêtre, même capital, mêmes frais que le run) ; `false` supprime tout le calcul |
-| `variant` | `"buy_and_hold"` | variante comparée : `buy_and_hold`, `cash` ou `none` |
+| `variant` | `"buy_and_hold"` | variante comparée : `buy_and_hold`, `cash`, `risk_free`, `random_entry` ou `none` |
+| `risk_free_rate` | `0.0` | **taux sans risque annuel, en fraction** (`0.05` = 5 %/an), `>= 0`. Sert à la fois au calcul des `sharpe_ratio`/`sortino_ratio` (stratégie **et** benchmark) et à la variante `risk_free`. Défaut `0.0` = comportement historique ; `0.05` est la valeur recommandée pour un run 2023-2025 (T-bills US) |
+| `n_random_simulations` | `1000` | nombre de simulations d'entrées aléatoires derrière la distribution `random_entry` (bornes `1 … 10000`) |
+| `random_entry_seed` | `42` | graine des simulations `random_entry` : même graine ⇒ même distribution, même percentile |
 
-Sens des trois valeurs de `variant` :
+Sens des cinq valeurs de `variant` :
 
 - `buy_and_hold` (**défaut**) — achat de l'actif sur la clôture de la première
   bougie de la fenêtre, conservation jusqu'à la dernière, avec le modèle de frais
   et de slippage du moteur : c'est la référence à battre ;
 - `cash` — capital laissé en cash : rendement `0.0`, aucune exposition. C'est la
-  référence « ne rien faire du tout », et le seul cas où la volatilité du
+  référence « ne rien faire du tout », et l'un des deux cas où la volatilité du
   benchmark est nulle (beta et corrélation deviennent alors « non calculables ») ;
+- `risk_free` — **cash rémunéré** : le capital est placé au taux
+  `risk_free_rate` composé bougie par bougie sur la même fenêtre
+  (`equity[i] = balance × (1 + risk_free_rate / periods_per_year(timeframe)) ** i`).
+  C'est le plancher économique honnête : ce que le capital rapportait sans aucun
+  risque. Différence avec `cash` : `cash` **ignore** le taux (courbe plate,
+  `total_return = 0.0`), `risk_free` l'encaisse ; à `risk_free_rate = 0.0` les
+  deux sont **bit-identiques**. Aucune des deux ne paie de frais ni de slippage :
+  il n'y a aucune transaction à exécuter ;
+- `random_entry` — **une distribution, pas une courbe** : `n_random_simulations`
+  stratégies à entrées aléatoires (même nombre de trades, durée de détention
+  dérivée de l'exposition réalisée, tout-en-un, frais et slippage sur les deux
+  jambes, graine `random_entry_seed`). Le rapport situe la stratégie réelle dans
+  cette distribution (`percentile`, p-value empirique `p_value`,
+  `strategy_beats_random` avec `MIN_P_VALUE = 0.05`) ; comme la référence n'est
+  pas une courbe, il n'y a **pas** de `gap` métrique par métrique ni de beta pour
+  cette variante. C'est le test « compétence ou chance » de la méthodologie
+  (§11.8 de [`docs/backtesting-methodology.md`](backtesting-methodology.md)) ;
 - `none` — **désactive le benchmark même quand `enabled` vaut `true`** : rien
   n'est quantifié, aucune section `Benchmark` n'est écrite dans le rapport et
   `run.benchmark` est absent du payload JSON. `enabled: false` et
   `variant: "none"` ont donc le même effet pratique ; le second sert à garder la
   variante choisie sous la main.
 
-Les deux clés se surchargent par l'environnement — `TB_BENCHMARK__ENABLED` et
-`TB_BENCHMARK__VARIANT` — ou, pour un run ponctuel, par le drapeau
-`--benchmark/--no-benchmark` de la CLI (§4). Méthodologie complète, lecture de
-l'alpha et biais haussier : [`docs/backtesting-methodology.md`](backtesting-methodology.md).
+Les clés se surchargent par l'environnement — `TB_BENCHMARK__ENABLED`,
+`TB_BENCHMARK__VARIANT`, `TB_BENCHMARK__RISK_FREE_RATE`,
+`TB_BENCHMARK__N_RANDOM_SIMULATIONS`, `TB_BENCHMARK__RANDOM_ENTRY_SEED` — ou,
+pour un run ponctuel, par les drapeaux `--benchmark/--no-benchmark`,
+`--benchmark-variant` et `--risk-free-rate` de la CLI (§4). Méthodologie
+complète, lecture de l'alpha, taux sans risque et biais haussier :
+[`docs/backtesting-methodology.md`](backtesting-methodology.md).
 
 ---
 
 ## 4. Exemples CLI
 
 Toutes les commandes acceptent `--help` et `--json` (un unique objet JSON sur
-stdout, au lieu du résumé humain). Quatre options structurent tous les exemples :
+stdout, au lieu du résumé humain). Six options structurent tous les exemples :
 
 - `--config CHEMIN` (`-c`) — le fichier JSON de configuration (**obligatoire**
   pour toutes les commandes) ;
@@ -310,13 +336,39 @@ stdout, au lieu du résumé humain). Quatre options structurent tous les exemple
 - `--no-network` — interdit tout téléchargement : un défaut de cache devient une
   erreur dure (`InsufficientDataError`). `monte-carlo` ne l'expose pas.
 - `--benchmark/--no-benchmark` — force (`--benchmark`) ou coupe
-  (`--no-benchmark`) le benchmark buy & hold **pour ce run**, sans modifier le
-  fichier de configuration.
+  (`--no-benchmark`) le benchmark **pour ce run**, sans modifier le fichier de
+  configuration.
+- `--benchmark-variant VARIANTE` — choisit la référence du run :
+  `buy_and_hold` (défaut), `cash`, `risk_free`, `random_entry` ou `none` ;
+  surcharge `benchmark.variant` pour ce run seulement.
+- `--risk-free-rate FRACTION` — fixe le taux sans risque **annuel** du run, en
+  fraction (`0.05` = 5 %/an) ; il alimente les `sharpe_ratio`/`sortino_ratio` de
+  la stratégie et du benchmark, ainsi que la variante `risk_free` (§3.9).
 
-Le drapeau est accepté par `backtest`, `walk-forward`, `robustness` et
-`monte-carlo` ; omis, il laisse la main à `benchmark.enabled` de la configuration
-(§3.9), et `--no-benchmark` retire à la fois la section `Benchmark` du rapport et
-`run.benchmark` du payload JSON.
+Ces trois derniers drapeaux sont acceptés par `backtest`, `walk-forward`,
+`robustness` et `monte-carlo` ; omis, ils laissent la main à `benchmark.enabled`,
+`benchmark.variant` et `benchmark.risk_free_rate` de la configuration (§3.9), et
+`--no-benchmark` retire à la fois la section `Benchmark` du rapport et
+`run.benchmark` du payload JSON. Une ligne suffit pour chacun des nouveaux :
+
+```bash
+--risk-free-rate 0.05            # taux sans risque annuel (T-bills US 2023-2025)
+--benchmark-variant risk_free    # référence : placement sans risque
+```
+
+Deux exemples d'un run ponctuel, sans toucher au fichier de configuration :
+
+```bash
+# benchmark au taux sans risque, taux réaliste 2023-2025 (T-bills US)
+python -m trading_backtest.cli backtest \
+    --config config/backtest_default.json --data-file btc.csv --no-network \
+    --benchmark-variant risk_free --risk-free-rate 0.05
+
+# test de compétence : entrées aléatoires reproductibles (graine du config)
+python -m trading_backtest.cli backtest \
+    --config config/backtest_default.json --data-file btc.csv --no-network \
+    --benchmark-variant random_entry --risk-free-rate 0.05
+```
 
 Les autres réglages ont chacun une option dédiée plutôt qu'une surcharge `TB_` :
 `--symbol`, `--timeframe`, `--start`, `--end`, `--output-dir`, `--formats`
@@ -558,18 +610,28 @@ Le document est un objet `Report` rendu par `Report.to_markdown()` :
    200 points.
 7. **`## Benchmark`** — présent dès que le benchmark est actif (§3.9) : la
    comparaison stratégie vs référence, avec l'écart métrique par métrique.
+8. **La section `random_entry`** — uniquement quand
+   `benchmark.variant: "random_entry"` : la distribution des entrées aléatoires
+   (moyenne, médiane, écart-type, percentiles) et la position de la stratégie
+   réelle dedans — `percentile`, `p_value` et le verdict
+   `strategy_beats_random`.
 
-La section **`Benchmark`** est un tableau à **trois lignes** : `strategy` (les
-métriques du run), `buy_and_hold` — ou `cash` selon `benchmark.variant` — et
-`gap = strategy − benchmark` pour **chaque** métrique. Le `gap` le plus important
-est `alpha`, l'écart des `total_return` : il est exprimé en **fraction**, donc
-`0.12` signifie 12 points de pourcentage d'avance sur le fait de ne rien faire.
-L'équivalent machine se trouve sous `run.benchmark` (dans la sortie `--json` et
-dans `report.json`) avec `strategy_beats_benchmark`, `alpha`, `beta` et
-`correlation` — ces deux derniers valant `null` (mention « non calculable »)
-quand les rendements ne sont pas appariables en nombre suffisant ou que la
-variance du benchmark est nulle. `--no-benchmark` (§4) supprime à la fois cette
-section et cette clé.
+La section **`Benchmark`** est un tableau à **trois lignes** pour les variantes à
+courbe : `strategy` (les métriques du run), la ligne du benchmark — dont le
+**libellé suit la variante choisie**, `buy_and_hold` (défaut), `cash` ou
+`risk_free` — et `gap = strategy − benchmark` pour **chaque** métrique. Le `gap`
+le plus important est `alpha`, l'écart des `total_return` : il est exprimé en
+**fraction**, donc `0.12` signifie 12 points de pourcentage d'avance sur le fait
+de ne rien faire. Avec `random_entry` il n'y a **pas de courbe** à comparer ligne
+à ligne : la référence est une distribution, et la section rapporte la
+distribution plus la position de la stratégie dedans (`percentile`, `p_value`,
+`strategy_beats_random`). L'équivalent machine se trouve sous `run.benchmark`
+(dans la sortie `--json` et dans `report.json`) avec `strategy_beats_benchmark`,
+`alpha`, `beta` et `correlation` — ces deux derniers valant `null` (mention
+« non calculable ») quand les rendements ne sont pas appariables en nombre
+suffisant ou que la variance du benchmark est nulle —, complétés pour
+`random_entry` par la distribution, son exposition simulée, le `percentile` et la
+`p_value`. `--no-benchmark` (§4) supprime à la fois cette section et cette clé.
 
 ### 5.2 Payload JSON
 
@@ -594,6 +656,8 @@ séries des listes).
 | VaR / CVaR 95 % | section Monte Carlo | queue plus profonde que le drawdown observé |
 | Probabilité de profit | section Monte Carlo | < 60 % |
 | Verdict vs benchmark (`strategy_beats_benchmark`) | section Benchmark | `false`, c'est-à-dire `alpha <= 0` : la stratégie ne bat pas le fait de ne rien faire |
+| Verdict de compétence (`strategy_beats_random`, `p_value`) | section `random_entry` | `p_value >= 0.05` (percentile < 95) : la performance s'explique par la chance |
+| Taux sans risque utilisé (`benchmark.risk_free_rate`) | section Metadata | `0.0` sur une fenêtre où le sans-risque rapportait 5 %/an : Sharpe et Sortino sont **optimistes** (voir §3.9 et la méthodologie, §11.7) |
 
 Détail des seuils et de leur justification :
 [`docs/backtesting-methodology.md`](backtesting-methodology.md).

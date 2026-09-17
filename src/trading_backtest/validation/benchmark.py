@@ -16,13 +16,24 @@ gate             question
 ``strategy_beats_benchmark``  does the edge survive *inaction*?
 ===============  ==========================================================
 
-Two rules are deliberate:
+Three rules are deliberate:
 
 * the verdict is a **strict** inequality -- ``alpha > MIN_ALPHA`` with
   :data:`MIN_ALPHA` = ``0.0`` -- so a tie is not a victory: a strategy that
   reproduces buy & hold exactly has merely paid fees and slippage for nothing;
 * ``alpha`` is a **fraction**, in the very same unit as ``total_return``
-  (``alpha * 100`` is an excess return in percentage points).
+  (``alpha * 100`` is an excess return in percentage points);
+* the annual ``risk_free_rate`` (default ``0.0``, i.e. "do not change the
+  legacy behaviour") is carried through to the comparison so that the
+  ``sharpe_ratio``/``sortino_ratio`` of **both** sides -- the strategy *and* the
+  benchmark -- are excess-of-cash figures, and so that the ``"risk_free"``
+  variant can compound that very rate over the window.  It never enters
+  ``alpha`` itself: ``total_return`` is risk-free-rate free by construction.
+
+The ``"random_entry"`` variant is deliberately **not** handled here: a random
+entry is not a passive benchmark but a distribution to situate the strategy in,
+and it lives in :mod:`trading_backtest.validation.random_entry` (gate
+``strategy_beats_random``).
 
 The metrics layer (``trading_backtest.metrics``) is imported **lazily** inside
 :func:`_resolve_comparison_fn` and every entry point accepts an explicit
@@ -63,10 +74,10 @@ __all__ = [
 #: margin", so a tie (``alpha == 0.0``) does **not** beat the benchmark.
 MIN_ALPHA: float = 0.0
 
-#: A comparison function: ``(result, data, **variant/fee_rate/slippage) ->
-#: BenchmarkComparison | None``.  Mirrors :data:`~trading_backtest.validation.
-#: walk_forward.MetricFn`: it is the injectable seam that keeps this module
-#: usable without the metrics layer.
+#: A comparison function: ``(result, data, **variant/fee_rate/slippage/
+#: risk_free_rate) -> BenchmarkComparison | None``.  Mirrors :data:`~trading_
+#: backtest.validation.walk_forward.MetricFn`: it is the injectable seam that
+#: keeps this module usable without the metrics layer.
 ComparisonFn = Callable[..., "BenchmarkComparison | None"]
 
 
@@ -168,6 +179,7 @@ def validate_benchmark(
     fee_rate: float = 0.0,
     slippage: float = 0.0,
     min_alpha: float = MIN_ALPHA,
+    risk_free_rate: float = 0.0,
     comparison_fn: ComparisonFn | None = None,
 ) -> BenchmarkGateResult | None:
     """Compare ``result`` with its ``variant`` benchmark and gate the verdict.
@@ -187,18 +199,27 @@ def validate_benchmark(
     variant:
         ``"buy_and_hold"`` (default, i.e.
         :data:`trading_backtest.metrics.benchmark.DEFAULT_BENCHMARK_VARIANT`),
-        ``"cash"`` or ``"none"`` -- the literal is inlined on purpose so that
-        this module never imports the metrics layer at import time.
+        ``"cash"``, ``"risk_free"`` or ``"none"`` -- the literal is inlined on
+        purpose so that this module never imports the metrics layer at import
+        time.  ``"random_entry"`` is *not* accepted here: it is a distribution
+        comparison, handled by
+        :func:`trading_backtest.validation.random_entry.validate_random_entry`.
     fee_rate, slippage:
         Costs applied to the benchmark side, identical to the backtest's.
     min_alpha:
         Minimum excess return the strategy must beat the benchmark by.
         Defaults to :data:`MIN_ALPHA` (``0.0``).
+    risk_free_rate:
+        **Annual** risk-free rate (e.g. ``0.05`` for a ~5 %/year T-bill), used
+        for the ``sharpe_ratio``/``sortino_ratio`` of both sides and as the
+        compounded return of the ``"risk_free"`` variant.  Defaults to ``0.0``,
+        which reproduces the legacy behaviour exactly (``"risk_free"`` then
+        degenerates to ``"cash"``).
     comparison_fn:
         Injectable comparison function; ``None`` means "use
         :func:`trading_backtest.metrics.benchmark.compare_benchmark`".  It is
         called as ``comparison_fn(result, data, variant=..., fee_rate=...,
-        slippage=...)``.
+        slippage=..., risk_free_rate=...)``.
 
     Returns
     -------
@@ -213,7 +234,9 @@ def validate_benchmark(
     ``strategy_beats_benchmark`` is ``bool(alpha > min_alpha)``: the comparison
     is **strictly** greater, so with the default ``min_alpha = 0.0`` a tie
     (``alpha == 0.0``) does **not** beat the benchmark -- reproducing buy & hold
-    exactly, fees and slippage included, is not an edge.
+    exactly, fees and slippage included, is not an edge.  ``risk_free_rate``
+    never moves that verdict: it only refines the risk-adjusted metrics of both
+    curves.
 
     Raises
     ------
@@ -224,7 +247,14 @@ def validate_benchmark(
         return None
 
     compare = _resolve_comparison_fn(comparison_fn, variant)
-    comparison = compare(result, data, variant=variant, fee_rate=fee_rate, slippage=slippage)
+    comparison = compare(
+        result,
+        data,
+        variant=variant,
+        fee_rate=fee_rate,
+        slippage=slippage,
+        risk_free_rate=risk_free_rate,
+    )
     if comparison is None:
         return None
 

@@ -27,6 +27,7 @@ from trading_backtest.core.models import BacktestResult
 from trading_backtest.metrics import (
     BENCHMARK_METRIC_NAMES,
     BENCHMARK_VARIANTS,
+    CURVE_VARIANTS,
     DEFAULT_BENCHMARK_VARIANT,
     MIN_RETURNS_FOR_BETA,
     BenchmarkComparison,
@@ -122,7 +123,8 @@ def rising_frame(n: int = 60) -> pd.DataFrame:
 # constants & exports
 # ---------------------------------------------------------------------------
 def test_module_constants_are_frozen() -> None:
-    assert BENCHMARK_VARIANTS == ("buy_and_hold", "cash", "none")
+    assert BENCHMARK_VARIANTS == ("buy_and_hold", "cash", "risk_free", "random_entry", "none")
+    assert CURVE_VARIANTS == ("buy_and_hold", "cash", "risk_free")
     assert DEFAULT_BENCHMARK_VARIANT == "buy_and_hold"
     assert BENCHMARK_METRIC_NAMES == (
         "total_return",
@@ -143,14 +145,22 @@ def test_metrics_package_exposes_every_new_symbol() -> None:
     for name in (
         "BENCHMARK_METRIC_NAMES",
         "BENCHMARK_VARIANTS",
+        "CURVE_VARIANTS",
         "DEFAULT_BENCHMARK_VARIANT",
+        "DEFAULT_N_SIMULATIONS",
+        "DEFAULT_RANDOM_SEED",
+        "MAX_SIMULATIONS",
         "MIN_RETURNS_FOR_BETA",
+        "PERCENTILE_LABELS",
+        "RANDOM_ENTRY_VARIANT",
         "BenchmarkComparison",
         "BenchmarkResult",
+        "RandomEntryResult",
         "benchmark_alpha",
         "buy_and_hold_equity",
         "compare_benchmark",
         "compute_benchmark",
+        "random_entry_benchmark",
     ):
         assert name in metrics.__all__, name
         assert hasattr(metrics, name), name
@@ -256,6 +266,167 @@ def test_cash_variant_ignores_fees_and_slippage() -> None:
     plain = buy_and_hold_equity(frame, variant="cash")
     costly = buy_and_hold_equity(frame, variant="cash", fee_rate=0.01, slippage=0.02)
     pd.testing.assert_series_equal(plain, costly, check_names=True)
+
+
+# ---------------------------------------------------------------------------
+# risk_free variant
+# ---------------------------------------------------------------------------
+def test_curve_variants_are_exactly_the_passive_ones() -> None:
+    assert set(CURVE_VARIANTS) < set(BENCHMARK_VARIANTS)
+    assert set(BENCHMARK_VARIANTS) - set(CURVE_VARIANTS) == {"random_entry", "none"}
+
+
+def test_risk_free_curve_compounds_the_annual_rate_on_every_candle() -> None:
+    frame = make_frame(RAMP)
+    period_rate = 0.05 / 8760.0  # one year of hourly candles
+    equity = buy_and_hold_equity(
+        frame, initial_balance=10_000.0, variant="risk_free", risk_free_rate=0.05
+    )
+
+    for position in range(len(RAMP)):
+        expected = 10_000.0 * (1.0 + period_rate) ** position
+        assert float(equity.iloc[position]) == pytest.approx(expected, rel=1e-12)
+    assert float(equity.iloc[0]) == 10_000.0
+    assert float(equity.iloc[-1]) > float(equity.iloc[0])
+    assert list(equity.index) == list(frame.index)
+    assert equity.name == "equity"
+    assert equity.dtype == np.float64
+    assert equity.index.name == OHLCV_INDEX_NAME
+    assert str(equity.index.tz) == UTC
+
+
+def test_risk_free_at_zero_rate_is_bit_identical_to_cash() -> None:
+    frame = make_frame(RAMP)
+    cash = buy_and_hold_equity(frame, initial_balance=5_000.0, variant="cash")
+    free = buy_and_hold_equity(
+        frame, initial_balance=5_000.0, variant="risk_free", risk_free_rate=0.0
+    )
+    pd.testing.assert_series_equal(cash, free, check_exact=True, check_names=True)
+    assert (free == 5_000.0).all()
+
+
+def test_risk_free_variant_ignores_fees_and_slippage() -> None:
+    frame = make_frame(RAMP)
+    plain = buy_and_hold_equity(frame, variant="risk_free", risk_free_rate=0.05)
+    costly = buy_and_hold_equity(
+        frame, variant="risk_free", risk_free_rate=0.05, fee_rate=0.01, slippage=0.02
+    )
+    pd.testing.assert_series_equal(plain, costly, check_names=True)
+
+
+def test_cash_and_risk_free_differ_by_exactly_the_carry() -> None:
+    frame = make_frame(RAMP)
+    cash = compute_benchmark(frame, variant="cash", initial_balance=10_000.0)
+    free = compute_benchmark(
+        frame, variant="risk_free", initial_balance=10_000.0, risk_free_rate=0.05
+    )
+    assert cash is not None and free is not None
+    assert cash["total_return"] == 0.0
+    assert cash["final_balance"] == 10_000.0
+    assert free["total_return"] > 0.0
+    assert free["final_balance"] == pytest.approx(10_000.0 * (1.0 + 0.05 / 8760.0) ** 2, rel=1e-12)
+    assert free["final_balance"] > cash["final_balance"]
+
+
+def test_risk_free_on_a_full_year_is_a_zero_variance_curve() -> None:
+    frame = make_frame(np.full(8761, 100.0))
+    result = compute_benchmark(
+        frame, variant="risk_free", risk_free_rate=0.05, initial_balance=10_000.0
+    )
+    assert result is not None
+    compounded = (1.0 + 0.05 / 8760.0) ** 8760 - 1.0
+    assert compounded == pytest.approx(0.05127095, abs=1e-8)
+
+    assert result.n_periods == 8760
+    assert result["total_return"] == pytest.approx(compounded, rel=1e-9)
+    assert result["total_return"] == pytest.approx(0.05, abs=5e-3)
+    assert result["cagr"] == pytest.approx(compounded, rel=1e-9)
+    assert result["final_balance"] == pytest.approx(10_000.0 * (1.0 + compounded), rel=1e-9)
+    assert result["final_balance"] == pytest.approx(10_500.0, rel=0.01)
+
+    # a constant-rate curve has zero variance: these four are exactly 0.0, and the
+    # variant's informative outputs are total_return / cagr / final_balance.
+    assert result["volatility"] == 0.0
+    assert result["sharpe_ratio"] == 0.0
+    assert result["sortino_ratio"] == 0.0
+    assert result["max_drawdown"] == 0.0
+    assert result["max_drawdown_duration"] == 0
+
+
+@pytest.mark.parametrize("rate", [-0.01, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_invalid_risk_free_rate_raises(rate: float) -> None:
+    frame = make_frame(RAMP)
+    with pytest.raises(MetricsError, match="risk_free_rate"):
+        buy_and_hold_equity(frame, variant="risk_free", risk_free_rate=rate)
+    with pytest.raises(MetricsError, match="risk_free_rate"):
+        compute_benchmark(frame, variant="risk_free", risk_free_rate=rate)
+
+
+def test_risk_free_rate_is_ignored_by_the_other_curve_variants() -> None:
+    frame = make_frame(RAMP)
+    plain = buy_and_hold_equity(frame, variant="buy_and_hold")
+    priced = buy_and_hold_equity(frame, variant="buy_and_hold", risk_free_rate=0.05)
+    pd.testing.assert_series_equal(plain, priced, check_exact=True, check_names=True)
+
+
+def test_risk_free_variant_propagates_config_error_for_an_unsupported_timeframe() -> None:
+    frame = make_frame(RAMP)
+    with pytest.raises(ConfigError):
+        buy_and_hold_equity(frame, variant="risk_free", risk_free_rate=0.05, timeframe="7h")
+    with pytest.raises(ConfigError):
+        compute_benchmark(frame, variant="risk_free", risk_free_rate=0.05, timeframe="7h")
+
+
+def test_beta_is_none_for_a_risk_free_benchmark_curve() -> None:
+    frame = rising_frame(30)
+    strategy = make_strategy(frame, np.linspace(10_000.0, 12_000.0, 30))
+    for rate in (0.0, 0.05):
+        comparison = compare_benchmark(strategy, frame, variant="risk_free", risk_free_rate=rate)
+        assert comparison is not None
+        assert comparison.n_returns == len(frame) - 1
+        assert comparison.n_returns >= MIN_RETURNS_FOR_BETA
+        assert comparison.beta is None
+        assert comparison.correlation is None
+        assert comparison.benchmark["volatility"] == 0.0
+
+
+def test_risk_free_rate_only_moves_the_sharpe_of_a_volatile_curve() -> None:
+    frame = rising_frame(40)
+    free = compute_benchmark(frame)
+    with_rate = compute_benchmark(frame, risk_free_rate=0.05)
+    assert free is not None and with_rate is not None
+    # the documented property: subtracting the risk-free rate lowers the Sharpe of
+    # a curve that actually has variance (buy & hold).
+    assert with_rate["sharpe_ratio"] < free["sharpe_ratio"]
+
+    # ... but it cannot move the risk_free variant's own Sharpe: its variance is
+    # exactly zero, so the value stays 0.0 at any rate.
+    zero = compute_benchmark(frame, variant="risk_free", risk_free_rate=0.0)
+    priced = compute_benchmark(frame, variant="risk_free", risk_free_rate=0.05)
+    assert zero is not None and priced is not None
+    assert zero["sharpe_ratio"] == 0.0
+    assert priced["sharpe_ratio"] == 0.0
+
+
+@pytest.mark.parametrize("entrypoint", ["equity", "compute", "compare"])
+def test_random_entry_variant_has_no_curve_and_points_at_its_distribution(
+    entrypoint: str,
+) -> None:
+    frame = make_frame(RAMP)
+    strategy = make_strategy(frame, (10_000.0, 11_000.0, 12_000.0))
+    with pytest.raises(MetricsError) as excinfo:
+        if entrypoint == "equity":
+            buy_and_hold_equity(frame, variant="random_entry")
+        elif entrypoint == "compute":
+            compute_benchmark(frame, variant="random_entry")
+        else:
+            compare_benchmark(strategy, frame, variant="random_entry")
+    message = str(excinfo.value)
+    assert "random_entry" in message
+    assert "random_entry_benchmark" in message
+    for curve_variant in CURVE_VARIANTS:
+        assert curve_variant in message
+    assert "no deterministic equity curve" in message
 
 
 def test_none_variant_returns_none_and_has_no_curve() -> None:

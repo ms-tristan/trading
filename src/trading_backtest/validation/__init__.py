@@ -8,6 +8,7 @@ Public API::
         parameter_sweep, RobustnessResult, RobustnessPoint, expand_grid, grid_size,
         monte_carlo, MonteCarloResult,
         validate_benchmark, BenchmarkGateResult, MIN_ALPHA,
+        validate_random_entry, RandomEntryGateResult, MIN_P_VALUE,
     )
 
 The layer is purely mechanical and fully injectable:
@@ -21,7 +22,12 @@ The layer is purely mechanical and fully injectable:
 * the benchmark gate accepts an explicit ``comparison_fn`` override and follows
   the same lazy rule: ``validate_benchmark`` answers "did the strategy beat buy &
   hold?" (``strategy_beats_benchmark``, with ``MIN_ALPHA = 0.0`` so a tie is not
-  a victory), next to ``is_robust`` and ``is_consistent``.
+  a victory), next to ``is_robust`` and ``is_consistent``;
+* the random-entry gate accepts an explicit ``entry_fn`` override and follows it
+  too: ``validate_random_entry`` answers "did the strategy beat **luck**?"
+  (``strategy_beats_random``, with ``MIN_P_VALUE = 0.05`` so a strategy must beat
+  at least 95 % of the random entries -- a strict inequality, and ties count
+  against it).
 
 Dependency direction: ``core`` / ``config`` / ``data`` -> ``validation``.
 """
@@ -39,6 +45,12 @@ from trading_backtest.validation.monte_carlo import (
     SERIALISED_SIMULATIONS,
     MonteCarloResult,
     monte_carlo,
+)
+from trading_backtest.validation.random_entry import (
+    MIN_P_VALUE,
+    RandomEntryFn,
+    RandomEntryGateResult,
+    validate_random_entry,
 )
 from trading_backtest.validation.robustness import (
     DEFAULT_MAX_COMBINATIONS,
@@ -69,6 +81,7 @@ __all__ = [
     "DEFAULT_MAX_COMBINATIONS",
     "METHODS",
     "MIN_ALPHA",
+    "MIN_P_VALUE",
     "MIN_ROWS_PER_SLICE",
     "PERCENTILE_LABELS",
     "POSITIVE_RATIO_THRESHOLD",
@@ -77,6 +90,8 @@ __all__ = [
     "WINDOW_MODES",
     "BenchmarkGateResult",
     "MonteCarloResult",
+    "RandomEntryFn",
+    "RandomEntryGateResult",
     "RobustnessPoint",
     "RobustnessResult",
     "WalkForwardResult",
@@ -89,5 +104,6 @@ __all__ = [
     "parameter_sweep",
     "split_is_oos",
     "validate_benchmark",
+    "validate_random_entry",
     "walk_forward",
 ]

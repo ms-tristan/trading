@@ -273,6 +273,7 @@ def test_injected_comparison_fn_is_used_without_metrics(monkeypatch: pytest.Monk
     assert recorder.calls[0]["variant"] == "buy_and_hold"
     assert recorder.calls[0]["fee_rate"] == 0.0
     assert recorder.calls[0]["slippage"] == 0.0
+    assert recorder.calls[0]["risk_free_rate"] == 0.0
 
 
 def test_fee_rate_and_slippage_are_passed_through() -> None:
@@ -292,6 +293,37 @@ def test_fee_rate_and_slippage_are_passed_through() -> None:
     assert gate.fee_rate == 0.002
     assert gate.slippage == 0.001
     assert gate.min_alpha == 0.005
+
+
+def test_risk_free_rate_is_passed_through() -> None:
+    """The annual risk-free rate reaches the comparison, and defaults to ``0.0``."""
+    comparison = StubComparison(alpha=0.01, strategy_total_return=0.10, benchmark_total_return=0.09)
+
+    default_gate, default_recorder = stub_gate(comparison)
+    flagged_gate, flagged_recorder = stub_gate(comparison, risk_free_rate=0.05)
+
+    assert default_gate is not None
+    assert flagged_gate is not None
+    assert default_recorder.calls[0]["risk_free_rate"] == 0.0
+    assert flagged_recorder.calls[0]["risk_free_rate"] == 0.05
+    # the rate never leaks into the frozen payload of the gate
+    assert tuple(default_gate.to_dict()) == GATE_KEYS
+    assert tuple(flagged_gate.to_dict()) == GATE_KEYS
+
+
+def test_none_variant_needs_no_comparison_even_with_a_risk_free_rate() -> None:
+    recorder = RecordingComparison(None)
+
+    gate = validate_benchmark(
+        object(),
+        make_frame((100.0, 110.0)),
+        variant="none",
+        risk_free_rate=0.05,
+        comparison_fn=recorder,
+    )
+
+    assert gate is None
+    assert recorder.calls == []
 
 
 def test_none_comparison_returns_none() -> None:

@@ -10,6 +10,9 @@
   },
   "benchmark": {
     "enabled": true,
+    "n_random_simulations": 1000,
+    "random_entry_seed": 42,
+    "risk_free_rate": 0.0,
     "variant": "buy_and_hold"
   },
   "data": {

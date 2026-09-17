@@ -1,10 +1,19 @@
-"""End-to-end tests of the buy & hold benchmark wiring of the CLI (work package wp-5).
+"""End-to-end tests of the benchmark wiring of the CLI (work package wp-5).
 
 Every test is **offline** and deterministic: the OHLCV window comes from
 ``tests/fixtures/BTC_USDT-1h.csv`` (200 synthetic, rising candles: 100.00 ->
 107.86), the report directory is a ``tmp_path`` and no test ever touches the
 network.  The ``PAYLOAD_KEYS`` contract is re-declared here on purpose so that
 this file stays independent from ``tests/test_cli.py``.
+
+The two flags added by this work package are covered here as well:
+``--risk-free-rate`` (the annual rate subtracted from the annualised mean return
+by ``sharpe_ratio``/``sortino_ratio`` and compounded by the ``risk_free`` curve)
+and ``--benchmark-variant`` (``buy_and_hold``, ``cash``, ``risk_free``,
+``random_entry`` or ``none``).  Every random-entry test runs on a temporary
+configuration holding ``benchmark.n_random_simulations = 50`` so that the suite
+stays fast; the seed stays the configured ``benchmark.random_entry_seed`` (42),
+which is what makes the distribution reproducible.
 """
 
 from __future__ import annotations
@@ -66,6 +75,35 @@ BENCHMARK_METRICS = (
     "final_balance",
 )
 
+#: Scalars every ``run["random_entry"]`` payload carries (the validation gate
+#: contract: ``RandomEntryGateResult.to_dict()`` plus the full distribution).
+RANDOM_ENTRY_KEYS = (
+    "n_simulations",
+    "random_seed",
+    "n_trades",
+    "holding_periods",
+    "exposure",
+    "initial_balance",
+    "timeframe",
+    "strategy_total_return",
+    "mean_return",
+    "median_return",
+    "std_return",
+    "percentiles",
+    "percentile",
+    "p_value",
+    "min_p_value",
+    "strategy_beats_random",
+    "distribution",
+)
+
+#: Percentile labels of the simulated-return distribution.
+PERCENTILE_LABELS = ("p05", "p25", "p50", "p75", "p95")
+
+#: Simulations used by the random-entry tests: small enough to keep the suite fast,
+#: large enough for the percentiles to be meaningful.
+TEST_SIMULATIONS = 50
+
 runner = CliRunner()
 
 #: ANSI SGR escape sequences emitted by rich when the CLI runs in a colour-forcing
@@ -73,9 +111,13 @@ runner = CliRunner()
 _ANSI_SGR = re.compile(rb"\x1b\[[0-9;]*m")
 
 
-def invoke(*args: str):
-    """Invoke the CLI in the isolated ``CliRunner`` environment, without ANSI styling."""
-    result = runner.invoke(app, list(args))
+def invoke(*args: str, env: dict[str, str] | None = None):
+    """Invoke the CLI in the isolated ``CliRunner`` environment, without ANSI styling.
+
+    ``env`` adds environment overrides for this one invocation: the ``--help``
+    tests set a wide ``COLUMNS`` so that rich never elides a long option name.
+    """
+    result = runner.invoke(app, list(args), env=env)
     result.stdout_bytes = _ANSI_SGR.sub(b"", result.stdout_bytes)
     result.stderr_bytes = _ANSI_SGR.sub(b"", result.stderr_bytes)
     result.output_bytes = _ANSI_SGR.sub(b"", result.output_bytes)
@@ -92,6 +134,8 @@ def write_config(
     *,
     variant: str | None = None,
     enabled: bool | None = None,
+    risk_free_rate: float | None = None,
+    n_random_simulations: int | None = None,
     name: str = "config.json",
 ) -> str:
     """Write the default configuration with an overridden ``benchmark`` section."""
@@ -100,6 +144,10 @@ def write_config(
         cfg.benchmark.variant = variant  # type: ignore[assignment]
     if enabled is not None:
         cfg.benchmark.enabled = enabled
+    if risk_free_rate is not None:
+        cfg.benchmark.risk_free_rate = risk_free_rate
+    if n_random_simulations is not None:
+        cfg.benchmark.n_random_simulations = n_random_simulations
     return str(dump_config(cfg, tmp_path / name))
 
 
@@ -150,6 +198,22 @@ def assert_benchmark_section(payload: dict[str, Any], *, variant: str) -> list[d
     return body
 
 
+def section_titles(payload: dict[str, Any]) -> list[str]:
+    """Return the titles of the report sections, in written order."""
+    json_report, _ = written_reports(payload)
+    return [str(section["title"]) for section in read_report(json_report)["sections"]]
+
+
+def error_text(result) -> str:
+    """The message rendered on stderr, with every run of whitespace collapsed.
+
+    ``rich`` wraps long messages at the console width, so a raw substring check
+    would depend on the terminal: the captured text is normalised, never the
+    assertion relaxed.
+    """
+    return " ".join(result.stderr.split())
+
+
 def backtest_args(data_file: str = FIXTURE) -> list[str]:
     """The offline ``backtest`` arguments shared by most tests."""
     return ["backtest", "--config", CONFIG, "--data-file", data_file, "--no-network"]
@@ -198,6 +262,21 @@ def test_benchmark_flags_are_documented_in_every_run_command_help() -> None:
         assert "--benchmark" in compact
         assert "--no-benchmark" in compact
         assert "benchmark" in compact.lower()
+
+
+def test_the_two_new_flags_are_documented_in_every_run_command_help() -> None:
+    """``--risk-free-rate`` and ``--benchmark-variant`` exist on the four run commands."""
+    for command in RUN_COMMANDS:
+        # a wide terminal keeps rich from eliding the longer option name to
+        # ``--risk-free-ra…`` (which it does at the default 80 columns)
+        result = invoke(command, "--help", env={"COLUMNS": "200"})
+        compact = "".join(result.output.split())
+
+        assert result.exit_code == 0, result.output
+        assert "--risk-free-rate" in compact
+        assert "--benchmark-variant" in compact
+        assert "risk_free" in compact.replace("\u2026", "")
+        assert "random_entry" in compact.replace("\u2026", "")
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +381,310 @@ def test_invalid_benchmark_variant_is_rejected_at_load_time(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
+# --risk-free-rate
+# ---------------------------------------------------------------------------
+
+
+def test_risk_free_rate_zero_matches_the_default_configuration(tmp_path: Path) -> None:
+    """The configuration default is ``0.0``: an explicit ``0.0`` changes nothing."""
+    explicit = run_json(*backtest_args(), "--risk-free-rate", "0.0", tmp_path=tmp_path)
+    implicit = run_json(*backtest_args(), tmp_path=tmp_path)
+
+    assert explicit["metrics"]["values"] == implicit["metrics"]["values"]
+    assert explicit["run"]["benchmark"] == implicit["run"]["benchmark"]
+
+
+def test_risk_free_rate_lowers_the_sharpe_and_sortino_ratios(tmp_path: Path) -> None:
+    zero = run_json(*backtest_args(), "--risk-free-rate", "0.0", tmp_path=tmp_path)
+    five = run_json(*backtest_args(), "--risk-free-rate", "0.05", tmp_path=tmp_path)
+
+    assert five["metrics"]["values"]["sharpe_ratio"] < zero["metrics"]["values"]["sharpe_ratio"]
+    assert five["metrics"]["values"]["sortino_ratio"] < zero["metrics"]["values"]["sortino_ratio"]
+    # ... and nothing else moves: total_return is a risk-free-rate-free quantity.
+    assert five["metrics"]["values"]["total_return"] == zero["metrics"]["values"]["total_return"]
+
+
+def test_risk_free_rate_leaves_alpha_bit_identical(tmp_path: Path) -> None:
+    """``alpha`` is a total-return difference: the riskless rate cannot move it."""
+    zero = run_json(*backtest_args(), "--risk-free-rate", "0.0", tmp_path=tmp_path)
+    five = run_json(*backtest_args(), "--risk-free-rate", "0.05", tmp_path=tmp_path)
+
+    assert five["run"]["benchmark"]["alpha"] == zero["run"]["benchmark"]["alpha"]
+    assert five["run"]["benchmark"]["strategy_total_return"] == pytest.approx(
+        zero["run"]["benchmark"]["strategy_total_return"]
+    )
+
+
+def test_the_configured_risk_free_rate_moves_the_metrics_without_a_flag(tmp_path: Path) -> None:
+    """``benchmark.risk_free_rate`` is the default of ``--risk-free-rate``."""
+    configured = write_config(tmp_path, risk_free_rate=0.05)
+    flagged = run_json(*backtest_args(), "--risk-free-rate", "0.05", tmp_path=tmp_path)
+    from_config = run_json(
+        "backtest",
+        "--config",
+        configured,
+        "--data-file",
+        FIXTURE,
+        "--no-network",
+        tmp_path=tmp_path,
+    )
+
+    assert from_config["metrics"]["values"] == flagged["metrics"]["values"]
+
+
+def test_a_negative_risk_free_rate_is_rejected(tmp_path: Path) -> None:
+    result = invoke(
+        *backtest_args(), "--risk-free-rate", "-0.01", "--json", "--output-dir", str(tmp_path)
+    )
+
+    assert result.exit_code == 1
+    assert "--risk-free-rate must be a finite fraction >= 0, got -0.01" in error_text(result)
+    assert "Traceback" not in result.stderr
+    failed = json_payload(result)
+    assert sorted(failed) == sorted(PAYLOAD_KEYS)
+    assert failed["ok"] is False
+    assert failed["run"] is None
+
+
+def test_the_risk_free_rate_is_rejected_on_every_run_command(tmp_path: Path) -> None:
+    for command in RUN_COMMANDS:
+        result = invoke(
+            *run_args(command, "--risk-free-rate", "-1.0", "--json"),
+            "--output-dir",
+            str(tmp_path),
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "--risk-free-rate must be a finite fraction >= 0" in error_text(result)
+        assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_a_non_finite_risk_free_rate_is_rejected(value: str, tmp_path: Path) -> None:
+    result = invoke(
+        *backtest_args(), "--risk-free-rate", value, "--json", "--output-dir", str(tmp_path)
+    )
+
+    assert result.exit_code == 1
+    assert "--risk-free-rate must be a finite fraction >= 0" in error_text(result)
+    assert "Traceback" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# --benchmark-variant
+# ---------------------------------------------------------------------------
+
+
+def test_benchmark_variant_override_selects_the_risk_free_curve(tmp_path: Path) -> None:
+    """``--benchmark-variant risk_free`` wins over the configured ``buy_and_hold``."""
+    payload = run_json(
+        *backtest_args(),
+        "--benchmark-variant",
+        "risk_free",
+        "--risk-free-rate",
+        "0.05",
+        tmp_path=tmp_path,
+    )
+
+    assert payload["run"]["benchmark"]["variant"] == "risk_free"
+    body = assert_benchmark_section(payload, variant="risk_free")
+    assert body[1]["variant"] == "risk_free"
+    # compounding 5 %/yr over the 200 hourly candles of the fixture really grows
+    assert body[1]["total_return"] > 0.0
+    assert body[1]["max_drawdown"] == pytest.approx(0.0)
+    # the "gap" row is the strategy minus the risk-free placement, not a new metric
+    assert body[2]["variant"] == "gap"
+    # read before the next invocation overwrites the report files of this directory
+    assert "Benchmark" in section_titles(payload)
+
+
+def test_the_risk_free_and_cash_variants_are_distinct(tmp_path: Path) -> None:
+    """``cash`` earns nothing, ``risk_free`` earns the configured rate."""
+    risk_free = run_json(
+        *backtest_args(),
+        "--benchmark-variant",
+        "risk_free",
+        "--risk-free-rate",
+        "0.05",
+        tmp_path=tmp_path,
+    )
+    risk_free_body = assert_benchmark_section(risk_free, variant="risk_free")
+    json_report, _ = written_reports(risk_free)
+    config_echo = read_report(json_report)["metadata"]["config"]
+    # the CLI override never rewrites the configuration echo
+    assert config_echo["benchmark"]["variant"] == "buy_and_hold"
+    assert config_echo["benchmark"]["risk_free_rate"] == 0.0
+
+    cash = run_json(*backtest_args(), "--benchmark-variant", "cash", tmp_path=tmp_path)
+    cash_body = assert_benchmark_section(cash, variant="cash")
+
+    assert cash["run"]["benchmark"]["variant"] == "cash"
+    assert cash_body[1]["total_return"] == pytest.approx(0.0)
+    assert risk_free_body[1]["total_return"] > cash_body[1]["total_return"]
+
+
+def test_an_unknown_benchmark_variant_override_is_rejected(tmp_path: Path) -> None:
+    result = invoke(
+        *backtest_args(), "--benchmark-variant", "hodl", "--json", "--output-dir", str(tmp_path)
+    )
+
+    message = error_text(result)
+    assert result.exit_code == 1
+    assert "unknown benchmark variant: 'hodl'" in message
+    assert "available variants" in message
+    assert "risk_free" in message
+    assert "random_entry" in message
+    assert "Traceback" not in result.stderr
+    failed = json_payload(result)
+    assert sorted(failed) == sorted(PAYLOAD_KEYS)
+    assert failed["ok"] is False
+
+
+def test_no_benchmark_beats_the_variant_override(tmp_path: Path) -> None:
+    """``--no-benchmark`` can never be resurrected by ``--benchmark-variant``."""
+    payload = run_json(
+        *backtest_args(), "--no-benchmark", "--benchmark-variant", "risk_free", tmp_path=tmp_path
+    )
+
+    assert "benchmark" not in payload["run"]
+    assert "Benchmark" not in section_titles(payload)
+
+
+# ---------------------------------------------------------------------------
+# --benchmark-variant random_entry (the skill test)
+# ---------------------------------------------------------------------------
+
+
+def random_entry_config(tmp_path: Path) -> str:
+    """A configuration running :data:`TEST_SIMULATIONS` random-entry simulations."""
+    return write_config(tmp_path, n_random_simulations=TEST_SIMULATIONS, name="random_entry.json")
+
+
+def test_random_entry_variant_exposes_the_distribution_and_the_verdict(tmp_path: Path) -> None:
+    config = random_entry_config(tmp_path)
+
+    payload = run_json(
+        "backtest",
+        "--config",
+        config,
+        "--data-file",
+        FIXTURE,
+        "--no-network",
+        "--benchmark-variant",
+        "random_entry",
+        tmp_path=tmp_path,
+    )
+
+    run = payload["run"]
+    assert "benchmark" not in run  # exactly one benchmark per run
+    gate = run["random_entry"]
+    assert set(RANDOM_ENTRY_KEYS) <= set(gate)
+    assert gate["n_simulations"] == TEST_SIMULATIONS
+    assert gate["random_seed"] == load_config(CONFIG).benchmark.random_entry_seed
+    assert gate["n_trades"] == len(run["trades"]) > 0
+    assert gate["holding_periods"] >= 1
+    assert gate["timeframe"] == "1h"
+    assert gate["initial_balance"] == pytest.approx(run["initial_balance"])
+    assert set(gate["percentiles"]) == set(PERCENTILE_LABELS)
+    assert 0.0 <= gate["percentile"] <= 100.0
+    assert 0.0 <= gate["p_value"] <= 1.0
+    assert gate["strategy_beats_random"] is (gate["p_value"] < gate["min_p_value"])
+
+    distribution = gate["distribution"]
+    assert distribution["n_simulations"] == TEST_SIMULATIONS
+    assert len(distribution["returns"]) == TEST_SIMULATIONS
+    assert len(distribution["final_balances"]) == TEST_SIMULATIONS
+    assert distribution["mean_return"] == pytest.approx(gate["mean_return"])
+    assert distribution["strategy_total_return"] == pytest.approx(gate["strategy_total_return"])
+    assert distribution["percentile"] == pytest.approx(gate["percentile"])
+    assert distribution["p_value"] == pytest.approx(gate["p_value"])
+
+
+def test_random_entry_writes_one_report_section_and_no_benchmark_section(tmp_path: Path) -> None:
+    config = random_entry_config(tmp_path)
+
+    payload = run_json(
+        "backtest",
+        "--config",
+        config,
+        "--data-file",
+        FIXTURE,
+        "--no-network",
+        "--benchmark-variant",
+        "random_entry",
+        tmp_path=tmp_path,
+    )
+
+    titles = section_titles(payload)
+    assert titles.count("random_entry") == 1
+    assert "Benchmark" not in titles
+    json_report, markdown_report = written_reports(payload)
+    sections = [
+        section
+        for section in read_report(json_report)["sections"]
+        if section["title"] == "random_entry"
+    ]
+    assert sections[0]["body"]["n_simulations"] == TEST_SIMULATIONS
+    assert "## random_entry" in markdown_report.read_text(encoding="utf-8")
+
+
+def test_random_entry_is_deterministic_across_two_invocations(tmp_path: Path) -> None:
+    """The seed comes from ``benchmark.random_entry_seed``: the run is reproducible."""
+    config = random_entry_config(tmp_path)
+    args = [
+        "backtest",
+        "--config",
+        config,
+        "--data-file",
+        FIXTURE,
+        "--no-network",
+        "--benchmark-variant",
+        "random_entry",
+    ]
+
+    first = run_json(*args, tmp_path=tmp_path)
+    second = run_json(*args, tmp_path=tmp_path)
+
+    dumped_first = json.dumps(first["run"]["random_entry"], sort_keys=True)
+    dumped_second = json.dumps(second["run"]["random_entry"], sort_keys=True)
+    assert dumped_first == dumped_second
+    assert first["run"]["random_entry"]["random_seed"] == 42
+
+
+def test_random_entry_is_not_computed_when_another_variant_is_selected(tmp_path: Path) -> None:
+    config = random_entry_config(tmp_path)
+
+    payload = run_json(
+        "backtest",
+        "--config",
+        config,
+        "--data-file",
+        FIXTURE,
+        "--no-network",
+        "--benchmark-variant",
+        "buy_and_hold",
+        tmp_path=tmp_path,
+    )
+
+    assert payload["run"]["benchmark"]["variant"] == "buy_and_hold"
+    assert "random_entry" not in payload["run"]
+    assert "random_entry" not in section_titles(payload)
+
+
+def test_the_variant_can_be_selected_from_the_configuration_alone(tmp_path: Path) -> None:
+    config = write_config(
+        tmp_path, variant="random_entry", n_random_simulations=TEST_SIMULATIONS, name="re.json"
+    )
+
+    payload = run_json(
+        "backtest", "--config", config, "--data-file", FIXTURE, "--no-network", tmp_path=tmp_path
+    )
+
+    assert payload["run"]["random_entry"]["n_simulations"] == TEST_SIMULATIONS
+    assert "benchmark" not in payload["run"]
+
+
+# ---------------------------------------------------------------------------
 # human summary
 # ---------------------------------------------------------------------------
 
@@ -397,6 +780,45 @@ def test_monte_carlo_exposes_the_benchmark_and_keeps_its_own_run(tmp_path: Path)
 
 
 @pytest.mark.parametrize("command", RUN_COMMANDS)
+def test_every_run_command_threads_the_risk_free_variant_and_rate(
+    command: str, tmp_path: Path
+) -> None:
+    """The two new flags are wired into the four run commands, not only ``backtest``."""
+    payload = run_json(
+        *run_args(command, "--benchmark-variant", "risk_free", "--risk-free-rate", "0.05"),
+        tmp_path=tmp_path,
+    )
+
+    assert payload["run"]["benchmark"]["variant"] == "risk_free"
+    assert_benchmark_section(payload, variant="risk_free")
+
+
+def test_walk_forward_exposes_the_random_entry_gate(tmp_path: Path) -> None:
+    """The random-entry gate travels inside ``run`` for the validation commands too."""
+    config = random_entry_config(tmp_path)
+
+    payload = run_json(
+        "walk-forward",
+        "--config",
+        config,
+        "--data-file",
+        FIXTURE,
+        "--no-network",
+        "--windows",
+        "2",
+        "--benchmark-variant",
+        "random_entry",
+        tmp_path=tmp_path,
+    )
+
+    run = payload["run"]
+    assert set(RUN_KEYS["walk-forward"]) <= set(run)
+    assert run["random_entry"]["n_simulations"] == TEST_SIMULATIONS
+    assert "benchmark" not in run
+    assert "random_entry" in section_titles(payload)
+
+
+@pytest.mark.parametrize("command", RUN_COMMANDS)
 def test_the_payload_and_exit_code_contract_of_every_run_command_is_unchanged(
     command: str, tmp_path: Path
 ) -> None:
@@ -421,7 +843,9 @@ def test_the_commands_still_work_without_the_benchmark(tmp_path: Path) -> None:
         assert payload["command"] == command.replace("-", "_")
         assert payload["metrics"]["values"]
         assert "benchmark" not in payload["run"]
+        assert "random_entry" not in payload["run"]
         assert len(payload["reports"]) == 2
         json_report, _ = written_reports(payload)
         titles = {section["title"] for section in read_report(json_report)["sections"]}
         assert "Benchmark" not in titles
+        assert "random_entry" not in titles
