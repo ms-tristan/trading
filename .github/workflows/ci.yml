@@ -5,7 +5,15 @@ name: CI
 # locally with `make docker-test`, so CI stays fast and 100% offline (no
 # exchange API, no market-data download, no optional extras, no live server).
 on:
+  # `push` is filtered to the integration branch ON PURPOSE: the workflow also
+  # runs on `pull_request`, so an unfiltered `push` triggered the whole matrix
+  # a second time for every commit of every pull request (two runs, four
+  # checks, one commit). Pull-request branches are covered by
+  # `pull_request` alone, and a merge landing on the integration branch is
+  # covered by `push`. `preprod` is never listed here: this repository has no
+  # such branch and the delivery workflow never creates one.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

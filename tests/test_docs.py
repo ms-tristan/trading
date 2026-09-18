@@ -213,6 +213,28 @@ def test_ci_workflow_text_contract() -> None:
     # Exactly two top-level jobs, no network-dependent step.
     assert text.count("\n  quality:") == 1
     assert text.count("\n  dashboard:") == 1
+
+    # The `push` trigger is filtered to the integration branch. The workflow
+    # also runs on `pull_request`, so an unfiltered `push` ran the whole matrix
+    # twice for every commit of every pull request -- the trigger block must
+    # therefore carry a branch filter, and that filter must be `main` (this
+    # repository has no `preprod` branch, and the workflow never creates one).
+    trigger_block = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+    trigger_lines = [
+        line.strip()
+        for line in trigger_block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert trigger_lines == [
+        "push:",
+        "branches: [main]",
+        "pull_request:",
+        "workflow_dispatch:",
+    ], (
+        "the push trigger must stay filtered to the integration branch, "
+        f"otherwise every pull-request commit runs CI twice: {trigger_lines}"
+    )
+
     for forbidden in ("curl ", "wget ", "git clone", "apt-get"):
         assert forbidden not in text
 
@@ -340,6 +362,14 @@ def test_ci_workflow_parses_as_yaml_and_matches_the_contract() -> None:
 
     triggers = _triggers(workflow)
     assert set(triggers) >= {"push", "pull_request", "workflow_dispatch"}
+
+    # One workflow run per event. `push` is limited to the integration branch,
+    # so a pull-request commit triggers the workflow once (through
+    # `pull_request`) instead of twice: the previous unfiltered `push` ran the
+    # whole two-job matrix again for every commit pushed to a PR branch.
+    assert triggers["push"] == {"branches": ["main"]}
+    assert triggers["pull_request"] is None
+    assert triggers["workflow_dispatch"] is None
 
     assert workflow["permissions"] == {"contents": "read"}
     concurrency = workflow["concurrency"]
