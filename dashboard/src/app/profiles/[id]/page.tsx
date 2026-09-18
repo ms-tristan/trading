@@ -8,6 +8,7 @@ import { ErrorBanner } from '@/components/ui/error-banner';
 import {
   ApiError,
   errorMessage,
+  fetchCandles,
   fetchEquity,
   fetchHealth,
   fetchKillSwitch,
@@ -17,6 +18,7 @@ import {
   fetchProfile,
   fetchTrades,
 } from '@/lib/api';
+import { CANDLE_RENDER_LIMIT } from '@/lib/candles';
 import { resolveDetailPollIntervalMs, resolvePollIntervalMs, serverApiBaseUrl } from '@/lib/config';
 import type { ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
 
@@ -103,6 +105,9 @@ export default async function ProfileDetailPage({
     fetchTrades(id, { baseUrl }),
     fetchOrders(id, { baseUrl }),
     fetchMetrics(id, { baseUrl }),
+    // The candle window is part of the first paint on purpose: the chart would
+    // otherwise show its empty state until the detail loop fired.
+    fetchCandles(id, CANDLE_RENDER_LIMIT, { baseUrl }),
     fetchHealth({ baseUrl }),
     fetchKillSwitch({ baseUrl }),
   ]).then(
@@ -114,7 +119,8 @@ export default async function ProfileDetailPage({
     return <OutageView profileId={id} message={errorMessage(bundlesResult.failure)} />;
   }
 
-  const [equity, positions, trades, orders, metrics, health, killSwitch] = bundlesResult.value;
+  const [equity, positions, trades, orders, metrics, candles, health, killSwitch] =
+    bundlesResult.value;
   const detail: ProfileDetailBundle = { equity, positions, trades, orders, metrics };
   const live: ProfileLiveBundle = { profile: profileResult.value, health, killSwitch };
 
@@ -126,6 +132,7 @@ export default async function ProfileDetailPage({
       profileId={id}
       initialLive={live}
       initialDetail={detail}
+      initialCandles={candles}
       initialCheckedAt={health.checked_at ?? new Date().toISOString()}
       pollIntervalMs={pollIntervalMs}
       detailIntervalMs={detailIntervalMs}

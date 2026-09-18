@@ -51,6 +51,14 @@ export interface CandlestickPanelProps {
   trades: TradesPayload;
   /** Cadence of the detail loop, in milliseconds. */
   detailIntervalMs: number;
+  /**
+   * Candles rendered by the Server Component for the first paint.
+   *
+   * Without them the panel starts on {@link EMPTY_CANDLES} and shows its empty
+   * state until the detail loop fires — ten seconds of "No candle yet" on every
+   * page load, for data the server already had.
+   */
+  initialCandles?: CandlesPayload;
   /** Absolute origin used by a Server Component; empty means same origin. */
   baseUrl?: string;
   /** Fetch implementation seam for tests. Defaults to the global `fetch`. */
@@ -75,6 +83,7 @@ export function CandlestickPanel({
   positions,
   trades,
   detailIntervalMs,
+  initialCandles,
   baseUrl,
   fetchImpl,
   className,
@@ -87,7 +96,8 @@ export function CandlestickPanel({
 
   const { data, error, refreshNow } = usePolling<CandlesPayload>({
     fetcher,
-    initialData: EMPTY_CANDLES,
+    // The server-rendered window is the first paint; the loop only refreshes it.
+    initialData: initialCandles ?? EMPTY_CANDLES,
     intervalMs: detailIntervalMs,
   });
 

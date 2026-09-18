@@ -37,7 +37,7 @@ import {
   fetchTrades,
 } from '@/lib/api';
 import { usePolling } from '@/lib/use-polling';
-import type { ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
+import type { CandlesPayload, ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
 
 import { BenchmarkPanel } from './benchmark-panel';
 import { MetricsPanel } from './metrics-panel';
@@ -54,6 +54,13 @@ export interface ProfileLiveProps {
   initialLive: ProfileLiveBundle;
   /** Detail bundle rendered by the Server Component. */
   initialDetail: ProfileDetailBundle;
+  /**
+   * Candle window rendered by the Server Component.
+   *
+   * It is the chart's first paint: without it the panel would show its empty
+   * state until the detail loop fired, ten seconds into the visit.
+   */
+  initialCandles?: CandlesPayload;
   /** ISO-8601 stamp of the server-side fetch. */
   initialCheckedAt: string;
   /** Cadence of the live loop, in milliseconds. */
@@ -79,6 +86,7 @@ export function ProfileLive({
   profileId,
   initialLive,
   initialDetail,
+  initialCandles,
   initialCheckedAt,
   pollIntervalMs,
   detailIntervalMs,
@@ -171,6 +179,7 @@ export function ProfileLive({
         positions={detail.data.positions}
         trades={detail.data.trades}
         detailIntervalMs={detailIntervalMs}
+        initialCandles={initialCandles}
       />
 
       <Card
