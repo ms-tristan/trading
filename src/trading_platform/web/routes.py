@@ -1,4 +1,4 @@
-"""Pure HTTP routing of the monitoring surface (layer 7, work package wp9).
+"""Pure HTTP routing of the monitoring API (layer 7, work package wp9).
 
 This module contains **no socket, no thread and no server**: :class:`Router`
 maps ``(method, path)`` onto an :class:`HttpResponse` and nothing else.  The
@@ -6,10 +6,18 @@ transport (:mod:`trading_platform.web.server`) is a thin adapter on top of it,
 which is what makes every route testable by calling one pure function -- the
 whole JSON contract of section 4 of the delivery brief is enforced here.
 
+JSON only
+---------
+Layer 7 is a **pure JSON API**: it serves no HTML document and no static asset.
+``GET /`` and every ``/static/...`` path are unknown routes and answer the
+documented JSON ``404`` (``{"error": "not found: <path>"}``) like any other
+unknown path.  The dashboard is a separate application (``dashboard/``, a
+Next.js server) that consumes this API from its own origin.
+
 Data sources
 ------------
 A route never reads SQLite, never imports the orchestrator and never touches the
-filesystem outside of ``static/``:
+filesystem at all:
 
 * :class:`SnapshotProvider` supplies the *cheap* in-memory view (the 2-second
   dashboard poll): the platform snapshot, the health body, one profile snapshot
@@ -46,7 +54,6 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol
 
 from trading_platform.config.models import MonitoringConfig
@@ -70,18 +77,6 @@ OPERATOR_TOKEN_HEADER = "X-Operator-Token"
 
 #: Content type of every JSON payload.
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
-
-#: Content type of the dashboard document.
-HTML_CONTENT_TYPE = "text/html; charset=utf-8"
-
-#: Fixed allowlist of the servable static assets -- segment -> content type.
-#: A fixed allowlist (instead of a path join) is what makes path traversal
-#: structurally impossible: ``..``, ``%2e%2e``, an absolute path or an encoded
-#: slash simply is not one of the two known segments.
-STATIC_ASSETS: dict[str, str] = {
-    "app.js": "text/javascript; charset=utf-8",
-    "styles.css": "text/css; charset=utf-8",
-}
 
 #: Profile identifier pattern, identical to ``config.models.ProfileConfig``.
 _PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -261,7 +256,7 @@ def _header_value(headers: Mapping[str, str] | None, name: str) -> str | None:
 
 
 def _not_found(path: str) -> HttpResponse:
-    """Build the documented 404 payload of an unknown route or asset."""
+    """Build the documented 404 payload of an unknown route."""
     return _json_response(404, {"error": f"not found: {path}"})
 
 
@@ -303,8 +298,6 @@ class Router:
     clock:
         Time seam (D4) used for ``checked_at`` and for the ``changed_at``
         fallback of the kill switch.  Tests inject a ``ManualClock``.
-    static_dir:
-        Directory holding ``index.html``, ``app.js`` and ``styles.css``.
     """
 
     def __init__(
@@ -317,7 +310,6 @@ class Router:
         operator_token: str | None = None,
         version: str = "",
         clock: Clock | None = None,
-        static_dir: Path | None = None,
     ) -> None:
         self._provider = provider
         self._monitor = monitor
@@ -326,9 +318,6 @@ class Router:
         self._operator_token = _normalise_token(operator_token)
         self._version = str(version)
         self._clock: Clock = SystemClock() if clock is None else clock
-        self._static_dir = (
-            Path(__file__).with_name("static") if static_dir is None else Path(static_dir)
-        )
 
     # -- introspection ------------------------------------------------------
 
@@ -399,6 +388,16 @@ class Router:
         headers: Mapping[str, str] | None,
     ) -> HttpResponse:
         route, argument = self._route(path)
+        if verb == "HEAD":
+            # ``HEAD`` answers exactly like ``GET`` with an empty body -- on an
+            # unknown path (a 404 has no body either) as on a known one.
+            answer = self._get_answer(route, argument, path)
+            return HttpResponse(
+                status=answer.status,
+                body=b"",
+                content_type=answer.content_type,
+                headers=answer.headers,
+            )
         if route == "unknown":
             return _not_found(path)
         allowed = _MUTATING_METHODS if route == "kill_switch" else _READ_METHODS
@@ -408,32 +407,22 @@ class Router:
                 {"error": "method not allowed"},
                 headers=(("Allow", ", ".join(allowed)),),
             )
-        if verb == "HEAD":
-            answer = (
-                self._kill_switch_read() if route == "kill_switch" else self._read(route, argument)
-            )
-            return HttpResponse(
-                status=answer.status,
-                body=b"",
-                content_type=answer.content_type,
-                headers=answer.headers,
-            )
         if route == "kill_switch":
             if verb == "POST":
                 return self._kill_switch(body, headers)
             return self._kill_switch_read()
         return self._read(route, argument)
 
+    def _get_answer(self, route: str, argument: str, path: str) -> HttpResponse:
+        """Build the response ``GET`` would answer for ``route`` (never a 405)."""
+        if route == "unknown":
+            return _not_found(path)
+        if route == "kill_switch":
+            return self._kill_switch_read()
+        return self._read(route, argument)
+
     def _read(self, route: str, argument: str) -> HttpResponse:
         """Answer one read route (``route`` is never ``kill_switch``)."""
-        if route == "index":
-            return HttpResponse(
-                status=200,
-                body=(self._static_dir / "index.html").read_bytes(),
-                content_type=HTML_CONTENT_TYPE,
-            )
-        if route == "static":
-            return self._static(argument)
         if route == "health":
             return _json_response(200, self._health_payload())
         if route == "profiles":
@@ -483,17 +472,6 @@ class Router:
                 "benchmark": self._monitor.benchmark(profile_id),
                 "generated_at": _iso(self._clock.now()),
             },
-        )
-
-    def _static(self, asset: str) -> HttpResponse:
-        """Serve one allow-listed asset, or refuse with the documented 404."""
-        content_type = STATIC_ASSETS.get(asset)
-        if content_type is None:
-            return _not_found(f"/static/{asset}")
-        return HttpResponse(
-            status=200,
-            body=(self._static_dir / asset).read_bytes(),
-            content_type=content_type,
         )
 
     def _unknown_profile(self, profile_id: str) -> HttpResponse:
@@ -634,18 +612,15 @@ class Router:
     def _route(path: str) -> tuple[str, str]:
         """Resolve ``path`` onto ``(route_name, argument)``.
 
-        An unknown path resolves to ``('unknown', '')`` so the caller answers the
-        documented 404.  Matching is **exact**: empty segments, a trailing slash
-        or a percent-encoded segment never resolve, which is what makes
-        ``/api/profiles//equity`` and ``/static/%2e%2e/routes.py`` a 404 instead
-        of a traversal.
+        An unknown path -- ``/`` and every ``/static/...`` path included, since
+        layer 7 is a pure JSON API -- resolves to ``('unknown', '')`` so the
+        caller answers the documented 404.  Matching is **exact**: empty
+        segments, a trailing slash or a percent-encoded segment never resolve,
+        which is what makes ``/api/profiles//equity`` and
+        ``/static/..%2Froutes.py`` a 404 instead of a traversal.
         """
-        if path == "/":
-            return ("index", "")
         segments = path.split("/")
         head = segments[1] if len(segments) > 1 else ""
-        if len(segments) == 3 and head == "static":
-            return ("static", segments[2])
         if len(segments) < 3 or head != "api":
             return ("unknown", "")
         name = segments[2]

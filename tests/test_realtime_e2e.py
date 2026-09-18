@@ -579,17 +579,55 @@ def test_no_realtime_module_reads_the_wall_clock_directly() -> None:
     assert wall_clock_calls(root / "realtime" / "clock.py")
 
 
-def test_the_dashboard_static_assets_are_shipped_and_offline(tmp_path: Path) -> None:
-    """The dashboard renders with no CDN, no build step and no external asset."""
-    static = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web" / "static"
-    for name in ("index.html", "app.js", "styles.css"):
-        assert (static / name).is_file()
-    html = (static / "index.html").read_text(encoding="utf-8")
-    javascript = (static / "app.js").read_text(encoding="utf-8")
-    assert "http://" not in html.replace("http://127.0.0.1", "")
-    assert "cdn" not in html.lower()
-    assert "cdn" not in javascript.lower()
-    assert "/api/profiles" in javascript
+def test_the_monitoring_surface_ships_json_only(tmp_path: Path) -> None:
+    """Layer 7 is a pure JSON API: no HTML document, no static asset.
+
+    The hand-written dashboard assets are deleted, and the dashboard itself is now
+    a separate application (``dashboard/``, a Next.js server) that consumes the
+    documented routes.  The contract is pinned on the wire, not only on disk:
+    ``/`` and every ``/static/...`` path answer the documented JSON ``404``
+    exactly like any other unknown route.
+    """
+    web = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web"
+    assert not (web / "static").exists()
+    assert {item.name for item in web.iterdir() if item.is_file()} == {
+        "__init__.py",
+        "routes.py",
+        "server.py",
+    }
+
+    path = write_scenario(tmp_path)
+    clock = SystemClock()
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    store.initialize()
+    orchestrator = RealtimeOrchestrator(
+        profiles=load_profiles(path),
+        store=store,
+        clock=clock,
+        realtime=load_realtime_config(path),
+        monitoring=MonitoringConfig(port=0),
+        stream_factory=lambda profile: None,  # never started: the API only reads
+        version="e2e",
+    )
+    server = create_server(
+        orchestrator,
+        monitor=Monitor(store, clock=clock),
+        config=MonitoringConfig(port=0),
+        read_only=True,
+        version="e2e",
+    )
+    thread = start_in_thread(server)
+    try:
+        for unknown in ("/", "/static/app.js", "/static/styles.css"):
+            status, body = get(server.port, unknown)
+            assert status == 404, unknown
+            assert body == {"error": f"not found: {unknown}"}, unknown
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=JOIN_TIMEOUT)
+        assert not thread.is_alive()
+        store.close()
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,10 @@ data comes from a **local** ``FakeStore``/``FakeProvider`` (never from SQLite,
 never from the orchestrator) and the metrics block is compared against a direct
 call of ``Monitor.metrics``, so a payload invented by the router instead of read
 from the read model would fail these tests.
+
+Layer 7 is a **pure JSON API**: the HTML document and the two static assets it
+used to serve are gone, and ``GET /`` as well as every ``/static/...`` path is
+pinned here as the documented JSON ``404``.
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, cast
 
@@ -43,6 +46,7 @@ from trading_platform.realtime.models import (
     RunMode,
 )
 from trading_platform.realtime.monitor import Monitor
+from trading_platform.web import routes as web_routes
 from trading_platform.web.routes import (
     HttpResponse,
     Router,
@@ -58,7 +62,9 @@ PROFILE_A = "btc-paper"
 PROFILE_B = "eth-live"
 UNKNOWN_PROFILE = "ghost"
 START = datetime(2024, 1, 1, tzinfo=UTC)
-STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web" / "static"
+
+#: Repository root, used to pin the absence of the removed asset directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 HEALTH_KEYS = [
     "checked_at",
@@ -101,7 +107,7 @@ KILL_SWITCH_KEYS = ["changed_at", "kill_switch", "reason"]
 
 
 def payload_of(response: HttpResponse) -> dict[str, Any]:
-    """Decode the JSON body of ``response`` (every non-asset body is JSON)."""
+    """Decode the JSON body of ``response`` (every body of this layer is JSON)."""
     decoded = json.loads(response.body.decode("utf-8"))
     assert isinstance(decoded, dict)
     return decoded
@@ -478,125 +484,59 @@ def router(provider: FakeProvider, monitor: Monitor, manual_clock: ManualClock) 
 
 
 # ---------------------------------------------------------------------------
-# dashboard document and static assets
+# layer 7 is a pure JSON API: no HTML document, no static asset
 # ---------------------------------------------------------------------------
 
+#: The removed static surface, as the contract spells it: the requested path.
+STATIC_PATHS = [
+    "/static/app.js",
+    "/static/styles.css",
+    "/static/index.html",
+    "/static/server.py",
+    "/static/unknown.js",
+    "/static/",
+    "/static/app.js/extra",
+    "/static/../routes.py",
+    "/static/%2e%2e/routes.py",
+    "/static/..%2Froutes.py",
+]
 
-def test_index_returns_the_verbatim_html_document(router: Router) -> None:
+
+def test_the_root_path_is_the_documented_json_404(router: Router) -> None:
+    """``GET /`` serves no HTML document any more: it is an unknown route."""
     response = router.handle("GET", "/")
-    assert response.status == 200
-    assert response.content_type == "text/html; charset=utf-8"
-    assert response.body == (STATIC_DIR / "index.html").read_bytes()
+    assert response.status == 404
+    assert response.content_type == "application/json; charset=utf-8"
+    assert payload_of(response) == {"error": "not found: /"}
+    assert header_value(response, "Allow") is None
 
 
-def test_static_assets_are_served_verbatim_with_the_right_content_type(router: Router) -> None:
-    javascript = router.handle("GET", "/static/app.js")
-    assert javascript.status == 200
-    assert javascript.content_type == "text/javascript; charset=utf-8"
-    assert javascript.body == (STATIC_DIR / "app.js").read_bytes()
-
-    stylesheet = router.handle("GET", "/static/styles.css")
-    assert stylesheet.status == 200
-    assert stylesheet.content_type == "text/css; charset=utf-8"
-    assert stylesheet.body == (STATIC_DIR / "styles.css").read_bytes()
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/static/../routes.py",
-        "/static/%2e%2e/routes.py",
-        "/static/..%2Froutes.py",
-        "/static/unknown.js",
-        "/static/",
-        "/static/app.js/extra",
-        "/static/index.html",
-        "/static/server.py",
-    ],
-)
-def test_static_path_traversal_and_unknown_assets_are_refused(router: Router, path: str) -> None:
+@pytest.mark.parametrize("path", STATIC_PATHS)
+def test_every_static_path_is_the_documented_json_404(router: Router, path: str) -> None:
+    """Every ``/static/...`` path echoes itself in the documented 404 body."""
     response = router.handle("GET", path)
     assert response.status == 404
+    assert response.content_type == "application/json; charset=utf-8"
     assert payload_of(response) == {"error": f"not found: {path}"}
+    assert header_value(response, "Allow") is None
 
 
-def test_dashboard_assets_never_reach_the_network() -> None:
-    """The three files must render fully offline (mandatory, D2)."""
-    for name in ("index.html", "app.js", "styles.css"):
-        text = (STATIC_DIR / name).read_text(encoding="utf-8").lower()
-        for forbidden in ("http://", "https://", "cdn", "@import", "fonts.googleapis"):
-            assert forbidden not in text, f"{name} references {forbidden}"
-
-    document = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    assert 'data-refresh-seconds="2"' in document
-    assert "/static/styles.css" in document
-    assert "/static/app.js" in document
-
-    script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-    assert "2000" in script
-    assert "mutations disabled" in script
-    for forbidden_call in (".innerHTML", "insertAdjacentHTML", "document.write", "eval("):
-        assert forbidden_call not in script, f"app.js calls {forbidden_call}"
-    assert "textContent" in script
-    assert "sessionStorage" in script
-    assert "X-Operator-Token" in script
-    assert "devicePixelRatio" in script
+def test_a_404_carries_no_allowed_method(router: Router) -> None:
+    """The two removed surfaces advertise no method at all (a 404 has no ``Allow``)."""
+    assert router.allowed_methods("/") == ()
+    assert router.allowed_methods("/static/app.js") == ()
 
 
-class _DocumentAudit(HTMLParser):
-    """Collect the identifiers, the asset references and any tag imbalance."""
-
-    _VOID = frozenset(
-        {"meta", "link", "br", "hr", "img", "input", "source", "area", "base", "col", "wbr"}
-    )
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.ids: set[str] = set()
-        self.assets: list[str] = []
-        self.problems: list[str] = []
-        self._open: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = {name: (value or "") for name, value in attrs}
-        if attributes.get("id"):
-            self.ids.add(attributes["id"])
-        if tag == "link" and attributes.get("href"):
-            self.assets.append(attributes["href"])
-        if tag == "script" and attributes.get("src"):
-            self.assets.append(attributes["src"])
-        if tag not in self._VOID:
-            self._open.append(tag)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self._VOID:
-            return
-        if not self._open or self._open[-1] != tag:
-            self.problems.append(f"unexpected closing tag </{tag}>")
-            return
-        self._open.pop()
+def test_the_static_asset_directory_is_gone() -> None:
+    """The hand-written dashboard is deleted, not left orphaned in the package."""
+    static = REPO_ROOT / "src" / "trading_platform" / "web" / "static"
+    assert not static.exists()
 
 
-def test_the_dashboard_document_is_well_formed_and_wires_the_whole_page() -> None:
-    """A broken page would render nothing: the structure is asserted, not assumed."""
-    audit = _DocumentAudit()
-    audit.feed((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
-    assert audit.problems == []
-    assert audit._open == []
-    assert audit.assets == ["/static/styles.css", "/static/app.js"]
-    assert {
-        "profiles",
-        "banner",
-        "platform-status",
-        "platform-version",
-        "profiles-running",
-        "profiles-total",
-        "checked-at",
-        "operator-token",
-        "kill-engage",
-        "kill-release",
-        "kill-message",
-    } <= audit.ids
+def test_the_router_module_exposes_no_html_or_static_surface() -> None:
+    """The removed constants must not come back through a stale definition."""
+    assert not hasattr(web_routes, "STATIC_ASSETS")
+    assert not hasattr(web_routes, "HTML_CONTENT_TYPE")
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +626,7 @@ def test_empty_provider_still_answers_every_platform_route(
     assert sorted(health) == HEALTH_KEYS
     assert health["profiles_total"] == 0
     assert health["profiles_running"] == 0
-    assert router.handle("GET", "/").status == 200
+    assert payload_of(router.handle("GET", "/")) == {"error": "not found: /"}
     assert router.handle("GET", "/api/profiles/" + PROFILE_A).status == 404
 
 
@@ -821,7 +761,8 @@ def test_unsupported_method_on_an_unknown_path_is_404(router: Router) -> None:
 
 
 def test_allowed_methods_advertises_the_documented_tuples(router: Router) -> None:
-    assert router.allowed_methods("/") == ("GET", "HEAD")
+    assert router.allowed_methods("/") == ()
+    assert router.allowed_methods("/static/app.js") == ()
     assert router.allowed_methods("/api/health") == ("GET", "HEAD")
     assert router.allowed_methods(f"/api/profiles/{PROFILE_A}/equity") == ("GET", "HEAD")
     assert router.allowed_methods("/api/kill-switch") == ("GET", "HEAD", "POST")
@@ -1137,6 +1078,8 @@ def test_every_error_body_is_valid_json(router: Router) -> None:
         ("/api/nowhere", "GET"),
         ("/api/health", "POST"),
         (f"/api/profiles/{UNKNOWN_PROFILE}", "GET"),
+        ("/", "GET"),
+        ("/static/app.js", "GET"),
     ):
         body = router.handle(method, path).body
         assert isinstance(json.loads(body.decode()), dict)

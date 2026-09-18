@@ -59,10 +59,10 @@ REALTIME_SECTIONS = (
     "## 7. What is NOT proven",
 )
 
-#: Routes the web-API table must enumerate.
+#: Routes the web-API table must enumerate.  The server is a pure JSON API: it
+#: serves no HTML page and no static asset, so the table carries the API rows
+#: only -- the read counterpart of the kill switch included.
 REALTIME_ROUTES = (
-    "GET /",
-    "GET /static/{asset}",
     "GET /api/health",
     "GET /api/profiles",
     "GET /api/profiles/{id}",
@@ -71,6 +71,7 @@ REALTIME_ROUTES = (
     "GET /api/profiles/{id}/orders",
     "GET /api/profiles/{id}/positions",
     "GET /api/profiles/{id}/metrics",
+    "GET /api/kill-switch",
     "POST /api/kill-switch",
 )
 
@@ -209,7 +210,8 @@ def test_architecture_documents_the_new_tree_entries() -> None:
         "# RealtimeOrchestrator : N profils",
         "# read model : ProfileReport",
         "# ThreadingHTTPServer, create_server",
-        "# tableau de bord hors ligne",
+        "# API-only layer 7",
+        "# standalone Next.js dashboard",
         "# temps réel multi-profils : profils",
         "# profils temps réel (profiles + realtime + monitoring)",
     ):
@@ -242,6 +244,29 @@ def test_realtime_page_documents_every_route() -> None:
         assert route in text, f"docs/realtime.md does not document {route}"
     assert "|" in text, "the routes must be rendered as a table"
     assert "2 secondes" in text or "2 s" in text
+
+
+def test_realtime_page_documents_the_api_only_404_and_the_nextjs_dashboard() -> None:
+    """§5 describes a pure JSON API and a *separate* Next.js dashboard."""
+    text = read(REALTIME)
+
+    # Every path outside the API table -- `GET /` and `GET /static/{asset}`
+    # included -- answers the documented JSON 404 payload.
+    assert "not found: <path>" in text, (
+        "docs/realtime.md must document the JSON 404 payload of a non-API path"
+    )
+    assert '{"error": "not found: <path>"}' in text
+    assert "`GET /`" in text
+    assert "`GET /static/{asset}`" in text
+    # ... and the two removed rows are gone from the route table itself.
+    assert "| `GET /` |" not in text, "the route table still advertises an HTML page"
+    assert "| `GET /static/{asset}` |" not in text, (
+        "the route table still advertises a static asset"
+    )
+
+    # The dashboard is an application of its own, polling the same JSON API.
+    assert "separate Next.js application" in text
+    assert "dashboard/" in text
 
 
 def test_realtime_page_documents_the_three_commands_and_payloads() -> None:

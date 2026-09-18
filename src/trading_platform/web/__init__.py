@@ -1,4 +1,10 @@
-"""Web layer (layer 7): the standard-library monitoring surface.
+"""Web layer (layer 7): the standard-library monitoring **JSON API**.
+
+The layer serves no HTML document and no static asset: every route answers
+JSON, and the dashboard is a separate application (``dashboard/``, a Next.js
+server) that consumes this API from its own origin.  ``GET /`` and every
+``/static/...`` path are therefore unknown routes and answer the documented
+JSON ``404``.
 
 Public surface
 --------------

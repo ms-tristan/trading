@@ -178,10 +178,20 @@ def test_ci_workflow_text_contract() -> None:
         "pull_request",
         "workflow_dispatch",
         "quality",
+        "dashboard",
         "ubuntu-latest",
         "actions/checkout@v4",
         "actions/setup-python@v5",
+        "actions/setup-node@v4",
         "cache: pip",
+        "cache: npm",
+        "cache-dependency-path: dashboard/package-lock.json",
+        'node-version: "24"',
+        "npm ci",
+        "npm run lint",
+        "npm run typecheck",
+        "npm run test:coverage",
+        "npm run build",
         "python -m pip install --upgrade pip",
         'python -m pip install -e ".[dev]"',
         "python -m ruff check .",
@@ -200,8 +210,9 @@ def test_ci_workflow_text_contract() -> None:
     # The coverage gate comes from pyproject.toml only -- never repeated in CI.
     run_lines = [line for line in text.splitlines() if line.strip().startswith("run:")]
     assert not [line for line in run_lines if "--cov-fail-under" in line]
-    # Exactly one job, no network-dependent step.
+    # Exactly two top-level jobs, no network-dependent step.
     assert text.count("\n  quality:") == 1
+    assert text.count("\n  dashboard:") == 1
     for forbidden in ("curl ", "wget ", "git clone", "apt-get"):
         assert forbidden not in text
 
@@ -226,6 +237,54 @@ def test_ci_workflow_steps_are_ordered() -> None:
         assert index != -1, f"ci.yml has no step containing {token!r}"
         positions.append(index)
     assert positions == sorted(positions), f"CI steps are out of order: {positions}"
+
+
+def dashboard_job_text() -> str:
+    """Return the text of the ``dashboard`` job of ``ci.yml``."""
+    _, sep, block = read(CI_WORKFLOW).partition("\n  dashboard:")
+    assert sep, "ci.yml declares no 'dashboard' job"
+
+    return block
+
+
+def test_ci_workflow_dashboard_steps_are_ordered() -> None:
+    block = dashboard_job_text()
+
+    ordered = (
+        "actions/checkout@v4",
+        "actions/setup-node@v4",
+        "npm ci",
+        "npm run lint",
+        "npm run typecheck",
+        "npm run test:coverage",
+        "npm run build",
+    )
+    positions = []
+    for token in ordered:
+        index = block.find(token)
+        assert index != -1, f"the dashboard job has no step containing {token!r}"
+        positions.append(index)
+    assert positions == sorted(positions), f"dashboard steps are out of order: {positions}"
+
+
+def test_ci_workflow_dashboard_job_stays_javascript_only() -> None:
+    block = dashboard_job_text()
+    run_lines = [line.strip() for line in block.splitlines() if line.strip().startswith("run:")]
+
+    assert run_lines, "the dashboard job declares no runnable step"
+    assert any("npm ci" in line for line in run_lines), (
+        "the dashboard job never installs with npm ci"
+    )
+    for line in run_lines:
+        lowered = line.lower()
+        assert "freqtrade" not in lowered, (
+            f"the dashboard job installs the freqtrade extra: {line!r}"
+        )
+        assert "ccxt" not in lowered, f"the dashboard job installs the exchange extra: {line!r}"
+        assert "pip" not in lowered, f"the dashboard job installs a Python dependency: {line!r}"
+        assert line.split(":", 1)[1].strip().startswith("npm "), (
+            f"the dashboard job runs a command that is not npm-based: {line!r}"
+        )
 
 
 def test_ci_workflow_declares_python_311() -> None:
@@ -288,7 +347,7 @@ def test_ci_workflow_parses_as_yaml_and_matches_the_contract() -> None:
     assert concurrency["cancel-in-progress"] is True
 
     jobs = workflow["jobs"]
-    assert list(jobs) == ["quality"]
+    assert list(jobs) == ["quality", "dashboard"]
     job = jobs["quality"]
     assert job["runs-on"] == "ubuntu-latest"
     assert job["strategy"]["matrix"]["python-version"] == ["3.11"]
@@ -326,6 +385,54 @@ def test_ci_workflow_parses_as_yaml_and_matches_the_contract() -> None:
     for command in install_steps:
         assert "freqtrade" not in command.lower()
         assert "ccxt" not in command.lower()
+
+    # --- the dashboard job: Node 24, npm ci, then the four documented commands
+    dashboard = jobs["dashboard"]
+    assert dashboard["name"] == "Dashboard: lint, type-check, tests & build"
+    assert dashboard["runs-on"] == "ubuntu-latest"
+
+    markers = _step_markers(dashboard["steps"])
+    installed = [str(step.get("run", "")) for step in dashboard["steps"] if step.get("run")]
+    ordered = (
+        "actions/checkout@v4",
+        "actions/setup-node@v4",
+        "npm ci",
+        "npm run lint",
+        "npm run typecheck",
+        "npm run test:coverage",
+        "npm run build",
+    )
+    positions = []
+    for token in ordered:
+        match = next((i for i, marker in enumerate(markers) if token in marker), None)
+        assert match is not None, f"the dashboard job has no step containing {token!r}"
+        positions.append(match)
+    assert positions == sorted(positions), f"dashboard steps are out of order: {positions}"
+    assert len(set(positions)) == len(positions), "dashboard steps are duplicated or merged"
+
+    setup_node = next(
+        step for step in dashboard["steps"] if step.get("uses") == "actions/setup-node@v4"
+    )
+    assert setup_node["with"]["node-version"] == "24"
+    assert setup_node["with"]["cache"] == "npm"
+    assert setup_node["with"]["cache-dependency-path"] == "dashboard/package-lock.json"
+
+    # Every runnable step of the dashboard job is scoped to dashboard/ and uses
+    # npm only: no Python interpreter, no optional extra, no live server.
+    scoped = [step for step in dashboard["steps"] if step.get("run")]
+    assert len(scoped) == len(installed)
+    for step in scoped:
+        assert step.get("working-directory") == "dashboard", (
+            f"dashboard step {step.get('name')!r} is not scoped to dashboard/"
+        )
+
+    for command in installed:
+        lowered = command.lower()
+        assert "freqtrade" not in lowered
+        assert "ccxt" not in lowered
+        assert "pip" not in lowered
+    assert any(command.strip() == "npm ci" for command in installed)
+    assert not any("--cov-fail-under" in command for command in installed)
 
 
 # ---------------------------------------------------------------------------

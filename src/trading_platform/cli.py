@@ -1844,7 +1844,7 @@ def realtime_serve(
     port: int | None = typer.Option(None, "--port", help=_PORT_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
-    """Serve the dashboard read-only over the persisted state; no engine runs."""
+    """Serve the monitoring JSON API read-only over the persisted state; no engine runs."""
     from trading_platform.realtime.clock import SystemClock
     from trading_platform.web.server import create_server, serve
 

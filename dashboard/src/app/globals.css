@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens of the trading monitor.
+ *
+ * Source of truth: design-system/trading-monitor/MASTER.md (dark-mode OLED
+ * palette, Fira Sans body / Fira Code numerics, density 8/10, motion 3/10).
+ * Every token is exposed as a Tailwind v4 theme variable, so a component writes
+ * `bg-card` or `text-loss` and never a raw hex.
+ */
+@theme {
+  /* -- palette (MASTER.md) ------------------------------------------------ */
+  --color-background: #020617;
+  --color-foreground: #f8fafc;
+  --color-card: #0e1223;
+  --color-card-foreground: #f8fafc;
+  --color-muted: #1a1e2f;
+  --color-muted-foreground: #94a3b8;
+  --color-border: #334155;
+  --color-primary: #0f172a;
+  --color-on-primary: #ffffff;
+  --color-secondary: #1e293b;
+  --color-on-secondary: #ffffff;
+  --color-accent: #22c55e;
+  --color-on-accent: #0f172a;
+  --color-destructive: #ef4444;
+  --color-on-destructive: #000000;
+  --color-ring: #ffffff;
+
+  /* -- semantic extensions (a trading surface needs them) ----------------- */
+  --color-profit: #22c55e;
+  --color-loss: #ef4444;
+  --color-warn: #f59e0b;
+  --color-info: #38bdf8;
+
+  /* -- chart series ------------------------------------------------------- */
+  --color-chart-equity: #22c55e;
+  --color-chart-cash: #38bdf8;
+  --color-chart-position: #a78bfa;
+  --color-chart-axis: #94a3b8;
+  --color-chart-grid: #1e293b;
+
+  /* -- typography --------------------------------------------------------- */
+  --font-sans: "Fira Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Fira Code", ui-monospace, sfmono-regular, menlo, monospace;
+
+  /* -- spacing (density 8/10) --------------------------------------------- */
+  --spacing-xs: 2px;
+  --spacing-sm: 4px;
+  --spacing-md: 8px;
+  --spacing-lg: 12px;
+  --spacing-xl: 16px;
+  --spacing-2xl: 24px;
+  --spacing-3xl: 32px;
+
+  /* -- shadows ------------------------------------------------------------ */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px rgb(0 0 0 / 0.1);
+  --shadow-xl: 0 20px 25px rgb(0 0 0 / 0.15);
+
+  /* -- radii (MASTER.md component specs) ---------------------------------- */
+  --radius-button: 8px;
+  --radius-card: 12px;
+  --radius-dialog: 16px;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    /* Density 8/10: a compact body size for a data-dense dashboard. */
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Headings are set in the monospace face (MASTER.md typography). */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  /* Visible focus for every keyboard user (never removed, only restyled). */
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--color-accent);
+    color: var(--color-on-accent);
+  }
+}
+
+/*
+ * Motion 3/10 and `prefers-reduced-motion` respected: a user asking for reduced
+ * motion gets the final state of every animation and transition immediately.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

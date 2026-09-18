@@ -4,8 +4,8 @@ This document describes the real-time platform delivered with the skeleton:
 
 - **`trading_platform.realtime`** (layer 6) — engine: market streams, broker,
   execution gateway, risk, persistence, orchestrator, observability;
-- **`trading_platform.web`** (layer 7) — HTTP transport using the **standard
-  library only** and a static dashboard;
+- **`trading_platform.web`** (layer 7) — HTTP transport, **standard library
+  only**: a pure JSON API (no HTML, no static asset);
 - **`trading_platform.cli`** (layer 8) — the three commands
   `realtime run`, `realtime serve` and `realtime check`.
 
@@ -172,16 +172,13 @@ The real-time engine **implements no formula**. It assembles:
 ## 5. Web API reference
 
 Server `http.server.ThreadingHTTPServer`, JSON everywhere, UTC ISO-8601
-timestamps, **no NaN and no Infinity** in any payload. The only static assets
-served are `app.js` and `styles.css` (fixed allow-list: any path traversal
-answers 404). The dashboard **polls** `GET /api/profiles` every 2 seconds
-(`monitoring.refresh_seconds`) and draws the equity curves with inline
-`canvas`/SVG, without any library.
+timestamps, **no NaN and no Infinity** in any payload. The server serves **no
+HTML page and no static asset**: every path outside the table below — `GET /`
+and `GET /static/{asset}` included — answers the documented JSON 404
+`{"error": "not found: <path>"}`, exactly like any other unknown route.
 
 | Method and route | 200 response | Errors |
 | --- | --- | --- |
-| `GET /` | HTML dashboard | 404 |
-| `GET /static/{asset}` | `app.js` or `styles.css` | 404 (unknown asset or traversal) |
 | `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at}` | — |
 | `GET /api/profiles` | `{profiles: [ProfileSnapshot…], generated_at}` | — |
 | `GET /api/profiles/{id}` | `ProfileSnapshot` | 404 `{error}` |
@@ -190,7 +187,19 @@ answers 404). The dashboard **polls** `GET /api/profiles` every 2 seconds
 | `GET /api/profiles/{id}/orders` | `{orders: [...]}` | 404 |
 | `GET /api/profiles/{id}/positions` | `{positions: [...]}` | 404 |
 | `GET /api/profiles/{id}/metrics` | `{metrics: {...}, benchmark: {...} \| null, generated_at}` | 404 |
+| `GET /api/kill-switch` | `{kill_switch, reason, changed_at}` | — |
 | `POST /api/kill-switch` | body `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` | 400 malformed body, 403 missing/invalid token, 403 server in read-only mode |
+
+The dashboard is a **separate Next.js application** (`dashboard/`): it owns its
+own Node server, it renders the overview page and the per-profile page, and it
+**polls** this same JSON API every 2 seconds (`monitoring.refresh_seconds`, the
+single source of truth for the cadence). The browser therefore only ever talks to
+its own origin — the `next.config.ts` rewrite proxies `/api/:path*` to this
+server — so there is no CORS preflight, no absolute URL in the browser, and the
+`X-Operator-Token` header flows through untouched. `trading_platform.web` serves
+neither the dashboard nor any of its assets: the transport is JSON only, and the
+read-only `GET /api/kill-switch` route is what the dashboard polls for the
+emergency-stop state.
 
 `realtime serve` opens the state database in schema read/write mode: if the file
 does not exist yet, it is **created** (empty schema) and the dashboard shows a
@@ -210,7 +219,7 @@ trace on the network. The single operator token comes from `TB_OPERATOR_TOKEN`
 # static pre-flight: passes NO order and does NOT touch the network
 trading realtime check --profiles config/profiles.example.json --json
 
-# engine + dashboard
+# engine + JSON monitoring API
 trading realtime run --profiles config/profiles.example.json
 trading realtime run --profiles config/profiles.example.json --host 127.0.0.1 --port 8080
 
@@ -259,9 +268,10 @@ fast as the CPU allows (it is backfill), it is not a live follow-up of real time
 
 ## 7. What is NOT proven
 
-- The dashboard **polls** over HTTP every 2 seconds: there is **neither
-  WebSocket nor ASGI** (the "standard library only" decision), hence no *push*,
-  and the display latency is bounded by the polling cadence.
+- The dashboard is a **separate Next.js application** that **polls** this JSON
+  API over HTTP every 2 seconds: the Python transport has **neither WebSocket nor
+  ASGI** (the "standard library only" decision), hence no *push*, and the display
+  latency is bounded by the polling cadence.
 - Authentication is limited to a **single operator token**: this is a
   **monitoring surface for a trusted network**, not an interface that can be
   exposed on the Internet.

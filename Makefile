@@ -12,6 +12,12 @@
 
 SHELL := /bin/bash
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3.11; fi)
+NPM ?= npm
+
+# The sandbox (and any locked-down machine) may not allow writing to the global
+# npm cache: every npm command below therefore uses a repository-local cache,
+# exactly like UV_CACHE_DIR=.uv-cache for uv. .npm-cache/ is git-ignored.
+NPM_CACHE ?= $(CURDIR)/.npm-cache
 
 CONFIG ?= config/backtest_default.json
 DOCKER_IMAGE ?= trading-platform:latest
@@ -19,7 +25,9 @@ DOCKER_TEST_IMAGE ?= trading-platform:test
 
 .DEFAULT_GOAL := help
 .PHONY: help venv install install-dev lint format type-check test test-cov cov check \
-	backtest walk-forward robustness monte-carlo data-download realtime docker-build docker-test clean
+	backtest walk-forward robustness monte-carlo data-download realtime docker-build docker-test clean \
+	dashboard-install dashboard-dev dashboard-lint dashboard-typecheck dashboard-test \
+	dashboard-test-coverage dashboard-build dashboard-check check-all
 
 # ---------------------------------------------------------------------------
 # meta
@@ -44,9 +52,18 @@ help: ## Show this help (every target below is runnable)
 	@echo "  make robustness     parameter sweep on $(CONFIG)"
 	@echo "  make monte-carlo    Monte Carlo simulation on $(CONFIG)"
 	@echo "  make data-download  fill the OHLCV cache (needs the exchange extra)"
-	@echo "  make realtime       run the realtime engine + monitoring dashboard (PROFILES=...)"
+	@echo "  make realtime       run the realtime engine + monitoring JSON API (PROFILES=...)"
 	@echo "  make docker-build   build the image $(DOCKER_IMAGE)"
 	@echo "  make docker-test    build the test stage and run the suite with the coverage gate"
+	@echo "  make dashboard-install         install the dashboard dependencies (npm ci)"
+	@echo "  make dashboard-dev             run the Next.js dev server on http://127.0.0.1:3000"
+	@echo "  make dashboard-lint            eslint the dashboard (dashboard/)"
+	@echo "  make dashboard-typecheck       type-check the dashboard (tsc --noEmit)"
+	@echo "  make dashboard-test            dashboard unit tests, no coverage gate (vitest run)"
+	@echo "  make dashboard-test-coverage   dashboard tests + coverage gate (docs/testing-policy.md section 9)"
+	@echo "  make dashboard-build           production build of the dashboard (next build)"
+	@echo "  make dashboard-check           the four dashboard gates: lint + typecheck + test-coverage + build"
+	@echo "  make check-all                 make check (Python) plus make dashboard-check"
 	@echo "  make clean          remove caches, coverage artifacts and build leftovers"
 
 # ---------------------------------------------------------------------------
@@ -109,7 +126,7 @@ data-download: ## Fill the on-disk OHLCV cache (only network-using target)
 		--symbol "$${SYMBOL:-BTC/USDT}" --timeframe "$${TIMEFRAME:-1h}" \
 		--start "$${START:-2023-01-01T00:00:00Z}" --end "$${END:-2024-01-01T00:00:00Z}"
 
-realtime: ## Run the realtime engine and the monitoring dashboard (PROFILES=... to override)
+realtime: ## Run the realtime engine and the monitoring JSON API (PROFILES=... to override)
 	$(PYTHON) -m trading_platform realtime run --profiles $${PROFILES:-config/profiles.example.json}
 
 # ---------------------------------------------------------------------------
@@ -123,6 +140,39 @@ docker-test: ## Build the docker test stage, then run the full suite with the co
 	docker build --target test -t $(DOCKER_TEST_IMAGE) .
 	docker run --rm --entrypoint python $(DOCKER_TEST_IMAGE) -m pytest tests \
 		--cov=trading_platform --cov-report=term-missing --cov-report=xml --cov-fail-under=85
+
+# ---------------------------------------------------------------------------
+# dashboard (standalone Next.js monitoring UI, dashboard/)
+#
+# The four gates of docs/testing-policy.md section 9.3: lint, typecheck,
+# test:coverage (the dashboard gate lives in dashboard/vitest.config.ts) and
+# build. Every command runs with the repository-local npm cache (NPM_CACHE).
+# ---------------------------------------------------------------------------
+
+dashboard-install: ## Install the dashboard dependencies (npm ci)
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) ci
+
+dashboard-dev: ## Run the Next.js dev server (http://127.0.0.1:3000)
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) run dev
+
+dashboard-lint: ## Lint the dashboard (eslint)
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) run lint
+
+dashboard-typecheck: ## Type-check the dashboard (tsc --noEmit)
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) run typecheck
+
+dashboard-test: ## Run the dashboard tests without the coverage gate
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) run test
+
+dashboard-test-coverage: ## Run the dashboard tests with the coverage gate (85%/75% branches)
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) run test:coverage
+
+dashboard-build: ## Build the dashboard for production (next build, standalone output)
+	cd dashboard && npm_config_cache=$(NPM_CACHE) npm_config_logs_dir=$(NPM_CACHE)/_logs $(NPM) run build
+
+dashboard-check: dashboard-lint dashboard-typecheck dashboard-test-coverage dashboard-build ## Full dashboard gate: lint + typecheck + test-coverage + build
+
+check-all: check dashboard-check ## Full repository gate: make check plus make dashboard-check
 
 # ---------------------------------------------------------------------------
 # housekeeping

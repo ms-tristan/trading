@@ -1,0 +1,383 @@
+'use client';
+
+import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
+import type { FormEvent, KeyboardEvent } from 'react';
+
+import { KeyRound, OctagonAlert, ShieldCheck, Trash2 } from 'lucide-react';
+
+import { Button } from '@/components/ui/button';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { ApiError, errorMessage, postKillSwitch } from '@/lib/api';
+import { cn } from '@/lib/cn';
+import { EMPTY_PLACEHOLDER, formatTimestamp } from '@/lib/format';
+import {
+  clearOperatorToken,
+  hasOperatorToken,
+  readOperatorToken,
+  saveOperatorToken,
+} from '@/lib/operator-token';
+import type { KillSwitchPayload } from '@/lib/types';
+
+/** Props of {@link KillSwitchPanel}. */
+export interface KillSwitchPanelProps {
+  /** State rendered by the Server Component (the first paint). */
+  initialState: KillSwitchPayload;
+  /** Live state from the polling hook; wins over the local state once present. */
+  state?: KillSwitchPayload | null;
+  className?: string;
+}
+
+type DialogAction = 'engage' | 'release';
+
+/*
+ * `sessionStorage` is a browser-only external store: it is read through
+ * `useSyncExternalStore`, whose server snapshot is always `false`. That keeps
+ * the indicator free of a hydration mismatch and free of a `setState` inside an
+ * effect.
+ */
+const tokenListeners = new Set<() => void>();
+
+function subscribeTokenSaved(listener: () => void): () => void {
+  tokenListeners.add(listener);
+  return () => {
+    tokenListeners.delete(listener);
+  };
+}
+
+function readTokenSavedSnapshot(): boolean {
+  return hasOperatorToken();
+}
+
+function readTokenSavedServerSnapshot(): boolean {
+  return false;
+}
+
+function notifyTokenSaved(): void {
+  for (const listener of tokenListeners) {
+    listener();
+  }
+}
+
+/**
+ * Message shown after a failed mutation.
+ *
+ * A 403 is the documented refusal of the server (read-only mode or a missing /
+ * invalid token): the payload text is shown verbatim so the operator knows which
+ * of the two applies. The status is prefixed when the body was not JSON.
+ */
+function mutationErrorMessage(failure: unknown): string {
+  if (failure instanceof ApiError && failure.status === 403) {
+    const message = failure.message.trim();
+    return message.startsWith('HTTP') ? message : `HTTP 403 · ${message}`;
+  }
+  return errorMessage(failure);
+}
+
+/**
+ * Kill-switch control: state, operator token and the engage / release commands.
+ *
+ * Security and accessibility rules that this panel implements:
+ *
+ * * the operator token lives in `sessionStorage` only, is written on submit,
+ *   cleared from the DOM immediately and **never** rendered back — the panel
+ *   only shows whether a token is stored;
+ * * engaging the emergency stop is destructive, so it always goes through an
+ *   explicit confirmation dialog that requires a reason; releasing confirms too;
+ * * a failure never throws and never clears the state on screen: it shows a
+ *   non-blocking banner and keeps the previous state.
+ */
+export function KillSwitchPanel({ initialState, state = null, className }: KillSwitchPanelProps) {
+  const [localState, setLocalState] = useState<KillSwitchPayload>(initialState);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<boolean>(false);
+  const [dialogAction, setDialogAction] = useState<DialogAction | null>(null);
+  const [reason, setReason] = useState<string>('');
+
+  const tokenInputRef = useRef<HTMLInputElement | null>(null);
+  const reasonInputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+
+  const headingId = useId();
+  const tokenId = useId();
+  const dialogTitleId = useId();
+  const dialogDescriptionId = useId();
+  const reasonId = useId();
+
+  const effective = state ?? localState;
+  const isEngaged = effective.kill_switch;
+  const tokenSaved = useSyncExternalStore(
+    subscribeTokenSaved,
+    readTokenSavedSnapshot,
+    readTokenSavedServerSnapshot,
+  );
+
+  const handleSaveToken = useCallback((event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const input = tokenInputRef.current;
+    const value = input === null ? '' : input.value;
+    saveOperatorToken(value);
+    if (input !== null) {
+      input.value = '';
+    }
+    notifyTokenSaved();
+    setError(null);
+  }, []);
+
+  const handleClearToken = useCallback(() => {
+    clearOperatorToken();
+    const input = tokenInputRef.current;
+    if (input !== null) {
+      input.value = '';
+    }
+    notifyTokenSaved();
+  }, []);
+
+  const submit = useCallback(async (engage: boolean, submittedReason: string): Promise<void> => {
+    setPending(true);
+    setError(null);
+    try {
+      const next = await postKillSwitch(
+        { engage, reason: submittedReason },
+        { operatorToken: readOperatorToken() ?? '' },
+      );
+      setLocalState(next);
+    } catch (failure) {
+      setError(mutationErrorMessage(failure));
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  const openDialog = useCallback((action: DialogAction, trigger: HTMLButtonElement) => {
+    triggerRef.current = trigger;
+    setReason('');
+    setDialogAction(action);
+  }, []);
+
+  const closeDialog = useCallback(() => {
+    setDialogAction(null);
+    const trigger = triggerRef.current;
+    triggerRef.current = null;
+    if (trigger !== null) {
+      trigger.focus();
+    }
+  }, []);
+
+  // Focus moves into the dialog as soon as it opens.
+  useEffect(() => {
+    if (dialogAction === null) {
+      return;
+    }
+    const target = reasonInputRef.current ?? dialogRef.current;
+    target?.focus();
+  }, [dialogAction]);
+
+  const handleDialogKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        closeDialog();
+      }
+    },
+    [closeDialog],
+  );
+
+  const requiresReason = dialogAction === 'engage';
+  const canConfirm = !pending && (!requiresReason || reason.trim() !== '');
+
+  const handleConfirm = useCallback(() => {
+    if (dialogAction === null || pending) {
+      return;
+    }
+    const trimmed = reason.trim();
+    if (dialogAction === 'engage' && trimmed === '') {
+      return;
+    }
+    const engage = dialogAction === 'engage';
+    closeDialog();
+    void submit(engage, trimmed);
+  }, [closeDialog, dialogAction, pending, reason, submit]);
+
+  const reasonText = effective.reason.trim();
+
+  return (
+    <section
+      aria-labelledby={headingId}
+      aria-busy={pending}
+      className={cn('rounded-card border border-border bg-card p-xl shadow-md', className)}
+    >
+      <header className="flex flex-wrap items-start justify-between gap-md">
+        <div className="min-w-0">
+          <h2 id={headingId} className="font-mono text-base font-semibold text-card-foreground">
+            Kill switch
+          </h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            Emergency stop of every profile. Read-only by default: mutations need the operator
+            token.
+          </p>
+        </div>
+        <p
+          data-tone={isEngaged ? 'error' : 'ok'}
+          data-state={isEngaged ? 'engaged' : 'released'}
+          className={cn(
+            'inline-flex items-center gap-xs rounded-button border px-md py-xs text-xs font-medium',
+            isEngaged
+              ? 'border-loss/40 bg-loss/10 text-loss'
+              : 'border-profit/40 bg-profit/10 text-profit',
+          )}
+        >
+          <span aria-hidden="true" className="inline-flex shrink-0 items-center">
+            {isEngaged ? (
+              <OctagonAlert className="size-3.5" />
+            ) : (
+              <ShieldCheck className="size-3.5" />
+            )}
+          </span>
+          {isEngaged ? 'Engaged' : 'Released'}
+        </p>
+      </header>
+
+      {isEngaged || reasonText !== '' ? (
+        <dl className="mt-lg grid gap-sm text-sm">
+          <div className="flex flex-wrap items-baseline gap-sm">
+            <dt className="text-xs uppercase tracking-wide text-muted-foreground">Reason</dt>
+            <dd className="font-mono text-foreground">
+              {reasonText === '' ? EMPTY_PLACEHOLDER : reasonText}
+            </dd>
+          </div>
+          <div className="flex flex-wrap items-baseline gap-sm">
+            <dt className="text-xs uppercase tracking-wide text-muted-foreground">Changed at</dt>
+            <dd className="font-mono tabular-nums text-foreground">
+              {formatTimestamp(effective.changed_at)}
+            </dd>
+          </div>
+        </dl>
+      ) : null}
+
+      <form onSubmit={handleSaveToken} className="mt-lg">
+        <label
+          htmlFor={tokenId}
+          className="block text-xs font-medium uppercase tracking-wide text-muted-foreground"
+        >
+          Operator token
+        </label>
+        <div className="mt-xs flex flex-wrap items-center gap-sm">
+          <input
+            id={tokenId}
+            ref={tokenInputRef}
+            type="password"
+            name="operatorToken"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="Paste the token, then save"
+            className={cn(
+              'min-w-0 flex-1 rounded-button border border-border bg-muted px-md py-sm font-mono text-sm text-foreground',
+              'placeholder:text-muted-foreground',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+            )}
+          />
+          <Button type="submit" size="sm" variant="secondary" icon={<KeyRound className="size-3.5" />}>
+            Save token
+          </Button>
+          {tokenSaved ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={handleClearToken}
+              icon={<Trash2 className="size-3.5" />}
+            >
+              Clear token
+            </Button>
+          ) : null}
+        </div>
+        <p role="status" aria-live="polite" className="mt-xs text-xs text-muted-foreground">
+          {tokenSaved
+            ? 'Token saved for this tab (session storage only). It is never shown again.'
+            : 'No token saved in this tab.'}
+        </p>
+      </form>
+
+      <div className="mt-lg flex flex-wrap items-center gap-sm">
+        <Button
+          variant="danger"
+          disabled={isEngaged || pending}
+          icon={<OctagonAlert className="size-4" />}
+          onClick={(event) => openDialog('engage', event.currentTarget)}
+        >
+          Engage kill switch
+        </Button>
+        <Button
+          variant="secondary"
+          disabled={!isEngaged || pending}
+          icon={<ShieldCheck className="size-4" />}
+          onClick={(event) => openDialog('release', event.currentTarget)}
+        >
+          Release kill switch
+        </Button>
+      </div>
+
+      <ErrorBanner message={error} className="mt-lg" />
+
+      {dialogAction !== null ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-xl">
+          <div
+            ref={dialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={dialogTitleId}
+            aria-describedby={dialogDescriptionId}
+            tabIndex={-1}
+            onKeyDown={handleDialogKeyDown}
+            className="w-full max-w-md rounded-dialog border border-border bg-card p-2xl text-card-foreground shadow-xl"
+          >
+            <h3 id={dialogTitleId} className="font-mono text-base font-semibold">
+              {requiresReason ? 'Engage the kill switch?' : 'Release the kill switch?'}
+            </h3>
+            <p id={dialogDescriptionId} className="mt-sm text-sm text-muted-foreground">
+              {requiresReason
+                ? 'Every profile stops trading immediately. This is a destructive action: give a reason, then confirm.'
+                : 'Trading resumes on every profile at the next candle. Confirm to release the kill switch.'}
+            </p>
+            <label
+              htmlFor={reasonId}
+              className="mt-lg block text-xs font-medium uppercase tracking-wide text-muted-foreground"
+            >
+              {requiresReason ? 'Reason (required)' : 'Reason (optional)'}
+            </label>
+            <input
+              id={reasonId}
+              ref={reasonInputRef}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              className={cn(
+                'mt-xs w-full rounded-button border border-border bg-muted px-md py-sm font-mono text-sm text-foreground',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+              )}
+            />
+            <div className="mt-xl flex flex-wrap justify-end gap-sm">
+              <Button variant="ghost" onClick={closeDialog}>
+                Cancel
+              </Button>
+              <Button
+                variant={requiresReason ? 'danger' : 'primary'}
+                onClick={handleConfirm}
+                disabled={!canConfirm}
+                icon={
+                  requiresReason ? (
+                    <OctagonAlert className="size-4" />
+                  ) : (
+                    <ShieldCheck className="size-4" />
+                  )
+                }
+              >
+                {requiresReason ? 'Engage kill switch' : 'Release kill switch'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}

@@ -68,6 +68,17 @@ hyperopt_results/
 .cache/
 .dsh-tmp/
 
+# ---- Node / dashboard ----
+# node_modules/, .next/ and the local npm cache are build inputs, never sources.
+# dashboard/next-env.d.ts IS tracked on purpose: `tsc --noEmit` needs it.
+node_modules/
+.next/
+out/
+.npm-cache/
+coverage/
+*.tsbuildinfo
+.eslintcache
+
 # ---- Reports (generated) ----
 reports/
 

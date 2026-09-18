@@ -16,6 +16,11 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .scratch
+# ---- Node / dashboard: rebuilt inside the image, never copied in ----
+dashboard/node_modules
+dashboard/.next
+dashboard/coverage
+.npm-cache
 # ---- secrets: never bake a credential into an image layer ----
 .env
 .env.*

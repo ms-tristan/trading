@@ -1,8 +1,9 @@
 name: CI
 
-# Single quality job on purpose: the Docker image is exercised locally with
-# `make docker-test`, so CI stays fast and 100% offline (no exchange API, no
-# market-data download, no optional extras).
+# Two jobs on purpose: `quality` covers the Python package, `dashboard` covers
+# the standalone Next.js monitoring dashboard. The Docker images are exercised
+# locally with `make docker-test`, so CI stays fast and 100% offline (no
+# exchange API, no market-data download, no optional extras, no live server).
 on:
   push:
   pull_request:
@@ -64,3 +65,43 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           if-no-files-found: warn
+
+  dashboard:
+    name: "Dashboard: lint, type-check, tests & build"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # The lockfile is committed: `npm ci` is the only supported install, and it
+      # brings nothing but the dashboard's own JavaScript dependencies.
+      - name: Install the dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Lint (eslint)
+        working-directory: dashboard
+        run: npm run lint
+
+      - name: Type-check (tsc --noEmit)
+        working-directory: dashboard
+        run: npm run typecheck
+
+      # Exact commands from docs/testing-policy.md section 9.3. The coverage gate
+      # (85% lines/statements/functions, 75% branches) lives only in
+      # dashboard/vitest.config.ts, so it is never repeated here.
+      - name: Tests & coverage gate
+        working-directory: dashboard
+        run: npm run test:coverage
+
+      - name: Production build (next build)
+        working-directory: dashboard
+        run: npm run build

@@ -1,0 +1,209 @@
+import { render, screen } from '@testing-library/react';
+import { describe, expect, it } from 'vitest';
+
+import { EMPTY_PLACEHOLDER } from '@/lib/format';
+import type { ProfileSnapshot, ProfileStatus } from '@/lib/types';
+
+import { ProfileCard } from './profile-card';
+
+/** One profile snapshot exactly as `GET /api/profiles` emits it. */
+function makeProfile(overrides: Partial<ProfileSnapshot> = {}): ProfileSnapshot {
+  return {
+    profile_id: 'alpha',
+    symbol: 'BTC/USDT',
+    timeframe: '1h',
+    strategy: 'BasicStrategy',
+    mode: 'paper',
+    status: 'running',
+    initial_balance: 10000,
+    equity: 10450.5,
+    cash: 8000,
+    position_value: 2450.5,
+    total_return: 0.045,
+    n_trades: 12,
+    open_positions: 1,
+    health: {
+      profile_id: 'alpha',
+      status: 'running',
+      last_candle_at: '2024-01-01T00:00:00+00:00',
+      lag_seconds: 12.5,
+      last_error: null,
+      reconnect_count: 0,
+      counters: {
+        candles_processed: 120,
+        orders_submitted: 4,
+        orders_filled: 3,
+        orders_rejected: 1,
+        stream_reconnects: 0,
+        risk_rejections: 1,
+        errors: 0,
+      },
+    },
+    started_at: '2023-12-01T00:00:00+00:00',
+    updated_at: '2024-01-01T00:00:00+00:00',
+    ...overrides,
+  };
+}
+
+/** The labelled field wrapper of `label` (its `<dt>` / `<dd>` pair). */
+function field(label: string): HTMLElement {
+  const wrapper = screen.getByText(label).closest('div');
+  if (wrapper === null) {
+    throw new Error(`no field wrapper for ${label}`);
+  }
+  return wrapper;
+}
+
+describe('ProfileCard', () => {
+  it('renders every labelled field of the profile', () => {
+    render(<ProfileCard profile={makeProfile()} />);
+
+    expect(field('Profile id')).toHaveTextContent('alpha');
+    expect(field('Symbol')).toHaveTextContent('BTC/USDT');
+    expect(field('Timeframe')).toHaveTextContent('1h');
+    expect(field('Strategy')).toHaveTextContent('BasicStrategy');
+    expect(field('Equity')).toHaveTextContent('$10,450.50');
+    expect(field('Cash')).toHaveTextContent('$8,000.00');
+    expect(field('Position value')).toHaveTextContent('$2,450.50');
+    expect(field('Initial balance')).toHaveTextContent('$10,000.00');
+    expect(field('Trades')).toHaveTextContent('12');
+    expect(field('Open positions')).toHaveTextContent('1');
+    expect(field('Last candle')).toHaveTextContent('2024-01-01 00:00:00 UTC');
+    expect(field('Candle lag')).toHaveTextContent('12s');
+    expect(field('Started at')).toHaveTextContent('2023-12-01 00:00:00 UTC');
+    expect(field('Updated at')).toHaveTextContent('2024-01-01 00:00:00 UTC');
+  });
+
+  it('labels the card with its heading and links it to the profile detail route', () => {
+    render(<ProfileCard profile={makeProfile({ profile_id: 'alpha beta' })} />);
+
+    const heading = screen.getByRole('heading', { level: 3 });
+    expect(heading).toHaveAttribute('id', 'profile-alpha-beta');
+
+    const link = screen.getByRole('link', { name: 'alpha beta' });
+    expect(link).toHaveAttribute('href', '/profiles/alpha%20beta');
+  });
+
+  it('renders the mode and the status as text labels, never colour alone', () => {
+    const { unmount } = render(<ProfileCard profile={makeProfile({ mode: 'live' })} />);
+
+    const liveBadge = screen.getByText('Live').closest('span[data-tone]');
+    expect(liveBadge).toHaveAttribute('data-tone', 'warn');
+    expect(liveBadge?.querySelector('svg')).not.toBeNull();
+    unmount();
+
+    render(<ProfileCard profile={makeProfile({ status: 'degraded', mode: 'paper' })} />);
+
+    expect(screen.getByText('Paper').closest('span[data-tone]')).toHaveAttribute('data-tone', 'info');
+    const degradedBadge = screen.getByText('Degraded').closest('span[data-tone]');
+    expect(degradedBadge).toHaveAttribute('data-tone', 'warn');
+    expect(degradedBadge?.querySelector('svg')).not.toBeNull();
+  });
+
+  it('pairs the total return with an explicit sign, a trend label and an icon', () => {
+    const { unmount } = render(<ProfileCard profile={makeProfile({ total_return: 0.045 })} />);
+
+    expect(field('Total return')).toHaveTextContent('+4.50%');
+    expect(field('Total return')).toHaveTextContent('Up');
+    expect(field('Total return').querySelector('svg')).not.toBeNull();
+    unmount();
+
+    render(<ProfileCard profile={makeProfile({ total_return: -0.02 })} />);
+
+    expect(field('Total return')).toHaveTextContent('-2.00%');
+    expect(field('Total return')).toHaveTextContent('Down');
+  });
+
+  it('renders the em dash for every absent value and never NaN or undefined', () => {
+    render(
+      <ProfileCard
+        profile={makeProfile({
+          symbol: '',
+          timeframe: null as unknown as string,
+          strategy: undefined as unknown as string,
+          initial_balance: null,
+          equity: null,
+          cash: null,
+          position_value: null,
+          total_return: null,
+          started_at: null,
+          updated_at: null,
+          n_trades: null as unknown as number,
+          open_positions: undefined as unknown as number,
+          health: {
+            profile_id: 'alpha',
+            status: 'running',
+            last_candle_at: null,
+            lag_seconds: null,
+            last_error: null,
+            reconnect_count: 0,
+            counters: {
+              candles_processed: 0,
+              orders_submitted: 0,
+              orders_filled: 0,
+              orders_rejected: 0,
+              stream_reconnects: 0,
+              risk_rejections: 0,
+              errors: 0,
+            },
+          },
+        })}
+      />,
+    );
+
+    for (const label of [
+      'Symbol',
+      'Timeframe',
+      'Strategy',
+      'Initial balance',
+      'Equity',
+      'Cash',
+      'Position value',
+      'Total return',
+      'Trades',
+      'Open positions',
+      'Last candle',
+      'Candle lag',
+      'Started at',
+      'Updated at',
+    ]) {
+      expect(field(label)).toHaveTextContent(EMPTY_PLACEHOLDER);
+    }
+
+    expect(screen.getAllByText(EMPTY_PLACEHOLDER).length).toBeGreaterThanOrEqual(14);
+    const text = document.body.textContent ?? '';
+    expect(text).not.toContain('NaN');
+    expect(text).not.toContain('undefined');
+    // An absent total return carries no trend claim at all.
+    expect(field('Total return')).not.toHaveTextContent('Flat');
+  });
+
+  it('surfaces a non-null last error as a labelled warning row', () => {
+    const { unmount } = render(
+      <ProfileCard
+        profile={makeProfile({
+          health: {
+            ...makeProfile().health,
+            status: 'degraded',
+            last_error: 'feed disconnected',
+          },
+        })}
+      />,
+    );
+
+    const row = screen.getByText('Last error').closest('p');
+    expect(row).toHaveTextContent('feed disconnected');
+    expect(row?.querySelector('svg')).not.toBeNull();
+    unmount();
+
+    render(<ProfileCard profile={makeProfile()} />);
+    expect(screen.queryByText('Last error')).not.toBeInTheDocument();
+  });
+
+  it('falls back to a neutral badge for a status outside the documented set', () => {
+    render(<ProfileCard profile={makeProfile({ status: 'unknown' as ProfileStatus })} />);
+
+    const badge = screen.getByText('unknown').closest('span[data-tone]');
+    expect(badge).toHaveAttribute('data-tone', 'neutral');
+  });
+});

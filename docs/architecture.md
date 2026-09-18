@@ -104,17 +104,14 @@ Trading/
 │   │   ├── orchestrator.py           # RealtimeOrchestrator : N profils, supervision, câblage, kill switch
 │   │   ├── monitor.py                # read model : ProfileReport, equity, métriques, benchmark, santé
 │   │   └── observability.py          # journalisation JSON structurée, filtre de masquage, compteurs
-│   ├── web/
+│   ├── web/                          # API-only layer 7: no static asset is served
 │   │   ├── __init__.py               # exports publics de la couche 7 (bibliothèque standard seule)
 │   │   ├── routes.py                 # routage pur requête -> réponse + couture SnapshotProvider
-│   │   ├── server.py                 # ThreadingHTTPServer, create_server, serve, start_in_thread
-│   │   └── static/
-│   │       ├── index.html            # tableau de bord hors ligne (aucun CDN, aucune étape de build)
-│   │       ├── app.js                # sondage 2 s, courbes equity en canvas/SVG, badges de santé
-│   │       └── styles.css            # feuille de style locale
+│   │   └── server.py                 # ThreadingHTTPServer, create_server, serve, start_in_thread
 │   └── cli.py                        # CLI Typer (couche 8) : backtest, walk-forward, robustness,
 │                                     # monte-carlo, data, config et `realtime run|serve|check`
 ├── tests/                            # suite pytest hors ligne (voir docs/testing-policy.md)
+├── dashboard/                        # standalone Next.js dashboard (App Router, Tailwind v4, 2 s polling)
 ├── user_data/
 │   ├── README.md                     # état écrit par Freqtrade (OHLCV, backtests, stratégies) — git-ignoré
 │   └── strategies/
@@ -153,7 +150,7 @@ un import et une déclaration de classe d'une ligne. Tout le reste de
         └──────────────────────────────────────────┘
                             │
         ┌────────────────────┬─────────────────────┐
-  7     │        web         │   HTTP + dashboard  │   transport — bibliothèque standard seule
+  7     │        web         │   HTTP JSON API     │   transport — bibliothèque standard seule
         └────────────────────┴─────────────────────┘
                             │
         ┌──────────────────────────────────────────┐
@@ -192,7 +189,7 @@ bas de cette liste.**
 | 4 | `trading_platform.reporting` | couches 1–3 (`core` et `metrics`) |
 | 5 | `trading_platform.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
 | 6 | `trading_platform.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) |
-| 7 | `trading_platform.web` | couches 1–6, **bibliothèque standard seule** (HTTP + tableau de bord ; il ne connaît de la plateforme que la couture `SnapshotProvider`) |
+| 7 | `trading_platform.web` | layers 1-6, standard library only (HTTP JSON API; no HTML, no static asset - it only knows the SnapshotProvider seam) |
 | 8 | `trading_platform.cli` | couches 1–7 (plus `freqtrade` pour valider une config Freqtrade) |
 
 > **`trading_platform.cli` a déménagé de la couche 6 à la couche 8.** La CLI
@@ -854,8 +851,10 @@ par le read model ; chaque profil porte son état explicite (`status`,
 
 Couche **7**, **bibliothèque standard uniquement** : `http.server.ThreadingHTTPServer`
 `+ json + sqlite3 + asyncio + logging + threading`. Aucun WebSocket, aucun ASGI,
-aucune dépendance tierce, aucun CDN et aucune étape de build : le tableau de bord
-(`index.html` + `app.js` + `styles.css`) s'affiche **hors ligne**.
+aucune dépendance tierce, aucun CDN et aucune étape de build.
+The HTML dashboard (`index.html` + `app.js` + `styles.css`) was **removed**:
+layer 7 serves a **pure JSON API**, and the monitoring UI is now the standalone
+**Next.js** application in `dashboard/`.
 
 - `routes.py` est un **routage pur** (`Router.handle(method, path, ...)` →
   `HttpResponse`) : aucune socket, aucun thread, donc testable directement. Il
@@ -863,12 +862,12 @@ aucune dépendance tierce, aucun CDN et aucune étape de build : le tableau de b
 - `server.py` porte le transport : `MonitoringServer` (port `0` accepté, port
   relu depuis `server.server_address`), `create_server(...)`, `serve(...)` et
   `start_in_thread(...)`.
-- La surface HTTP est exactement celle du tableau de bord :
-  `GET /`, `GET /static/{asset}`, `GET /api/health`, `GET /api/profiles`,
-  `GET /api/profiles/{id}`, `.../equity`, `.../trades`, `.../orders`,
-  `.../positions`, `.../metrics` et `POST /api/kill-switch`. Les actifs statiques
-  sont servis par **liste blanche fixe** (`app.js`, `styles.css`) : toute
-  traversée de chemin répond 404, structurellement.
+- The HTTP surface is **exactly** the `/api` routes: `GET /api/health`,
+  `GET /api/profiles`, `GET /api/profiles/{id}`, `.../equity`, `.../trades`,
+  `.../orders`, `.../positions`, `.../metrics`, `GET /api/kill-switch` and
+  `POST /api/kill-switch`. Every other path — `GET /` and `GET /static/{asset}`
+  included — answers the documented JSON 404 `{"error": "not found: <path>"}`:
+  the layer keeps **no** static directory and **no** static allow-list.
 - Les erreurs sont des payloads : `400` malformé, `404` route ou profil inconnu,
   `405` méthode incorrecte (avec `Allow`), `403` jeton opérateur absent/invalide
   ou serveur en lecture seule, `500` `{error}` — **jamais** de trace sur le

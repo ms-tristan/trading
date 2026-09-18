@@ -3,7 +3,7 @@
 Plateforme de trading modulaire, robuste et scalable, basée sur **Freqtrade** :
 un moteur de backtesting (walk-forward, out-of-sample, robustesse, Monte Carlo)
 **et** un moteur temps réel multi-profils (paper/live, persistance, arrêt
-d'urgence, tableau de bord de surveillance).
+d'urgence, API JSON de surveillance).
 
 ## Objectif
 
@@ -51,6 +51,16 @@ Une fois la stratégie validée, **la même définition** est exposée à Freqtr
 [`docs/architecture.md`](docs/architecture.md#49-ladaptateur-freqtrade-écrire-une-stratégie-une-fois-lexposer-deux-fois)
 et la section « Exposer une stratégie à Freqtrade / dry-run » de
 [`docs/usage.md`](docs/usage.md).
+
+**Monitoring dashboard.** The dashboard is a standalone **Next.js** application
+(App Router, React 19, Tailwind CSS v4, TypeScript strict) living in `dashboard/`:
+it runs as a real Node server — not a static export — and it polls the monitoring
+JSON API. The Python monitoring server serves **no HTML page and no static
+asset**: `trading_platform.web` is a pure JSON API, so `GET /`,
+`GET /static/{asset}` and every other non-API path answer a JSON 404
+(`{"error": "not found: <path>"}`). Install and start the dashboard with
+`make dashboard-install` and `make dashboard-dev` (default URL
+`http://127.0.0.1:3000`, with `/api` proxied to `http://127.0.0.1:8080`).
 
 ## Documentation
 
