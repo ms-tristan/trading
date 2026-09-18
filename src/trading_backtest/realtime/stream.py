@@ -19,7 +19,7 @@ Four implementations are provided:
 
 Contract shared by every implementation
 ---------------------------------------
-* ``next_candle`` returns the **oldest closed candle strictly newer** than the
+* ``next_candle`` returns the **newest closed candle strictly newer** than the
   last candle already emitted for that ``(symbol, timeframe)`` pair, or ``None``
   when there is nothing new.  A candle is *closed* when its timestamp is at most
   ``now - candle_delta(timeframe)``: the candle that is still forming is never
@@ -27,6 +27,12 @@ Contract shared by every implementation
 * ``history`` returns the most recent candles available to a decision taken
   **now**, so the runner can warm a strategy up.  It never raises: an unknown
   key or an unavailable window yields a well-formed, empty OHLCV frame.
+* the two rules above are **one contract, not two**: the runner warms a strategy
+  up on ``history`` (a window ending *now*) and appends the candle returned by
+  ``next_candle`` to it, so a stream that handed out an old candle would feed the
+  strategy a truncated window -- and, on a live venue, would trade a past signal
+  at the present price.  A deliberate replay of a past window is
+  :class:`ReplayMarketStream`'s job, never the live streams'.
 * every ``await`` on a wait of our own is bounded by ``asyncio.wait_for`` with an
   explicit timeout; a retry loop is bounded by ``max_reconnects`` and ends in a
   :class:`~trading_backtest.core.errors.MarketStreamError`.
@@ -503,12 +509,25 @@ class PollingMarketStream:
     # -- data --------------------------------------------------------------
 
     async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
-        """Poll the provider and return the next closed candle, or ``None``.
+        """Poll the provider and return the newest closed candle, or ``None``.
 
         Only candles satisfying ``timestamp <= now - candle_delta(timeframe)`` are
-        candidates; the oldest candidate strictly newer than the last emitted one
-        wins.  When the provider fails (or answers an empty/invalid frame) the
-        stream records the error, backs off for a bounded delay and retries, up to
+        candidates; the **newest** candidate strictly newer than the last emitted
+        one wins.  Candles whose close was already known when the engine started
+        (or that closed while the process was down) are deliberately **skipped**,
+        not replayed: this stream is the live seam, and a decision taken on a
+        stale candle would be filled at today's price.  Skipped candles are
+        reported through ``realtime.market_data.candles_skipped``; a deterministic
+        replay of a past window is what :class:`ReplayMarketStream` is for.
+
+        Choosing the newest candidate is also what keeps this stream consistent
+        with :meth:`history`, which returns the window ending *now*: the runner
+        builds its warm-up frame as ``history[index < stamp]`` plus the candle
+        ``stamp``, which is only a complete window when ``stamp`` is the latest
+        closed candle.
+
+        When the provider fails (or answers an empty/invalid frame) the stream
+        records the error, backs off for a bounded delay and retries, up to
         ``max_reconnects`` consecutive attempts.
 
         Raises
@@ -549,10 +568,26 @@ class PollingMarketStream:
                 if closed.empty:
                     await self._idle()
                     return None
-                timestamp = closed.index[0]
+                timestamp = closed.index[-1]
                 self._last_emitted[key] = pd.Timestamp(timestamp)
+                if len(closed) > 1:
+                    # Only surface the gap once per emission: a fresh engine and a
+                    # restart after a downtime both land here, and the operator has
+                    # to know that the candles in between were not traded.
+                    LOGGER.warning(
+                        "realtime.market_data.candles_skipped",
+                        extra={
+                            "event": "market_data.candles_skipped",
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "skipped": len(closed) - 1,
+                            "skipped_from": closed.index[0].isoformat(),
+                            "skipped_to": closed.index[-2].isoformat(),
+                            "emitting": pd.Timestamp(timestamp).isoformat(),
+                        },
+                    )
                 return _candle_from_row(
-                    closed.iloc[0],
+                    closed.iloc[-1],
                     symbol=key[0],
                     timeframe=key[1],
                     timestamp=timestamp,
@@ -788,10 +823,13 @@ class CcxtProMarketStream:
                     closed = closed.loc[closed.index > watermark]
                 if closed.empty:
                     return None
-                timestamp = closed.index[0]
+                # Same rule as the polling stream: a live seam emits the NEWEST
+                # closed candle, so ``history`` (a window ending now) is a complete
+                # warm-up for it and the engine never trades a stale signal.
+                timestamp = closed.index[-1]
                 self._last_emitted[key] = pd.Timestamp(timestamp)
                 return _candle_from_row(
-                    closed.iloc[0],
+                    closed.iloc[-1],
                     symbol=key[0],
                     timeframe=key[1],
                     timestamp=timestamp,

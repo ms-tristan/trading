@@ -81,6 +81,20 @@ timeframe après le signal**, exactement comme le moteur de backtest, et les deu
 moteurs ne produisent pas les mêmes chiffres (seuls les **signaux** sont le
 contrat).
 
+**Les flux vivants émettent la bougie fermée la plus récente, jamais une bougie
+ancienne.** `PollingMarketStream` et `CcxtProMarketStream` sautent les bougies
+dont la clôture était déjà connue au démarrage du moteur — ou pendant une
+indisponibilité — et le signalent par l'événement structuré
+`market_data.candles_skipped`. Ce n'est pas un détail d'implémentation : le
+moteur échauffe la stratégie sur `history()` (une fenêtre qui se termine
+**maintenant**) puis ajoute la bougie émise à cette fenêtre ; émettre la plus
+ancienne bougie de la fenêtre de rétrospection produisait une trame d'une seule
+ligne (`warmup_incomplete`) et, une fois la trame devenue assez longue, faisait
+décider le moteur sur une bougie vieille de plusieurs jours **en la remplissant
+au prix du jour**. Le rejeu déterministe d'une fenêtre passée est le rôle de
+`ReplayMarketStream` (`realtime run --once`, tests), jamais celui d'un flux
+vivant.
+
 ### 2.2 Réutilisation obligatoire
 
 Le moteur temps réel **n'implémente aucune formule**. Il assemble :
@@ -232,6 +246,16 @@ En mode `--json`, l'URL de démarrage est annoncée sur **stderr** : stdout ne
 contient qu'un seul objet JSON. `SIGINT` arrête proprement le serveur et le
 moteur, puis sort avec le code `0`.
 
+**Journalisation.** `realtime run` et `realtime serve` installent les journaux
+JSON structurés de la couche (`observability.configure_logging`) : un flux sur
+**stderr** et un fichier durable `realtime-YYYYMMDD.log` sous
+`realtime.logs_dir`. Le niveau se règle par `TB_LOG_LEVEL` (`INFO` par défaut).
+Sans cette installation, les événements de la couche retombent sur le *handler*
+de dernier recours de l'interpréteur, qui n'affiche que le **nom** de l'événement
+au niveau `WARNING` et au-dessus — un opérateur lit alors `profile_crashed` sans
+l'erreur, sans le profil et sans le symbole, et ne voit jamais un seul
+`candle_processed`.
+
 L'horloge : `realtime.start_at` arme un `ManualClock` (replay déterministe)
 sinon `SystemClock` est utilisé. Le `ManualClock` injecté par la CLI **rend la
 main à la boucle d'événements** après chaque `sleep` : le moteur ne se cadence
@@ -256,6 +280,12 @@ temps réel.
 - Les décisions sont prises sur des bougies **fermées** uniquement : un profil
   live réagit une frontière de timeframe après le signal, exactement comme le
   moteur de backtest.
+- Les bougies clôturées **avant** le démarrage du moteur (ou pendant une
+  indisponibilité) sont **sautées**, pas rejouées : un flux vivant ne rattrape
+  pas son retard bougie par bougie. Un redémarrage reprend donc à la première
+  bougie qui se clôture après lui — la raison est écrite en §2.1, et
+  l'événement `market_data.candles_skipped` dit exactement combien de bougies
+  ont été ignorées et sur quelle plage.
 - **Aucun** financement, emprunt, levier ou type d'ordre spécifique à un
   exchange n'est modélisé (les ordres sont des ordres au marché, éventuellement
   limites touchées).

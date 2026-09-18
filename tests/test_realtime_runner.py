@@ -19,6 +19,7 @@ import logging
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -32,7 +33,7 @@ from trading_backtest.core.errors import (
 )
 from trading_backtest.core.models import Direction, ExitReason, TradeRecord
 from trading_backtest.realtime import runner as runner_module
-from trading_backtest.realtime.clock import ManualClock
+from trading_backtest.realtime.clock import ManualClock, SystemClock
 from trading_backtest.realtime.models import (
     BrokerAck,
     CandleEvent,
@@ -51,6 +52,7 @@ from trading_backtest.realtime.models import (
 )
 from trading_backtest.realtime.observability import LOGGER_NAME, Counters
 from trading_backtest.realtime.runner import ProfileRunner
+from trading_backtest.realtime.store import SqliteStateStore
 from trading_backtest.strategy.base import Strategy, StrategyParams, ensure_signal_frame
 
 TIMEOUT = 5.0
@@ -1070,6 +1072,68 @@ def test_run_respects_max_iterations(install: Any, logs: Any) -> None:
     assert len(store.marked) == 3
     assert runner.counters().candles_processed == 3
     assert "candle_processed" in events(logs)
+
+
+def test_the_pacing_sleep_survives_when_the_interval_equals_the_timeout(
+    install: Any, logs: Any
+) -> None:
+    """``poll_interval_seconds == timeout_seconds`` must not kill the profile.
+
+    Regression test for the defect that crash-looped the Docker deployment: the
+    pacing sleep was capped at ``min(poll_interval, timeout)`` *and* wrapped in a
+    ``wait_for`` of exactly ``timeout``, so the two deadlines collided and the loop
+    raised ``TimeoutError`` on its first idle poll -- taking every profile, and the
+    container, down with it.
+
+    A real clock is required: ``ManualClock.sleep`` returns immediately, so the
+    collision only exists when the sleep really awaits (which is what production
+    does).  Both bounds are tiny so the test stays fast.
+    """
+    install(mode="hold")
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(
+        store=store,
+        clock=SystemClock(),
+        profile_config=profile(poll_interval_seconds=0.05),
+        timeout_seconds=0.05,
+    )
+
+    async def scenario() -> None:
+        await runner.start()
+        await runner.run(max_iterations=3)
+
+    run(scenario())
+    assert runner.counters().errors == 0
+    assert runner.health().status is not ProfileStatus.ERROR
+
+
+def test_a_restart_never_accumulates_the_stopped_prefix(install: Any, tmp_path: Path) -> None:
+    """``stopped after:`` is written once, however many times the platform restarts.
+
+    The persisted ``STOPPED`` detail *is* the ``last_error`` restored on the next
+    start, so N restarts used to store ``stopped after: stopped after: ...`` in
+    front of the real error -- a status field growing without bound in the store the
+    dashboard reads.  The real SQLite store is used on purpose: it is the component
+    that carries the persisted detail back into ``last_error``.
+    """
+    install(mode="hold")
+    clock = ManualClock(datetime(2024, 1, 1, 2, 0, tzinfo=UTC))
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    store.initialize()
+    try:
+        for cycle in range(3):
+            runner, _stream, _gateway, _store, _clock = build(store=store, clock=clock)  # type: ignore[arg-type]
+            if cycle == 0:
+                runner.mark_crashed(RuntimeError("the venue vanished"))
+            else:
+                # a restart: ``start`` restores the persisted detail as last_error
+                run(runner.start())
+            run(runner.stop())
+            status = store.load_status("btc-paper")
+            assert status is not None
+            assert status.last_error == "stopped after: RuntimeError: the venue vanished"
+    finally:
+        store.close()
 
 
 def test_cancelling_run_persists_stopped(install: Any, logs: Any) -> None:

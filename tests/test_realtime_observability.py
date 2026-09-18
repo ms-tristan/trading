@@ -373,6 +373,40 @@ def test_configure_logging_uses_stderr_by_default() -> None:
     assert handler.stream is sys.stderr
 
 
+def test_configure_logging_writes_a_durable_json_file(tmp_path: Path) -> None:
+    """The optional file sink keeps the structured events after the process dies.
+
+    Regression test for the deployed container: the console handler alone is lost as
+    soon as the container runtime recreates the process, which is exactly when an
+    operator needs to read *why* a profile stopped.
+    """
+    target = tmp_path / "logs" / "realtime-20240307.log"
+    configure_logging(level="INFO", stream=io.StringIO(), secrets=[], log_file=target)
+    logger = logging.getLogger(LOGGER_NAME)
+    assert target.parent.is_dir()
+    log_event(logger, "profile_crashed", profile_id="btc-paper", error="RuntimeError: boom")
+    for handler in logger.handlers:
+        handler.flush()
+    payloads = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
+    assert [item["event"] for item in payloads] == ["profile_crashed"]
+    assert payloads[0]["profile_id"] == "btc-paper"
+    assert "RuntimeError: boom" in json.dumps(payloads[0])
+
+
+def test_configure_logging_replaces_the_previous_file_sink(tmp_path: Path) -> None:
+    """A second call never duplicates a line, file sink included."""
+    first = tmp_path / "first.log"
+    second = tmp_path / "second.log"
+    configure_logging(level="INFO", stream=io.StringIO(), secrets=[], log_file=first)
+    logger = configure_logging(level="INFO", stream=io.StringIO(), secrets=[], log_file=second)
+    assert len(logger.handlers) == 2
+    log_event(logger, "platform_started", profiles=2)
+    for handler in logger.handlers:
+        handler.flush()
+    assert first.read_text(encoding="utf-8") == ""
+    assert len(second.read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
 def test_log_path_is_deterministic_for_a_date(tmp_path: Path) -> None:
     """``realtime-YYYYMMDD.log`` depends only on the moment it is given."""
     moment = datetime(2024, 3, 7, 23, 59, tzinfo=UTC)

@@ -1367,6 +1367,23 @@ def _announce(url: str, *, json_output: bool) -> None:
     typer.echo(f"monitoring: {url}", err=json_output)
 
 
+def _realtime_logging(realtime: RealtimeConfig) -> None:
+    """Install the structured JSON logs of a realtime command.
+
+    The observability module owns the format; without this call the layer's events
+    fall through to the interpreter's last-resort handler, which prints the bare
+    event name at WARNING and above and drops every INFO event -- an operator then
+    reads ``profile_crashed`` with no error, no profile and no symbol, and never
+    sees a single ``candle_processed``.  The console sink goes to ``stderr`` and a
+    durable ``realtime-YYYYMMDD.log`` is written under ``realtime.logs_dir`` so the
+    reason survives a container restart.
+    """
+    from trading_backtest.realtime.observability import configure_logging, log_path
+
+    level = os.environ.get("TB_LOG_LEVEL", "INFO").upper()
+    configure_logging(level=level, log_file=log_path(Path(realtime.logs_dir)))
+
+
 def _realtime_clock(realtime: RealtimeConfig) -> Any:
     """Build the time seam of a run.
 
@@ -1785,6 +1802,7 @@ def realtime_run(
         engine_profiles = load_profiles(path)
         realtime = load_realtime_config(path)
         monitoring = load_monitoring_config(path)
+        _realtime_logging(realtime)
         clock = _realtime_clock(realtime)
         store = _realtime_store(realtime, clock)
 
@@ -1835,6 +1853,7 @@ def realtime_serve(
         load_profiles(path)
         realtime = load_realtime_config(path)
         monitoring = load_monitoring_config(path)
+        _realtime_logging(realtime)
         clock = SystemClock()
         store = _realtime_store(realtime, clock)
         store.initialize()

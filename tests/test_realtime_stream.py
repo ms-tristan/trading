@@ -686,8 +686,15 @@ def test_polling_never_emits_the_same_candle_twice() -> None:
     assert timestamps == sorted(timestamps)
 
 
-def test_polling_catches_up_oldest_first_when_the_window_holds_several_new_candles() -> None:
-    """Documented trade-off: the window is walked oldest first, one candle per call."""
+def test_polling_skips_stale_candles_and_emits_the_newest_closed_one() -> None:
+    """A live stream trades the present: past candles are skipped, never replayed.
+
+    Regression test for the ``warmup_incomplete`` dead-lock: the runner warms the
+    strategy up on ``history`` (a window ending *now*) and appends the emitted
+    candle to it, so emitting the **oldest** candle of the look-back window fed the
+    strategy a one-row frame -- and, once the frame grew, made the engine decide on
+    a days-old candle while the venue would fill at today's price.
+    """
     clock = ManualClock(datetime(2024, 1, 1, 12, 0, tzinfo=UTC))
     stream, _ = make_polling(clock=clock, count=4, history_candles=4)
 
@@ -700,11 +707,26 @@ def test_polling_catches_up_oldest_first_when_the_window_holds_several_new_candl
                 out.append(event.timestamp)
         return out
 
-    assert run(scenario()) == [
-        pd.Timestamp("2024-01-01 09:00", tz="UTC"),
-        pd.Timestamp("2024-01-01 10:00", tz="UTC"),
-        pd.Timestamp("2024-01-01 11:00", tz="UTC"),
-    ]
+    # The window holds 09:00, 10:00, 11:00 closed; only 11:00 is ever emitted, and
+    # the calls after it report "nothing new" instead of walking backwards.
+    assert run(scenario()) == [pd.Timestamp("2024-01-01 11:00", tz="UTC")]
+
+
+def test_polling_first_emission_agrees_with_the_warmup_window() -> None:
+    """The invariant the runner depends on: ``history[index < stamp]`` is never empty."""
+    clock = ManualClock(datetime(2024, 1, 1, 12, 0, tzinfo=UTC))
+    stream, _ = make_polling(clock=clock, count=6, history_candles=6)
+
+    async def scenario() -> tuple[pd.Timestamp, int]:
+        await stream.start()
+        event = await stream.next_candle(BTC, HOUR)
+        assert event is not None
+        window = await stream.history(BTC, HOUR, 4)
+        return event.timestamp, int((window.index < event.timestamp).sum())
+
+    stamp, rows = run(scenario())
+    assert stamp == pd.Timestamp("2024-01-01 11:00", tz="UTC")
+    assert rows > 0
 
 
 def test_polling_history_returns_the_provider_window() -> None:
@@ -956,6 +978,38 @@ def test_ccxt_pro_maps_the_watch_payload_to_a_closed_candle(
         return await stream.next_candle(BTC, HOUR)
 
     assert run(second()) is None
+
+
+def test_ccxt_pro_emits_the_newest_closed_candle_of_the_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnected buffer holds several closed candles: only the last one is traded.
+
+    The same rule as the polling stream (regression test for the deployment defect):
+    a live seam must not replay its buffer, otherwise the engine decides on a
+    candle that is older than the warm-up window ``history`` returns.
+    """
+    clock = ManualClock(datetime(2024, 1, 1, 12, 0, tzinfo=UTC))
+    rows = [
+        [ms("2024-01-01 09:00"), 90.0, 91.0, 89.0, 90.5, 1.0],
+        [ms("2024-01-01 10:00"), 92.0, 93.0, 91.0, 92.5, 2.0],
+        [ms("2024-01-01 11:00"), 100.0, 101.0, 99.0, 100.5, 5.0],
+        [ms("2024-01-01 12:00"), 101.0, 102.0, 100.0, 101.5, 6.0],
+    ]
+    exchange = FakeCcxtProExchange(rows)
+    install_fake_ccxt_pro(monkeypatch, exchange)
+    stream = make_ccxt(exchange, clock=clock)
+
+    async def scenario() -> list[pd.Timestamp]:
+        await stream.start()
+        out: list[pd.Timestamp] = []
+        for _ in range(4):
+            event = await stream.next_candle(BTC, HOUR)
+            if event is not None:
+                out.append(event.timestamp)
+        return out
+
+    assert run(scenario()) == [pd.Timestamp("2024-01-01 11:00", tz="UTC")]
 
 
 def test_ccxt_pro_unknown_exchange_raises_market_stream_error(

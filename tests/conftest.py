@@ -13,6 +13,8 @@ Design rules:
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +57,46 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "network" in item.keywords:
             item.add_marker(skip_network)
+
+
+# ---------------------------------------------------------------------------
+# global log isolation
+# ---------------------------------------------------------------------------
+
+REALTIME_LOGGER_NAME = "trading_backtest.realtime"
+
+
+@pytest.fixture(autouse=True)
+def _restore_realtime_logger() -> Iterator[None]:
+    """Restore the global realtime logger after every test.
+
+    ``python -m trading_backtest realtime run|serve`` installs the layer's
+    structured logging on a module-global logger: a handler pair, a level and
+    ``propagate = False``.  Several test files drive that CLI, and without this
+    snapshot the first of them leaves the logger at ``INFO`` with propagation
+    switched off, which silently mutes the ``caplog`` assertions of every later
+    file in the same process (tests/test_realtime_gateway.py and
+    tests/test_realtime_observability.py were the visible victims).
+
+    The name is written as a literal on purpose: this module must stay importable
+    (and cheap) without pulling in a layer just to restore a logger.
+    """
+    logger = logging.getLogger(REALTIME_LOGGER_NAME)
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    saved_handlers = list(logger.handlers)
+    try:
+        yield
+    finally:
+        for handler in list(logger.handlers):
+            if handler not in saved_handlers:
+                logger.removeHandler(handler)
+                handler.close()
+        for handler in saved_handlers:
+            if handler not in logger.handlers:
+                logger.addHandler(handler)
+        logger.setLevel(saved_level)
+        logger.propagate = saved_propagate
 
 
 # ---------------------------------------------------------------------------

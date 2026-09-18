@@ -102,8 +102,36 @@ _LOGGER = logging.getLogger(LOGGER_NAME)
 #: Lowest number of rows a frame must hold before a strategy may decide.
 MIN_FRAME_ROWS = 2
 
+#: Head-room added to the bound of the pacing sleep between two ticks.
+#:
+#: The sleep is deliberately capped at the profile's poll interval, and it used to
+#: be wrapped in a ``wait_for`` of exactly the stream timeout: whenever a profile's
+#: poll interval equalled that timeout -- the natural thing to configure, and the
+#: shape the Docker deployment uses -- the two deadlines fell on the same instant
+#: and the tick died with ``TimeoutError`` on the first idle poll, taking the whole
+#: platform down with it.  The sleep now gets one extra second of budget, so it can
+#: never be the cause of its own timeout.
+_PACING_GRACE_SECONDS = 1.0
+
 #: Order type every order of the engine uses (the venue decides the fill).
 _ORDER_TYPE = OrderType.MARKET
+
+#: Prefix every ``STOPPED`` detail carries in front of the last error.
+_STOP_PREFIX = "stopped after: "
+
+
+def _strip_stop_prefix(text: str) -> str:
+    """Remove every nested ``stopped after:`` prefix from a persisted detail.
+
+    The store keeps one string per profile (the ``STOPPED`` detail *is* the
+    persisted ``last_error``), so a platform restarted N times used to accumulate
+    ``stopped after: `` N times in front of the real message -- a status field that
+    grows without bound and hides the error it is supposed to carry.
+    """
+    stripped = str(text)
+    while stripped.startswith(_STOP_PREFIX):
+        stripped = stripped[len(_STOP_PREFIX) :]
+    return stripped
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +380,22 @@ class ProfileRunner:
         """
         self._status = ProfileStatus.STOPPED
         self._started = False
-        detail = "stopped" if not self._last_error else f"stopped after: {self._last_error}"
+        detail = (
+            "stopped"
+            if not self._last_error
+            else f"stopped after: {_strip_stop_prefix(self._last_error)}"
+        )
         self._store.save_status(self.profile_id, ProfileStatus.STOPPED, detail=detail)
         log_event(_LOGGER, "profile_stopped", profile_id=self.profile_id, detail=detail)
+
+    def mark_crashed(self, exc: BaseException) -> None:
+        """Persist the last-resort failure of a profile that left its loop.
+
+        Called by the orchestrator when :meth:`run` raised: the store is the durable
+        record an operator reads through the dashboard, so a profile that died must
+        not keep saying ``running`` until the process disappears.
+        """
+        self._record_error(exc)
 
     def mark_degraded(self, detail: str) -> None:
         """Mark the profile degraded and keep it degraded across its next ticks.
@@ -391,17 +432,17 @@ class ProfileRunner:
                 iterations += 1
                 try:
                     await self.run_once()
+                    await asyncio.wait_for(
+                        self._clock.sleep(
+                            min(float(self._profile.poll_interval_seconds), self._timeout)
+                        ),
+                        timeout=self._timeout + _PACING_GRACE_SECONDS,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     self._record_error(exc)
                     raise
-                await asyncio.wait_for(
-                    self._clock.sleep(
-                        min(float(self._profile.poll_interval_seconds), self._timeout)
-                    ),
-                    timeout=self._timeout,
-                )
         except asyncio.CancelledError:
             # The cancellation may land in the tick *or* in the pacing sleep: both
             # must persist STOPPED before the task really ends.

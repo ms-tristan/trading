@@ -266,24 +266,30 @@ def configure_logging(
     stream: TextIO | None = None,
     secrets: Sequence[str] | None = None,
     environ: Mapping[str, str] | None = None,
+    log_file: Path | None = None,
 ) -> logging.Logger:
     """Install the JSON handler on the realtime logger and return it.
 
-    Idempotent: the handler this function installed previously is removed before
-    the new one is added, so calling it twice never duplicates an output line and a
-    later call can change the level, the stream or the secret list.
+    Idempotent: the handlers this function installed previously are removed before
+    the new ones are added, so calling it twice never duplicates an output line and
+    a later call can change the level, the stream, the secret list or the file.
 
     Parameters
     ----------
     level:
-        Level name applied to both the logger and its handler.
+        Level name applied to the logger and to both handlers.
     stream:
-        Destination of the handler; defaults to ``sys.stderr``.
+        Destination of the console handler; defaults to ``sys.stderr``.
     secrets:
         Values to redact.  ``None`` collects them from ``environ`` (or the process
         environment) using the documented credential variable names.
     environ:
         Environment mapping used by the default secret scan.
+    log_file:
+        Optional durable sink (``realtime-YYYYMMDD.log``, see :func:`log_path`).
+        Its parent directory is created.  The console handler alone is lost as soon
+        as the process is supervised by a container runtime that rotates its
+        output, which is exactly when an operator needs to read why a profile died.
     """
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(level)
@@ -291,6 +297,7 @@ def configure_logging(
     for handler in list(logger.handlers):
         if getattr(handler, _HANDLER_FLAG, False):
             logger.removeHandler(handler)
+            handler.close()
     resolved: Sequence[str]
     if secrets is None:
         resolved = _environment_secrets(os.environ if environ is None else environ)
@@ -302,6 +309,15 @@ def configure_logging(
     handler.addFilter(RedactionFilter(resolved))
     setattr(handler, _HANDLER_FLAG, True)
     logger.addHandler(handler)
+    if log_file is not None:
+        target = Path(log_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(target, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(JsonLogFormatter())
+        file_handler.addFilter(RedactionFilter(resolved))
+        setattr(file_handler, _HANDLER_FLAG, True)
+        logger.addHandler(file_handler)
     return logger
 
 

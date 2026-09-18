@@ -753,6 +753,18 @@ méthode**), `CompositeMarketStream` (multiplexe plusieurs symboles) ;
 écritures en transaction, UPSERT sur clé naturelle, ligne `schema_version` avec
 contrôle de migration) ; `PaperBroker` et `CcxtBroker`.
 
+**Règle unique des flux vivants.** `next_candle` rend la bougie fermée la **plus
+récente** strictement postérieure à la dernière émise, et `history` la fenêtre
+qui se termine **maintenant** : les deux règles n'en forment qu'une, parce que le
+`ProfileRunner` échauffe la stratégie sur `history()` puis ajoute la bougie émise
+à cette fenêtre. Un flux vivant qui émettrait la plus ancienne bougie de sa
+fenêtre de rétrospection donnerait à la stratégie une trame tronquée
+(`warmup_incomplete`, aucun trade) puis, la trame ayant grossi, lui ferait
+décider sur une bougie vieille de plusieurs jours — remplie au prix du jour. Les
+bougies sautées sont signalées (`market_data.candles_skipped`) ; le rejeu
+déterministe d'une fenêtre passée reste le rôle de `ReplayMarketStream`
+(`realtime run --once`, tests).
+
 #### 4.10.2 Les quatre autres coutures
 
 ```python

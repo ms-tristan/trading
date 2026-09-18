@@ -21,6 +21,7 @@ signal, and every server is stopped and joined inside the test that started it.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import logging
 import sqlite3
@@ -42,10 +43,11 @@ from trading_backtest.config import (
     load_realtime_config,
 )
 from trading_backtest.data.synthetic import make_ohlcv
-from trading_backtest.realtime.clock import SystemClock
+from trading_backtest.realtime.clock import ManualClock, SystemClock
 from trading_backtest.realtime.monitor import Monitor
 from trading_backtest.realtime.orchestrator import RealtimeOrchestrator
 from trading_backtest.realtime.store import SqliteStateStore
+from trading_backtest.realtime.stream import PollingMarketStream
 from trading_backtest.web.server import create_server, start_in_thread
 
 RUNNER = CliRunner()
@@ -588,3 +590,131 @@ def test_the_dashboard_static_assets_are_shipped_and_offline(tmp_path: Path) -> 
     assert "cdn" not in html.lower()
     assert "cdn" not in javascript.lower()
     assert "/api/profiles" in javascript
+
+
+# ---------------------------------------------------------------------------
+# 7. The deployment shape: a LIVE polling stream (no anchored clock, network
+#    provider) must trade its first tick.  This is the regression test for the
+#    defect found while deploying the platform in Docker: the polling stream used
+#    to emit the *oldest* candle of its look-back window, while the runner warms
+#    the strategy up on ``history`` -- a window ending *now*.  The two disagreed,
+#    every tick failed with ``warmup_incomplete`` and the profile never processed
+#    a single candle (and, once the frame would have been big enough, it would
+#    have decided on a days-old candle and filled it at today's price).
+# ---------------------------------------------------------------------------
+
+LIVE_NOW = pd.Timestamp("2024-06-01 12:00:00", tz="UTC")
+LIVE_CLOSED = pd.Timestamp("2024-06-01 11:00:00", tz="UTC")
+
+
+class LiveLikeProvider:
+    """A provider that answers like a real exchange: a window ending *now*.
+
+    It is deliberately written the way a venue behaves -- the answer always ends
+    at the candle that is still forming, whatever ``since`` is asked for -- so the
+    test exercises the contract, not a fixture shaped for the engine.
+    """
+
+    def __init__(self, *, rows: int = 400, seed: int = 5) -> None:
+        self._rows = rows
+        self._seed = seed
+        self.calls: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, since: Any, until: Any) -> pd.DataFrame:
+        self.calls.append((symbol, timeframe, pd.Timestamp(since), pd.Timestamp(until)))
+        end = pd.Timestamp(until).floor("h")
+        start = end - (self._rows - 1) * pd.Timedelta(hours=1)
+        frame = make_ohlcv(self._rows, start=start.isoformat(), timeframe="1h", seed=self._seed)
+        window = frame.loc[
+            (frame.index >= pd.Timestamp(since)) & (frame.index <= pd.Timestamp(until))
+        ]
+        return window.copy()
+
+
+def write_live_scenario(directory: Path) -> Path:
+    """Write the deployment-shaped profiles document of the live scenario."""
+    document = {
+        "profiles": [
+            {
+                "id": "btc-live-shape",
+                "symbol": BTC,
+                "timeframe": "1h",
+                "strategy": "basic",
+                "mode": "paper",
+                "initial_balance": 10000.0,
+                "stake_amount": 1000.0,
+                "warmup_candles": 50,
+                "poll_interval_seconds": 30.0,
+                "risk": {
+                    "max_position_notional": 5000.0,
+                    "max_order_notional": 2000.0,
+                    "max_open_positions": 1,
+                    "max_daily_loss": 500.0,
+                    "max_drawdown_pct": 0.5,
+                    "max_daily_trades": 10,
+                },
+            }
+        ],
+        # no anchor: this is the wall-clock deployment shape
+        "realtime": {"start_at": None, "history_candles": 300, "csv_dir": None},
+        "monitoring": {"port": 0},
+    }
+    path = directory / "profiles-live.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def test_a_live_polling_stream_trades_its_first_tick_with_a_full_warmup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The deployment shape must process the newest closed candle on the first tick."""
+    path = write_live_scenario(tmp_path)
+    database = tmp_path / "state.db"
+    clock = ManualClock(LIVE_NOW.to_pydatetime())
+    provider = LiveLikeProvider()
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+
+    def factory(profile: Any) -> Any:
+        return PollingMarketStream(
+            provider,
+            clock=clock,
+            exchange=str(profile.exchange),
+            history_candles=300,
+            poll_interval_seconds=30.0,
+            timeout_seconds=30.0,
+            max_reconnects=3,
+            reconnect_backoff_seconds=1.0,
+        )
+
+    try:
+        # the module-level autouse fixture mutes the structured logs; this test
+        # asserts on them, so logging is re-enabled for its own duration only
+        logging.disable(logging.NOTSET)
+        try:
+            with caplog.at_level(logging.WARNING):
+                orchestrator = RealtimeOrchestrator(
+                    profiles=load_profiles(path),
+                    store=store,
+                    clock=clock,
+                    realtime=load_realtime_config(path),
+                    monitoring=MonitoringConfig(port=0),
+                    stream_factory=factory,
+                    version="e2e",
+                )
+                asyncio.run(orchestrator.run_once())
+                runner = orchestrator.runner("btc-live-shape")
+                assert runner is not None
+                live = runner.health()
+        finally:
+            logging.disable(logging.CRITICAL)
+
+        # The newest closed candle -- not the oldest one of the look-back window.
+        assert store.last_processed_candle("btc-live-shape") == LIVE_CLOSED
+        assert live.counters.candles_processed == 1
+        assert "warmup_incomplete" not in caplog.text
+        # and the warm-up window really was the provider window ending now
+        assert provider.calls, "the live stream never asked the provider for candles"
+        assert provider.calls[0][3] == LIVE_NOW
+    finally:
+        store.close()

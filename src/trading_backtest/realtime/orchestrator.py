@@ -587,11 +587,13 @@ class RealtimeOrchestrator:
 
     async def _supervise(self, runner: ProfileRunner) -> None:
         """Keep one profile's failure from taking the platform down with it."""
+        failure: BaseException | None = None
         try:
             await runner.run()
         except asyncio.CancelledError:
             raise
         except RealtimeError as exc:
+            failure = exc
             log_event(
                 _LOGGER,
                 "profile_stopped_on_error",
@@ -600,6 +602,7 @@ class RealtimeOrchestrator:
                 error=str(exc),
             )
         except Exception as exc:
+            failure = exc
             log_event(
                 _LOGGER,
                 "profile_crashed",
@@ -607,6 +610,12 @@ class RealtimeOrchestrator:
                 profile_id=runner.profile_id,
                 error=f"{type(exc).__name__}: {exc}",
             )
+        if failure is not None:
+            # A profile that ended on an error must say so on the dashboard, not
+            # only in the log stream: the persisted status is what survives the
+            # process.  ``ProfileRunner.run`` records its own tick failures, so this
+            # is the last-resort path (a failure outside the tick loop).
+            runner.mark_crashed(failure)
 
     async def _stop_streams(self) -> None:
         """Best-effort shutdown of the injected streams (bounded, never fatal)."""

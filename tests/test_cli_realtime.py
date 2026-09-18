@@ -488,6 +488,40 @@ def test_check_prints_a_human_summary_and_exits_one_on_a_finding(tmp_path: Path)
 # ---------------------------------------------------------------------------
 
 
+def test_run_installs_the_structured_logs_of_the_layer(tmp_path: Path) -> None:
+    """``realtime run`` must wire the JSON logs, console *and* durable file.
+
+    Regression test for the deployed container: nothing called
+    ``configure_logging``, so the layer's events fell through to the interpreter's
+    last-resort handler -- bare event names at WARNING and above, every INFO event
+    dropped, and a ``profile_crashed`` line that did not carry its error.
+    """
+    path = write_profiles(tmp_path)
+    logs_dir = tmp_path / "logs"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["realtime"]["logs_dir"] = str(logs_dir)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    result = None
+    logging.disable(logging.NOTSET)  # this test asserts the log stream itself
+    try:
+        result = invoke("realtime", "run", "--profiles", str(path), "--once", "--json")
+    finally:
+        logging.disable(logging.CRITICAL)
+
+    assert result is not None
+    assert result.exit_code == 0
+    files = sorted(logs_dir.glob("realtime-*.log"))
+    assert len(files) == 1, "the durable JSON log was not created"
+    lines = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    events = [entry["event"] for entry in lines]
+    assert "profile_starting" in events
+    assert "candle_processed" in events, "INFO events must reach the log stream"
+    processed = next(entry for entry in lines if entry["event"] == "candle_processed")
+    assert processed["profile_id"] == "btc-paper"
+    assert "equity" in processed
+
+
 def test_run_once_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     """The heart of the contract: one tick writes durable state, twice does not double it."""
     path = write_profiles(tmp_path)
