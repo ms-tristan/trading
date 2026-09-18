@@ -1039,16 +1039,19 @@ def test_control_state_reports_paused_and_running_per_profile(tmp_path: Path) ->
 
 
 def test_candle_series_reads_the_persisted_window(tmp_path: Path) -> None:
-    """The engine persists every processed candle; the orchestrator reads them back."""
+    """The engine persists the window it consumed; the orchestrator reads it back."""
     orchestrator, store, _clock, _streams = build_orchestrator(
         tmp_path, [profile("btc-paper", SYMBOL_BTC)]
     )
     run(orchestrator.run_once())
     candles = orchestrator.candle_series("btc-paper", 10)
-    assert len(candles) == 1
-    assert candles[0].profile_id == "btc-paper"
-    assert candles[0].close == pytest.approx(101.0)
-    assert candles[0].closed is True
+    # The first tick seeds the warm-up window it fed the strategy, so the chart
+    # is usable immediately, and it ends on the candle just processed.
+    assert len(candles) == 2
+    assert [row.timestamp for row in candles] == sorted(row.timestamp for row in candles)
+    assert candles[-1].profile_id == "btc-paper"
+    assert candles[-1].close == pytest.approx(101.0)
+    assert candles[-1].closed is True
 
     store.append_candle(
         CandleEvent(
@@ -1064,7 +1067,7 @@ def test_candle_series_reads_the_persisted_window(tmp_path: Path) -> None:
         profile_id="btc-paper",
     )
     series = orchestrator.candle_series("btc-paper", 10)
-    assert [row.close for row in series] == [101.0, 150.0]
+    assert [row.close for row in series] == [100.0, 101.0, 150.0]
     assert len(orchestrator.candle_series("btc-paper", 1)) == 1
     assert orchestrator.candle_series("nope", 10) == []
     store.close()

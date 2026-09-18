@@ -295,6 +295,7 @@ class ProfileRunner:
         self._sequence_stamp: pd.Timestamp | None = None
         self._started_at: pd.Timestamp | None = None
         self._paused = False
+        self._history_seeded = False
         self._peak_equity = float(profile.initial_balance)
         self._day_start_equity = float(profile.initial_balance)
         self._day: Any = None
@@ -588,6 +589,17 @@ class ProfileRunner:
         # 4. the strategy is the only producer of indicators and rules.
         _prepared, signals = self._strategy_run(frame)
 
+        # 3b. seed the persisted candle history once, from the very window the
+        #     strategy just consumed. It is display only: these rows feed the
+        #     bounded ``candles`` table the dashboard draws, they are never
+        #     replayed as ticks and they never touch the watermark that gates a
+        #     decision, so seeding changes no trading behaviour. Without it the
+        #     chart would stay empty until the profile had processed a full
+        #     window one timeframe at a time.
+        if not self._history_seeded:
+            self._seed_candle_history(frame)
+            self._history_seeded = True
+
         # 5. and 6. stop first, then the signal row of the just-closed candle.
         plan = self._plan(candle, signals)
         state = self._equity_state(stamp, plan.reference_price)
@@ -762,6 +774,44 @@ class ProfileRunner:
         if strategy is None:  # pragma: no cover - _prepare always runs first
             raise RealtimeError(f"profile {self.profile_id!r} has no resolved strategy")
         return strategy.run(frame)
+
+    def _seed_candle_history(self, frame: pd.DataFrame) -> None:
+        """Persist the warmup window once, so the dashboard chart is never empty.
+
+        Every row goes through the store's idempotent :meth:`append_candle` (one
+        row per ``(profile_id, timestamp)``, bounded retention), so a restart
+        re-seeds nothing and the table stays bounded. The rows are **display
+        only**: they are never replayed as ticks and the watermark that gates a
+        trading decision is untouched.
+        """
+        symbol = str(self._profile.symbol)
+        timeframe = str(self._profile.timeframe)
+        written = 0
+        for stamp, row in frame.iterrows():
+            known = self._store.append_candle(
+                CandleEvent(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    timestamp=_as_utc(stamp),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row["volume"]),
+                    closed=True,
+                ),
+                profile_id=self.profile_id,
+            )
+            if not known:
+                written += 1
+        log_event(
+            _LOGGER,
+            "candle_history_seeded",
+            profile_id=self.profile_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            rows=written,
+        )
 
     def _build_frame(
         self, history: pd.DataFrame | None, candle: CandleEvent, stamp: pd.Timestamp

@@ -1584,7 +1584,7 @@ def test_broker_ack_and_candle_helpers_are_not_needed_by_the_runner() -> None:
 
 
 def test_a_processed_candle_is_appended_verbatim(install: Any) -> None:
-    """The candle row is the event the tick decided on, field for field."""
+    """The row the tick decided on is persisted field for field, as the last one."""
     install(mode="hold")
     stream = FakeStream()
     store = FakeStore()
@@ -1597,8 +1597,10 @@ def test_a_processed_candle_is_appended_verbatim(install: Any) -> None:
     decision = run(scenario())
     expected = candle_at(stream.frame, 1)
     assert decision is not None
-    assert store.candles == [(expected, "btc-paper")]
-    stored = store.candles_of()[0]
+    # The processed candle is the LAST row: the warm-up window that preceded it
+    # is seeded on the same first tick (see the seeding test below).
+    assert store.candles[-1] == (expected, "btc-paper")
+    stored = store.candles_of()[-1]
     assert stored.timestamp == decision.timestamp
     assert stored.open == pytest.approx(float(expected.open))
     assert stored.high == pytest.approx(float(expected.high))
@@ -1606,8 +1608,43 @@ def test_a_processed_candle_is_appended_verbatim(install: Any) -> None:
     assert stored.close == pytest.approx(float(expected.close))
     assert stored.volume == pytest.approx(float(expected.volume))
     assert stored.closed is True
-    assert store.candle_series("btc-paper") == [expected]
+    assert store.candle_series("btc-paper")[-1] == expected
     assert store.candle_series("eth-paper") == []
+
+
+def test_the_first_tick_seeds_the_warmup_window_once(install: Any) -> None:
+    """The whole window the strategy consumed is persisted, and only once.
+
+    Without this the dashboard chart would stay empty until the profile had
+    processed a full window one timeframe at a time (hours to days). The seeded
+    rows are display only: the watermark that gates a decision is untouched, so
+    the second tick appends exactly one candle, never a re-seed.
+    """
+    install(mode="hold")
+    stream = FakeStream()
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(stream=stream, store=store)
+
+    async def scenario() -> Any:
+        await runner.start()
+        await runner.run_once()
+        after_first = len(store.candles)
+        stream.seek(2)
+        await runner.run_once()
+        return after_first, len(store.candles)
+
+    after_first, after_second = run(scenario())
+
+    # The warm-up window plus the candle just processed: strictly more than the
+    # single candle the previous behaviour appended.
+    assert after_first > 1
+    # One-shot: the second tick appends its own candle and re-seeds nothing.
+    assert after_second == after_first + 1
+
+    stamps = sorted({candle.timestamp for candle in store.candle_series("btc-paper")})
+    assert stamps == sorted(stamps)
+    assert len(stamps) == after_first  # no two seeded rows share a timestamp
+    assert stamps[-1] == pd.Timestamp(stream.frame.index[2])
 
 
 def test_a_candle_still_forming_keeps_its_closed_flag(install: Any) -> None:
@@ -1622,13 +1659,18 @@ def test_a_candle_still_forming_keeps_its_closed_flag(install: Any) -> None:
         return await runner.run_once()
 
     run(scenario())
-    stored = store.candles_of()[0]
+    stored = store.candles_of()[-1]
     assert stored.closed is False
     assert stored.timestamp == pd.Timestamp(stream.frame.index[1])
 
 
 def test_a_tick_that_decides_nothing_appends_no_candle(install: Any) -> None:
-    """No candle, a stale candle, an incomplete warm-up and a blocked order write nothing."""
+    """No candle, a stale candle and an incomplete warm-up write nothing at all.
+
+    A blocked order is different: the tick reaches a decision, so the candle
+    history the strategy consumed is seeded for the chart, but the tick still
+    aborts before publishing — no equity point and no watermark.
+    """
     install(mode="entry_long", stop_loss=90.0)
 
     empty = FakeStore()
@@ -1677,9 +1719,12 @@ def test_a_tick_that_decides_nothing_appends_no_candle(install: Any) -> None:
     decision = run(blocked())
     assert decision is not None
     assert decision.blocked is True
-    assert refused.candles == []
     assert refused.equity == []
     assert refused.marked == []
+    # The blocked order must not hide the price action from the operator: the
+    # seeded window ends on the candle the tick decided on.
+    assert len(refused.candles) > 1
+    assert refused.candles[-1][0].timestamp == pd.Timestamp(make_frame().index[1])
 
 
 # ---------------------------------------------------------------------------
@@ -1718,7 +1763,7 @@ def test_pause_turns_an_entry_signal_into_a_hold(install: Any, logs: Any) -> Non
     assert store.marked == [("btc-paper", expected)]
     assert len(store.equity) == 1
     assert store.equity[0].timestamp == expected
-    assert store.candles_of() == [candle_at(stream.frame, 1)]
+    assert store.candles_of()[-1] == candle_at(stream.frame, 1)
     assert store.status_values()[-1] == "running"
     assert runner.health().status is ProfileStatus.RUNNING
     assert runner.counters().candles_processed == 1
@@ -1750,7 +1795,7 @@ def test_pause_does_not_suppress_the_stop_loss(install: Any) -> None:
     assert reference == pytest.approx(95.0)
     assert context["closes_position"] is True
     assert runner.paused is True
-    assert store.candles_of() == [candle_at(frame, 1)]
+    assert store.candles_of()[-1] == candle_at(frame, 1)
     assert len(store.marked) == 1
 
 
@@ -1834,7 +1879,9 @@ def test_resume_restores_the_entry_order(install: Any, logs: Any) -> None:
     assert len(gateway.submissions) == 1
     assert gateway.submissions[0][0].client_order_id == resumed.client_order_id
     assert runner.paused is False
-    assert len(store.candles) == 2
+    # Both ticks processed and persisted their own candle: the history seeding
+    # is one-shot, so the second tick appends exactly one row, the resumed one.
+    assert store.candles[-1] == (candle_at(_stream.frame, 2), "btc-paper")
     assert "profile_resumed" in events(logs)
 
 
