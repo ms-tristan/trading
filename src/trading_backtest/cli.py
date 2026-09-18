@@ -12,6 +12,31 @@ the ``core``/``config``/``data`` layers.  ``trading_backtest.strategy``,
 command bodies**, so ``--help``, ``--version``, ``config show`` and
 ``config validate`` stay fast and never require the other layers to exist.
 
+The ``realtime`` group (layer 8) obeys the very same rule, and it is mechanically
+tested (``tests/test_cli_realtime.py``): ``trading_backtest.realtime`` (layer 6)
+and ``trading_backtest.web`` (layer 7) are imported **inside the command bodies
+and their helpers**, never at module import time.  Importing
+``trading_backtest.cli`` therefore leaves neither of the two new layers in
+``sys.modules``, which is what keeps ``--help`` free of the engine and of the
+optional ``ccxt``/``freqtrade`` extras.  The three commands are:
+
+* ``realtime run`` — starts the engine *and* the monitoring server (``--once``
+  runs a single deterministic tick and exits, without starting any server);
+* ``realtime serve`` — read-only monitoring over the persisted state, no engine;
+* ``realtime check`` — static pre-flight: it validates the profiles document,
+  the credential *presence*, the live gate, the risk limits and the writability
+  of the state database; it never places an order, never needs the network, and
+  exits ``1`` as soon as one profile cannot start.
+
+Their payloads have their own key sets (documented verbatim in
+``docs/usage.md`` and ``docs/realtime.md``): ``realtime-check`` carries
+``state_db_writable`` plus one entry per profile, while ``realtime-run`` and
+``realtime-serve`` carry ``profiles`` (snapshots), ``decisions`` and the
+monitoring ``url``.  They travel through :func:`_emit_realtime` instead of
+:func:`_payload` for that reason; stdout still carries exactly one JSON object
+per invocation, and the startup URL is announced on **stderr** when ``--json``
+is used.
+
 Exit codes: ``0`` success, ``1`` domain error (any
 :class:`~trading_backtest.core.errors.TradingBacktestError`), ``2`` usage error
 (unknown command, missing argument, invalid choice...).
@@ -36,8 +61,10 @@ distribution, not a curve, so it has its own gate.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
@@ -50,12 +77,24 @@ from rich.console import Console
 from rich.table import Table
 
 from trading_backtest import __version__
-from trading_backtest.config import AppConfig, load_config
+from trading_backtest.config import (
+    AppConfig,
+    MonitoringConfig,
+    ProfileConfig,
+    RealtimeConfig,
+    default_realtime_config,
+    load_config,
+    load_monitoring_config,
+    load_profiles,
+    load_realtime_config,
+)
 from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
 from trading_backtest.core.errors import (
     ConfigError,
     FreqtradeConfigError,
     InsufficientDataError,
+    MarketStreamError,
+    MonitoringError,
     TradingBacktestError,
 )
 from trading_backtest.core.models import BacktestResult, RunnerFn
@@ -76,7 +115,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
         RandomEntryGateResult,
     )
 
-__all__ = ["app", "config_app", "data_app", "main"]
+__all__ = ["app", "config_app", "data_app", "main", "realtime_app"]
 
 #: Name used in usage/help messages (the console script of ``pyproject.toml``).
 PROG_NAME = "trading-backtest"
@@ -769,8 +808,14 @@ config_app = typer.Typer(
     no_args_is_help=True,
     help="Inspect and validate configuration files.",
 )
+realtime_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Run and monitor N concurrent trading profiles in real time.",
+)
 app.add_typer(data_app, name="data")
 app.add_typer(config_app, name="config")
+app.add_typer(realtime_app, name="realtime")
 
 _CONFIG_HELP = "Path to the JSON configuration file."
 _SYMBOL_HELP = "Trading pair, e.g. 'BTC/USDT' (inferred from --data-file when omitted)."
@@ -1236,6 +1281,713 @@ def config_validate(
             ),
             json_output=json_output,
         )
+
+
+# ---------------------------------------------------------------------------
+# realtime engine and monitoring (layers 6 and 7, imported in the bodies)
+# ---------------------------------------------------------------------------
+
+#: Environment variable arming live trading (mirrors ``realtime.risk.LiveTradingGate``).
+LIVE_TRADING_ENV = "TB_ALLOW_LIVE_TRADING"
+
+#: The exact value :data:`LIVE_TRADING_ENV` must carry to arm live trading.
+LIVE_TRADING_VALUE = "I_UNDERSTAND_THE_RISK"
+
+_PROFILES_HELP = "Path to the JSON profiles file (profiles + realtime + monitoring)."
+_HOST_HELP = "Monitoring bind host (default: monitoring.host)."
+_PORT_HELP = "Monitoring port; 0 binds an ephemeral port (default: monitoring.port)."
+_ONCE_HELP = "Run ONE deterministic engine tick over the polled candles and exit."
+
+#: Credential variable names quoted by the pre-flight messages (never their values).
+_CREDENTIAL_HELP = "set TB_LIVE_API_KEY/TB_LIVE_API_SECRET or TB_PROFILE_<ID>_API_KEY/_API_SECRET"
+
+#: Bound of the extra join of the monitoring thread at shutdown, in seconds.
+_SERVER_JOIN_TIMEOUT = 5.0
+
+
+def _print_realtime_human(payload: Mapping[str, Any]) -> None:
+    """Print the rich summary of a realtime payload (``realtime run|serve|check``)."""
+    command = str(payload.get("command") or "")
+    console.print(f"[bold]{command}[/bold]", highlight=False)
+    for key in ("config_path", "state_db", "state_db_writable", "kill_switch", "url"):
+        if key in payload and payload[key] is not None:
+            console.print(f"  {key}: {_format_value(payload[key])}", highlight=False)
+
+    issues = payload.get("issues")
+    if isinstance(issues, list) and issues:
+        console.print("  issues:", highlight=False)
+        for issue in issues:
+            console.print(f"    - {issue}", highlight=False)
+
+    profiles = payload.get("profiles")
+    if isinstance(profiles, list) and profiles:
+        table = Table(title="Profiles", header_style="bold")
+        for column in ("Profile", "Symbol", "Timeframe", "Mode", "State"):
+            table.add_column(column)
+        for entry in profiles:
+            if not isinstance(entry, Mapping):
+                continue
+            state = entry.get("status")
+            if state is None:
+                state = "ok" if entry.get("ok") else "issues"
+            entry_issues = entry.get("issues")
+            if isinstance(entry_issues, list) and entry_issues:
+                state = f"{state} ({len(entry_issues)} issue(s))"
+            table.add_row(
+                str(entry.get("profile_id") or entry.get("id") or "-"),
+                str(entry.get("symbol") or "-"),
+                str(entry.get("timeframe") or "-"),
+                str(entry.get("mode") or "-"),
+                str(state),
+            )
+        console.print(table)
+
+    decisions = payload.get("decisions")
+    if isinstance(decisions, list):
+        console.print(f"  decisions: {len(decisions)}", highlight=False)
+        for decision in decisions:
+            if isinstance(decision, Mapping):
+                console.print(
+                    f"    {decision.get('profile_id')} {decision.get('action')} "
+                    f"{decision.get('timestamp')}",
+                    highlight=False,
+                )
+
+
+def _emit_realtime(payload: Mapping[str, Any], *, json_output: bool) -> None:
+    """Print a realtime payload as the single JSON object, or as the rich summary."""
+    if json_output:
+        typer.echo(json.dumps(dict(payload), indent=2, sort_keys=True, default=str))
+        return
+    _print_realtime_human(payload)
+
+
+def _announce(url: str, *, json_output: bool) -> None:
+    """Announce the bound monitoring URL (on stderr in ``--json`` mode)."""
+    typer.echo(f"monitoring: {url}", err=json_output)
+
+
+def _realtime_clock(realtime: RealtimeConfig) -> Any:
+    """Build the time seam of a run.
+
+    ``realtime.start_at`` is the deterministic replay/backfill anchor: when it is
+    set the engine runs on a :class:`~trading_backtest.realtime.clock.ManualClock`
+    anchored at that instant, which is what makes ``realtime run --once``
+    reproducible; otherwise the engine reads the system clock.
+
+    The manual clock is *yielding* on purpose.  The engine paces itself **only**
+    through ``Clock.sleep`` (the stream's idle wait and the runner's pacing
+    sleep), and ``ManualClock.sleep`` returns without suspending: the supervised
+    profile loop then becomes one CPU-bound synchronous stretch inside a single
+    task, the event loop never regains control, none of its timers fire (so no
+    ``asyncio.wait_for`` bound does) and a ``SIGINT`` is never delivered -- the
+    process spins at 100 % of one core and cannot be interrupted.  Adding a
+    single ``asyncio.sleep(0)`` (which reads no wall clock) keeps the replay
+    byte-identical while leaving the loop cooperative.  The trade-off is written
+    down in ``docs/realtime.md``: an anchored continuous run replays as fast as
+    the CPU allows instead of following wall time.
+    """
+    from trading_backtest.realtime.clock import ManualClock, SystemClock
+
+    anchor = _parse_moment(realtime.start_at, field="realtime.start_at")
+    if anchor is None:
+        return SystemClock()
+
+    class YieldingManualClock(ManualClock):
+        """``ManualClock`` that hands the event loop back after every sleep."""
+
+        async def sleep(self, seconds: float) -> None:
+            """Advance the virtual time by ``seconds``, then yield once."""
+            self.advance(seconds)
+            await asyncio.sleep(0)
+
+    return YieldingManualClock(anchor.to_pydatetime())
+
+
+def _realtime_store(realtime: RealtimeConfig, clock: Any) -> Any:
+    """Build the SQLite state store of a run (never initialized here)."""
+    from trading_backtest.realtime.store import SqliteStateStore
+
+    return SqliteStateStore(Path(realtime.state_db), clock=clock)
+
+
+def _realtime_monitor(store: Any, *, clock: Any, realtime: RealtimeConfig) -> Any:
+    """Build the read model over persisted state."""
+    from trading_backtest.realtime.monitor import Monitor
+
+    return Monitor(store, clock=clock, realtime=realtime)
+
+
+def _realtime_stream_factory(realtime: RealtimeConfig, clock: Any) -> Any:
+    """Build the per-profile market-stream factory of a run.
+
+    With ``realtime.csv_dir`` set the engine polls a
+    :class:`~trading_backtest.data.loader.CsvDataProvider` and never touches the
+    network; otherwise it polls the cache-first
+    :class:`~trading_backtest.data.loader.OHLCVLoader` of the profile's exchange,
+    whose provider is only built (and therefore only needs the optional ``ccxt``
+    extra) when that profile is actually wired.
+    """
+    from trading_backtest.data.loader import CsvDataProvider, OHLCVLoader
+    from trading_backtest.realtime.stream import PollingMarketStream
+
+    csv_dir = realtime.csv_dir
+
+    def factory(profile: ProfileConfig) -> Any:
+        provider: Any
+        if csv_dir is not None:
+            provider = CsvDataProvider(Path(csv_dir))
+        else:
+            provider = OHLCVLoader(
+                str(profile.exchange),
+                Path(realtime.cache_dir),
+                fmt=str(realtime.format),
+                allow_network=bool(realtime.allow_network),
+                validate=True,
+            ).provider
+        return PollingMarketStream(
+            provider,
+            clock=clock,
+            exchange=str(profile.exchange),
+            history_candles=int(realtime.history_candles),
+            poll_interval_seconds=float(profile.poll_interval_seconds),
+            timeout_seconds=float(realtime.stream_poll_timeout_seconds),
+            max_reconnects=int(realtime.max_stream_reconnects),
+            reconnect_backoff_seconds=float(realtime.reconnect_backoff_seconds),
+        )
+
+    return factory
+
+
+def _realtime_orchestrator(
+    profiles: Sequence[ProfileConfig],
+    realtime: RealtimeConfig,
+    monitoring: MonitoringConfig,
+    *,
+    clock: Any,
+    store: Any,
+) -> Any:
+    """Wire the engine: one orchestrator, N profiles, one shared state store."""
+    from trading_backtest.realtime.orchestrator import RealtimeOrchestrator
+
+    return RealtimeOrchestrator(
+        profiles=profiles,
+        store=store,
+        clock=clock,
+        realtime=realtime,
+        monitoring=monitoring,
+        stream_factory=_realtime_stream_factory(realtime, clock),
+        environ=os.environ,
+        version=__version__,
+    )
+
+
+def _realtime_profiles(orchestrator: Any) -> list[dict[str, Any]]:
+    """Return the snapshot payload of every profile of a live orchestrator."""
+    return [entry.to_dict() for entry in orchestrator.snapshot().profiles]
+
+
+def _realtime_tick(
+    profiles: Sequence[ProfileConfig],
+    realtime: RealtimeConfig,
+    monitoring: MonitoringConfig,
+    *,
+    clock: Any,
+    store: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run exactly ONE deterministic engine tick.
+
+    Returns the decisions of the tick and the profile snapshots **read before the
+    store is closed** (a snapshot read after ``stop()`` would be reading a closed
+    database).  The bound is explicit: the orchestrator ticks its profiles
+    sequentially, so the budget is one stream timeout per profile plus one for
+    the shutdown.
+    """
+    orchestrator = _realtime_orchestrator(profiles, realtime, monitoring, clock=clock, store=store)
+    budget = float(realtime.stream_poll_timeout_seconds) * (len(profiles) + 1)
+    decisions_payload: list[dict[str, Any]] = []
+    profiles_payload: list[dict[str, Any]] = []
+    try:
+        try:
+            decisions = asyncio.run(asyncio.wait_for(orchestrator.run_once(), timeout=budget))
+        except TimeoutError as exc:
+            # A tick that refuses to finish is a stream failure, not a traceback.
+            raise MarketStreamError(
+                f"the realtime engine did not finish one tick within {budget} s"
+            ) from exc
+        decisions_payload = [decision.to_dict() for decision in decisions]
+        profiles_payload = _realtime_profiles(orchestrator)
+    finally:
+        asyncio.run(orchestrator.stop())
+    return decisions_payload, profiles_payload
+
+
+async def _engine_until_stopped(orchestrator: Any, sink: list[dict[str, Any]]) -> None:
+    """Run the supervised platform, then stop it **on the very same event loop**.
+
+    ``orchestrator.stop()`` cancels the profile tasks it created, so it must run
+    on the loop that owns them: calling it from a fresh ``asyncio.run`` after a
+    ``SIGINT`` closed the first loop raises ``RuntimeError: Event loop is closed``
+    (the tasks of a dead loop cannot be cancelled).  Read the snapshots *before*
+    ``stop()`` closes the store, hence the ``sink``: a snapshot read afterwards
+    would query a closed database.
+
+    ``SIGINT`` reaches this coroutine as an ``asyncio.CancelledError`` (CPython
+    cancels the main task before re-raising ``KeyboardInterrupt``), so both the
+    interrupted and the nominal path stop the platform the same way.
+    """
+    try:
+        await orchestrator.run_forever()
+    except asyncio.CancelledError:
+        sink.extend(_realtime_profiles(orchestrator))
+        await orchestrator.stop()
+        raise
+    except BaseException:  # a failing profile must still close the store
+        await orchestrator.stop()
+        raise
+    sink.extend(_realtime_profiles(orchestrator))
+    await orchestrator.stop()
+
+
+def _realtime_engine(
+    profiles: Sequence[ProfileConfig],
+    realtime: RealtimeConfig,
+    monitoring: MonitoringConfig,
+    *,
+    clock: Any,
+    store: Any,
+    host: str | None,
+    port: int | None,
+    json_output: bool,
+) -> tuple[list[dict[str, Any]], str]:
+    """Start the monitoring server, run the engine forever, then stop both.
+
+    Returns the last profile snapshots and the monitoring URL.  ``SIGINT`` is a
+    clean shutdown: the server is closed and the orchestrator stopped before the
+    payload is emitted, and the exit code stays ``0``.
+    """
+    from trading_backtest.web.server import create_server, start_in_thread
+
+    orchestrator = _realtime_orchestrator(profiles, realtime, monitoring, clock=clock, store=store)
+    server = create_server(
+        orchestrator,
+        monitor=_realtime_monitor(store, clock=clock, realtime=realtime),
+        config=monitoring,
+        read_only=False,
+        host=host,
+        port=port,
+        version=__version__,
+    )
+    thread = start_in_thread(server)
+    url = f"http://{monitoring.host if host is None else host}:{server.port}/"
+    _announce(url, json_output=json_output)
+    snapshots: list[dict[str, Any]] = []
+    try:
+        asyncio.run(_engine_until_stopped(orchestrator, snapshots))
+    except KeyboardInterrupt:
+        typer.echo("interrupted: the platform is shut down and stopped", err=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=_SERVER_JOIN_TIMEOUT)
+    return snapshots, url
+
+
+def _state_db_writable(path: Path) -> tuple[bool, str]:
+    """Probe the writability of the state-database directory.
+
+    The probe creates the parent directory (``mkdir(parents=True, exist_ok=True)``)
+    and then writes and deletes a temporary file next to the database: it proves
+    the directory is usable **without ever creating the state database itself**,
+    which is the documented guarantee of ``realtime check``.
+    """
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        probe = parent / f".{path.name}.write-probe"
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return False, f"the state-database directory {parent} is not writable: {exc}"
+    return True, ""
+
+
+def _realtime_profile_entry(
+    profile: ProfileConfig, *, environ: Mapping[str, str], gate: Any
+) -> dict[str, Any]:
+    """Build the ``realtime check`` entry of one profile (no order, no network).
+
+    The limits are *resolved* through ``RiskLimits.from_config`` -- their
+    validation belongs to the pydantic configuration layer, which already ran --
+    and the credentials are only ever probed for **presence**: neither a value nor
+    a network call is involved.
+    """
+    from trading_backtest.realtime.credentials import credentials_from_env
+    from trading_backtest.realtime.risk import RiskLimits
+
+    issues: list[str] = []
+    risk = RiskLimits.from_config(profile.risk).to_dict()
+
+    configured = False
+    try:
+        credentials = credentials_from_env(
+            str(profile.id), exchange=str(profile.exchange), environ=environ
+        )
+        configured = credentials is not None and bool(credentials.configured)
+    except TradingBacktestError as exc:
+        # Presence checking never raises: a half-written credential is a finding.
+        issues.append(str(exc))
+
+    allowed = bool(gate.allowed(profile))
+    if str(profile.mode) == "live":
+        if not allowed:
+            issues.append(
+                f"live profile {profile.id!r} is not armed: set "
+                f"{LIVE_TRADING_ENV}={LIVE_TRADING_VALUE}"
+            )
+        if not configured:
+            issues.append(
+                f"live profile {profile.id!r} has no credentials in the environment: "
+                f"{_CREDENTIAL_HELP}"
+            )
+    return {
+        "id": str(profile.id),
+        "symbol": str(profile.symbol),
+        "timeframe": str(profile.timeframe),
+        "strategy": str(profile.strategy),
+        "mode": str(profile.mode),
+        "ok": not issues,
+        "issues": issues,
+        "credentials_present": configured,
+        "live_gate_allowed": allowed,
+        "risk": risk,
+    }
+
+
+def _realtime_check_payload(
+    path: Path,
+    *,
+    realtime: RealtimeConfig,
+    entries: Sequence[Mapping[str, Any]],
+    issues: Sequence[str],
+    writable: bool,
+    kill_switch: bool,
+) -> dict[str, Any]:
+    """Assemble the documented ``realtime-check`` payload.
+
+    ``issues`` is the **platform-level** counterpart of the per-profile ``issues``
+    list (an unreadable document, an unwritable state directory): the documented
+    keys are always present, and that eighth key never carries a profile finding.
+    """
+    profile_entries = [dict(entry) for entry in entries]
+    ok = (
+        bool(profile_entries)
+        and not issues
+        and writable
+        and all(bool(entry["ok"]) for entry in profile_entries)
+    )
+    return {
+        "command": "realtime-check",
+        "ok": ok,
+        "config_path": str(path),
+        "state_db": str(realtime.state_db),
+        "state_db_writable": bool(writable),
+        "kill_switch": bool(kill_switch),
+        "profiles": profile_entries,
+        "issues": [str(issue) for issue in issues],
+    }
+
+
+def _realtime_preflight(path: Path) -> dict[str, Any]:
+    """Run the static pre-flight of a profiles document (offline, order-free)."""
+    from trading_backtest.realtime.risk import KillSwitch, LiveTradingGate
+
+    profiles = load_profiles(path)
+    realtime = load_realtime_config(path)
+    load_monitoring_config(path)
+
+    gate = LiveTradingGate(os.environ)
+    entries = [
+        _realtime_profile_entry(profile, environ=os.environ, gate=gate) for profile in profiles
+    ]
+
+    issues: list[str] = []
+    writable, problem = _state_db_writable(Path(realtime.state_db))
+    if not writable:
+        issues.append(problem)
+
+    kill_switch = KillSwitch(
+        clock=_realtime_clock(realtime),
+        flag_path=realtime.kill_switch_file,
+        environ=os.environ,
+    ).engaged()
+    return _realtime_check_payload(
+        path,
+        realtime=realtime,
+        entries=entries,
+        issues=issues,
+        writable=writable,
+        kill_switch=kill_switch,
+    )
+
+
+def _realtime_check_failure(path: Path, message: str) -> dict[str, Any]:
+    """Build the documented ``realtime-check`` payload of an unreadable document."""
+    return _realtime_check_payload(
+        path,
+        realtime=default_realtime_config(),
+        entries=(),
+        issues=[message],
+        writable=False,
+        kill_switch=False,
+    )
+
+
+@realtime_app.command("check")
+def realtime_check(
+    profiles: Path = typer.Option(..., "--profiles", "-p", help=_PROFILES_HELP),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Static pre-flight of a profiles file; exit 1 when a profile cannot start."""
+    with _error_surface("realtime-check", json_output=json_output):
+        path = Path(profiles)
+        try:
+            payload = _realtime_preflight(path)
+        except ConfigError as exc:
+            # An unreadable/invalid document is a pre-flight *finding*, not a crash:
+            # it is reported through the documented check payload and its `issues`
+            # list, and the reason is echoed on stderr exactly like `_error_surface`
+            # would (there is no per-profile entry to carry it).
+            payload = _realtime_check_failure(path, str(exc))
+            _emit_realtime(payload, json_output=json_output)
+            err_console.print(f"error: {exc}", style="red", markup=False, highlight=False)
+            raise typer.Exit(code=1) from exc
+        _emit_realtime(payload, json_output=json_output)
+        if not payload["ok"]:
+            raise typer.Exit(code=1)
+
+
+@realtime_app.command("run")
+def realtime_run(
+    profiles: Path = typer.Option(..., "--profiles", "-p", help=_PROFILES_HELP),
+    host: str | None = typer.Option(None, "--host", help=_HOST_HELP),
+    port: int | None = typer.Option(None, "--port", help=_PORT_HELP),
+    once: bool = typer.Option(False, "--once", help=_ONCE_HELP),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Run N concurrent profiles in real time, with the monitoring dashboard.
+
+    ``--once`` executes a single deterministic tick over the polled candles,
+    persists the state and exits without starting any HTTP server.
+    """
+    with _error_surface("realtime-run", json_output=json_output):
+        path = Path(profiles)
+        engine_profiles = load_profiles(path)
+        realtime = load_realtime_config(path)
+        monitoring = load_monitoring_config(path)
+        clock = _realtime_clock(realtime)
+        store = _realtime_store(realtime, clock)
+
+        url: str | None = None
+        if once:
+            decisions, snapshots = _realtime_tick(
+                engine_profiles, realtime, monitoring, clock=clock, store=store
+            )
+        else:
+            decisions = []
+            snapshots, url = _realtime_engine(
+                engine_profiles,
+                realtime,
+                monitoring,
+                clock=clock,
+                store=store,
+                host=host,
+                port=port,
+                json_output=json_output,
+            )
+        _emit_realtime(
+            {
+                "command": "realtime-run",
+                "ok": True,
+                "config_path": str(path),
+                "state_db": str(realtime.state_db),
+                "profiles": snapshots,
+                "decisions": decisions,
+                "url": url,
+            },
+            json_output=json_output,
+        )
+
+
+@realtime_app.command("serve")
+def realtime_serve(
+    profiles: Path = typer.Option(..., "--profiles", "-p", help=_PROFILES_HELP),
+    host: str | None = typer.Option(None, "--host", help=_HOST_HELP),
+    port: int | None = typer.Option(None, "--port", help=_PORT_HELP),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Serve the dashboard read-only over the persisted state; no engine runs."""
+    from trading_backtest.realtime.clock import SystemClock
+    from trading_backtest.web.server import create_server, serve
+
+    with _error_surface("realtime-serve", json_output=json_output):
+        path = Path(profiles)
+        load_profiles(path)
+        realtime = load_realtime_config(path)
+        monitoring = load_monitoring_config(path)
+        clock = SystemClock()
+        store = _realtime_store(realtime, clock)
+        store.initialize()
+        snapshots: list[dict[str, Any]] = []
+        url = ""
+        try:
+            provider = _PersistedSnapshotProvider(store, clock=clock, realtime=realtime)
+            server = create_server(
+                provider,
+                monitor=provider.monitor,
+                config=monitoring,
+                read_only=True,
+                host=host,
+                port=port,
+                version=__version__,
+            )
+            url = f"http://{monitoring.host if host is None else host}:{server.port}/"
+            _announce(url, json_output=json_output)
+            try:
+                serve(server, block=True)
+            except KeyboardInterrupt:
+                typer.echo("interrupted: stopping the monitoring server", err=True)
+            finally:
+                snapshots = list(provider.snapshot().to_dict()["profiles"])
+                server.shutdown()
+                server.server_close()
+        finally:
+            store.close()
+        _emit_realtime(
+            {
+                "command": "realtime-serve",
+                "ok": True,
+                "config_path": str(path),
+                "state_db": str(realtime.state_db),
+                "profiles": snapshots,
+                "url": url,
+            },
+            json_output=json_output,
+        )
+
+
+class _PersistedSnapshotProvider:
+    """Read-only :class:`~trading_backtest.web.routes.SnapshotProvider` over SQLite.
+
+    ``realtime serve`` runs no engine, so the web layer needs a provider that
+    rebuilds the dashboard view from the persisted state only.  Every read is
+    cheap (no metric is computed: ``/api/profiles/{id}/metrics`` is answered by
+    the injected :class:`~trading_backtest.realtime.monitor.Monitor`), and the two
+    mutating members refuse loudly -- the server is built with
+    ``read_only=True``, so the transport already answers ``403`` before reaching
+    them; implementing them keeps the provider structurally conformant instead of
+    silently incomplete.
+    """
+
+    def __init__(self, store: Any, *, clock: Any, realtime: RealtimeConfig) -> None:
+        from trading_backtest.realtime.risk import KillSwitch
+
+        self._store = store
+        self._clock = clock
+        self.monitor = _realtime_monitor(store, clock=clock, realtime=realtime)
+        self._kill_switch = KillSwitch(
+            store,
+            clock=clock,
+            flag_path=realtime.kill_switch_file,
+            environ=os.environ,
+        )
+
+    def profile_snapshot(self, profile_id: str) -> Any:
+        """Return the persisted snapshot of one profile, or ``None`` when unknown."""
+        from trading_backtest.realtime.models import ProfileSnapshot, ProfileStatus, RunMode
+
+        specs = {str(profile.id): profile for profile in self._store.load_profiles()}
+        spec = specs.get(str(profile_id))
+        if spec is None:
+            return None
+        equity = self.monitor.equity(profile_id)
+        positions = self.monitor.positions(profile_id)
+        trades = self.monitor.trades(profile_id)
+        health = self.monitor.health(profile_id)
+        last = equity[-1] if equity else None
+        initial = float(spec.initial_balance)
+        cash = float(last.cash) if last is not None else initial
+        position_value = float(last.position_value) if last is not None else 0.0
+        equity_value = float(last.equity) if last is not None else initial
+        state = self._store.profile_state(profile_id)
+        return ProfileSnapshot(
+            profile_id=str(profile_id),
+            symbol=str(spec.symbol),
+            timeframe=str(spec.timeframe),
+            strategy=str(spec.strategy),
+            mode=RunMode(str(spec.mode)),
+            status=ProfileStatus(state.status),
+            initial_balance=initial,
+            equity=equity_value,
+            cash=cash,
+            position_value=position_value,
+            total_return=(equity_value / initial - 1.0) if initial else 0.0,
+            n_trades=len(trades),
+            open_positions=len(positions),
+            health=health,
+            started_at=None,
+            updated_at=state.updated_at,
+        )
+
+    def snapshot(self) -> Any:
+        """Return the whole platform rebuilt from the persisted state."""
+        import pandas as pd
+
+        from trading_backtest.realtime.models import PlatformSnapshot
+
+        profiles = [
+            item
+            for item in (
+                self.profile_snapshot(str(profile.id)) for profile in self._store.load_profiles()
+            )
+            if item is not None
+        ]
+        state = self.kill_switch_state()
+        return PlatformSnapshot(
+            profiles=tuple(profiles),
+            generated_at=pd.Timestamp(self._clock.now()),
+            kill_switch=bool(state.engaged),
+            kill_switch_reason=str(state.reason),
+            kill_switch_changed_at=state.changed_at,
+            version=__version__,
+            started_at=None,
+            uptime_seconds=0.0,
+        )
+
+    def health(self) -> dict[str, Any]:
+        """Return the ``/api/health`` body of the persisted platform (no engine)."""
+        snapshot = self.snapshot()
+        return {
+            "status": "degraded" if snapshot.kill_switch else "ok",
+            "version": snapshot.version,
+            "uptime_seconds": snapshot.uptime_seconds,
+            "profiles_total": len(snapshot.profiles),
+            "profiles_running": 0,
+            "kill_switch": snapshot.kill_switch,
+            "checked_at": self._clock.now().isoformat(),
+        }
+
+    def kill_switch_state(self) -> Any:
+        """Return the effective kill-switch state (file, environment, store)."""
+        return self._kill_switch.state()
+
+    def engage_kill_switch(self, reason: str) -> Any:  # pragma: no cover - read-only server
+        """Refuse: ``realtime serve`` never mutates the platform."""
+        raise MonitoringError("this monitoring server is read-only: run `realtime run` instead")
+
+    def release_kill_switch(self) -> Any:  # pragma: no cover - read-only server
+        """Refuse: ``realtime serve`` never mutates the platform."""
+        raise MonitoringError("this monitoring server is read-only: run `realtime run` instead")
 
 
 # ---------------------------------------------------------------------------

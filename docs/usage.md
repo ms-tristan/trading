@@ -707,6 +707,7 @@ exactement les mêmes commandes que `make check` en local.
 | `make robustness` | `python -m trading_backtest robustness --config $(CONFIG)` | balayage paramétrique |
 | `make monte-carlo` | `python -m trading_backtest monte-carlo --config $(CONFIG)` | Monte Carlo |
 | `make data-download` | `python -m trading_backtest data download …` | remplissage du cache (seule cible qui utilise le réseau) |
+| `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + tableau de bord (§11) |
 | `make docker-build` | `docker build` | construction de l'image |
 | `make docker-test` | `docker build --target test` puis `docker run … pytest tests --cov-fail-under=85` | suite complète dans le conteneur |
 | `make clean` | suppression des caches et artefacts | nettoyage |
@@ -864,3 +865,272 @@ backtest  →  robustness  →  walk-forward  →  monte-carlo
 | `StrategyError` | nom de stratégie inconnu | vérifier `strategy.name` et les noms passés à `register_strategy` |
 | Aucun trade | paramètres trop stricts (RSI, seuils) | élargir `rsi_min`/`rsi_max`, réduire `ema_fast`/`ema_slow` |
 | Tests rouges sur la couverture | seuil de 85 % non atteint | voir [`docs/testing-policy.md`](testing-policy.md) §5 |
+
+---
+
+## 11. Temps réel multi-profils (`realtime`)
+
+Le groupe `realtime` exécute **N profils concurrents** (`asset + stratégie +
+timeframe + paper/live + limites de risque`) dans un seul processus, persiste
+leur état dans un fichier SQLite et l'expose par un tableau de bord HTTP.
+Le contrat complet (interfaces, API, limites assumées) est dans
+[`docs/realtime.md`](realtime.md) ; cette section donne des exemples copiables.
+
+### 11.1 Les trois commandes
+
+```bash
+# pré-vol statique : ne passe AUCUN ordre, ne touche PAS au réseau
+python -m trading_backtest realtime check --profiles config/profiles.example.json
+
+# un seul tick déterministe (ancre realtime.start_at), puis sortie 0
+python -m trading_backtest realtime run --profiles config/profiles.example.json --once --json
+
+# moteur + tableau de bord (port 0 = port éphémère choisi par l'OS)
+python -m trading_backtest realtime run --profiles config/profiles.example.json \
+    --host 127.0.0.1 --port 8080
+
+# surveillance seule, LECTURE SEULE, sur l'état déjà persisté
+python -m trading_backtest realtime serve --profiles config/profiles.example.json --port 8080
+```
+
+| Commande | Options | Rôle |
+| --- | --- | --- |
+| `realtime run` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--once`, `--json` | moteur **et** serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
+| `realtime serve` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--json` | surveillance **lecture seule** sur l'état persisté, sans moteur : `POST /api/kill-switch` répond **403** |
+| `realtime check` | `--profiles/-p` (obligatoire), `--json` | pré-vol statique : validité de la configuration, **présence** des credentials (jamais leur valeur), porte live, limites de risque, inscriptibilité de la base d'état ; sortie `1` dès qu'un **un** profil ne peut pas démarrer ; ne crée **pas** la base d'état |
+
+`SIGINT` arrête proprement le serveur et le moteur, puis la commande sort avec le
+code `0`. En mode `--json`, l'URL de démarrage est annoncée sur **stderr** :
+stdout ne contient qu'**un seul** objet JSON.
+
+### 11.2 Payloads JSON (clés exactes)
+
+`realtime check` :
+
+```json
+{
+  "command": "realtime-check",
+  "ok": true,
+  "config_path": "config/profiles.example.json",
+  "state_db": "data/realtime/state.db",
+  "state_db_writable": true,
+  "kill_switch": false,
+  "profiles": [
+    {
+      "id": "btc-paper",
+      "symbol": "BTC/USDT",
+      "timeframe": "1h",
+      "strategy": "basic",
+      "mode": "paper",
+      "ok": true,
+      "issues": [],
+      "credentials_present": false,
+      "live_gate_allowed": true,
+      "risk": {
+        "max_position_notional": 5000.0,
+        "max_order_notional": 1000.0,
+        "max_open_positions": 1,
+        "max_daily_loss": 500.0,
+        "max_drawdown_pct": 0.25,
+        "max_daily_trades": 10
+      }
+    }
+  ],
+  "issues": []
+}
+```
+
+La clé **`issues` de premier niveau** porte les problèmes *de plateforme*
+(document illisible, répertoire d'état non inscriptible) ; les `issues` de
+chaque profil portent les problèmes *du profil* (porte live non armée,
+credentials absents, profil désactivé…).
+
+`realtime run` et `realtime run --once` :
+
+```json
+{
+  "command": "realtime-run",
+  "ok": true,
+  "config_path": "config/profiles.example.json",
+  "state_db": "data/realtime/state.db",
+  "profiles": [ "« ProfileSnapshot.to_dict() » pour chaque profil" ],
+  "decisions": [ "« TradeSignalDecision.to_dict() » — vide en mode serveur, vide aussi si le tick n'a rien de neuf à traiter" ],
+  "url": "http://127.0.0.1:8080/"
+}
+```
+
+`url` vaut `null` avec `--once` (aucun serveur n'est démarré) et
+`http://host:port/` sinon. `realtime serve` renvoie le même objet avec
+`"command": "realtime-serve"` et **sans** clé `decisions`.
+
+### 11.3 Anatomie du fichier de profils
+
+`config/profiles.example.json` porte **trois** clés racine — `profiles`,
+`realtime`, `monitoring` — et **aucune** credential : les secrets viennent
+uniquement de l'environnement (§11.4).
+
+Chaque entrée de `profiles` est un `ProfileConfig` (`extra="forbid"` : toute clé
+inconnue, dont `api_key`, est refusée bruyamment) :
+
+| Champ | Type | Rôle |
+| --- | --- | --- |
+| `id` | `str` | identité du profil, `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` : clé primaire de l'état |
+| `symbol` | `str` | paire négociée, par exemple `BTC/USDT` |
+| `timeframe` | `str` | `1m`, `5m`, `15m`, `30m`, `1h`, `4h` ou `1d` |
+| `strategy` | `str` | nom du registre `strategy.registry.get_strategy` |
+| `params` | `object` | paramètres de la stratégie (mêmes conventions que `AppConfig`) |
+| `mode` | `"paper"` \| `"live"` | simulation ou lieu réel (§11.4) |
+| `initial_balance` | `float > 0` | capital initial |
+| `stake_amount` | `float > 0` \| `null` | montant engagé par entrée |
+| `exchange` | `str` | nom du lieu d'exécution |
+| `enabled` | `bool` | un profil désactivé est persisté mais jamais démarré |
+| `warmup_candles` | `int >= 1` | bougies passées fournies à la stratégie à chaque décision |
+| `poll_interval_seconds` | `float > 0` | cadence de sondage propre au profil |
+| `risk` | `object` | bloc `RiskLimitsConfig` ci-dessous |
+
+`risk` (`RiskLimitsConfig`) — toutes les limites sont optionnelles, `null`
+signifie « non appliquée », et `0` est une valeur **valide** pour les limites de
+comptage :
+
+| Champ | Type | Rôle |
+| --- | --- | --- |
+| `max_position_notional` | `float > 0` \| `null` | notionnel maximal d'une position |
+| `max_order_notional` | `float > 0` \| `null` | notionnel maximal d'un ordre |
+| `max_open_positions` | `int >= 0` (défaut `1`) | nombre maximal de positions ouvertes (`0` interdit toute ouverture) |
+| `max_daily_loss` | `float > 0` \| `null` | perte journalière maximale |
+| `max_drawdown_pct` | `float` dans `]0, 1]` \| `null` | drawdown maximal (`0.25` = 25 %) |
+| `max_daily_trades` | `int >= 0` \| `null` | nombre maximal de trades par jour |
+
+`realtime` (`RealtimeConfig`) :
+
+| Champ | Défaut | Rôle |
+| --- | --- | --- |
+| `state_db` | `data/realtime/state.db` | base SQLite de l'état (git-ignorée) |
+| `logs_dir` | `data/realtime/logs` | journaux JSON structurés |
+| `data_dir` | `data` | racine des données |
+| `cache_dir` | `data/cache` | cache OHLCV utilisé par le provider réseau |
+| `format` | `parquet` | format du cache (`parquet` ou `csv`) |
+| `allow_network` | `true` | `false` interdit tout téléchargement |
+| `csv_dir` | `null` | répertoire de CSV locaux : **court-circuite le réseau**, c'est le mode des tests et du replay |
+| `start_at` | `null` | ancre de replay : arme un `ManualClock` (tick déterministe) |
+| `history_candles` | `300` | taille de la fenêtre de sondage |
+| `poll_interval_seconds` | `5.0` | cadence de sondage par défaut |
+| `stream_poll_timeout_seconds` | `10.0` | borne explicite de **chaque** attente |
+| `max_stream_reconnects` | `5` | reconnexions consécutives tolérées avant `MarketStreamError` |
+| `reconnect_backoff_seconds` | `1.0` | base de l'attente exponentielle bornée |
+| `reconcile_interval_seconds` | `60.0` | intervalle de réconciliation avec le lieu |
+| `risk_free_rate` | `0.0` | taux sans risque annuel du benchmark du read model |
+| `benchmark_variant` | `buy_and_hold` | variante de benchmark (`none` la désactive) |
+| `kill_switch_file` | `null` | fichier drapeau du kill switch global |
+
+`monitoring` (`MonitoringConfig`) :
+
+| Champ | Défaut | Rôle |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | interface d'écoute |
+| `port` | `8080` | port (`0` = port éphémère choisi par l'OS) |
+| `refresh_seconds` | `2.0` | cadence de sondage du tableau de bord |
+| `request_timeout_seconds` | `10.0` | délai maximal d'une requête |
+| `max_request_bytes` | `65536` | taille maximale d'un corps de requête |
+
+Aucun de ces modèles ne porte de champ de credential, et `extra="forbid"`
+s'applique partout : un fichier qui contient `api_key`, `api_secret`,
+`password` ou `token` échoue avec un `ConfigError` explicite.
+
+### 11.4 Le modèle de sûreté paper/live
+
+```bash
+# 1. les credentials viennent UNIQUEMENT de l'environnement (jamais du dépôt)
+export TB_LIVE_API_KEY="…"           # portée globale
+export TB_LIVE_API_SECRET="…"
+export TB_LIVE_API_PASSWORD="…"      # seulement si le lieu en exige un
+# … ou par profil (les variables de profil gagnent sur les globales) :
+export TB_PROFILE_BTC_LIVE_API_KEY="…"
+export TB_PROFILE_BTC_LIVE_API_SECRET="…"
+
+# 2. armer explicitement le live : VALEUR EXACTE, sinon LiveTradingForbiddenError
+export TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK
+
+# 3. jeton de l'unique opérateur autorisé à muter l'état (POST /api/kill-switch)
+export TB_OPERATOR_TOKEN="…"
+```
+
+Sans `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK`, tout profil `mode: "live"`
+est refusé (`LiveTradingForbiddenError`) et `realtime check` le signale avec
+`live_gate_allowed: false`. Un profil `paper` n'a jamais besoin d'être armé, et
+il ne peut **jamais** être routé vers un courtier réel : le mode fait partie de
+l'identité du profil et de chaque ordre persisté.
+
+Le **kill switch global** existe sous trois formes, et il est persisté dans
+l'état (il survit donc à un redémarrage) :
+
+1. **fichier** — créer le fichier `realtime.kill_switch_file`
+   (`data/realtime/KILL_SWITCH`) ; il est *forçant* : l'API ne peut pas le lever ;
+2. **environnement** — la variable d'environnement correspondante (également
+   forçante) ;
+3. **API** — `curl -X POST -H 'X-Operator-Token: …' -d '{"engage": true,
+   "reason": "incident"}' http://127.0.0.1:8080/api/kill-switch`.
+
+Le kill switch arrête tous les profils, **n'annule rien en silence**, et chaque
+refus est journalisé avec sa raison.
+
+### 11.5 Base d'état, redémarrage et réconciliation
+
+L'état vit dans **un seul** fichier SQLite (`realtime.state_db`). Toutes les
+écritures sont **idempotentes** (UPSERT sur clé naturelle) et l'identifiant de
+commande est **déterministe** : `profile_id + symbol + horodatage de la bougie +
+séquence`. Un redémarrage entre la soumission et le remplissage ne double donc
+**jamais** un ordre, et la **dernière bougie traitée** est persistée par profil :
+un redémarrage ne rejoue pas une bougie et n'en saute pas.
+
+Au démarrage, l'orchestrateur **réconcilie** l'état local contre le lieu
+d'exécution (`Broker.reconcile()`) et marque le profil `degraded` en cas
+d'écart. Le magasin est **mono-écrivain** : lancer deux orchestrateurs sur le
+même fichier échoue avec `StateStoreError` (verrou de fichier), et une base
+écrite par une version de schéma plus récente échoue de la même façon.
+
+```bash
+# un tick, puis inspection directe de l'état persisté
+python -m trading_backtest realtime run --profiles config/profiles.example.json --once
+sqlite3 data/realtime/state.db "select profile_id, timestamp, equity from equity;"
+sqlite3 data/realtime/state.db "select key, value from meta where key like 'last_candle%';"
+```
+
+### 11.6 API web
+
+Le tableau de bord sonde `GET /api/profiles` toutes les 2 secondes ; toutes les
+réponses sont du JSON (horodatages ISO-8601 UTC, aucun `NaN`).
+
+| Méthode et route | Réponse |
+| --- | --- |
+| `GET /` | tableau de bord HTML (rendu hors ligne) |
+| `GET /static/app.js`, `GET /static/styles.css` | actifs statiques (liste blanche fixe) |
+| `GET /api/health` | `status`, `version`, `uptime_seconds`, `profiles_total`, `profiles_running`, `kill_switch`, `checked_at` |
+| `GET /api/profiles` | `{profiles: [...], generated_at}` |
+| `GET /api/profiles/{id}` | le snapshot du profil |
+| `GET /api/profiles/{id}/equity` | `{points: [{timestamp, equity, cash, position_value}…]}` |
+| `GET /api/profiles/{id}/trades` | `{trades: [...], count}` |
+| `GET /api/profiles/{id}/orders` | `{orders: [...]}` |
+| `GET /api/profiles/{id}/positions` | `{positions: [...]}` |
+| `GET /api/profiles/{id}/metrics` | `{metrics: {...}, benchmark: {...} \| null, generated_at}` |
+| `POST /api/kill-switch` | `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` ; exige `X-Operator-Token` |
+
+`400` requête malformée, `403` jeton absent/invalide **ou** serveur en lecture
+seule (`realtime serve`), `404` route ou profil inconnu, `405` méthode
+incorrecte, `500` `{error}` — jamais de trace sur le réseau.
+
+```bash
+# vérification rapide d'une instance
+curl -s http://127.0.0.1:8080/api/health
+curl -s http://127.0.0.1:8080/api/profiles/btc-paper/metrics
+```
+
+### 11.7 Cible `make`
+
+```bash
+make realtime                                   # moteur + tableau de bord
+PROFILES=config/profiles.example.json make realtime
+```
+
+La cible `realtime` appelle `realtime run --profiles
+${PROFILES:-config/profiles.example.json}` et laisse `make check` intact.

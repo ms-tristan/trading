@@ -19,7 +19,7 @@ DOCKER_TEST_IMAGE ?= trading-backtest:test
 
 .DEFAULT_GOAL := help
 .PHONY: help venv install install-dev lint format type-check test test-cov cov check \
-	backtest walk-forward robustness monte-carlo data-download docker-build docker-test clean
+	backtest walk-forward robustness monte-carlo data-download realtime docker-build docker-test clean
 
 # ---------------------------------------------------------------------------
 # meta
@@ -44,6 +44,7 @@ help: ## Show this help (every target below is runnable)
 	@echo "  make robustness     parameter sweep on $(CONFIG)"
 	@echo "  make monte-carlo    Monte Carlo simulation on $(CONFIG)"
 	@echo "  make data-download  fill the OHLCV cache (needs the exchange extra)"
+	@echo "  make realtime       run the realtime engine + monitoring dashboard (PROFILES=...)"
 	@echo "  make docker-build   build the image $(DOCKER_IMAGE)"
 	@echo "  make docker-test    build the test stage and run the suite with the coverage gate"
 	@echo "  make clean          remove caches, coverage artifacts and build leftovers"
@@ -107,6 +108,9 @@ data-download: ## Fill the on-disk OHLCV cache (only network-using target)
 	$(PYTHON) -m trading_backtest data download --config $(CONFIG) \
 		--symbol "$${SYMBOL:-BTC/USDT}" --timeframe "$${TIMEFRAME:-1h}" \
 		--start "$${START:-2023-01-01T00:00:00Z}" --end "$${END:-2024-01-01T00:00:00Z}"
+
+realtime: ## Run the realtime engine and the monitoring dashboard (PROFILES=... to override)
+	$(PYTHON) -m trading_backtest realtime run --profiles $${PROFILES:-config/profiles.example.json}
 
 # ---------------------------------------------------------------------------
 # docker (reproducible environment)

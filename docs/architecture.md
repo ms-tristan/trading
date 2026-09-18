@@ -42,10 +42,12 @@ Trading/
 ├── config/
 │   ├── backtest_default.json         # configuration de référence du moteur (AppConfig)
 │   ├── freqtrade_config.json         # config Freqtrade « bot » (live/paper)
-│   └── freqtrade_dryrun.json         # variante dry-run de la config Freqtrade
+│   ├── freqtrade_dryrun.json         # variante dry-run de la config Freqtrade
+│   └── profiles.example.json         # profils temps réel (profiles + realtime + monitoring)
 ├── docs/
 │   ├── architecture.md               # ce document
 │   ├── backtesting-methodology.md    # protocole de validation statistique
+│   ├── realtime.md                   # temps réel multi-profils : profils, sûreté, API, limites
 │   ├── usage.md                      # guide d'usage (install, CLI, rapports, Docker)
 │   └── testing-policy.md             # politique de tests et de couverture (gelé)
 ├── src/trading_backtest/
@@ -54,7 +56,7 @@ Trading/
 │   ├── core/
 │   │   ├── constants.py              # constantes partagées (timeframes, colonnes OHLCV, UTC)
 │   │   ├── models.py                 # modèles de domaine : TradeRecord, BacktestResult, RunnerFn
-│   │   └── errors.py                 # hiérarchie d'exceptions du projet
+│   │   └── errors.py                 # hiérarchie d'exceptions du projet (dont la branche RealtimeError)
 │   ├── config/
 │   │   ├── models.py                 # configuration typée (pydantic) : AppConfig et sous-modèles
 │   │   └── loader.py                 # chargement et validation d'un fichier JSON de configuration
@@ -87,7 +89,31 @@ Trading/
 │   │   └── writer.py                 # write_report / read_report : écriture markdown + JSON
 │   ├── freqtrade/
 │   │   └── config.py                 # validation des configs Freqtrade (dry-run et live)
-│   └── cli.py                        # CLI Typer : backtest, walk-forward, robustness, monte-carlo, data, config
+│   ├── realtime/
+│   │   ├── __init__.py               # exports publics de la couche 6 (classes moteur paresseuses)
+│   │   ├── models.py                 # vocabulaire gelé : dataclasses gelées + to_dict() de chaque payload
+│   │   ├── clock.py                  # couture temps : Clock, SystemClock, ManualClock
+│   │   ├── stream.py                 # couture marché : MarketStream + Replay/Polling/CcxtPro/Composite
+│   │   ├── store.py                  # couture état : StateStore + SqliteStateStore (schéma et migration)
+│   │   ├── broker.py                 # couture lieu : Broker + PaperBroker + CcxtBroker
+│   │   ├── credentials.py            # ExchangeCredentials : résolution par environnement et masquage
+│   │   ├── risk.py                   # RiskLimits / RiskManager / KillSwitch / LiveTradingGate
+│   │   ├── gateway.py                # ExecutionGateway : l'UNIQUE cycle de vie d'un ordre (paper = live)
+│   │   ├── strategies.py             # résolution de stratégie + pont IStrategy Freqtrade (paresseux)
+│   │   ├── runner.py                 # ProfileRunner : un profil, warm-up, boucle par bougie, santé
+│   │   ├── orchestrator.py           # RealtimeOrchestrator : N profils, supervision, câblage, kill switch
+│   │   ├── monitor.py                # read model : ProfileReport, equity, métriques, benchmark, santé
+│   │   └── observability.py          # journalisation JSON structurée, filtre de masquage, compteurs
+│   ├── web/
+│   │   ├── __init__.py               # exports publics de la couche 7 (bibliothèque standard seule)
+│   │   ├── routes.py                 # routage pur requête -> réponse + couture SnapshotProvider
+│   │   ├── server.py                 # ThreadingHTTPServer, create_server, serve, start_in_thread
+│   │   └── static/
+│   │       ├── index.html            # tableau de bord hors ligne (aucun CDN, aucune étape de build)
+│   │       ├── app.js                # sondage 2 s, courbes equity en canvas/SVG, badges de santé
+│   │       └── styles.css            # feuille de style locale
+│   └── cli.py                        # CLI Typer (couche 8) : backtest, walk-forward, robustness,
+│                                     # monte-carlo, data, config et `realtime run|serve|check`
 ├── tests/                            # suite pytest hors ligne (voir docs/testing-policy.md)
 ├── user_data/
 │   ├── README.md                     # état écrit par Freqtrade (OHLCV, backtests, stratégies) — git-ignoré
@@ -123,7 +149,15 @@ un import et une déclaration de classe d'une ligne. Tout le reste de
 
 ```
         ┌──────────────────────────────────────────┐
-  6     │                  cli                     │   orchestration, entrées/sorties
+  8     │                  cli                     │   orchestration, entrées/sorties
+        └──────────────────────────────────────────┘
+                            │
+        ┌────────────────────┬─────────────────────┐
+  7     │        web         │   HTTP + dashboard  │   transport — bibliothèque standard seule
+        └────────────────────┴─────────────────────┘
+                            │
+        ┌──────────────────────────────────────────┐
+  6     │               realtime                   │   moteur : flux, courtier, passerelle, risque, état
         └──────────────────────────────────────────┘
                             │
         ┌──────────────────────────────────────────┐
@@ -157,7 +191,17 @@ bas de cette liste.**
 | 3 | `trading_backtest.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_backtest.metrics` | couches 1–2 (`strategy.engine` importe `config` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
 | 4 | `trading_backtest.reporting` | couches 1–3 (`core` et `metrics`) |
 | 5 | `trading_backtest.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
-| 6 | `trading_backtest.cli` | couches 1–5 (plus `freqtrade` pour valider une config Freqtrade) |
+| 6 | `trading_backtest.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) |
+| 7 | `trading_backtest.web` | couches 1–6, **bibliothèque standard seule** (HTTP + tableau de bord ; il ne connaît de la plateforme que la couture `SnapshotProvider`) |
+| 8 | `trading_backtest.cli` | couches 1–7 (plus `freqtrade` pour valider une config Freqtrade) |
+
+> **`trading_backtest.cli` a déménagé de la couche 6 à la couche 8.** La CLI
+> importe désormais `realtime` (couche 6) et `web` (couche 7) dans le corps de ses
+> commandes : la garder en couche 6 aurait été un import **ascendant interdit**.
+> Les couches 1 à 5 sont inchangées, seul le haut de la pile a grandi. La règle
+> est **mécaniquement testée** : `tests/test_cli_realtime.py` prouve dans un
+> sous-processus qu'importer `trading_backtest.cli` ne met **ni**
+> `trading_backtest.realtime` **ni** `trading_backtest.web` dans `sys.modules`.
 
 Conséquences pratiques :
 
@@ -168,6 +212,12 @@ Conséquences pratiques :
   l'inverse : elle n'importe **jamais** `strategy.engine` — c'est l'appelant
   (la CLI) qui construit le runner avec `make_runner(cfg)`. Le moteur, lui,
   ignore ce qu'est un walk-forward.
+- `realtime` **réutilise** les couches basses au lieu de les réimplémenter :
+  stratégies du registre, `data.loader` / `data.validation`, `metrics`,
+  `validation`, `config` et le pont Freqtrade. Il n'écrit **aucune** formule.
+- `web` n'importe **jamais** l'orchestrateur : il ne connaît de la plateforme que
+  la couture `SnapshotProvider`, ce qui lui permet de servir un état persisté
+  alors qu'aucun moteur ne tourne (`realtime serve`).
 - L'ordre « `metrics` **sous** `validation` » est structurel : `validation`
   note ses fenêtres avec `metrics.metric_value`, importé paresseusement dans le
   corps des fonctions.
@@ -177,32 +227,40 @@ Conséquences pratiques :
 ### 3.1 Décision de couches — l'adaptateur Freqtrade ne crée **aucune** arête
 
 L'adaptateur Freqtrade (§4.9) est la brique 1 de la trajectoire vers le temps
-réel multi-profils. **Le graphe ci-dessus ne change pas** : aucun paquet n'est
-déplacé, aucune arête n'est ajoutée, le tableau des couches reste celui du §3.
-Le point est tranché explicitement :
+réel multi-profils, et la brique 2 est arrivée : `trading_backtest.realtime`
+(couche 6) et `trading_backtest.web` (couche 7) existent désormais. Ce qui change
+ici, et pourquoi :
 
-- les quatre modules `trading_backtest.strategy.freqtrade_parameters`,
-  `freqtrade_stoploss`, `freqtrade_adapter` et `freqtrade_basic` vivent en
-  **couche 3**, dans le paquet `trading_backtest.strategy` ;
-- `trading_backtest.strategy` -> `trading_backtest.freqtrade` est donc un import
-  **descendant** (couche 3 -> couche 2), parfaitement légal : la couche 3 a le
-  droit d'importer `core`, `config`, `data` **et** `freqtrade` ;
+- le bloc de l'adaptateur lui-même reste **en couche 3** : les quatre modules
+  `trading_backtest.strategy.freqtrade_parameters`, `freqtrade_stoploss`,
+  `freqtrade_adapter` et `freqtrade_basic` ne bougent pas, et
+  `trading_backtest.strategy` -> `trading_backtest.freqtrade` reste un import
+  **descendant** (couche 3 -> couche 2), parfaitement légal ;
 - `trading_backtest.freqtrade` **conserve sa règle de liaison actuelle** : ce
   paquet n'importe que `trading_backtest.core` et **n'importe jamais
   `freqtrade`** (c'est son docstring). Déplacer l'adaptateur *dans*
   `trading_backtest.freqtrade` serait un import **ascendant** (couche 2 ->
   couche 3) et falsifierait ce docstring : **c'est refusé** ;
+- **les seules arêtes ajoutées** sont `realtime` -> `strategy` / `data` /
+  `metrics` (couche 6 -> couches 3 et 2, donc **descendantes**) et
+  `web` -> `realtime` (couche 7 -> couche 6) ; `cli` passe de la couche 6 à la
+  couche 8, ce qui rend son import de `realtime` et de `web` **descendant** lui
+  aussi. Aucune arête montante n'apparaît ;
 - l'import du paquet externe `import freqtrade` est **paresseux et gardé** : il
   est exécuté *dans le corps des fonctions* (`freqtrade_available`,
-  `make_freqtrade_strategy`, `validate_freqtrade_adapter_class`), jamais au
-  chargement de `trading_backtest.strategy`. Conséquence directe : avec le seul
-  extra `.[dev]` — donc **sans** Freqtrade installé — le paquet reste
-  importable, `freqtrade_available()` rend `False`, et la suite de tests
-  complète reste verte ([`docs/testing-policy.md`](testing-policy.md)).
+  `make_freqtrade_strategy`, `validate_freqtrade_adapter_class`,
+  `realtime.strategies.freqtrade_strategy_for`), jamais au chargement d'un
+  paquet. Conséquence directe : avec le seul extra `.[dev]` — donc **sans**
+  Freqtrade installé — les paquets restent importables,
+  `freqtrade_available()` rend `False`, et la suite de tests complète reste verte
+  ([`docs/testing-policy.md`](testing-policy.md)). `ccxt` suit exactement la même
+  règle : il n'est importé que dans le corps de `CcxtBroker` et de
+  `CcxtProMarketStream`.
 
 Autrement dit : la logique métier (indicateurs, règles d'entrée/sortie) reste
-écrite **une seule fois** dans `trading_backtest.strategy`, et l'adaptateur se
-contente de **traduire** entre les deux contrats. Il ne duplique rien.
+écrite **une seule fois** dans `trading_backtest.strategy`, et l'adaptateur comme
+le moteur temps réel se contentent de **traduire** entre les deux contrats. Ils
+ne dupliquent rien.
 
 ---
 
@@ -372,6 +430,15 @@ identiques donnent des résultats identiques.
 | `trading-backtest monte-carlo` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--simulations`, `--method`, `--seed`, `--output-dir`, `--formats` (pas de `--no-network`) | Monte Carlo sur les trades d'un backtest |
 | `trading-backtest data download` | `--config`, `--symbol`, `--timeframe`, `--start`, `--end` (tous obligatoires) | téléchargement OHLCV vers le cache — seule commande qui peut sortir sur le réseau |
 | `trading-backtest config show` / `config validate` | `--config/-c` | affiche la configuration effective / valide un fichier `AppConfig` **ou** Freqtrade (type détecté automatiquement) |
+| `trading-backtest realtime run` | `--profiles/-p` (obligatoire), `--host`, `--port` (0 = port éphémère), `--once`, `--json` | démarre le moteur **et** le serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
+| `trading-backtest realtime serve` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--json` | surveillance **lecture seule** sur l'état persisté, sans moteur ; les routes mutantes répondent 403 |
+| `trading-backtest realtime check` | `--profiles/-p` (obligatoire), `--json` | pré-vol statique : validité de la config, présence des credentials, porte live, limites de risque, inscriptibilité de la base d'état ; ne passe **aucun** ordre et ne touche **pas** au réseau ; sortie `1` dès qu'un profil ne peut pas démarrer |
+
+Les trois commandes `realtime` ont leurs propres ensembles de clés JSON
+(`realtime-check`, puis `realtime-run`/`realtime-serve`) : elles ne passent pas
+par `PAYLOAD_KEYS`. Ces payloads sont documentés mot pour mot dans
+[`docs/realtime.md`](realtime.md#6-les-trois-commandes) et
+[`docs/usage.md`](usage.md).
 
 Le point d'entrée console est `trading-backtest = trading_backtest.cli:main`
 (déclaré dans `pyproject.toml`) ; `python -m trading_backtest …`
@@ -602,6 +669,206 @@ dans [`docs/backtesting-methodology.md`](backtesting-methodology.md).
 
 ---
 
+### 4.10 Le temps réel — `trading_backtest.realtime`
+
+Le moteur exécute **N profils concurrents** (`asset + stratégie + timeframe +
+paper/live + limites de risque`) dans une seule boucle d'événements `asyncio`.
+Il ne réimplémente **rien** : stratégies du registre, données, métriques,
+validation, configuration et pont Freqtrade restent les implémentations des
+couches basses.
+
+#### 4.10.1 Les quatre coutures injectables
+
+Toute la testabilité hors ligne de la couche tient à ces `typing.Protocol` : un
+test (ou un autre paquet) fournit une implémentation locale, et le moteur ne
+change pas.
+
+```python
+class Clock(Protocol):  # realtime/clock.py
+    def now(self) -> datetime: ...  # UTC, tz-aware
+    def monotonic(self) -> float: ...
+    async def sleep(self, seconds: float) -> None: ...
+
+
+class MarketStream(Protocol):  # realtime/stream.py
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None: ...
+    async def history(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame: ...
+    @property
+    def connected(self) -> bool: ...
+    @property
+    def last_error(self) -> str | None: ...
+    @property
+    def reconnect_count(self) -> int: ...
+
+
+class Broker(Protocol):  # realtime/broker.py
+    name: str
+
+    def submit(self, request: OrderRequest, *, reference_price: float) -> BrokerAck: ...
+    def cancel(self, client_order_id: str) -> bool: ...
+    def poll(self) -> list[BrokerEvent]: ...
+    def open_orders(self) -> list[Order]: ...
+    def fetch_balance(self) -> float | None: ...
+    def reconcile(self) -> ReconciliationReport: ...
+
+
+class StateStore(Protocol):  # realtime/store.py
+    def initialize(self) -> None: ...
+    def close(self) -> None: ...
+    def save_profile(self, spec: ProfileConfig) -> None: ...
+    def load_profiles(self) -> list[ProfileConfig]: ...
+    def upsert_order(self, order: Order) -> None: ...
+    def get_order(self, client_order_id: str) -> Order | None: ...
+    def list_orders(self, profile_id: str, *, limit: int = 100) -> list[Order]: ...
+    def append_fill(self, fill: Fill) -> bool: ...  # idempotent
+    def upsert_position(self, position: Position) -> None: ...
+    def delete_position(self, profile_id: str, symbol: str) -> None: ...
+    def get_position(self, profile_id: str, symbol: str) -> Position | None: ...
+    def list_positions(self, profile_id: str) -> list[Position]: ...
+    def append_equity(self, point: EquityPoint) -> bool: ...  # idempotent
+    def equity_curve(self, profile_id: str) -> list[EquityPoint]: ...
+    def append_trade(self, trade: TradeRecord) -> bool: ...  # idempotent
+    def list_trades(self, profile_id: str) -> list[TradeRecord]: ...
+    def save_status(self, profile_id: str, status: ProfileStatus, detail: str = "") -> None: ...
+    def load_status(self, profile_id: str) -> ProfileState: ...
+    def get_meta(self, key: str) -> str | None: ...
+    def set_meta(self, key: str, value: str) -> None: ...
+    def last_processed_candle(self, profile_id: str) -> pd.Timestamp | None: ...
+    def profile_state(self, profile_id: str) -> ProfileState: ...
+
+
+class MetaStore(Protocol):  # realtime/risk.py
+    def get_meta(self, key: str) -> str | None: ...
+    def set_meta(self, key: str, value: str) -> None: ...
+```
+
+Implémentations livrées : `SystemClock` / `ManualClock` ; `ReplayMarketStream`
+(déterministe, hors ligne), `PollingMarketStream` (réutilise
+`data.loader.MarketDataProvider.fetch_ohlcv` via un provider injecté et un
+`Clock` injecté), `CcxtProMarketStream` (`import ccxt.pro` **dans le corps de la
+méthode**), `CompositeMarketStream` (multiplexe plusieurs symboles) ;
+`SqliteStateStore` (`sqlite3` standard, WAL, une connexion par thread appelant,
+écritures en transaction, UPSERT sur clé naturelle, ligne `schema_version` avec
+contrôle de migration) ; `PaperBroker` et `CcxtBroker`.
+
+#### 4.10.2 Les quatre autres coutures
+
+```python
+class SnapshotProvider(Protocol):  # web/routes.py (réexporté par web/server.py)
+    def snapshot(self) -> PlatformSnapshot: ...
+    def health(self) -> dict[str, Any]: ...
+    def profile_snapshot(self, profile_id: str) -> ProfileSnapshot | None: ...
+    def engage_kill_switch(self, reason: str) -> Any: ...
+    def release_kill_switch(self) -> Any: ...
+    def kill_switch_state(self) -> Any: ...
+```
+
+C'est la **seule** chose que la couche 7 sait de la plateforme : elle n'importe
+jamais `RealtimeOrchestrator`. `RiskManager`, `KillSwitch` et `LiveTradingGate`
+(realtime/risk.py) complètent la surface de sûreté : le kill switch s'appuie sur
+la couture `MetaStore` (`get_meta`/`set_meta`) et ne dépend donc pas durement de
+`SqliteStateStore`.
+
+#### 4.10.3 Vocabulaire gelé — `realtime/models.py`
+
+Toutes les dataclasses gelées du domaine temps réel vivent dans ce module, et
+chacune expose `to_dict()` (payload JSON-able, pas de NaN ni d'Infinity,
+horodatages ISO-8601 UTC) :
+
+`CandleEvent`, `OrderRequest`, `Order`, `OrderState`, `Fill`, `BrokerAck`,
+`BrokerEvent`, `ReconciliationReport`, `Position`, `EquityPoint`, `ProfileState`,
+`ProfileSnapshot`, `PlatformSnapshot`, `ProfileHealth`, `ProfileStatus`,
+`RunMode`, `TradeSignalDecision`, `EngineCounters`, plus la fabrique
+`new_client_order_id(...)`.
+
+Les énumérations gélées sont `RunMode` (`paper`/`live`), `ProfileStatus`
+(`starting|running|degraded|halted|stopped|error`), `OrderSide`, `OrderType`,
+`OrderState`, `BrokerEventType` et `SignalAction`. `SignalAction` et `Direction`
+sont partagés avec le moteur de backtest.
+
+#### 4.10.4 Équivalence d'exécution et cycle de vie d'un ordre
+
+- La décision est évaluée à la **clôture de la bougie `t`** et exécutée à
+  l'**ouverture de `t+1`**, slippage toujours défavorable (convention de
+  `strategy.engine`, voir §4.9.4). En temps réel, la clôture de `t` **est**
+  l'instant de déclenchement : le prix de référence d'une décision est la
+  **clôture de `t`**, et seules les bougies fermées sont émises.
+- **Il n'y a qu'un seul chemin d'exécution** : une `ExecutionGateway` et un
+  `ProfileRunner`. Paper et live ne diffèrent que par (a) le `Broker` injecté par
+  la fabrique de l'orchestrateur, (b) la porte `LiveTradingGate` quand
+  `mode == "live"` et (c) la configuration. La passerelle ne contient **aucune**
+  branche « si paper / si live » : elle route vers le courtier injecté, et le
+  mode fait partie de l'identité du profil et de chaque ordre persisté.
+- Le risque est évalué **avant** l'appel au courtier ; tout refus est journalisé
+  avec sa raison et n'écrit **pas** de watermark de bougie.
+- Le kill switch global est **persisté** : il survit à un redémarrage, et rien
+  n'est annulé en silence.
+
+#### 4.10.5 Persistance, redémarrage, réconciliation
+
+L'état vit dans **un seul** fichier SQLite (`realtime.state_db`, défaut
+`data/realtime/state.db`, ignoré par git) : chaque écriture est idempotente
+(UPSERT sur clé naturelle) et le `client_order_id` est **déterministe** —
+dérivé de `profile_id + symbol + horodatage de la bougie + séquence` — donc la
+même décision produit toujours la même identité et un redémarrage entre
+soumission et remplissage ne double jamais un ordre.
+
+La dernière bougie traitée est persistée par profil : un redémarrage ne rejoue
+pas une bougie et n'en saute pas non plus. Au démarrage, l'orchestrateur
+réconcilie l'état local contre le lieu d'exécution (`Broker.reconcile()`) et
+marque le profil `degraded` en cas d'écart. Le magasin est **mono-écrivain** :
+un second orchestrateur sur le même fichier lève `StateStoreError`, et une
+version de schéma plus récente lève la même erreur au lieu d'écrire à l'aveugle.
+
+Un lieu **simulé** n'a pas de mémoire : après un redémarrage son cash repart du
+solde initial alors que la position, elle, est restaurée depuis le magasin.
+L'orchestrateur **réamorce donc le cash du courtier papier** avec le dernier
+point d'equity persisté (`PaperBroker.restore_cash`) avant la première bougie,
+sinon la position serait comptée **deux fois** (`cash + quantité × mark`). Un
+lieu réel n'est jamais réamorcé : il publie son propre solde.
+
+#### 4.10.6 Observabilité
+
+`realtime/observability.py` émet des **journaux JSON structurés** (un objet par
+ligne : `ts`, `level`, `event`, `profile_id`, contexte) via un formateur standard
+et un **filtre de masquage** ; des **compteurs** en mémoire (ordres soumis /
+remplis / rejetés, bougies traitées, reconnexions, refus de risque) sont exposés
+par le read model ; chaque profil porte son état explicite (`status`,
+`last_candle_at`, `lag_seconds`, `last_error`, `reconnect_count`).
+
+### 4.11 La couche web — `trading_backtest.web`
+
+Couche **7**, **bibliothèque standard uniquement** : `http.server.ThreadingHTTPServer`
+`+ json + sqlite3 + asyncio + logging + threading`. Aucun WebSocket, aucun ASGI,
+aucune dépendance tierce, aucun CDN et aucune étape de build : le tableau de bord
+(`index.html` + `app.js` + `styles.css`) s'affiche **hors ligne**.
+
+- `routes.py` est un **routage pur** (`Router.handle(method, path, ...)` →
+  `HttpResponse`) : aucune socket, aucun thread, donc testable directement. Il
+  porte la couture `SnapshotProvider` (§4.10.2) et le contrat JSON complet.
+- `server.py` porte le transport : `MonitoringServer` (port `0` accepté, port
+  relu depuis `server.server_address`), `create_server(...)`, `serve(...)` et
+  `start_in_thread(...)`.
+- La surface HTTP est exactement celle du tableau de bord :
+  `GET /`, `GET /static/{asset}`, `GET /api/health`, `GET /api/profiles`,
+  `GET /api/profiles/{id}`, `.../equity`, `.../trades`, `.../orders`,
+  `.../positions`, `.../metrics` et `POST /api/kill-switch`. Les actifs statiques
+  sont servis par **liste blanche fixe** (`app.js`, `styles.css`) : toute
+  traversée de chemin répond 404, structurellement.
+- Les erreurs sont des payloads : `400` malformé, `404` route ou profil inconnu,
+  `405` méthode incorrecte (avec `Allow`), `403` jeton opérateur absent/invalide
+  ou serveur en lecture seule, `500` `{error}` — **jamais** de trace sur le
+  réseau.
+- `realtime serve` construit la couche 7 avec `read_only=True` : seules les
+  routes `GET` répondent, la mutation est refusée (403).
+
+Le détail route par route, les payloads et la cadence de sondage sont documentés
+dans [`docs/realtime.md`](realtime.md#5-reference-de-lapi-web).
+
+---
+
 ## 5. Contrat de données OHLCV
 
 Toute fonction qui consomme des bougies (stratégies, moteur, validation,
@@ -726,8 +993,26 @@ TradingBacktestError
 │   ├── RobustnessError
 │   └── MonteCarloError
 ├── MetricsError
-└── ReportingError
+├── ReportingError
+└── RealtimeError
+    ├── ProfileError             # configuration de profil invalide
+    ├── MarketStreamError        # flux de marché en échec / reconnexions épuisées
+    ├── StateStoreError          # échec de persistance, version de schéma incompatible
+    ├── BrokerError              # défaillance du lieu d'exécution
+    │   ├── BrokerUnavailableError   # extra optionnel ccxt/freqtrade manquant
+    │   └── OrderRejectedError
+    ├── GatewayError             # cycle de vie d'un ordre / réconciliation
+    ├── LiveTradingForbiddenError    # porte live non satisfaite
+    ├── RiskLimitExceededError   # une limite de risque du profil a bloqué l'ordre
+    ├── KillSwitchActiveError    # kill switch global engagé
+    └── MonitoringError          # échec du read model de la couche web
 ```
+
+La branche `RealtimeError` couvre **tout** le temps réel : le moteur (couche 6)
+et le transport de surveillance (couche 7) dérivent de la même racine, si bien
+qu'un `except RealtimeError` attrape l'ensemble de la surface live. Elle est
+déclarée dans `core.errors`, qui reste importable **sans aucun import du
+projet** (règle de couche 1).
 
 Aucun module ne lève d'exception « nue » : les erreurs de bas niveau de pandas
 ou de pydantic sont converties à la frontière de la couche concernée.
@@ -830,3 +1115,39 @@ Limites **restantes** de la brique Freqtrade (§4.9) — elles sont assumées et
   **brique 1**, pas la brique finale ;
 - **les deux backtests ne produisent pas les mêmes chiffres** (§4.9.4), et aucun
   mécanisme ne cherche à les réconcilier : seuls les **signaux** sont le contrat.
+
+### 9.1 Limites de la brique temps réel (couches 6 et 7)
+
+La brique multi-profils existe désormais (§4.10, §4.11) et elle est **honnête**
+sur ce qui n'est **PAS prouvé** : la liste ci-dessous dit exactement ce que la
+suite de tests ne démontre pas. Elle est reprise mot pour mot dans
+[`docs/realtime.md`](realtime.md#7-ce-qui-nest-pas-prouvé) :
+
+- **le tableau de bord sonde en HTTP toutes les 2 s** (`monitoring.refresh_seconds`)
+  et il n'y a **ni WebSocket ni ASGI** : c'est le prix de la décision
+  « bibliothèque standard uniquement » (couche 7 sans aucune dépendance tierce),
+  donc **pas de *push*** et une latence d'affichage bornée par la cadence de
+  sondage ;
+- **l'authentification se limite à un jeton opérateur unique**
+  (`TB_OPERATOR_TOKEN`, comparaison en temps constant, et refus de toute mutation
+  quand aucun jeton n'est configuré) : c'est une surface de **surveillance pour
+  réseau de confiance**, pas une interface exposable sur Internet ;
+- **les remplissages sont réconciliés sur un intervalle de sondage borné** : entre
+  deux sondages, l'état local peut **retarder** sur le lieu d'exécution, et en
+  mode papier les remplissages partiels sont **simulés de façon déterministe**
+  (graine explicite) au lieu d'être modélisés depuis un **carnet d'ordres** réel ;
+- **les décisions ne portent que sur des bougies fermées** : un profil live
+  réagit **une frontière de timeframe après le signal**, exactement comme le
+  moteur de backtest — ce n'est pas un bug, c'est la même convention d'exécution ;
+- **aucun financement (*funding*), emprunt (*borrowing*), levier ni type d'ordre
+  spécifique à un exchange** n'est modélisé ;
+- **le trading live est implémenté mais il n'est PAS exercé contre un vrai
+  exchange par la suite de tests** : les tests couvrent le courtier papier, la
+  porte `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK`, les limites de risque et
+  tous les chemins d'erreur — jamais un ordre réel ;
+- **le magasin SQLite est mono-écrivain** (*single-writer*, un seul processus) :
+  un second orchestrateur sur le même fichier lève `StateStoreError`, ce
+  n'est pas un magasin partagé ;
+- un `run` **ancré** sur `realtime.start_at` rejoue l'historique aussi vite que le
+  CPU le permet (mode *backfill*) : c'est déterministe et interruptible, mais ce
+  n'est pas un suivi du temps réel.

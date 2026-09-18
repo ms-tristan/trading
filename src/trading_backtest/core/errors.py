@@ -11,16 +11,28 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 __all__ = [
+    "BrokerError",
+    "BrokerUnavailableError",
     "ConfigError",
     "DataDownloadError",
     "DataError",
     "DataValidationError",
     "FreqtradeConfigError",
+    "GatewayError",
     "InsufficientDataError",
+    "KillSwitchActiveError",
+    "LiveTradingForbiddenError",
+    "MarketStreamError",
     "MetricsError",
+    "MonitoringError",
     "MonteCarloError",
+    "OrderRejectedError",
+    "ProfileError",
+    "RealtimeError",
     "ReportingError",
+    "RiskLimitExceededError",
     "RobustnessError",
+    "StateStoreError",
     "StrategyError",
     "TradingBacktestError",
     "ValidationLayerError",
@@ -103,3 +115,58 @@ class ReportingError(TradingBacktestError):
 
 class FreqtradeConfigError(ConfigError):
     """A Freqtrade configuration file is invalid or incomplete."""
+
+
+# ---------------------------------------------------------------------------
+# Realtime branch (layer 6 / layer 7): streaming engine, venue adapters and
+# monitoring transport.  Every class below derives from :class:`RealtimeError`
+# so that ``except RealtimeError`` catches the whole live-trading surface.
+# ---------------------------------------------------------------------------
+
+
+class RealtimeError(TradingBacktestError):
+    """Base class of every failure raised by the realtime engine and its web layer."""
+
+
+class ProfileError(RealtimeError):
+    """A profile definition is invalid or cannot be used to start a runner."""
+
+
+class MarketStreamError(RealtimeError):
+    """Reading the market data stream failed or exhausted its reconnect budget."""
+
+
+class StateStoreError(RealtimeError):
+    """The persistent state store failed, or its schema version is not supported."""
+
+
+class BrokerError(RealtimeError):
+    """Base class of every venue (broker) failure."""
+
+
+class BrokerUnavailableError(BrokerError):
+    """The optional exchange extra (ccxt / freqtrade) is not installed."""
+
+
+class OrderRejectedError(BrokerError):
+    """The venue refused an order."""
+
+
+class GatewayError(RealtimeError):
+    """The order lifecycle or the reconciliation against the venue failed."""
+
+
+class LiveTradingForbiddenError(RealtimeError):
+    """Live trading was requested without satisfying the live gate."""
+
+
+class RiskLimitExceededError(RealtimeError):
+    """A per-profile risk limit blocked an order before it reached the venue."""
+
+
+class KillSwitchActiveError(RealtimeError):
+    """The global kill switch is engaged, so no order may be submitted."""
+
+
+class MonitoringError(RealtimeError):
+    """The web layer could not build its read model."""

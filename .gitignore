@@ -71,6 +71,15 @@ hyperopt_results/
 # ---- Reports (generated) ----
 reports/
 
+# ---- Realtime runtime state (never commit) ----
+data/realtime/
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.sqlite3
+realtime-*.log
+
 # ---- Testing / coverage ----
 .pytest_cache/
 .coverage

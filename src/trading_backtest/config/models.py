@@ -8,6 +8,7 @@ e.g. ``TB_DATA__TIMEFRAME=4h`` or ``TB_BACKTEST__INITIAL_BALANCE=2500``.
 
 from __future__ import annotations
 
+import re
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,11 @@ __all__ = [
     "BenchmarkConfig",
     "DataConfig",
     "ExchangeConfig",
+    "MonitoringConfig",
+    "ProfileConfig",
+    "RealtimeConfig",
     "ReportingConfig",
+    "RiskLimitsConfig",
     "StrategyConfig",
     "ValidationConfig",
 ]
@@ -43,6 +48,9 @@ ParamValue = float | int | bool | str
 #: Formats the report can be rendered into.
 ReportFormat = Literal["markdown", "json"]
 _DEFAULT_REPORT_FORMATS: list[ReportFormat] = ["markdown", "json"]
+
+#: Accepted profile identifiers: 1-64 characters, no dot, slash or space.
+_PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class ExchangeConfig(BaseModel):
@@ -185,6 +193,119 @@ class ReportingConfig(BaseModel):
     trade_limit: int = Field(default=50, ge=0)
 
 
+class RiskLimitsConfig(BaseModel):
+    """Per-profile risk limits enforced *before* any order reaches the venue.
+
+    Every limit is optional: ``None`` means "not enforced".  ``0`` is a valid,
+    meaningful value for the counting limits (``max_open_positions=0`` forbids
+    opening a position at all, ``max_daily_trades=0`` forbids trading).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    max_position_notional: float | None = Field(default=None, gt=0)
+    max_order_notional: float | None = Field(default=None, gt=0)
+    max_open_positions: int = Field(default=1, ge=0)
+    max_daily_loss: float | None = Field(default=None, gt=0)
+    max_drawdown_pct: float | None = Field(default=None, gt=0, le=1)
+    max_daily_trades: int | None = Field(default=None, ge=0)
+
+
+class ProfileConfig(BaseModel):
+    """One independently runnable trading profile (asset + strategy + mode).
+
+    The model carries **no credential field on purpose**: ``extra="forbid"``
+    turns a profile file that contains ``api_key``/``api_secret``/``password``
+    into a loud :class:`~trading_backtest.core.errors.ConfigError` instead of a
+    silently ignored key.  Secrets are resolved from the environment only (see
+    ``trading_backtest.realtime.credentials``).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    symbol: str
+    timeframe: str = DEFAULT_TIMEFRAME
+    strategy: str = "basic"
+    params: dict[str, ParamValue] = Field(default_factory=dict)
+    mode: Literal["paper", "live"] = "paper"
+    initial_balance: float = Field(default=DEFAULT_INITIAL_BALANCE, gt=0)
+    stake_amount: float | None = Field(default=None, gt=0)
+    exchange: str = "binance"
+    enabled: bool = True
+    warmup_candles: int = Field(default=200, ge=1)
+    poll_interval_seconds: float = Field(default=5.0, gt=0)
+    risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        if not _PROFILE_ID.match(value):
+            raise ValueError(
+                f"invalid profile id: {value!r} (expected ^[A-Za-z0-9][A-Za-z0-9_-]{{0,63}}$)"
+            )
+        return value
+
+    @field_validator("symbol")
+    @classmethod
+    def _check_symbol(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("symbol must not be empty")
+        return stripped
+
+    @field_validator("timeframe")
+    @classmethod
+    def _check_timeframe(cls, value: str) -> str:
+        if value not in SUPPORTED_TIMEFRAMES:
+            supported = ", ".join(sorted(SUPPORTED_TIMEFRAMES))
+            raise ValueError(f"unsupported timeframe: {value!r} (supported: {supported})")
+        return value
+
+
+class RealtimeConfig(BaseModel):
+    """Engine settings shared by every profile of a realtime run."""
+
+    model_config = {"extra": "forbid"}
+
+    state_db: Path = Path("data/realtime/state.db")
+    logs_dir: Path = Path("data/realtime/logs")
+    data_dir: Path = Path("data")
+    cache_dir: Path = Path("data/cache")
+    format: Literal["parquet", "csv"] = "parquet"
+    allow_network: bool = True
+    csv_dir: Path | None = None
+    start_at: datetime | None = None
+    history_candles: int = Field(default=300, ge=1)
+    poll_interval_seconds: float = Field(default=5.0, gt=0)
+    stream_poll_timeout_seconds: float = Field(default=10.0, gt=0)
+    max_stream_reconnects: int = Field(default=5, ge=0)
+    reconnect_backoff_seconds: float = Field(default=1.0, gt=0)
+    reconcile_interval_seconds: float = Field(default=60.0, gt=0)
+    risk_free_rate: float = Field(default=0.0, ge=0)
+    benchmark_variant: Literal["buy_and_hold", "cash", "risk_free", "random_entry", "none"] = (
+        "buy_and_hold"
+    )
+    kill_switch_file: Path | None = None
+
+
+class MonitoringConfig(BaseModel):
+    """HTTP monitoring surface settings (standard library server only).
+
+    There is **no operator token field on purpose**: the token is a credential
+    and is resolved from the environment (``TB_OPERATOR_TOKEN``) by
+    ``trading_backtest.web.server``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=8080, ge=0, le=65535)
+    refresh_seconds: float = Field(default=2.0, gt=0)
+    request_timeout_seconds: float = Field(default=10.0, gt=0)
+    max_request_bytes: int = Field(default=65536, ge=1)
+
+
 class AppConfig(BaseSettings):
     """Aggregate configuration root.
 
@@ -209,6 +330,8 @@ class AppConfig(BaseSettings):
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
+    realtime: RealtimeConfig = Field(default_factory=RealtimeConfig)
+    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 
     @property
     def timezone(self) -> str:

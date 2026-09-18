@@ -4,6 +4,14 @@ The loader accepts a JSON file (only), an optional mapping of overrides (nested
 dicts and/or dotted keys) and validates the result through
 :class:`~trading_backtest.config.models.AppConfig`.  Every failure is normalised
 to :class:`~trading_backtest.core.errors.ConfigError`.
+
+The same module owns the realtime documents: a *profiles file* is a single JSON
+object whose three allowed root keys are ``profiles`` (a required, non-empty list
+of :class:`~trading_backtest.config.models.ProfileConfig`), ``realtime`` and
+``monitoring``.  :func:`load_profiles`, :func:`load_realtime_config` and
+:func:`load_monitoring_config` read that one file; each of them ignores the keys
+it does not own, so a run, a monitoring-only server and a pre-flight check all
+consume the same document.
 """
 
 from __future__ import annotations
@@ -11,26 +19,51 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from trading_backtest.config.models import AppConfig
+from trading_backtest.config.models import (
+    AppConfig,
+    MonitoringConfig,
+    ProfileConfig,
+    RealtimeConfig,
+)
 from trading_backtest.core.errors import ConfigError
 
 __all__ = [
     "default_config",
+    "default_monitoring_config",
+    "default_realtime_config",
     "dump_config",
     "load_config",
+    "load_monitoring_config",
+    "load_profiles",
+    "load_realtime_config",
     "override_params",
 ]
 
 _JSON_SUFFIXES = (".json",)
 
+#: The only keys accepted at the root of a profiles document.
+_PROFILES_ROOT_KEYS: frozenset[str] = frozenset({"profiles", "realtime", "monitoring"})
+
+_SectionModel = TypeVar("_SectionModel", bound=BaseModel)
+
 
 def default_config() -> AppConfig:
     """Return the built-in configuration (no file, environment still applies)."""
     return AppConfig()
+
+
+def default_realtime_config() -> RealtimeConfig:
+    """Return the built-in realtime engine configuration."""
+    return RealtimeConfig()
+
+
+def default_monitoring_config() -> MonitoringConfig:
+    """Return the built-in monitoring server configuration."""
+    return MonitoringConfig()
 
 
 def _read_payload(path: Path) -> dict[str, Any]:
@@ -171,3 +204,141 @@ def override_params(cfg: AppConfig, params: Mapping[str, Any]) -> AppConfig:
     merged.update(params)
     updated.strategy.params = merged
     return updated
+
+
+# ---------------------------------------------------------------------------
+# profiles document: profiles + realtime + monitoring
+# ---------------------------------------------------------------------------
+
+
+def load_profiles(path: str | Path) -> list[ProfileConfig]:
+    """Load every profile declared by the profiles document ``path``.
+
+    The document is a JSON object whose root keys are limited to ``profiles``,
+    ``realtime`` and ``monitoring``.  This function owns the ``profiles`` key and
+    ignores the two others.
+
+    Parameters
+    ----------
+    path:
+        JSON profiles file (``.json`` only, like :func:`load_config`).
+
+    Returns
+    -------
+    list[ProfileConfig]
+        The declared profiles, in file order.  Profiles whose ``enabled`` flag is
+        ``False`` are returned too: filtering is the caller's decision.
+
+    Raises
+    ------
+    ConfigError
+        Wrong extension, missing file, invalid JSON, non-object root, unknown root
+        key, missing or empty ``profiles`` list, invalid profile entry or a
+        duplicated profile id.
+    """
+    target = Path(path)
+    payload = _read_payload(target)
+    for key in payload:
+        if key not in _PROFILES_ROOT_KEYS:
+            allowed = ", ".join(sorted(_PROFILES_ROOT_KEYS))
+            raise ConfigError(
+                f"unknown key at the root of the profiles file {target}: {key!r} "
+                f"(allowed: {allowed})"
+            )
+    if "profiles" not in payload:
+        raise ConfigError(f"the profiles file {target} declares no 'profiles' key")
+    raw_profiles = payload["profiles"]
+    if not isinstance(raw_profiles, list):
+        raise ConfigError(
+            f"the 'profiles' key of {target} must be a JSON list, got {type(raw_profiles).__name__}"
+        )
+    if not raw_profiles:
+        raise ConfigError("the profiles file declares no profile")
+
+    profiles: list[ProfileConfig] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw_profiles):
+        if not isinstance(entry, Mapping):
+            raise ConfigError(
+                f"invalid profile at index {index}: expected a JSON object, "
+                f"got {type(entry).__name__}"
+            )
+        try:
+            profile = ProfileConfig.model_validate(dict(entry))
+        except ValidationError as exc:
+            raise ConfigError(
+                f"invalid profile at index {index}: {_format_validation_error(exc)}"
+            ) from exc
+        if profile.id in seen:
+            raise ConfigError(f"duplicate profile id: {profile.id!r}")
+        seen.add(profile.id)
+        profiles.append(profile)
+    return profiles
+
+
+def _strip_section_prefix(overrides: Mapping[str, Any], key: str) -> dict[str, Any]:
+    """Drop the ``"<section>."`` prefix of dotted override keys.
+
+    ``load_realtime_config(path, {"realtime.poll_interval_seconds": 1})`` and
+    ``load_realtime_config(path, {"poll_interval_seconds": 1})`` therefore mean
+    the same thing.  A key that does not start with the section name is left
+    untouched, so an override targeting another section is still rejected loudly
+    by ``extra="forbid"`` instead of being silently swallowed.
+    """
+    prefix = f"{key}."
+    return {
+        (override_key[len(prefix) :] if override_key.startswith(prefix) else override_key): value
+        for override_key, value in overrides.items()
+    }
+
+
+def _load_section(
+    model: type[_SectionModel],
+    key: str,
+    path: str | Path | None,
+    overrides: Mapping[str, Any] | None,
+) -> _SectionModel:
+    """Load one ``realtime``/``monitoring`` section over the built-in defaults."""
+    payload: dict[str, Any] = {}
+    if path is not None:
+        document = _read_payload(Path(path))
+        section = document.get(key)
+        if section is not None and not isinstance(section, Mapping):
+            raise ConfigError(
+                f"the {key!r} key of {path} must be a JSON object, got {type(section).__name__}"
+            )
+        payload = dict(section or {})
+    merged = _deep_merge(model().model_dump(), payload)
+    if overrides is not None:
+        merged = _apply_overrides(merged, _strip_section_prefix(overrides, key))
+    try:
+        return model.model_validate(merged)
+    except ValidationError as exc:
+        raise ConfigError(f"invalid {key} configuration: {_format_validation_error(exc)}") from exc
+
+
+def load_realtime_config(
+    path: str | Path | None = None,
+    overrides: Mapping[str, Any] | None = None,
+) -> RealtimeConfig:
+    """Build a :class:`RealtimeConfig` from the ``realtime`` key of a profiles file.
+
+    ``path=None`` means "defaults only".  ``overrides`` accepts nested mappings and
+    dotted keys: the section name prefix is optional, so both
+    ``{"poll_interval_seconds": 1.0}`` and ``{"realtime.poll_interval_seconds": 1.0}``
+    override the same field, and an unknown key is rejected with a
+    :class:`~trading_backtest.core.errors.ConfigError` (``extra="forbid"``).
+    """
+    return _load_section(RealtimeConfig, "realtime", path, overrides)
+
+
+def load_monitoring_config(
+    path: str | Path | None = None,
+    overrides: Mapping[str, Any] | None = None,
+) -> MonitoringConfig:
+    """Build a :class:`MonitoringConfig` from the ``monitoring`` key of a profiles file.
+
+    ``path=None`` means "defaults only"; ``overrides`` follows the same nested /
+    dotted semantics as :func:`load_config`.
+    """
+    return _load_section(MonitoringConfig, "monitoring", path, overrides)

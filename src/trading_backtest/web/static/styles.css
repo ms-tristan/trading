@@ -1,0 +1,281 @@
+/*
+ * Feuille de style du tableau de bord de supervision (couche 7, wp9).
+ *
+ * Autonome par construction : aucune importation distante, aucune police
+ * telechargee, aucune image externe. La pile de polices est celle du systeme,
+ * donc la page s'affiche a l'identique hors ligne.
+ */
+
+:root {
+  --bg: #0f1319;
+  --panel: #161c25;
+  --panel-alt: #1c2430;
+  --line: #26303d;
+  --text: #e6ebf2;
+  --muted: #8b97a8;
+  --ok: #37c98a;
+  --warn: #e2b33c;
+  --bad: #e2564f;
+  --accent: #4ea1ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+  letter-spacing: 0.02em;
+}
+
+h2 {
+  font-size: 16px;
+}
+
+h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand p {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
+.platform {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.kill-switch {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.kill-switch label {
+  color: var(--muted);
+}
+
+.kill-switch input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 8px;
+  width: 160px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+button {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button.danger {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+button.danger:hover {
+  background: var(--bad);
+  color: #12161d;
+}
+
+.badge {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 1px 8px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.badge-ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.badge-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.badge-bad {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.badge-unknown {
+  color: var(--muted);
+}
+
+.banner {
+  background: rgba(226, 86, 79, 0.12);
+  border-bottom: 1px solid var(--bad);
+  color: var(--bad);
+  margin: 0;
+  padding: 8px 20px;
+}
+
+.hidden {
+  display: none;
+}
+
+.profiles {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  padding: 20px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px 16px 16px;
+}
+
+.card-head {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.card-head h2 {
+  margin-right: auto;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.facts {
+  display: grid;
+  gap: 4px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  margin-bottom: 10px;
+}
+
+.field {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px dotted var(--line);
+  font-size: 12px;
+  padding: 1px 0;
+}
+
+.field-label {
+  color: var(--muted);
+}
+
+.field-value {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.error {
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.equity {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  display: block;
+  height: 96px;
+  margin: 8px 0 12px;
+  width: 100%;
+}
+
+.block {
+  margin-top: 10px;
+}
+
+table.grid {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+}
+
+table.grid th {
+  color: var(--muted);
+  font-weight: 500;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 6px 2px 0;
+}
+
+table.grid td {
+  border-bottom: 1px solid var(--panel-alt);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  padding: 2px 6px 2px 0;
+}
+
+.footer {
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  padding: 12px 20px 24px;
+}

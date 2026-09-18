@@ -195,3 +195,92 @@ test files but must not edit an existing one.
 | Tests + coverage | the FULL command of §3 |
 
 CI installs `.[dev]` only. A red CI on coverage is a **blocking** failure, not a warning.
+
+---
+
+## 8. Addendum — the realtime and web layers (`trading_backtest.realtime`, `trading_backtest.web`)
+
+**Status:** binding addendum, owned by the repository planning authority like the rest of this
+file. Written **once**, before the work packages of `feat/realtime-multi-profile-platform` start:
+no work package may modify this file.
+
+Everything of §1–§7 applies unchanged. This section only fixes what is *specific* to the two new
+layers.
+
+### 8.1 The gate is NOT redefined
+
+§3 (the FULL command) and §5.2 (`fail_under = 85`, measured on the **whole** `trading_backtest`
+package with `--cov=trading_backtest`) are **unchanged**. The new modules are measured by the very
+same run; there is no per-layer threshold, no exemption for the optional `ccxt` / `freqtrade`
+adapters and no change to `pyproject.toml` — which stays frozen (§1.4).
+
+### 8.2 Scoped commands while a package is in flight
+
+Packages run concurrently in one checkout (§4). A realtime/web implementer runs **only** their own
+files, **never** with `--cov`:
+
+```bash
+# one file, no coverage, fast
+.venv/bin/python -m pytest tests/test_realtime_stream.py -q --no-cov
+
+# one area
+.venv/bin/python -m pytest tests/test_realtime_*.py -q --no-cov
+
+# one test, verbose
+.venv/bin/python -m pytest tests/test_realtime_risk.py::test_max_order_notional -vv --no-cov
+
+# the CLI / end-to-end files
+.venv/bin/python -m pytest tests/test_cli_realtime.py tests/test_realtime_e2e.py -q --no-cov
+```
+
+The FULL command of §3 is run **once** by the integration agent, at the end, on the frozen tree.
+
+### 8.3 Offline and determinism rules for the new layers
+
+1. **No network, no real exchange, no real order.** No test may reach a venue, and no test may
+   place an order anywhere but in `PaperBroker` (simulated) or in a local fake implementing the
+   `Broker` protocol.
+2. **No `ccxt` / `freqtrade` import at module scope — neither in the sources nor in the tests.**
+   The optional extras are imported *inside function bodies* only. A test that simulates the
+   missing extra does it *in the test body*, through `monkeypatch.setitem(sys.modules, "ccxt",
+   None)` (plus the purge of cached `ccxt.*` submodules, §1.2), never at module level.
+3. **The wall clock is banned.** Every timestamp and every delay in the realtime layer goes through
+   the injected `Clock`; a test injects `ManualClock` and advances it explicitly. `datetime.now()`,
+   `datetime.utcnow()` and `time.time()` may appear in `SystemClock` only.
+4. **Explicit seeds.** Every random draw (`PaperBroker` partial fills, jitter) takes an explicit
+   seed; two runs of the same command produce byte-identical state and payloads.
+5. **TCP port 0 only.** No test may bind a fixed port: the monitoring server is started on port `0`
+   and the chosen port is read back from the server object before the first request.
+6. **Bounded timeouts, always.** Every `await` in production code is wrapped in
+   `asyncio.wait_for(..., timeout=<explicit>)`; stream reconnects use a bounded attempt budget and a
+   bounded backoff. No test may hang: the suite must finish without an external timeout.
+7. **No secret on disk, in a log or in a `repr()`.** Credentials come from the environment only, and
+   a test asserts that a sentinel secret value never appears in `repr()`, in `to_dict()`, in the
+   captured log records or in the SQLite file.
+
+### 8.4 Test layout for the new layers (one owner per file)
+
+Mirroring §6 — every file below has exactly **one** owning work package:
+
+```
+tests/test_realtime_models.py         # wp1  frozen domain models, errors, config, example profile
+tests/test_realtime_stream.py         # wp2  Replay / Polling / Composite / ccxt-pro streams
+tests/test_realtime_store.py          # wp3  SqliteStateStore, idempotency, schema/migration
+tests/test_realtime_broker.py         # wp4  PaperBroker + CcxtBroker + credentials/redaction
+tests/test_realtime_credentials.py    # wp4  env resolution, repr/log redaction
+tests/test_realtime_risk.py           # wp5  every risk limit, kill switch, live gate
+tests/test_realtime_gateway.py        # wp6  the single order lifecycle (paper == live path)
+tests/test_realtime_runner.py         # wp7  ProfileRunner per-candle loop, warmup, health
+tests/test_realtime_orchestrator.py   # wp7  N concurrent profiles, supervision, restart
+tests/test_realtime_observability.py  # wp7  JSON logs, redaction filter, counters
+tests/test_realtime_monitor.py        # wp8  read model, metrics reuse, benchmark block
+tests/test_web_routes.py              # wp9  pure routing/request->response, status codes
+tests/test_web_server.py             # wp9  ThreadingHTTPServer, port 0, read-only mode, assets
+tests/test_cli_realtime.py            # wp10 `realtime run|serve|check` via CliRunner
+tests/test_realtime_e2e.py            # wp10 deterministic end-to-end (`--once`) over SQLite
+tests/test_realtime_docs.py           # wp10 documentation contract of the new layers
+```
+
+`tests/conftest.py` stays owned by the core/data package: a realtime package that needs a shared
+object defines a **local fake** implementing the protocol it depends on, in its own test file.
+
