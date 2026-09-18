@@ -381,3 +381,80 @@ def test_usage_documents_tooling_and_freqtrade_configs() -> None:
     for token in ("docker build", "docker-test", "freqtrade_dryrun.json", "AppConfig"):
         assert token in text, f"usage.md does not mention {token!r}"
     assert "| Cible |" in text
+
+
+# ---------------------------------------------------------------------------
+# 7. The Freqtrade adapter is documented (write-once / expose-twice recipe)
+# ---------------------------------------------------------------------------
+
+
+def test_architecture_documents_the_freqtrade_adapter() -> None:
+    text = read(ARCHITECTURE)
+
+    for token in ("freqtrade_adapter", "make_freqtrade_strategy"):
+        assert token in text, f"architecture.md does not mention {token!r}"
+
+
+def test_architecture_documents_the_entry_long_rename() -> None:
+    """The ``entry_long`` -> ``enter_long`` rename is the adapter's trap #1."""
+    text = read(ARCHITECTURE)
+
+    house = [match.start() for match in re.finditer("entry_long", text)]
+    freqtrade = [match.start() for match in re.finditer("enter_long", text)]
+    assert house, "architecture.md does not mention the house column 'entry_long'"
+    assert freqtrade, "architecture.md does not mention the Freqtrade column 'enter_long'"
+
+    # Both names must be documented *together* (as a translation), not merely listed
+    # in two unrelated places.
+    assert any(abs(left - right) <= 200 for left in house for right in freqtrade), (
+        "architecture.md must document the entry_long -> enter_long rename"
+    )
+
+
+def test_architecture_documents_the_stoploss_mapping_and_the_shim() -> None:
+    text = read(ARCHITECTURE)
+
+    # The frozen symbol of the absolute-stop -> ratio translation.
+    assert "stoploss_ratio_from_absolute" in text, (
+        "architecture.md must document the frozen stoploss translation symbol"
+    )
+    # ... and the upstream Freqtrade helper it delegates to (verbatim token).
+    assert "stoploss_from_absolute" in text, (
+        "architecture.md must spell out the 'stoploss from absolute' translation"
+    )
+    assert "user_data/strategies/BasicStrategy.py" in text, (
+        "architecture.md must document the shipped Freqtrade shim"
+    )
+
+
+def test_architecture_documents_the_execution_model_gap() -> None:
+    text = read(ARCHITECTURE)
+
+    # The shared convention, spelled out in both wordings: the frozen English
+    # docstring of strategy/engine.py and the French side-by-side table.
+    assert "close of candle" in text
+    assert "open of candle" in text
+    assert "clôture de `t`" in text
+    assert "ouverture de `t+1`" in text
+
+    # The conclusion must be written literally: the two backtests diverge.
+    lowered = text.lower()
+    for token in ("pas comparables", "pas les mêmes chiffres", "n'est pas un bug"):
+        assert token in lowered, f"architecture.md does not state {token!r}"
+
+
+def test_usage_documents_the_freqtrade_exposure_section() -> None:
+    text = read(USAGE)
+
+    # The optional extra, the naming convention, the shim and the escape hatch.
+    assert 'pip install -e ".[freqtrade]"' in text
+    assert "BasicStrategy" in text
+    assert "BasicFreqtradeStrategy" in text
+    assert "make_freqtrade_strategy" in text
+    assert "--strategy-path" in text
+    assert "user_data/strategies/BasicStrategy.py" in text
+    assert "dry-run" in text
+    # Paper and live commands are both spelled out.
+    assert "freqtrade trade" in text
+    assert "freqtrade_dryrun.json" in text
+    assert "freqtrade_config.json" in text

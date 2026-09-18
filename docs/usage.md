@@ -782,6 +782,67 @@ Points clés :
   les fichiers automatiquement — une divergence est une erreur de configuration,
   pas un bug.
 
+### 9.1 Exposer une stratégie à Freqtrade / dry-run
+
+La stratégie s'écrit **une seule fois** dans `trading_backtest.strategy` (voir
+[`docs/architecture.md`](architecture.md#49-ladaptateur-freqtrade--écrire-une-stratégie-une-fois-lexposer-deux-fois)
+pour le contrat de traduction). L'exposition à Freqtrade se fait ensuite sans
+écrire de code métier.
+
+**1. Installer l'extra `freqtrade`** (facultatif : le moteur de backtest n'en a
+jamais besoin) :
+
+```bash
+.venv/bin/python -m pip install -e ".[freqtrade]"
+```
+
+**2. Convention de nom.** Le nom maison se traduit en nom Freqtrade :
+
+| Nom maison (`strategy.name`) | Classe adaptateur | Nom Freqtrade (config `strategy:`) |
+| --- | --- | --- |
+| `basic` | `BasicFreqtradeStrategy` | `BasicStrategy` |
+
+`config/freqtrade_config.json` (live) et `config/freqtrade_dryrun.json` (paper)
+déclarent tous les deux `"strategy": "BasicStrategy"` : c'est le nom attendu par
+Freqtrade, et il doit correspondre au nom de classe du fichier de shim.
+
+**3. Le shim livré.** `user_data/strategies/BasicStrategy.py` est le **seul**
+fichier suivi de `user_data/` : il ne contient aucune logique, seulement le
+`make_freqtrade_strategy("basic")` et une déclaration de classe d'une ligne pour
+donner à Freqtrade le nom qu'il attend. Le reste de `user_data/` est l'état
+écrit par Freqtrade et reste git-ignoré.
+
+**4. Lancer le bot.** Freqtrade cherche les stratégies dans
+`user_data/strategies/` : le shim y est déjà, rien à copier.
+
+```bash
+# paper trading (dry-run sur flux réel) — commencer TOUJOURS par là
+.venv/bin/python -m freqtrade trade \
+    --config config/freqtrade_dryrun.json \
+    --strategy BasicStrategy --userdir user_data
+
+# live (capital réel) — après validation, taille réduite puis progressive
+.venv/bin/python -m freqtrade trade \
+    --config config/freqtrade_config.json \
+    --strategy BasicStrategy --userdir user_data
+```
+
+Si le shim vit ailleurs (dépôt de stratégies séparé, `user_data/` non versionné
+sur la machine cible), pointez le répertoire explicitement avec
+`--strategy-path` :
+
+```bash
+.venv/bin/python -m freqtrade trade \
+    --config config/freqtrade_dryrun.json \
+    --strategy BasicStrategy \
+    --strategy-path user_data/strategies --userdir user_data
+```
+
+Le backtest Freqtrade et le backtest maison **ne donnent pas les mêmes
+chiffres** : les signaux sont partagés, pas l'exécution. L'écart est documenté
+et attendu — voir le §4.9.4 de
+[`docs/architecture.md`](architecture.md#494-lécart-de-modèle-dexécution--écrit-noir-sur-blanc).
+
 Parcours recommandé :
 
 ```
