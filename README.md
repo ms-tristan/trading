@@ -57,6 +57,7 @@ et la section « Exposer une stratégie à Freqtrade / dry-run » de
 - [`docs/usage.md`](docs/usage.md) — installation, configuration, CLI, rapports, Docker
 - [`docs/realtime.md`](docs/realtime.md) — temps réel multi-profils : moteur, paper/live, persistance, dashboard
 - [`docs/testing-policy.md`](docs/testing-policy.md) — politique de tests et de couverture
+- [`deploy/README.md`](deploy/README.md) — déploiement local du tableau de bord temps réel (Docker, nginx, TLS, fail2ban)
 
 ## Licence
 
