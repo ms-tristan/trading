@@ -8,10 +8,11 @@ Every routing, authentication and payload decision lives in the pure router.
 Standard library only (brief D2)
 --------------------------------
 ``http.server.ThreadingHTTPServer`` + ``json`` + ``logging`` + ``threading``.
-No WebSocket, no ASGI, no third-party HTTP framework, no CDN and no build step
-for the dashboard: the dashboard polls over plain HTTP.  This is a deliberate
-trade-off (documented in ``docs/realtime.md`` as a limitation), and it is what
-keeps the whole suite green with the dev extra only.
+No WebSocket, no ASGI, no third-party HTTP framework, no CDN and no static
+asset: layer 7 serves **JSON only** and the dashboard is a separate application
+(``dashboard/``, a Next.js server) that polls this API over plain HTTP.  This is
+a deliberate trade-off (documented in ``docs/realtime.md`` as a limitation), and
+it is what keeps the whole suite green with the dev extra only.
 
 Two consequences worth stating up front:
 

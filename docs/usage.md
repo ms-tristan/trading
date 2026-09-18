@@ -707,7 +707,7 @@ exactement les mêmes commandes que `make check` en local.
 | `make robustness` | `python -m trading_platform robustness --config $(CONFIG)` | balayage paramétrique |
 | `make monte-carlo` | `python -m trading_platform monte-carlo --config $(CONFIG)` | Monte Carlo |
 | `make data-download` | `python -m trading_platform data download …` | remplissage du cache (seule cible qui utilise le réseau) |
-| `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + tableau de bord (§11) |
+| `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + API JSON (§11) ; dashboard : `make dashboard-dev` (§11.6) |
 | `make docker-build` | `docker build` | construction de l'image |
 | `make docker-test` | `docker build --target test` puis `docker run … pytest tests --cov-fail-under=85` | suite complète dans le conteneur |
 | `make clean` | suppression des caches et artefacts | nettoyage |
@@ -872,7 +872,7 @@ backtest  →  robustness  →  walk-forward  →  monte-carlo
 
 Le groupe `realtime` exécute **N profils concurrents** (`asset + stratégie +
 timeframe + paper/live + limites de risque`) dans un seul processus, persiste
-leur état dans un fichier SQLite et l'expose par un tableau de bord HTTP.
+leur état dans un fichier SQLite et l'expose par une **API JSON** HTTP.
 Le contrat complet (interfaces, API, limites assumées) est dans
 [`docs/realtime.md`](realtime.md) ; cette section donne des exemples copiables.
 
@@ -885,7 +885,7 @@ python -m trading_platform realtime check --profiles config/profiles.example.jso
 # un seul tick déterministe (ancre realtime.start_at), puis sortie 0
 python -m trading_platform realtime run --profiles config/profiles.example.json --once --json
 
-# moteur + tableau de bord (port 0 = port éphémère choisi par l'OS)
+# moteur + API JSON (port 0 = port éphémère choisi par l'OS)
 python -m trading_platform realtime run --profiles config/profiles.example.json \
     --host 127.0.0.1 --port 8080
 
@@ -1101,10 +1101,12 @@ sqlite3 data/realtime/state.db "select key, value from meta where key like 'last
 Le tableau de bord sonde `GET /api/profiles` toutes les 2 secondes ; toutes les
 réponses sont du JSON (horodatages ISO-8601 UTC, aucun `NaN`).
 
+The Python server serves **no HTML page and no static asset**: every path outside
+the table below — `GET /` and `GET /static/{asset}` included — answers the
+documented JSON 404 `{"error": "not found: <path>"}`.
+
 | Méthode et route | Réponse |
 | --- | --- |
-| `GET /` | tableau de bord HTML (rendu hors ligne) |
-| `GET /static/app.js`, `GET /static/styles.css` | actifs statiques (liste blanche fixe) |
 | `GET /api/health` | `status`, `version`, `uptime_seconds`, `profiles_total`, `profiles_running`, `kill_switch`, `checked_at` |
 | `GET /api/profiles` | `{profiles: [...], generated_at}` |
 | `GET /api/profiles/{id}` | le snapshot du profil |
@@ -1113,11 +1115,23 @@ réponses sont du JSON (horodatages ISO-8601 UTC, aucun `NaN`).
 | `GET /api/profiles/{id}/orders` | `{orders: [...]}` |
 | `GET /api/profiles/{id}/positions` | `{positions: [...]}` |
 | `GET /api/profiles/{id}/metrics` | `{metrics: {...}, benchmark: {...} \| null, generated_at}` |
+| `GET /api/kill-switch` | `{kill_switch, reason, changed_at}` (the emergency-stop state the dashboard polls) |
 | `POST /api/kill-switch` | `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` ; exige `X-Operator-Token` |
 
 `400` requête malformée, `403` jeton absent/invalide **ou** serveur en lecture
 seule (`realtime serve`), `404` route ou profil inconnu, `405` méthode
 incorrecte, `500` `{error}` — jamais de trace sur le réseau.
+
+The monitoring dashboard is a standalone **Next.js** application in `dashboard/`
+(App Router, React 19, Tailwind CSS v4, TypeScript strict): it runs as a real Node
+server — not a static export — and it polls the JSON API above on the cadence of
+`monitoring.refresh_seconds` (2 s by default). Install and start it with
+`make dashboard-install` and `make dashboard-dev`, then open
+`http://127.0.0.1:3000`. The browser only ever talks to that origin: the rewrite
+declared in `dashboard/next.config.ts` proxies `/api/:path*` to this Python server
+(`API_ORIGIN`, `http://127.0.0.1:8080` by default), so there is no CORS, no
+absolute URL in the browser, and the `X-Operator-Token` header flows through
+untouched.
 
 ```bash
 # vérification rapide d'une instance
@@ -1128,9 +1142,23 @@ curl -s http://127.0.0.1:8080/api/profiles/btc-paper/metrics
 ### 11.7 Cible `make`
 
 ```bash
-make realtime                                   # moteur + tableau de bord
+make realtime                                   # moteur + API JSON
 PROFILES=config/profiles.example.json make realtime
 ```
 
 La cible `realtime` appelle `realtime run --profiles
 ${PROFILES:-config/profiles.example.json}` et laisse `make check` intact.
+
+The dashboard has its own targets, next to the Python ones:
+
+```bash
+make dashboard-install          # npm ci in dashboard/ (the lockfile is committed)
+make dashboard-dev              # Next.js dev server on http://127.0.0.1:3000
+make dashboard-lint             # eslint
+make dashboard-typecheck        # tsc --noEmit
+make dashboard-test             # vitest run
+make dashboard-test-coverage    # vitest run --coverage (docs/testing-policy.md §9)
+make dashboard-build            # next build (standalone output)
+make dashboard-check            # lint + typecheck + test-coverage + build
+make check-all                  # make check (Python) + make dashboard-check
+```

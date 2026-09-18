@@ -284,3 +284,102 @@ tests/test_realtime_docs.py           # wp10 documentation contract of the new l
 `tests/conftest.py` stays owned by the core/data package: a realtime package that needs a shared
 object defines a **local fake** implementing the protocol it depends on, in its own test file.
 
+---
+
+## 9. Addendum — the standalone dashboard (`dashboard/`)
+
+**Status:** binding addendum, owned by the repository planning authority like the rest of this
+file. Written **once**, before the work packages of `feat/nextjs-monitoring-dashboard` start: no
+work package may modify this file.
+
+Everything of §1–§8 applies unchanged; §1–§8 govern the Python suite. This section fixes what is
+specific to the standalone Next.js dashboard delivered in `dashboard/`.
+
+### 9.1 The Python gate is NOT redefined
+
+`fail_under = 85` measured with `--cov=trading_platform` over the whole package (§5.2) stays
+exactly as it is, and `pyproject.toml` stays frozen (§1.4). The dashboard is a **separate**
+project with a **separate**, mechanical gate.
+
+### 9.2 Threshold — **85 % lines / 85 % statements / 85 % functions / 75 % branches**
+
+* measured over `dashboard/src/**/*.{ts,tsx}` (tests, `*.d.ts` and the root config files excluded);
+* enforced by `coverage.thresholds` in `dashboard/vitest.config.ts` — `vitest run --coverage`
+  exits non-zero below a threshold, so the gate is mechanical, not a convention;
+* branch coverage is the single number below the line threshold because the Python policy itself
+  measures **line** coverage only (`branch = false`, §5.2) and JSX produces trivially unreachable
+  branches. Every one of the four numbers is a hard gate;
+* a file this feature does not test may not be excluded to make the gate pass: the honest escape
+  hatch is the `/* v8 ignore ... */` comment next to the statement, and it must be justified in
+  the work-package report.
+
+### 9.3 The FULL dashboard command — must be green before any push
+
+```bash
+export npm_config_cache=/Users/mac/Projects/Trading/.npm-cache
+export npm_config_logs_dir=$npm_config_cache/_logs
+cd dashboard
+npm run lint          # eslint .
+npm run typecheck     # tsc --noEmit
+npm run test:coverage # vitest run --coverage, with the thresholds of §9.2
+npm run build         # next build (production build, standalone output)
+```
+
+Equivalent commands: `make dashboard-check` (all four) and `make check-all` (the Python gate of
+§3 **plus** the dashboard gate).
+
+Non-negotiable rules for this project:
+
+1. **No live server, ever.** Every dashboard test mocks the network (an injected `fetchImpl` or
+   `vi.stubGlobal("fetch", ...)`); no test binds a port, no test reaches the Python monitoring
+   server, no test reads the real `sessionStorage` of a browser.
+2. **Deterministic.** Polling tests use fake timers and explicit cadences; timestamps are fixed
+   reference values; no test depends on the wall clock or on a random identifier.
+3. **The lockfile is committed.** CI installs with `npm ci`; a dependency that is not declared in
+   `dashboard/package.json` (owned by the foundation package) may never be added by another
+   package.
+4. **No network at test time.** The remote font/asset story is solved at build time (self-hosted
+   packages), never by a runtime CDN.
+
+### 9.4 Scoped commands — what a dashboard implementer runs while working
+
+Packages run concurrently in one checkout (§4). Export the cache first (see §9.6), then run
+**only** your own files, and never the coverage gate or the production build:
+
+```bash
+cd dashboard
+npx vitest run src/lib/format.test.ts          # one file
+npx vitest run src/components/overview         # one directory
+npx vitest run src/components/profile -t "positions"
+npx eslint src/components/profile              # one area
+npm run typecheck                              # whole project, cheap and safe
+```
+
+The FULL command of §9.3 is run **once** by the integration agent, at the end, on the frozen tree.
+A scoped run that needs a file owned by another package means the dependency was declared wrong —
+report it instead of editing the other package's files.
+
+### 9.5 Dashboard test layout (one owner per file)
+
+```
+dashboard/src/lib/*.test.ts                     # wp-3  API client, formatting, operator token, polling
+dashboard/src/components/ui/*.test.tsx          # wp-3  shared primitives and the kill-switch flow
+dashboard/src/components/overview/*.test.tsx    # wp-4  profile cards, live header, empty/error states
+dashboard/src/components/profile/*.test.tsx     # wp-5  positions / trades / orders / metrics tables
+dashboard/src/components/charts/*.test.tsx      # wp-5  equity chart geometry, tooltip, empty series
+dashboard/src/app/**/page.test.tsx              # wp-4, wp-5  page-level render contracts
+```
+
+### 9.6 Sandbox: the npm cache lives inside the repository
+
+The agent sandbox only permits writes **inside** the repository, and the global npm cache
+(`~/.npm`) is not writable: a bare `npm` command fails while writing its logs. Every npm/node
+command therefore runs with a repository-local cache:
+
+```bash
+export npm_config_cache=/Users/mac/Projects/Trading/.npm-cache
+export npm_config_logs_dir=$npm_config_cache/_logs
+```
+
+`.npm-cache/` is git-ignored, exactly like `.uv-cache/`.
+

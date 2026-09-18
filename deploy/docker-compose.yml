@@ -5,12 +5,19 @@
 #   docker compose -f deploy/docker-compose.yml logs -f
 #   docker compose -f deploy/docker-compose.yml down          # keep the volumes
 #
-# The container serves PLAIN HTTP on 8080 and is published on the loopback
-# interface only (127.0.0.1:3030): TLS, HTTP Basic authentication, rate
-# limiting and fail2ban are the host nginx's job (see deploy/README.md).
+# Two containers:
+#   trading-realtime   the Python engine + monitoring JSON API (plain HTTP 8080)
+#   trading-dashboard  the Next.js dashboard (plain HTTP 3000); it proxies
+#                      /api/* to trading-realtime over the compose network, so
+#                      the browser only ever talks to its own origin
+#
+# Both are published on the loopback interface only (127.0.0.1:3030 and
+# 127.0.0.1:3031): TLS, HTTP Basic authentication, rate limiting and fail2ban
+# are the host nginx's job (see deploy/README.md). nginx serves the dashboard
+# on / and the Python API is published for local debugging only.
 #
 # Credentials come from deploy/.env (git-ignored, mode 600) and are injected
-# through the environment -- the image itself contains no secret.
+# through the environment -- the images themselves contain no secret.
 # ---------------------------------------------------------------------------
 services:
   trading-realtime:
@@ -39,6 +46,35 @@ services:
 
     # the image healthcheck already probes GET /api/health on 8080
     stop_grace_period: 30s
+
+  trading-dashboard:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.dashboard
+      # baked at build time: rewrites() is resolved when next.config.ts is
+      # evaluated, so changing the API origin means rebuilding the image
+      args:
+        API_ORIGIN: "http://trading-realtime:8080"
+    image: trading-dashboard:latest
+    container_name: trading-dashboard
+    restart: unless-stopped
+
+    environment:
+      API_ORIGIN: "http://trading-realtime:8080"
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    # loopback only: nginx terminates TLS and fronts this port (upstream
+    # trading_dashboard -> 127.0.0.1:3031)
+    ports:
+      - "127.0.0.1:3031:3000"
+
+    depends_on:
+      - trading-realtime
+
+    # the image healthcheck probes GET / on 3000 with Node's global fetch
+    stop_grace_period: 10s
 
 volumes:
   trading-state:

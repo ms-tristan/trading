@@ -17,7 +17,6 @@ import contextlib
 import http.client
 import json
 import logging
-import re
 import socket
 import threading
 import time
@@ -56,7 +55,6 @@ from trading_platform.web.server import (
 
 PROFILE_A = "btc-paper"
 START = datetime(2024, 1, 1, tzinfo=UTC)
-STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web" / "static"
 CLIENT_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
 
@@ -357,20 +355,27 @@ def test_head_returns_the_same_headers_with_an_empty_body(server: MonitoringServ
     assert "Allow" not in head_headers
 
 
-def test_dashboard_and_assets_over_http(server: MonitoringServer) -> None:
-    status, headers, payload = http_request(server, "GET", "/")
-    assert status == 200
-    assert headers["Content-Type"] == "text/html; charset=utf-8"
-    assert payload == (STATIC_DIR / "index.html").read_bytes()
+def test_the_removed_html_surface_is_a_documented_json_404(
+    server: MonitoringServer,
+) -> None:
+    """Layer 7 serves JSON only: ``/`` and every ``/static/...`` path are unknown.
 
-    status, headers, payload = http_request(server, "GET", "/static/app.js")
-    assert status == 200
-    assert headers["Content-Type"] == "text/javascript; charset=utf-8"
-    assert payload == (STATIC_DIR / "app.js").read_bytes()
-
-    status, _, payload = http_request(server, "GET", "/static/%2e%2e/routes.py")
-    assert status == 404
-    assert decode(payload) == {"error": "not found: /static/%2e%2e/routes.py"}
+    The transport adds nothing of its own here: the response is exactly the
+    documented router 404, with a JSON content type and the requested path echoed
+    verbatim -- no HTML document, no asset, and no stdlib error page.
+    """
+    for path in (
+        "/",
+        "/static/app.js",
+        "/static/styles.css",
+        "/static/index.html",
+        "/static/../routes.py",
+        "/static/%2e%2e/routes.py",
+    ):
+        status, headers, payload = http_request(server, "GET", path)
+        assert status == 404, path
+        assert headers["Content-Type"] == "application/json; charset=utf-8", path
+        assert decode(payload) == {"error": f"not found: {path}"}, path
 
 
 def test_unknown_route_and_wrong_method_over_http(server: MonitoringServer) -> None:
@@ -438,8 +443,6 @@ def test_a_read_only_server_refuses_the_kill_switch(server: MonitoringServer) ->
 @pytest.mark.parametrize(
     "path",
     [
-        "/",
-        "/static/styles.css",
         "/api/health",
         "/api/profiles",
         f"/api/profiles/{PROFILE_A}",
@@ -454,6 +457,17 @@ def test_a_read_only_server_refuses_the_kill_switch(server: MonitoringServer) ->
 def test_a_read_only_server_answers_every_get(server: MonitoringServer, path: str) -> None:
     status, _, _ = http_request(server, "GET", path)
     assert status == 200
+
+
+@pytest.mark.parametrize("path", ["/", "/static/styles.css"])
+def test_a_read_only_server_answers_the_removed_surface_with_a_404(
+    server: MonitoringServer, path: str
+) -> None:
+    """Read-only mode is beside the point: these paths are simply not routes."""
+    status, headers, payload = http_request(server, "GET", path)
+    assert status == 404
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert decode(payload) == {"error": f"not found: {path}"}
 
 
 def test_a_mutating_server_engages_the_kill_switch(
@@ -691,13 +705,15 @@ def test_serve_blocking_runs_until_shutdown(provider: FakeProvider, monitor: Mon
 def test_a_polling_browser_never_exhausts_the_store_connections(tmp_path: Path) -> None:
     """The dashboard's own polling must not leak a SQLite connection per request.
 
-    Regression test for the deployed dashboard going dark.  ``app.js`` polls five
-    routes every two seconds, three of which are read from the SQLite store
-    (``/equity``, ``/positions``, ``/trades``).  The store keeps one connection per
-    *caller thread* and retained every one of them, while ``ThreadingHTTPServer``
-    runs a thread per request -- so a browser left open leaked descriptors until the
-    container hit ``OSError: Too many open files`` and answered ``500`` to
-    everything, ``/`` included: the page itself stopped loading.
+    Regression test for the deployed dashboard going dark.  The browser client
+    polls five documented routes every two seconds
+    (``monitoring.refresh_seconds``), three of which are read from the SQLite
+    store (``/equity``, ``/positions``, ``/trades``).  The store keeps one
+    connection per *caller thread* and retained every one of them, while
+    ``ThreadingHTTPServer`` runs a thread per request -- so a browser left open
+    leaked descriptors until the container hit ``OSError: Too many open files``
+    and answered ``500`` to everything, the dashboard's own polls included: the
+    page stopped updating.
 
     The client threads run *concurrently* on purpose: threads alive at the same time
     necessarily have distinct ids, so the leak is visible on this host too (a
@@ -749,75 +765,3 @@ def test_a_polling_browser_never_exhausts_the_store_connections(tmp_path: Path) 
             )
     finally:
         store.close()
-
-
-# ---------------------------------------------------------------------------
-# the dashboard must not rebuild itself on every poll
-# ---------------------------------------------------------------------------
-
-
-def dashboard_javascript_code() -> str:
-    """Return ``app.js`` with its comments removed.
-
-    The assertions below are about the code, and the file deliberately *explains*
-    the flicker it avoids (the words "loading detail..." and ``replaceChildren``
-    both appear in its prose).  Without stripping the comments the checks would be
-    reading the documentation instead of the code.
-    """
-    source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-    without_blocks = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
-    return "\n".join(
-        line for line in without_blocks.splitlines() if not line.strip().startswith("//")
-    )
-
-
-def test_the_dashboard_updates_in_place_instead_of_rebuilding_every_poll() -> None:
-    """The polling loop must not wipe and recreate the profile cards.
-
-    Regression test for "the page keeps reloading and shows no data". The first
-    version called ``replaceChildren()`` on the profile container on every cycle:
-    each card, its equity canvas and its detail block were destroyed and rebuilt
-    every two seconds, the detail block was reset to a "loading detail..."
-    placeholder, and the curve was redrawn only after every detail request had
-    resolved.  Measured against the deployed dashboard over a 400 ms link, that
-    placeholder was on screen for 21 % of the samples.
-
-    The browser behaviour itself cannot be asserted here (the suite is offline and
-    has no browser); what is pinned is the structural contract that makes it
-    impossible: the container is never cleared while updating, cards are created
-    once and updated in place, and a late failure never blanks what is already
-    displayed.
-    """
-    javascript = dashboard_javascript_code()
-
-    assert "elements.profiles.replaceChildren()" not in javascript, (
-        "the profile list is wiped on every poll again: that is the flicker"
-    )
-    assert "function createCard(" in javascript
-    assert "function updateCard(" in javascript
-    assert "cardsById" in javascript, "cards must be tracked by profile id, not recreated"
-    # the detail block may only be emptied when nothing was ever loaded
-    assert "detailLoaded" in javascript
-    # the placeholder is written once, when the card is created
-    assert javascript.count("loading detail...") == 1
-
-
-def test_the_dashboard_cadence_comes_from_the_configuration() -> None:
-    """`monitoring.refresh_seconds` drives the page, it is not a hardcoded constant."""
-    javascript = dashboard_javascript_code()
-
-    assert 'getAttribute("data-refresh-seconds")' in javascript
-    assert "DEFAULT_REFRESH_SECONDS" in javascript
-
-
-def test_the_dashboard_javascript_stays_es5() -> None:
-    """The dashboard is served as-is to any browser: no transpiler, no build step.
-
-    A single arrow function or template literal would silently break an older
-    browser with no way to notice from the server side, so the code is pinned to
-    the syntax the file was written in.
-    """
-    javascript = dashboard_javascript_code()
-
-    for needle in ("=>", "`", "let ", "const ", "class "):
-        assert needle not in javascript, f"app.js uses post-ES5 syntax: {needle!r}"
