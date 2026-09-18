@@ -20,8 +20,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import secrets
 import stat
-import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -53,6 +53,9 @@ _JSON_SUFFIXES = (".json",)
 
 #: The only keys accepted at the root of a profiles document.
 _PROFILES_ROOT_KEYS: frozenset[str] = frozenset({"profiles", "realtime", "monitoring"})
+
+#: How many names :func:`_open_temporary` tries before giving up.
+_TEMPORARY_ATTEMPTS: int = 100
 
 _SectionModel = TypeVar("_SectionModel", bound=BaseModel)
 
@@ -282,6 +285,24 @@ def load_profiles(path: str | Path) -> list[ProfileConfig]:
     return profiles
 
 
+def _open_temporary(directory: Path, name: str, mode: int) -> tuple[int, str]:
+    """Create a unique temporary file next to ``name``, with ``mode``.
+
+    ``tempfile.mkstemp`` cannot be used here: it hard-codes 0o600, and the mode
+    of the file that gets renamed onto the target is the one the target ends up
+    with. ``O_EXCL`` keeps the creation atomic, so two concurrent callers can
+    never pick the same name.
+    """
+    for _ in range(_TEMPORARY_ATTEMPTS):
+        candidate = directory / f".{name}.{secrets.token_hex(6)}.tmp"
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+        except FileExistsError:
+            continue
+        return descriptor, str(candidate)
+    raise ConfigError(f"cannot create a temporary file next to {directory / name}")
+
+
 def save_profiles(path: str | Path, profiles: Sequence[ProfileConfig]) -> Path:
     """Rewrite the ``profiles`` key of the profiles document ``path``, atomically.
 
@@ -324,26 +345,25 @@ def save_profiles(path: str | Path, profiles: Sequence[ProfileConfig]) -> Path:
     payload = _read_payload(target)
     payload["profiles"] = [profile.model_dump(mode="json") for profile in profiles]
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    # The mode has to be right at CREATION time. Some bind mounts -- Docker
+    # Desktop's virtiofs on macOS, for one -- refuse chmod outright with EPERM,
+    # and ``tempfile.mkstemp`` hard-codes 0o600: the rename would then hand the
+    # target a mode that makes it unreadable to the uid the mount maps the owner
+    # to, which is exactly how the container lost access to the config it had
+    # just written.
+    try:
+        mode = stat.S_IMODE(target.stat().st_mode)
+    except OSError:
+        mode = 0o644
     temporary: Path | None = None
     try:
-        handle, name = tempfile.mkstemp(
-            dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
-        )
+        handle, name = _open_temporary(target.parent, target.name, mode)
         temporary = Path(name)
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        # ``os.replace`` swaps the inode, so the temporary file's mode would
-        # silently become the target's. ``mkstemp`` creates it 0o600, which would
-        # turn a formerly world-readable config into an owner-only one -- enough
-        # to break a container whose bind mount maps the owner to another uid.
-        # Carry the existing mode over, defaulting to the usual 0o644 when it
-        # cannot be read.
-        try:
-            mode = stat.S_IMODE(target.stat().st_mode)
-        except OSError:
-            mode = 0o644
+        # Best effort, for platforms where the umask stripped bits at creation.
         with contextlib.suppress(OSError):
             temporary.chmod(mode)
         # ``Path.replace`` *is* ``os.replace``: an atomic rename on every supported

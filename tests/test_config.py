@@ -432,11 +432,11 @@ def test_save_profiles_preserves_every_other_root_key_verbatim(tmp_path: Path) -
 def test_save_profiles_preserves_the_file_mode(tmp_path: Path) -> None:
     """``os.replace`` swaps the inode, so the mode has to be carried over.
 
-    ``mkstemp`` creates the temporary file 0o600; without an explicit chmod the
-    rewritten document would silently become owner-only. In the deployed
-    container the bind mount maps the owner to another uid, so an owner-only
-    file is unreadable by the very process that wrote it -- the create route
-    worked once and every later read failed.
+    The temporary file is created 0o600 by default; without carrying the target's
+    mode over, the rewritten document would silently become owner-only. In the
+    deployed container the bind mount maps the owner to another uid, so an
+    owner-only file is unreadable by the very process that wrote it -- the create
+    route worked once and every later read failed.
     """
     path = profiles_document(tmp_path, ["aaa-paper"])
     path.chmod(0o644)
@@ -449,6 +449,32 @@ def test_save_profiles_preserves_the_file_mode(tmp_path: Path) -> None:
     path.chmod(0o600)
     save_profiles(path, [ProfileConfig(id="ccc-paper", symbol="SOL/USDT")])
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_save_profiles_sets_the_mode_at_creation_not_by_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filesystem that refuses ``chmod`` still gets the right mode.
+
+    Docker Desktop's virtiofs bind mount answers ``EPERM`` to every chmod, and
+    the temporary file is created 0o600 by default: the document then came out
+    owner-only and the container -- whose mount maps the owner to another uid --
+    could no longer read the config it had just written. The mode therefore has
+    to reach ``os.open``, not be restored afterwards.
+    """
+    path = profiles_document(tmp_path, ["aaa-paper"])
+    path.chmod(0o644)
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(Path, "chmod", refuse)
+    monkeypatch.setattr(os, "chmod", refuse)
+
+    save_profiles(path, [ProfileConfig(id="bbb-paper", symbol="ETH/USDT")])
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert load_profiles(path) == [ProfileConfig(id="bbb-paper", symbol="ETH/USDT")]
 
 
 def test_save_profiles_adds_then_removes_a_profile(tmp_path: Path) -> None:
