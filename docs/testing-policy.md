@@ -196,6 +196,15 @@ test files but must not edit an existing one.
 
 CI installs `.[dev]` only. A red CI on coverage is a **blocking** failure, not a warning.
 
+**One run per event.** The workflow triggers on `pull_request` (every pull-request branch, including
+a stacked one) and on `push` **filtered to `main`**, plus `workflow_dispatch`. The filter is what
+keeps a single pull-request commit from running the whole matrix twice: an unfiltered `push` fires
+alongside `pull_request` for the very same commit, which produced two workflow runs and four checks
+per push. `preprod` is deliberately absent from the filter — this repository has no such branch and
+the delivery workflow never creates one. Adding a branch to that filter, or removing it, changes how
+many times CI runs per commit; `tests/test_docs.py` pins both the textual and the parsed shape of
+`on:`.
+
 ---
 
 ## 8. Addendum — the realtime and web layers (`trading_platform.realtime`, `trading_platform.web`)
