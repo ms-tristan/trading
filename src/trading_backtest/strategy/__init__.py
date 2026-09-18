@@ -11,15 +11,33 @@ Public API::
         run_backtest,         # the deterministic backtest engine
         run_backtest_on_config,
         make_runner,          # RunnerFn bound to an AppConfig (validation seam)
+        make_freqtrade_strategy,           # house strategy -> Freqtrade IStrategy
+        validate_freqtrade_adapter_class,  # proof that the produced class is valid
+        freqtrade_available,               # is the optional extra installed?
     )
 
-Dependency direction: this layer only depends on ``core``, ``config`` and
-``data`` — never on ``validation``, ``metrics``, ``reporting`` or ``cli``.
+Dependency direction: this layer only depends on ``core``, ``config``, ``data``
+and ``freqtrade`` (layer 2) — never on ``validation``, ``metrics``,
+``reporting`` or ``cli``.
+
+The Freqtrade **adapter** lives *here*, in layer 3
+(:mod:`trading_backtest.strategy.freqtrade_adapter`): ``strategy -> freqtrade``
+is a downward import (layer 3 -> layer 2), whereas moving the adapter into
+``trading_backtest.freqtrade`` would be an upward import and would falsify that
+package's "never imports anything but ``core``" contract.  So
+``trading_backtest.freqtrade`` stays a **freqtrade-free** layer-2 module.
+Freqtrade itself stays an optional extra: the adapter imports it lazily, inside
+functions, so this namespace is importable on the ``.[dev]`` extra alone — which
+is why it never imports
+:mod:`trading_backtest.strategy.freqtrade_basic`.  That module (and the literal
+``user_data/strategies/BasicStrategy.py`` shim Freqtrade resolves by class name)
+builds its class at import time and is therefore **only** importable with the
+extra installed.
 """
 
 from __future__ import annotations
 
-from trading_backtest.strategy import indicators
+from trading_backtest.strategy import freqtrade_adapter, indicators
 from trading_backtest.strategy.base import (
     BOOL_SIGNAL_COLUMNS,
     Strategy,
@@ -34,6 +52,14 @@ from trading_backtest.strategy.engine import (
     run_backtest,
     run_backtest_on_config,
 )
+from trading_backtest.strategy.freqtrade_adapter import (
+    FREQTRADE_INTERFACE_VERSION,
+    FREQTRADE_ORDER_COLUMNS,
+    SIGNAL_TO_FREQTRADE_COLUMNS,
+    freqtrade_available,
+    make_freqtrade_strategy,
+    validate_freqtrade_adapter_class,
+)
 from trading_backtest.strategy.indicators import atr, ema, rsi, true_range
 from trading_backtest.strategy.registry import (
     STRATEGIES,
@@ -46,6 +72,9 @@ from trading_backtest.strategy.registry import (
 __all__ = [
     "BOOL_SIGNAL_COLUMNS",
     "ENGINE_VERSION",
+    "FREQTRADE_INTERFACE_VERSION",
+    "FREQTRADE_ORDER_COLUMNS",
+    "SIGNAL_TO_FREQTRADE_COLUMNS",
     "STRATEGIES",
     "BasicStrategy",
     "BasicStrategyParams",
@@ -54,8 +83,11 @@ __all__ = [
     "atr",
     "ema",
     "ensure_signal_frame",
+    "freqtrade_adapter",
+    "freqtrade_available",
     "get_strategy",
     "indicators",
+    "make_freqtrade_strategy",
     "make_runner",
     "register_strategy",
     "require_ohlcv_frame",
@@ -65,4 +97,5 @@ __all__ = [
     "strategy_names",
     "strategy_param_space",
     "true_range",
+    "validate_freqtrade_adapter_class",
 ]

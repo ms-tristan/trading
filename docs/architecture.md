@@ -68,7 +68,11 @@ Trading/
 │   │   ├── base.py                   # Strategy : contrat prepare / signals / run
 │   │   ├── basic.py                  # BasicStrategy : croisement EMA + filtre RSI + stop ATR
 │   │   ├── registry.py               # register_strategy / get_strategy (résolution par nom)
-│   │   └── engine.py                 # run_backtest / make_runner : boucle d'exécution + seam RunnerFn
+│   │   ├── engine.py                 # run_backtest / make_runner : boucle d'exécution + seam RunnerFn
+│   │   ├── freqtrade_parameters.py   # traduction ParamsModel / PARAM_SPACE -> IntParameter, DecimalParameter, CategoricalParameter
+│   │   ├── freqtrade_stoploss.py     # stop-loss par bougie -> stop Freqtrade : table d'entrée + ratio par trade
+│   │   ├── freqtrade_adapter.py      # make_freqtrade_strategy : fabrique une IStrategy générique depuis une Strategy du registre
+│   │   └── freqtrade_basic.py        # BasicFreqtradeStrategy : la classe concrète de `basic`, chargeable par nom
 │   ├── validation/
 │   │   ├── split.py                  # split_is_oos / make_windows : découpage IS/OOS + purge
 │   │   ├── walk_forward.py           # walk_forward : fenêtres glissantes ou ancrées
@@ -86,7 +90,9 @@ Trading/
 │   └── cli.py                        # CLI Typer : backtest, walk-forward, robustness, monte-carlo, data, config
 ├── tests/                            # suite pytest hors ligne (voir docs/testing-policy.md)
 ├── user_data/
-│   └── README.md                     # état écrit par Freqtrade (OHLCV, backtests, stratégies) — git-ignoré
+│   ├── README.md                     # état écrit par Freqtrade (OHLCV, backtests, stratégies) — git-ignoré
+│   └── strategies/
+│       └── BasicStrategy.py          # shim suivi : la SEULE exception à user_data/ git-ignoré (§4.9)
 ├── Dockerfile                        # image reproductible (Python 3.11)
 ├── Makefile                          # tâches de développement
 ├── pyproject.toml                    # packaging + config ruff / mypy / pytest / coverage (gelé)
@@ -103,6 +109,13 @@ un sous-module de `validation`.
 Les découpages internes (`split.py` / `walk_forward.py` / …) sont des détails
 d'implémentation : ce qui est **gelé**, ce sont les chemins de paquets
 (`trading_backtest.<paquet>`) et les symboles listés au §4.
+
+**`user_data/` reste l'état de Freqtrade** — OHLCV téléchargé, résultats de
+backtest, bases SQLite, stratégies engendrées — et demeure **git-ignoré** : la
+seule exception suivie est `user_data/strategies/BasicStrategy.py`, le shim
+d'exposition décrit au §4.9. Ce fichier n'embarque **aucune** logique métier :
+un import et une déclaration de classe d'une ligne. Tout le reste de
+`user_data/` est produit par Freqtrade à l'exécution et n'est jamais versionné.
 
 ---
 
@@ -141,7 +154,7 @@ bas de cette liste.**
 | --- | --- | --- |
 | 1 | `trading_backtest.core` | la bibliothèque standard, `pandas` |
 | 2 | `trading_backtest.config`, `trading_backtest.data`, `trading_backtest.freqtrade` | couche 1 |
-| 3 | `trading_backtest.strategy` (dont `strategy.engine`), `trading_backtest.metrics` | couches 1–2 (`strategy.engine` importe `config` ; `metrics` n'importe que `core`) |
+| 3 | `trading_backtest.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_backtest.metrics` | couches 1–2 (`strategy.engine` importe `config` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
 | 4 | `trading_backtest.reporting` | couches 1–3 (`core` et `metrics`) |
 | 5 | `trading_backtest.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
 | 6 | `trading_backtest.cli` | couches 1–5 (plus `freqtrade` pour valider une config Freqtrade) |
@@ -160,6 +173,36 @@ Conséquences pratiques :
   corps des fonctions.
 - Seule la CLI a le droit de parler à l'utilisateur (sortie terminal, fichiers
   de rapport) et de lire des arguments.
+
+### 3.1 Décision de couches — l'adaptateur Freqtrade ne crée **aucune** arête
+
+L'adaptateur Freqtrade (§4.9) est la brique 1 de la trajectoire vers le temps
+réel multi-profils. **Le graphe ci-dessus ne change pas** : aucun paquet n'est
+déplacé, aucune arête n'est ajoutée, le tableau des couches reste celui du §3.
+Le point est tranché explicitement :
+
+- les quatre modules `trading_backtest.strategy.freqtrade_parameters`,
+  `freqtrade_stoploss`, `freqtrade_adapter` et `freqtrade_basic` vivent en
+  **couche 3**, dans le paquet `trading_backtest.strategy` ;
+- `trading_backtest.strategy` -> `trading_backtest.freqtrade` est donc un import
+  **descendant** (couche 3 -> couche 2), parfaitement légal : la couche 3 a le
+  droit d'importer `core`, `config`, `data` **et** `freqtrade` ;
+- `trading_backtest.freqtrade` **conserve sa règle de liaison actuelle** : ce
+  paquet n'importe que `trading_backtest.core` et **n'importe jamais
+  `freqtrade`** (c'est son docstring). Déplacer l'adaptateur *dans*
+  `trading_backtest.freqtrade` serait un import **ascendant** (couche 2 ->
+  couche 3) et falsifierait ce docstring : **c'est refusé** ;
+- l'import du paquet externe `import freqtrade` est **paresseux et gardé** : il
+  est exécuté *dans le corps des fonctions* (`freqtrade_available`,
+  `make_freqtrade_strategy`, `validate_freqtrade_adapter_class`), jamais au
+  chargement de `trading_backtest.strategy`. Conséquence directe : avec le seul
+  extra `.[dev]` — donc **sans** Freqtrade installé — le paquet reste
+  importable, `freqtrade_available()` rend `False`, et la suite de tests
+  complète reste verte ([`docs/testing-policy.md`](testing-policy.md)).
+
+Autrement dit : la logique métier (indicateurs, règles d'entrée/sortie) reste
+écrite **une seule fois** dans `trading_backtest.strategy`, et l'adaptateur se
+contente de **traduire** entre les deux contrats. Il ne duplique rien.
 
 ---
 
@@ -235,6 +278,45 @@ de test ne peut pas sortir sur le réseau.
 | `register_strategy` | `register_strategy(cls: type[Strategy]) -> type[Strategy]` | décorateur de classe qui enregistre la stratégie dans `STRATEGIES` |
 | `get_strategy` | `get_strategy(name: str, params: Mapping[str, Any] \| None = None) -> Strategy` | instancie une stratégie enregistrée |
 | `strategy_names` / `strategy_param_space` | `strategy_names() -> list[str]`, `strategy_param_space(name: str) -> dict[str, list[float \| int]]` | noms disponibles et grille de paramètres d'une stratégie (base du balayage de robustesse) |
+| `make_freqtrade_strategy` | `make_freqtrade_strategy(house_name: str, …) -> type[IStrategy]` | **fabrique générique** : rend une classe `IStrategy` Freqtrade pour **n'importe quelle** stratégie du registre (§4.9) |
+| `validate_freqtrade_adapter_class` | `validate_freqtrade_adapter_class(cls) -> None` | vérifie que la classe produite est une `IStrategy` valide (version d'interface, les trois `populate_*`, attributs requis) et lève `StrategyError` sinon ; rend `None` quand tout est conforme |
+| `freqtrade_available` | `freqtrade_available() -> bool` | `True` si le paquet externe `freqtrade` est importable — import **paresseux**, jamais au chargement du paquet |
+| `BasicFreqtradeStrategy` | `make_freqtrade_strategy("basic")` ; `BASIC_FREQTRADE_STRATEGY_NAME = "BasicStrategy"` | la classe concrète chargeable par nom qui expose la stratégie maison `basic` à Freqtrade |
+
+### 4.4.1 Inventaire de l'adaptateur Freqtrade — `trading_backtest.strategy.freqtrade_*`
+
+Ces symboles sont **gelés** comme les précédents. Ils appartiennent tous à la
+couche 3 et ne sont utilisés que par le chemin d'exposition à Freqtrade (§4.9).
+
+| Symbole | Module | Rôle |
+| --- | --- | --- |
+| `FREQTRADE_INTERFACE_VERSION` | `freqtrade_adapter` | `3` — la valeur d'`INTERFACE_VERSION` déclarée par la classe produite (contrat vérifié contre Freqtrade 2026.8) |
+| `FREQTRADE_ORDER_COLUMNS` | `freqtrade_adapter` | tuple des colonnes de signal **Freqtrade** : `enter_long`, `exit_long`, `enter_short`, `exit_short` |
+| `SIGNAL_TO_FREQTRADE_COLUMNS` | `freqtrade_adapter` | table de renommage maison -> Freqtrade : `entry_long -> enter_long`, `exit_long -> exit_long`, `entry_short -> enter_short`, `exit_short -> exit_short` |
+| `house_frame` | `freqtrade_adapter` | traduit une frame Freqtrade (index positionnel `RangeIndex` + colonne `date`) vers le contrat OHLCV maison (`DatetimeIndex` UTC nommé `timestamp`) |
+| `freqtrade_indicator_frame` / `freqtrade_entry_frame` / `freqtrade_exit_frame` | `freqtrade_adapter` | traduisent la frame maison vers la frame rendue par chacun des trois `populate_*` : mêmes lignes, même ordre, index positionnel préservé, colonnes de signal renommées |
+| `FreqtradeParamSpec` | `freqtrade_parameters` | description d'**un** paramètre traduit : nom, type (`IntParameter` / `DecimalParameter` / `CategoricalParameter`), bornes, défaut, espace, décimales |
+| `freqtrade_param_specs` | `freqtrade_parameters` | dérive la liste des `FreqtradeParamSpec` d'une stratégie maison (depuis `ParamsModel` et `PARAM_SPACE`) |
+| `freqtrade_parameter_attributes` | `freqtrade_parameters` | rend le dictionnaire d'attributs de classe (`{"ema_fast": IntParameter(...), …}`) injecté dans l'espace de noms de la classe engendrée |
+| `startup_candle_count_for` | `freqtrade_parameters` | dérive `startup_candle_count` des paramètres de la stratégie (périodes d'indicateurs) au lieu de le laisser à `0` |
+| `DEFAULT_FREQTRADE_STOPLOSS` | `freqtrade_stoploss` | `-0.99` — l'attribut global `stoploss` de la classe engendrée : une borne dure, jamais le stop réellement utilisé |
+| `entry_stop_map` | `freqtrade_stoploss` | table (mémoire de process) des stops **par bougie de signal** construite pendant la traduction de la frame de signaux |
+| `signal_candle_for` | `freqtrade_stoploss` | retrouve la bougie de signal d'un trade (`trade.open_date_utc` décalée d'une bougie) |
+| `lookup_entry_stop` | `freqtrade_stoploss` | lit le stop associé à cette bougie dans `entry_stop_map` (trois clés essayées : bougie de signal, bougie d'exécution, horodatage brut) et rend `None` si rien ne correspond — Freqtrade retombe alors sur son attribut `stoploss` |
+| `stoploss_ratio_from_absolute` | `freqtrade_stoploss` | convertit un **prix** de stop absolu (colonne `stop_loss`) en **ratio** relatif au prix courant : délègue à l'helper natif `freqtrade.strategy.stoploss_from_absolute(stop_rate, current_rate, is_short=…)` (seule unité acceptée par `custom_stoploss`) |
+| `freqtrade_strategy_namespace` | `freqtrade_adapter` | construit l'espace de noms injecté dans `type(...)` : attributs d'instance gelés (`timeframe`, `can_short`, `minimal_roi`, `process_only_new_candles`, `use_custom_stoploss`, `INTERFACE_VERSION`…) et les trois `populate_*` |
+| `BasicFreqtradeStrategy` | `freqtrade_basic` | la classe concrète de `basic` : `make_freqtrade_strategy("basic")`, chargeable par nom par Freqtrade |
+| `BASIC_FREQTRADE_STRATEGY_NAME` | `freqtrade_basic` | `"BasicStrategy"` — le nom visible côté Freqtrade, celui de `config/freqtrade_config.json` et `config/freqtrade_dryrun.json` |
+
+**Note de nommage.** La conversion « stop absolu -> ratio » existe en deux
+exemplaires : l'**helper natif de Freqtrade** `stoploss_from_absolute`
+(`freqtrade.strategy.stoploss_from_absolute(stop_rate, current_rate,
+is_short=False, leverage=1.0)`, vérifié en 2026.8) et le **wrapper maison**
+`stoploss_ratio_from_absolute`, qui n'est qu'une délégation vérifiée à
+l'helper natif — avec l'erreur explicite `StrategyError` quand l'extra
+`freqtrade` est absent. Le token `stoploss_from_absolute` employé dans cette
+documentation désigne donc bien l'API **amont**, pas un symbole maison
+supplémentaire.
 
 ### 4.5 Validation — `trading_backtest.validation`
 
@@ -295,6 +377,228 @@ Le point d'entrée console est `trading-backtest = trading_backtest.cli:main`
 (déclaré dans `pyproject.toml`) ; `python -m trading_backtest …`
 (`__main__.py`) est strictement équivalent. Détail des options :
 [`docs/usage.md`](usage.md#4-exemples-cli).
+
+### 4.9 L'adaptateur Freqtrade — écrire une stratégie **une fois**, l'exposer deux fois
+
+L'adaptateur est la brique 1 de la trajectoire vers le temps réel multi-profils
+(un profil = actif + stratégie + timeframe + paper/live). Son principe tient en
+une phrase : **les indicateurs et les règles d'entrée/sortie restent écrits dans
+`trading_backtest.strategy`**, et l'adaptateur ne fait que **traduire** entre
+deux contrats — celui du moteur maison et celui de
+`freqtrade.strategy.IStrategy`. Aucune règle métier n'est recopiée.
+
+Les faits ci-dessous ont été **vérifiés contre l'interface réelle** de Freqtrade
+2026.8 installé dans `.venv` (`INTERFACE_VERSION = 3`), jamais contre une
+supposition.
+
+#### 4.9.1 Le contrat de traduction
+
+Freqtrade 2026.8 impose exactement trois méthodes de peuplement :
+
+```
+populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame
+populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame
+populate_exit_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame
+```
+
+Les attributs de classe lus par Freqtrade sont `INTERFACE_VERSION`, `timeframe`,
+`stoploss`, `can_short`, `minimal_roi`, `startup_candle_count`,
+`use_custom_stoploss` et `process_only_new_candles`. La traduction faite par
+l'adaptateur :
+
+| Contrat maison | Contrat Freqtrade 2026.8 | Traitement |
+| --- | --- | --- |
+| colonne `entry_long` | colonne `enter_long` | **renommage** — `entry_long` n'existe pas côté Freqtrade, c'est le piège n°1 de ce contrat (`SIGNAL_TO_FREQTRADE_COLUMNS`) |
+| colonne `exit_long` | colonne `exit_long` | nom inchangé |
+| colonne `entry_short` | colonne `enter_short` | **renommage** (même piège, côté short) |
+| colonne `exit_short` | colonne `exit_short` | nom inchangé |
+| colonne `stop_loss` (par bougie) | attribut `stoploss` global | `stoploss = DEFAULT_FREQTRADE_STOPLOSS` (`-0.99`) : borne dure, **jamais** le stop utilisé ; le stop réel est capturé dans `entry_stop_map` et rejoué par `use_custom_stoploss = True` + `custom_stoploss()` (§4.9.4). La colonne `stop_loss` reste malgré tout dans la frame Freqtrade, **pour audit seulement** — Freqtrade l'ignore (elle ne fait pas partie de ses `HEADERS`) |
+| `ParamsModel` / `StrategyParams` (pydantic) | `IntParameter` / `DecimalParameter` / `CategoricalParameter` | traduction automatique quand elle est **exacte** (§4.9.3) |
+| `Strategy.prepare` + `Strategy.signals` | les trois `populate_*` | `prepare` alimente `populate_indicators` ; `signals` alimente `populate_entry_trend` et `populate_exit_trend` |
+| — | `INTERFACE_VERSION` | `FREQTRADE_INTERFACE_VERSION = 3` |
+| — | `minimal_roi` | `{"0": 100.0}` : le ROI table de Freqtrade est **désactivé** — le moteur maison ne produit jamais de take-profit, en activer un rendrait les deux exécutions encore moins comparables |
+| — | `use_custom_stoploss` | `True` — c'est le seul mécanisme qui permette de rejouer un stop **par trade** |
+| — | `can_short` | `True` si la stratégie maison déclare `allow_short`, `False` sinon |
+| — | `process_only_new_candles` | `True` (défaut Freqtrade) |
+| — | `startup_candle_count` | dérivé des paramètres par `startup_candle_count_for` : le plus grand champ `int` du modèle (donc `21`, soit `ema_slow`, pour `basic`), `0` si le modèle n'en déclare aucun |
+
+Deux détails de forme, vérifiés sur les données réelles du cache
+(`data/cache/binance/BTC_USDT/1h.parquet`) :
+
+- la frame reçue par un `populate_*` a un **`RangeIndex` positionnel** et porte
+  l'horodatage dans une **colonne `date`** (tz-aware UTC), pas dans son index —
+  `house_frame` la convertit vers le contrat OHLCV du §5
+  (`DatetimeIndex` UTC nommé `timestamp`), et les trois `freqtrade_*_frame`
+  font le chemin inverse ;
+- le traitement est **positionnel et non destructif** : l'adaptateur n'ajoute ni
+  ne supprime aucune ligne, ne réordonne rien et ne consomme pas la frame reçue
+  (aucune mutation de l'argument). Le nombre de lignes rendues par chaque
+  `populate_*` est exactement celui reçu.
+
+#### 4.9.2 Écrire une stratégie **une seule fois**
+
+Le mode d'emploi tient en quatre étapes, et la quatrième est la seule qui parle
+de Freqtrade :
+
+1. **écrire la stratégie maison** — hériter de `Strategy`, implémenter
+   `prepare` (indicateurs, avec `strategy.indicators`) et `signals` (colonnes
+   `entry_long` / `exit_long` / `entry_short` / `exit_short` / `stop_loss`),
+   déclarer un `ParamsModel` pydantic et un `PARAM_SPACE` ;
+2. **l'enregistrer** avec `@register_strategy` — c'est ce qui la rend résolvable
+   par `get_strategy(name)` **et** par `make_freqtrade_strategy(name)` ;
+3. **la valider avec le moteur maison** : `backtest`, `walk-forward`,
+   `robustness`, `monte-carlo` — c'est là que la stratégie se gagne ou se perd ;
+4. **l'exposer à Freqtrade** — une seule ligne de code, et **aucun** code par
+   stratégie :
+
+   ```python
+   BasicFreqtradeStrategy = make_freqtrade_strategy("basic")
+   ```
+
+   puis, dans `user_data/strategies/<ClassName>.py`, la déclaration d'une ligne
+   qui donne à Freqtrade le nom qu'il attend :
+
+   ```python
+   class BasicStrategy(BasicFreqtradeStrategy):
+       pass
+   ```
+
+Le **résolveur** de shim est volontairement strict, pour qu'un fichier périmé ne
+puisse pas passer silencieusement : le texte du fichier doit contenir
+littéralement `class <Name>(` et le `__module__` de la classe chargée doit être
+égal au *stem* du fichier. Concrètement, `user_data/strategies/BasicStrategy.py`
+doit définir `class BasicStrategy(` et la classe doit avoir
+`__module__ == "BasicStrategy"`.
+
+Cette règle n'ajoute **aucune** logique dans `user_data/` : le shim ne contient
+ni indicateur, ni règle d'entrée, ni paramètre. Toute la logique reste dans la
+couche maison ; supprimer le shim ne change rien au backtest maison.
+
+#### 4.9.3 Traduction des paramètres pydantic
+
+La traduction est **déterministe** (ordre de déclaration de
+`ParamsModel.model_fields`) et se fait en deux temps : `freqtrade_param_specs`
+produit des descriptions **inertes** (`FreqtradeParamSpec`, testables hors
+ligne, sans Freqtrade), puis `freqtrade_parameter_attributes` produit les
+**vrais** objets Freqtrade (importés *dans* la fonction).
+
+| Annotation pydantic | Paramètre Freqtrade produit |
+| --- | --- |
+| `bool` | `BooleanParameter(default=..., space="buy")` |
+| `int` | `IntParameter(low, high, default=..., space="buy")` |
+| `float` | `DecimalParameter(low, high, default=..., decimals=3, space="buy")` |
+| grille `PARAM_SPACE` à ≥ 2 candidats **passée explicitement**, et dont le défaut est l'un des candidats | `CategoricalParameter(categories=..., default=...)` |
+| toute autre annotation (`str`, `Enum`, `datetime`, `Sequence`) | **non mappée** : absente du résultat, le défaut maison s'applique à l'exécution |
+
+Les bornes sont lues par *duck-typing* des métadonnées pydantic v2
+(`ge` / `gt` / `lt` / `le`) :
+
+- `int` — `low = ge`, sinon `gt + 1`, sinon `0` ; `high = le`, sinon `lt − 1`,
+  sinon `max(low + 1, int(default × 2.0))` ;
+- `float` — `low = ge`, sinon `gt + 10⁻³`, sinon `0.0` ; `high = le`, sinon
+  `lt − 10⁻³`, sinon `round(default × 2.0, 3)` ; `decimals = 3`.
+
+**Garde obligatoire** : Freqtrade ne vérifie **pas** que le défaut tombe dans
+`[low, high]` (`IntParameter(1, 18, default=20)` est accepté silencieusement en
+2026.8), donc chaque spec numérique est **clampée** jusqu'à ce que
+`low <= default <= high` et `low < high` tiennent — une plage de largeur nulle
+ferait échantillonner un unique point à l'hyperopt.
+
+Limites de cette traduction, écrites ici plutôt que découvertes plus tard :
+
+1. les bornes **exclusives** `gt` / `lt` sont approximées par un décalage de
+   `10**-decimals` (Freqtrade n'a que des bornes inclusives) : l'ensemble
+   admissible est **rétréci**, jamais élargi ;
+2. `extra="forbid"` et les invariants inter-champs (`ema_slow > ema_fast`,
+   `rsi_min < rsi_max`) n'ont **aucun** équivalent Freqtrade, dont les
+   paramètres sont des objets indépendants champ par champ : ils restent
+   appliqués par le `ParamsModel` maison, que l'adaptateur **revalide** au
+   moment de l'exécution ;
+3. les paramètres Freqtrade sont des **attributs de classe** : un fichier de
+   paramètres Freqtrade (`--strategy-params` / `buy_params`) peut les
+   surcharger et **contourner** le modèle maison — d'où la revalidation du
+   point 2 ;
+4. la grille de `PARAM_SPACE` n'est **jamais devinée** : elle est passée
+   explicitement (`grid=…`) ; sans elle, chaque champ garde son type numérique.
+
+**Mapping manuel.** `freqtrade_param_specs(..., overrides={…})` est
+l'échappatoire documentée : après la passe automatique, une entrée **remplace**
+une spec par nom (à la même position) ou en **ajoute** une (en fin de liste) —
+c'est le chemin pour exposer un champ non mappé du point précédent, par exemple
+en `CategoricalParameter`. Une spec surchargée passe par la **même** garde
+numérique : une surcharge mal formée est réparée, jamais émise telle quelle.
+
+#### 4.9.4 L'écart de modèle d'exécution — écrit noir sur blanc
+
+**Les deux backtests ne donneront pas les mêmes chiffres.** C'est **attendu**, ce
+n'est pas un bug, et les **signaux** — eux — sont bien identiques.
+
+Le point commun, vérifié dans le code de Freqtrade 2026.8 : la convention
+« décision à la clôture de `t`, exécution à l'ouverture de `t+1` » est la même
+des deux côtés. Le docstring gelé de `strategy/engine.py` la formule ainsi :
+
+> signals are evaluated **at the close of candle ``t``** and filled **at the
+> open of candle ``t + 1``**
+
+Côté Freqtrade, `Backtesting._get_ohlcv_as_lists` **décale les colonnes de
+signal d'une bougie** (`.shift(1)`) puis supprime la première ligne, et la
+boucle d'entrée entre au prix `row[OPEN_IDX]` — c'est-à-dire à l'**ouverture**
+de la bougie qui suit le signal. Le moteur maison fait exactement la même
+chose.
+
+Tout le reste diffère :
+
+| Point | Moteur maison (`strategy.engine`) | Freqtrade 2026.8 |
+| --- | --- | --- |
+| Signal -> fill | clôture de `t` -> ouverture de `t+1` (achat `open × (1 + slippage)`, vente `open × (1 − slippage)`) | **même convention** (signaux décalés d'une bougie, entrée à `row[OPEN_IDX]`) |
+| Type d'ordre | prix d'ouverture, plus slippage paramétrique | `entry` / `exit` / `stoploss` en **limit** par défaut, `stoploss_on_exchange = False` : les prix d'exécution peuvent différer du prix théorique |
+| Frais | `fee_rate × size × (entry_price + exit_price)`, les deux jambes | frais de l'exchange, maker/taker, résolus par la config et la précision de la paire |
+| Take-profit | **jamais** produit (`TAKE_PROFIT` existe dans l'enum mais n'est jamais émis) | **désactivé** par l'adaptateur via `minimal_roi = {"0": 100.0}` ; Freqtrade sait faire, on lui dit de ne pas le faire |
+| Stop-loss | colonne `stop_loss` de la **bougie de signal**, **statique** pour tout le trade, testée intrabar depuis la bougie d'entrée contre `low` (long) / `high` (short), remplie **au prix du stop** | stop **absolu capturé** sur la bougie de signal puis reconverti en ratio à **chaque** appel de `custom_stoploss()` (rien n'est mis en cache : le stop reste absolu et ne dérive donc pas en trailing stop) ; borné par `self.stoploss = -0.99`, et Freqtrade ne l'applique que s'il **resserre** le stop live — le stop exécuté peut être plus serré, jamais plus large, que celui du moteur maison |
+| Nombre de positions | **une seule** à la fois : un signal d'entrée pendant une position ouverte est ignoré | `max_open_trades` de la config (`1`) **et** une seule position par paire : la contrainte se rejoint, mais par deux mécanismes différents (verrous de paire, protections) |
+| Ordres non remplis | sans objet : le fill est supposé au prix d'ouverture | `unfilledtimeout` et expiration d'ordre : un ordre limit non rempli peut être annulé, retardé ou re-tarifé |
+| Analyse des bougies | à chaque bougie | `process_only_new_candles` : l'analyse peut être sautée sur une bougie déjà vue |
+| Startup | aucun échauffement implicite, la stratégie gère ses `NaN` | `startup_candle_count` **rogne** les premières bougies : les fenêtres ne portent pas sur le même nombre de bougies |
+| Précision et coûts d'exchange | prix bruts du CSV / parquet | précision, pas de cotation, minimum notionnel, funding en futures |
+| Sortie | ordre de priorité : stop -> signal -> fin de données (`END_OF_DATA` à la dernière clôture) | ordre de priorité **propre à Freqtrade** : stop-loss, puis ROI, puis signal de sortie, puis sortie forcée |
+| Sortie de fin de série | position ouverte sur la dernière bougie **fermée à la dernière clôture** | la position reste ouverte et est marquée « open trade » dans le rapport de backtest |
+
+**Conclusion, à retenir telle quelle : les SIGNAUX partagés sont le contrat ; le
+PnL, la liste des trades et les métriques ne sont PAS comparables entre les deux
+backtests, et une divergence n'est pas un bug.** Un écart entre le backtest
+maison et le backtest Freqtrade est le **prix normal** de deux moteurs
+d'exécution différents ; ce qu'il faut vérifier, c'est que les **colonnes de
+signal** coïncident bougie par bougie (c'est ce que fait le test d'intégration),
+pas que les rendements s'égalent.
+
+Le détail des hypothèses d'exécution du moteur maison — et de leur lecture — est
+dans [`docs/backtesting-methodology.md`](backtesting-methodology.md).
+
+#### 4.9.5 Limites connues de l'adaptateur
+
+- **La table des stops vit en mémoire de process.** `entry_stop_map` associe une
+  bougie de signal à son stop absolu ; elle est reconstruite à chaque cycle
+  d'analyse mais **jamais persistée**, et ne connaît **aucun élagage** : environ
+  un flottant par bougie et par paire pour toute la durée de vie du process —
+  une limite réelle sur un run live en 1 minute qui tourne des mois. Un trade
+  dont la bougie de signal sort de la fenêtre chargée (`lookup_entry_stop` rend
+  alors `None`) retombe sur le stop global `-0.99`.
+- **Aucun take-profit et aucune durée maximale** ne sont traduits : le moteur
+  maison ne les produit pas, l'adaptateur ne les invente pas.
+- **Le ROI Freqtrade est désactivé** (`minimal_roi = {"0": 100.0}`) : activer un
+  ROI côté Freqtrade ferait diverger les deux exécutions sans qu'aucune règle
+  maison ne le justifie.
+- **La traduction des paramètres a ses trous** (§4.9.3) : bornes exclusives
+  approximées, invariants inter-champs non traduits, champs d'annotation non
+  scalaire non mappés, et surcharge possible par un fichier de paramètres
+  Freqtrade — d'où la revalidation du modèle maison à l'exécution.
+- **Le shim n'est pas un mécanisme de synchronisation** : si `BasicStrategy.py`
+  et la stratégie maison divergent (mauvais nom de classe, fichier périmé), le
+  résolveur échoue — c'est voulu — mais rien ne réécrit le fichier
+  automatiquement.
+- **Un seul profil à la fois.** L'adaptateur expose **une** stratégie pour **un**
+  couple actif/timeframe : il n'y a pas encore d'orchestration multi-profils, ni
+  de sélection de profil par le bot. C'est précisément la brique suivante.
 
 ---
 
@@ -493,6 +797,7 @@ paires `(timestamp, valeur)` sérialisables.
 | Nouveau mode de validation | nouveau module dans `trading_backtest.validation`, exposé par la CLI, sans toucher au moteur |
 | Nouvel exchange | implémentation dans `trading_backtest.data`, l'import `ccxt` restant paresseux |
 | Nouveau format de rapport | branche supplémentaire dans `write_report`, activée par `reporting.formats` |
+| Exposer une stratégie à Freqtrade | **aucun code par stratégie** : `make_freqtrade_strategy(<nom enregistré>)` rend la classe `IStrategy` générique (§4.9.2), puis une déclaration de classe d'**une ligne** dans `user_data/strategies/<ClassName>.py`. Résolveur de shim : le texte du fichier doit contenir `class <Name>(` et `__module__` doit valoir le *stem* du fichier |
 
 ---
 
@@ -508,3 +813,20 @@ l'interprétation des résultats est dans
 Ajouter une brique (levier, multi-positions, coûts de financement) se fait
 **dans la couche concernée** (respectivement `strategy.engine`, `strategy.engine`,
 `metrics`), jamais en travers des couches.
+
+Limites **restantes** de la brique Freqtrade (§4.9) — elles sont assumées et
+écrites ici pour ne pas être découvertes en production :
+
+- **la table des stops vit en mémoire de process** (`entry_stop_map`) et n'est
+  pas persistée : un redémarrage du bot perd le stop par trade des positions
+  déjà ouvertes, qui retombe sur le stop global ;
+- **les configurations sont spécifiques au mode d'exécution** :
+  `config/freqtrade_dryrun.json` (paper) et `config/freqtrade_config.json`
+  (live) sont deux fichiers distincts, à garder cohérents **à la main** avec
+  `config/backtest_default.json` — le squelette ne synchronise rien ;
+- **aucune orchestration multi-profils** n'existe encore : l'adaptateur expose
+  *une* stratégie pour *un* couple actif/timeframe. Un profil = actif +
+  stratégie + timeframe + paper/live reste à construire ; l'adaptateur en est la
+  **brique 1**, pas la brique finale ;
+- **les deux backtests ne produisent pas les mêmes chiffres** (§4.9.4), et aucun
+  mécanisme ne cherche à les réconcilier : seuls les **signaux** sont le contrat.

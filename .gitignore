@@ -29,6 +29,9 @@ env/
 # ---- Freqtrade ----
 user_data/*
 !user_data/README.md
+!user_data/strategies/
+user_data/strategies/*
+!user_data/strategies/BasicStrategy.py
 *.log
 logs/
 freqtrade-*.log
@@ -63,6 +66,7 @@ hyperopt_results/
 .uv/
 .scratch/
 .cache/
+.dsh-tmp/
 
 # ---- Reports (generated) ----
 reports/

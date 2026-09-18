@@ -13,6 +13,17 @@ by any work package — every package may read it, no package may modify it.
    (`trading_backtest.data.synthetic`) or read from a CSV fixture checked into `tests/fixtures/`.
 2. **No real Freqtrade dependency in tests.** `freqtrade` is an *optional* extra. The suite must be
    green with only `.[dev]` installed.
+   * The guard goes **inside the test body** (`pytest.importorskip("freqtrade")`), never at module
+     level, whenever the same file also carries assertions that must run *without* the extra: a
+     module-level guard skips the whole module, offline assertions included.
+   * Simulating the missing extra in-process means `monkeypatch.setitem(sys.modules, "freqtrade",
+     None)` **plus** dropping the cached `freqtrade.*` submodules through `monkeypatch` — a cached
+     submodule is served straight from `sys.modules` and the simulation silently stops biting. Those
+     purges must stay inside `monkeypatch` (or a subprocess): permanently deleting `freqtrade.*`
+     makes the next import build a **second** `IStrategy` class, and `issubclass`/`isinstance`
+     checks against the first one (Freqtrade's own `StrategyResolver` included) then fail.
+   * From pytest 9.1 on, `importorskip` skips on `ModuleNotFoundError` only: a simulation whose
+     blocker raises plain `ImportError` errors out instead of skipping.
 3. **Determinism.** Any test involving randomness passes an explicit seed. Two runs of the full
    command must produce identical results.
 4. **`pyproject.toml` is shared and frozen.** Packages must never edit it. All pytest, coverage,
