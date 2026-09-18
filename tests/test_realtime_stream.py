@@ -38,7 +38,7 @@ import pytest
 from trading_backtest.core.constants import REQUIRED_OHLCV_COLUMNS, candle_delta
 from trading_backtest.core.errors import MarketStreamError
 from trading_backtest.realtime import stream as stream_module
-from trading_backtest.realtime.clock import ManualClock
+from trading_backtest.realtime.clock import ManualClock, SystemClock
 from trading_backtest.realtime.models import CandleEvent
 from trading_backtest.realtime.stream import (
     CcxtProMarketStream,
@@ -627,6 +627,61 @@ def test_polling_emits_only_closed_candles() -> None:
     assert (symbol, timeframe) == (BTC, HOUR)
     assert until == pd.Timestamp("2024-01-01 12:00", tz="UTC")
     assert since == until - 2 * candle_delta(HOUR)
+
+
+def test_polling_idle_wait_survives_when_the_interval_equals_the_timeout() -> None:
+    """``poll_interval_seconds == timeout_seconds`` must not raise ``TimeoutError``.
+
+    Regression test for the defect that crash-looped the Docker deployment: the
+    idle wait slept the poll interval under a bound of exactly the same duration,
+    so the two deadlines collided on the first idle poll and every profile died.
+    A real clock is required -- ``ManualClock.sleep`` returns immediately, so the
+    collision only exists when the sleep really awaits.
+    """
+    stream, _provider = make_polling(
+        clock=SystemClock(),
+        count=2,
+        poll_interval_seconds=0.05,
+        timeout_seconds=0.05,
+    )
+
+    async def scenario() -> list[Any]:
+        await stream.start()
+        return [await stream.next_candle(BTC, HOUR) for _ in range(3)]
+
+    events = run(scenario())
+    assert events[0] is not None, "the first poll must deliver the closed candle"
+    assert events[1:] == [None, None], "an idle poll reports 'nothing new'"
+    assert stream.last_error is None
+
+
+def test_polling_backoff_may_pass_the_timeout_without_being_cut_short() -> None:
+    """An exponential retry delay larger than the stream timeout still completes.
+
+    A pacing wait is not a read: bounding the backoff by ``timeout_seconds`` cut the
+    third retry (0.04 s under a 0.02 s bound) short with a ``TimeoutError``, which
+    killed a profile over a failure the stream is designed to ride out.  A real
+    clock is used so the collision actually schedules.
+    """
+    stream, provider = make_polling(
+        clock=SystemClock(),
+        timeout_seconds=0.02,
+        max_reconnects=4,
+        reconnect_backoff_seconds=0.01,
+        fail_forever=True,
+    )
+
+    async def scenario() -> None:
+        await stream.start()
+        await stream.next_candle(BTC, HOUR)
+
+    with pytest.raises(MarketStreamError) as excinfo:
+        run(scenario())
+
+    assert "gave up after 4 attempts" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert len(provider.calls) == 4
+    assert stream.reconnect_count == 4
 
 
 def test_polling_returns_none_when_nothing_is_new_and_waits_one_poll_interval() -> None:

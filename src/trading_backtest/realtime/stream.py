@@ -91,7 +91,35 @@ LOGGER = logging.getLogger(__name__)
 #: a misbehaving child, so they are bounded by this explicit constant.
 _FAN_OUT_TIMEOUT_SECONDS = 10.0
 
+
 #: Message raised when the optional ``exchange`` extra (ccxt/ccxt.pro) is missing.
+def _wait_bound(delay: float) -> float:
+    """Return a bound strictly greater than the pacing wait it wraps.
+
+    See :data:`_WAIT_MARGIN_RATIO`: the bound must never equal the wait, or the
+    two deadlines collide and a healthy idle poll is reported as a timeout.
+    """
+    return max(0.0, float(delay)) * (1.0 + _WAIT_MARGIN_RATIO) + _WAIT_MARGIN_FLOOR_SECONDS
+
+
+_MISSING_CCXT_PRO = "ccxt.pro is not installed: pip install -e '.[exchange]'"
+
+#: Head-room added to the bound of every pacing wait this module owns.
+#:
+#: Every wait of the layer is bounded (that is the rule), but a bound *equal to the
+#: wait it wraps* is a race, not a bound: the idle wait used the profile's poll
+#: interval while the bound used the stream timeout, so an operator configuring
+#: both to the same value -- the natural thing to do, and the shape the Docker
+#: deployment ships -- got a ``TimeoutError`` on the first idle poll, which killed
+#: every profile and crash-looped the container.  A pacing wait is also not a read:
+#: its duration is the poll interval (or a retry backoff), never the stream
+#: timeout, so its bound is derived from the wait itself -- proportional, plus a
+#: small floor -- which keeps every configured delay intact and can never be the
+#: cause of its own timeout.
+_WAIT_MARGIN_RATIO = 0.05
+_WAIT_MARGIN_FLOOR_SECONDS = 0.05
+
+
 _MISSING_CCXT_PRO = "ccxt.pro is not installed: pip install -e '.[exchange]'"
 
 
@@ -637,14 +665,26 @@ class PollingMarketStream:
 
     async def _idle(self) -> None:
         """Wait one poll interval (bounded) before reporting "nothing new"."""
-        await asyncio.wait_for(
-            self._clock.sleep(self._poll_interval_seconds), timeout=self._timeout_seconds
-        )
+        await self._bounded_sleep(self._poll_interval_seconds)
+
+    async def _bounded_sleep(self, seconds: float) -> None:
+        """Sleep ``seconds`` under a bound that can never cut the sleep itself.
+
+        A *pacing* wait is not a stream read: its nominal duration is the poll
+        interval (or a retry backoff), not the stream timeout, so bounding it by
+        ``timeout_seconds`` made the bound equal to the wait whenever an operator
+        configured the two to the same value -- and the two deadlines then
+        collided on the first idle poll, raising ``TimeoutError`` and crash-looping
+        the deployment.  The bound is now derived from the wait itself, which keeps
+        every configured delay intact and can never be the cause of its own
+        timeout.
+        """
+        delay = max(0.0, float(seconds))
+        await asyncio.wait_for(self._clock.sleep(delay), timeout=_wait_bound(delay))
 
     async def _backoff(self, attempt: int) -> None:
         """Sleep the bounded exponential backoff of failed attempt ``attempt``."""
-        delay = self._reconnect_backoff_seconds * 2 ** (attempt - 1)
-        await asyncio.wait_for(self._clock.sleep(delay), timeout=self._timeout_seconds)
+        await self._bounded_sleep(self._reconnect_backoff_seconds * 2 ** (attempt - 1))
 
     def _record_failure(self, message: str) -> None:
         """Record a failed poll: health, counter and one structured warning."""
@@ -875,9 +915,15 @@ class CcxtProMarketStream:
     # -- internals ---------------------------------------------------------
 
     async def _backoff(self, attempt: int) -> None:
-        """Sleep the bounded exponential backoff of failed attempt ``attempt``."""
+        """Sleep the bounded exponential backoff of failed attempt ``attempt``.
+
+        The delay grows with the attempt (2 s, 4 s, 8 s …) and may pass the stream
+        timeout: it is a pacing wait, so it is bounded by its own duration plus a
+        proportional margin rather than by the read timeout, which used to cut a
+        retryable venue failure short with a ``TimeoutError``.
+        """
         delay = self._reconnect_backoff_seconds * 2 ** (attempt - 1)
-        await asyncio.wait_for(self._clock.sleep(delay), timeout=self._timeout_seconds)
+        await asyncio.wait_for(self._clock.sleep(delay), timeout=_wait_bound(delay))
 
     def _record_failure(self, message: str) -> None:
         """Record a failed read: health, counter and one structured warning."""

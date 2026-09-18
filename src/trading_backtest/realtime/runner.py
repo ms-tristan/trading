@@ -102,16 +102,18 @@ _LOGGER = logging.getLogger(LOGGER_NAME)
 #: Lowest number of rows a frame must hold before a strategy may decide.
 MIN_FRAME_ROWS = 2
 
-#: Head-room added to the bound of the pacing sleep between two ticks.
+#: Relative and absolute head-room added to every bound this module applies.
 #:
-#: The sleep is deliberately capped at the profile's poll interval, and it used to
-#: be wrapped in a ``wait_for`` of exactly the stream timeout: whenever a profile's
-#: poll interval equalled that timeout -- the natural thing to configure, and the
-#: shape the Docker deployment uses -- the two deadlines fell on the same instant
-#: and the tick died with ``TimeoutError`` on the first idle poll, taking the whole
-#: platform down with it.  The sleep now gets one extra second of budget, so it can
-#: never be the cause of its own timeout.
-_PACING_GRACE_SECONDS = 1.0
+#: A bound *equal to the wait it wraps* is a race, not a bound: the pacing sleep and
+#: the stream calls were bounded by exactly the stream timeout, so whenever a
+#: profile's poll interval equalled that timeout -- the natural thing to configure,
+#: and the shape the Docker deployment ships -- the two deadlines fell on the same
+#: instant and the tick died with ``TimeoutError`` on the first idle poll, taking
+#: the whole platform down with it.  The margin stays proportional so a tight bound
+#: (a test, or an operator asking for a 50 ms budget) is still tight: 5 % plus 50 ms
+#: leaves a 0.05 s budget at ~0.10 s and a 30 s budget at ~31.6 s.
+_BOUND_MARGIN_RATIO = 0.05
+_BOUND_MARGIN_FLOOR_SECONDS = 0.05
 
 #: Order type every order of the engine uses (the venue decides the fill).
 _ORDER_TYPE = OrderType.MARKET
@@ -372,6 +374,15 @@ class ProfileRunner:
             self._store.save_status(self.profile_id, ProfileStatus.RUNNING, detail="running")
         self._started = True
 
+    def _bound(self) -> float:
+        """Return the bound applied to one wait of this profile's loop.
+
+        Derived from ``self._timeout`` and always strictly greater than it, so no
+        wait of the loop can be cut short by a bound equal to its own nominal
+        duration (see :data:`_BOUND_MARGIN_RATIO`).
+        """
+        return self._timeout * (1.0 + _BOUND_MARGIN_RATIO) + _BOUND_MARGIN_FLOOR_SECONDS
+
     async def stop(self) -> None:
         """Persist ``STOPPED``; the runner closes nothing it does not own.
 
@@ -436,7 +447,7 @@ class ProfileRunner:
                         self._clock.sleep(
                             min(float(self._profile.poll_interval_seconds), self._timeout)
                         ),
-                        timeout=self._timeout + _PACING_GRACE_SECONDS,
+                        timeout=self._bound(),
                     )
                 except asyncio.CancelledError:
                     raise
@@ -464,9 +475,12 @@ class ProfileRunner:
         symbol = str(self._profile.symbol)
         timeframe = str(self._profile.timeframe)
 
-        # 1. the next candle, always bounded.
+        # 1. the next candle, always bounded.  The bound carries the same
+        #    head-room as the pacing sleep: a stream that is idle legitimately
+        #    waits a whole poll interval, which may equal ``self._timeout``.
         candle = await asyncio.wait_for(
-            self._stream.next_candle(symbol, timeframe), timeout=self._timeout
+            self._stream.next_candle(symbol, timeframe),
+            timeout=self._bound(),
         )
         if candle is None:
             return None
@@ -489,7 +503,8 @@ class ProfileRunner:
 
         # 3. the frame ending at this candle.
         history = await asyncio.wait_for(
-            self._stream.history(symbol, timeframe, self._warmup), timeout=self._timeout
+            self._stream.history(symbol, timeframe, self._warmup),
+            timeout=self._bound(),
         )
         frame = ensure_ohlcv(
             self._build_frame(history, candle, stamp), name=f"realtime:{self.profile_id}"
