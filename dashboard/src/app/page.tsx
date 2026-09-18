@@ -23,6 +23,19 @@ interface Overview {
 }
 
 /**
+ * The page heading.
+ *
+ * It is deliberately **visually hidden**: the app shell already names the
+ * surface ("Trading Platform — real-time monitor"), so a second visible title
+ * plus a one-line subtitle was pure duplication at the top of every render.
+ * It stays in the accessibility tree because a page without a level-1 heading
+ * loses its screen-reader outline.
+ */
+function PageHeading() {
+  return <h1 className="sr-only">Overview</h1>;
+}
+
+/**
  * First paint rendered when the monitoring API cannot be reached.
  *
  * It is an ordinary page render, not an error screen: the operator gets the
@@ -32,12 +45,7 @@ interface Overview {
 function ApiUnreachable({ message, baseUrl }: { message: string; baseUrl: string }) {
   return (
     <div className="flex flex-col gap-xl">
-      <header>
-        <h1 className="font-mono text-xl font-semibold text-foreground">Overview</h1>
-        <p className="mt-xs text-sm text-muted-foreground">
-          Every trading profile at a glance, refreshed by HTTP polling.
-        </p>
-      </header>
+      <PageHeading />
       <ErrorBanner message={message} />
       <EmptyState
         title="The monitoring API is unreachable"
@@ -81,12 +89,7 @@ export default async function OverviewPage() {
 
   return (
     <div className="flex flex-col gap-2xl">
-      <header>
-        <h1 className="font-mono text-xl font-semibold text-foreground">Overview</h1>
-        <p className="mt-xs text-sm text-muted-foreground">
-          Every trading profile at a glance, refreshed by HTTP polling.
-        </p>
-      </header>
+      <PageHeading />
 
       <PlatformSummary health={health} killSwitch={killSwitch} profiles={profiles.profiles} />
 

@@ -1,0 +1,37 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 32 32"
+  width="32"
+  height="32"
+  role="img"
+  aria-label="Trading Platform"
+>
+  <!--
+    Favicon of the trading monitor.
+
+    It is the same mark as the app-shell brand (the `Activity` icon of the
+    Lucide set, geometry `M22 12h-4l-3 9L9 3l-3 9H2`, 24x24, round-capped
+    stroke), scaled onto a 32x32 tile: the 24-unit glyph is translated by 4 on
+    both axes to centre it, and the stroke is widened to 2.5 so the pulse stays
+    legible at 16px.
+
+    Colours come from the design system (design-system/trading-monitor/MASTER.md):
+    the background token #020617 for the tile and the accent token #22c55e for
+    the pulse. The tile is drawn rather than left transparent so the mark keeps
+    its contrast against both light and dark browser chrome.
+
+    Keep this comment free of double hyphens: XML forbids them inside a comment,
+    and the file would stop parsing as an SVG.
+  -->
+  <rect width="32" height="32" rx="8" fill="#020617" />
+  <g
+    transform="translate(4 4)"
+    fill="none"
+    stroke="#22c55e"
+    stroke-width="2.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+  </g>
+</svg>
