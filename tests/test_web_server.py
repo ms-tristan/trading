@@ -42,10 +42,12 @@ from trading_platform.realtime.models import (
     RunMode,
 )
 from trading_platform.realtime.monitor import Monitor
-from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.realtime.store import CandleRow, SqliteStateStore
 from trading_platform.web.server import (
+    CatalogProvider,
     MonitoringHandler,
     MonitoringServer,
+    ProfileController,
     SnapshotProvider,
     create_server,
     operator_token_from_env,
@@ -54,9 +56,11 @@ from trading_platform.web.server import (
 )
 
 PROFILE_A = "btc-paper"
+UNKNOWN_PROFILE = "ghost"
 START = datetime(2024, 1, 1, tzinfo=UTC)
 CLIENT_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
+TOKEN = "s3cret-operator-token"
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +108,23 @@ class FakeStore:
             last_candle_at=pd.Timestamp(START + timedelta(hours=2)),
             lag_seconds=3.0,
         )
+
+
+def make_candles(profile_id: str, count: int = 3) -> list[CandleRow]:
+    """Build ``count`` deterministic persisted candles, oldest first."""
+    return [
+        CandleRow(
+            profile_id=profile_id,
+            timestamp=pd.Timestamp(START + timedelta(hours=step)),
+            open=100.0 + step,
+            high=110.0 + step,
+            low=90.0 + step,
+            close=105.0 + step,
+            volume=2.5 + step,
+            closed=step < count - 1,
+        )
+        for step in range(count)
+    ]
 
 
 def make_profile_snapshot(profile_id: str) -> ProfileSnapshot:
@@ -167,6 +188,11 @@ class FakeProvider:
                 return profile
         return None
 
+    def candle_series(self, profile_id: str, limit: int) -> list[CandleRow]:
+        if profile_id != PROFILE_A:
+            return []
+        return make_candles(profile_id)[:limit]
+
     def engage_kill_switch(self, reason: str) -> Any:
         self.kill_switch = True
         self.kill_switch_reason = reason
@@ -218,6 +244,8 @@ def build_server(
     read_only: bool = True,
     operator_token: str | None = None,
     max_request_bytes: int = 65536,
+    controller: ProfileController | None = None,
+    catalog: CatalogProvider | None = None,
 ) -> MonitoringServer:
     """Build a bound server on an ephemeral loopback port."""
     return create_server(
@@ -227,6 +255,8 @@ def build_server(
         read_only=read_only,
         operator_token=operator_token,
         version="0.1.0",
+        controller=controller,
+        catalog=catalog,
     )
 
 
@@ -765,3 +795,255 @@ def test_a_polling_browser_never_exhausts_the_store_connections(tmp_path: Path) 
             )
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# the profile surface of the transport: candles, catalog, control, lifecycle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeCatalog:
+    """Local catalog seam (no network: the symbols are literals)."""
+
+    calls: int = 0
+
+    def catalog(self) -> dict[str, Any]:
+        self.calls += 1
+        return {
+            "symbols": [{"symbol": "BTC/USDT", "base": "BTC", "quote": "USDT"}],
+            "strategies": ["basic"],
+            "timeframes": ["1m", "1h"],
+            "modes": ["paper", "live"],
+        }
+
+
+@dataclass
+class FakeController:
+    """Local lifecycle seam recording every command it is handed."""
+
+    profiles: tuple[ProfileSnapshot, ...] = ()
+    commands: list[tuple[str, str]] = field(default_factory=list)
+
+    def pause_profile(self, profile_id: str) -> ProfileSnapshot:
+        self.commands.append(("pause", profile_id))
+        return self._snapshot(profile_id)
+
+    def resume_profile(self, profile_id: str) -> ProfileSnapshot:
+        self.commands.append(("resume", profile_id))
+        return self._snapshot(profile_id)
+
+    def delete_profile(self, profile_id: str) -> str:
+        self.commands.append(("delete", profile_id))
+        return profile_id
+
+    def create_profile(self, payload: Mapping[str, Any]) -> ProfileSnapshot:
+        self.commands.append(("create", str(payload["profile_id"])))
+        return make_profile_snapshot(str(payload["profile_id"]))
+
+    def control_state(self) -> Mapping[str, Any]:
+        return {
+            "profiles": [
+                {"profile_id": profile.profile_id, "paused": False, "running": True}
+                for profile in self.profiles
+            ]
+        }
+
+    @staticmethod
+    def _snapshot(profile_id: str) -> ProfileSnapshot:
+        return make_profile_snapshot(profile_id)
+
+
+def make_controller() -> FakeController:
+    """Build a controller exposing the one deterministic profile."""
+    return FakeController(profiles=(make_profile_snapshot(PROFILE_A),))
+
+
+def test_catalog_and_control_round_trip_over_http(server: MonitoringServer) -> None:
+    """Both new read routes answer the documented shapes with no engine running."""
+    status, headers, payload = http_request(server, "GET", "/api/catalog")
+    assert status == 200
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    catalog = decode(payload)
+    assert sorted(catalog) == ["modes", "strategies", "symbols", "timeframes"]
+    assert sorted(catalog["symbols"][0]) == ["base", "quote", "symbol"]
+    assert catalog["modes"] == ["paper", "live"]
+
+    status, _, payload = http_request(server, "GET", "/api/control")
+    assert status == 200
+    control = decode(payload)
+    assert sorted(control) == ["engine_running", "mutable", "profiles", "read_only"]
+    assert control["engine_running"] is False
+    assert control["read_only"] is True
+    assert control["mutable"] is False
+    assert control["profiles"] == []
+
+
+def test_the_catalog_route_answers_an_injected_catalog(
+    provider: FakeProvider, monitor: Monitor
+) -> None:
+    catalog = FakeCatalog()
+    built = build_server(provider, monitor, catalog=catalog)
+    with running(built) as server:
+        status, _, payload = http_request(server, "GET", "/api/catalog")
+        assert status == 200
+        assert decode(payload)["symbols"] == [
+            {"symbol": "BTC/USDT", "base": "BTC", "quote": "USDT"}
+        ]
+        assert catalog.calls == 1
+
+
+def test_the_candles_route_round_trips_and_validates_its_limit(
+    server: MonitoringServer,
+) -> None:
+    status, headers, payload = http_request(server, "GET", f"/api/profiles/{PROFILE_A}/candles")
+    assert status == 200
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    body = decode(payload)
+    assert sorted(body) == ["candles", "count"]
+    assert body["count"] == 3
+    for candle in body["candles"]:
+        assert sorted(candle) == [
+            "close",
+            "closed",
+            "high",
+            "low",
+            "open",
+            "profile_id",
+            "timestamp",
+            "volume",
+        ]
+    stamps = [datetime.fromisoformat(candle["timestamp"]) for candle in body["candles"]]
+    assert stamps == sorted(stamps)
+
+    status, _, payload = http_request(server, "GET", f"/api/profiles/{PROFILE_A}/candles?limit=1")
+    assert status == 200
+    assert decode(payload)["count"] == 1
+
+    status, _, payload = http_request(server, "GET", f"/api/profiles/{PROFILE_A}/candles?limit=0")
+    assert status == 400
+    assert decode(payload) == {
+        "error": "malformed query parameter: 'limit' must be a positive integer"
+    }
+
+    status, _, payload = http_request(server, "GET", f"/api/profiles/{UNKNOWN_PROFILE}/candles")
+    assert status == 404
+    assert decode(payload) == {"error": f"unknown profile: {UNKNOWN_PROFILE!r}"}
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("POST", f"/api/profiles/{PROFILE_A}/pause", b"{}"),
+        ("POST", f"/api/profiles/{PROFILE_A}/resume", b"{}"),
+        ("DELETE", f"/api/profiles/{PROFILE_A}", b""),
+        (
+            "POST",
+            "/api/profiles",
+            json.dumps(
+                {
+                    "profile_id": "sol-paper",
+                    "symbol": "SOL/USDT",
+                    "timeframe": "15m",
+                    "strategy": "basic",
+                    "mode": "paper",
+                }
+            ).encode(),
+        ),
+    ],
+)
+def test_a_read_only_server_refuses_every_lifecycle_route_over_http(
+    server: MonitoringServer, method: str, path: str, body: bytes
+) -> None:
+    status, _, payload = http_request(
+        server, method, path, body=body, headers={"X-Operator-Token": TOKEN}
+    )
+    assert status == 403
+    assert decode(payload) == {"error": "mutations are disabled on this server"}
+
+
+@pytest.mark.parametrize(
+    "method,path,allow",
+    [
+        ("PUT", "/api/catalog", "GET, HEAD"),
+        ("POST", "/api/control", "GET, HEAD"),
+        ("PUT", f"/api/profiles/{PROFILE_A}/pause", "POST"),
+        ("GET", f"/api/profiles/{PROFILE_A}/pause", "POST"),
+        ("POST", f"/api/profiles/{PROFILE_A}", "GET, HEAD, DELETE"),
+        ("PUT", f"/api/profiles/{PROFILE_A}/candles", "GET, HEAD"),
+    ],
+)
+def test_the_wrong_method_on_a_new_route_over_http(
+    server: MonitoringServer, method: str, path: str, allow: str
+) -> None:
+    status, headers, payload = http_request(server, method, path, body=b"{}")
+    assert status == 405
+    assert headers["Allow"] == allow
+    assert decode(payload) == {"error": "method not allowed"}
+
+
+def test_a_writable_server_runs_the_whole_lifecycle_over_http(
+    provider: FakeProvider, monitor: Monitor
+) -> None:
+    """The transport routes ``POST``/``DELETE`` to the injected controller."""
+    controller = make_controller()
+    built = build_server(
+        provider,
+        monitor,
+        read_only=False,
+        operator_token=TOKEN,
+        controller=controller,
+        catalog=FakeCatalog(),
+    )
+    auth = {"X-Operator-Token": TOKEN}
+    with running(built) as server:
+        status, _, payload = http_request(server, "GET", "/api/control")
+        assert status == 200
+        control = decode(payload)
+        assert control["engine_running"] is True
+        assert control["mutable"] is True
+        assert [entry["profile_id"] for entry in control["profiles"]] == [PROFILE_A]
+
+        status, _, payload = http_request(
+            server, "POST", f"/api/profiles/{PROFILE_A}/pause", body=b"{}", headers=auth
+        )
+        assert status == 200
+        assert decode(payload)["paused"] is True
+
+        status, _, payload = http_request(
+            server, "POST", f"/api/profiles/{PROFILE_A}/resume", body=b"{}", headers=auth
+        )
+        assert status == 200
+        assert decode(payload)["paused"] is False
+
+        body = json.dumps(
+            {
+                "profile_id": "sol-paper",
+                "symbol": "SOL/USDT",
+                "timeframe": "15m",
+                "strategy": "basic",
+                "mode": "paper",
+            }
+        ).encode()
+        status, _, payload = http_request(server, "POST", "/api/profiles", body=body, headers=auth)
+        assert status == 201
+        assert decode(payload)["profile"]["profile_id"] == "sol-paper"
+
+        status, _, payload = http_request(
+            server, "DELETE", f"/api/profiles/{PROFILE_A}", headers=auth
+        )
+        assert status == 200
+        assert decode(payload) == {"profile_id": PROFILE_A, "deleted": True}
+
+        status, _, payload = http_request(
+            server, "POST", f"/api/profiles/{UNKNOWN_PROFILE}/pause", body=b"{}", headers=auth
+        )
+        assert status == 404
+        assert decode(payload) == {"error": f"unknown profile: {UNKNOWN_PROFILE!r}"}
+
+    assert controller.commands == [
+        ("pause", PROFILE_A),
+        ("resume", PROFILE_A),
+        ("create", "sol-paper"),
+        ("delete", PROFILE_A),
+    ]

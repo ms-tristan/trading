@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '@/lib/api';
 import type {
+  CandlesPayload,
   EquityPayload,
   HealthPayload,
   KillSwitchPayload,
@@ -29,6 +30,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
     fetchTrades: vi.fn(),
     fetchOrders: vi.fn(),
     fetchMetrics: vi.fn(),
+    fetchCandles: vi.fn(),
   };
 });
 
@@ -162,6 +164,22 @@ const METRICS: MetricsPayload = {
   generated_at: '2024-01-01T05:01:00+00:00',
 };
 
+const CANDLES: CandlesPayload = {
+  candles: [
+    {
+      profile_id: 'btc-paper',
+      timestamp: '2024-01-01T00:30:00+00:00',
+      open: 20000,
+      high: 20500,
+      low: 19800,
+      close: 20400,
+      volume: 12.5,
+      closed: true,
+    },
+  ],
+  count: 1,
+};
+
 const INITIAL_LIVE: ProfileLiveBundle = { profile: PROFILE, health: HEALTH, killSwitch: KILL_SWITCH };
 const INITIAL_DETAIL: ProfileDetailBundle = {
   equity: EQUITY,
@@ -211,6 +229,7 @@ beforeEach(() => {
   vi.mocked(api.fetchTrades).mockResolvedValue(TRADES);
   vi.mocked(api.fetchOrders).mockResolvedValue(ORDERS);
   vi.mocked(api.fetchMetrics).mockResolvedValue(METRICS);
+  vi.mocked(api.fetchCandles).mockResolvedValue(CANDLES);
 });
 
 afterEach(() => {
@@ -304,12 +323,35 @@ describe('ProfileLive', () => {
   it('refreshes both loops on demand without waiting for the interval', async () => {
     renderLive();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh now' }));
+    // The candles panel carries its own "Refresh now"; the toolbar's is first.
+    fireEvent.click(screen.getAllByRole('button', { name: 'Refresh now' })[0] as HTMLElement);
     await advance(1);
 
     expect(api.fetchProfile).toHaveBeenCalledTimes(1);
     expect(api.fetchEquity).toHaveBeenCalledTimes(1);
     expect(api.fetchMetrics).toHaveBeenCalledTimes(1);
+  });
+
+  it('polls the candles of the profile on the detail cadence', async () => {
+    renderLive({ pollIntervalMs: 2000, detailIntervalMs: 10000 });
+
+    expect(api.fetchCandles).not.toHaveBeenCalled();
+    expect(screen.getByText('Candles')).toBeInTheDocument();
+    expect(screen.getByText('No candle yet')).toBeInTheDocument();
+
+    await advance(10000);
+
+    expect(api.fetchCandles).toHaveBeenCalledTimes(1);
+    expect(api.fetchCandles).toHaveBeenCalledWith(
+      'btc-paper',
+      500,
+      expect.objectContaining({ signal: expect.anything() }),
+    );
+    // The payload reaches the chart's text alternative, between the equity
+    // curve and the positions table.
+    expect(screen.getByText('Candle data')).toBeInTheDocument();
+    expect(screen.getByText('2024-01-01 00:30:00 UTC')).toBeInTheDocument();
+    expect(screen.queryByText('No candle yet')).toBeNull();
   });
 
   it('keeps the last known good data and shows one banner when both loops fail', async () => {

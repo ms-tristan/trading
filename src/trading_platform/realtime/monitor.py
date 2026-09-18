@@ -24,9 +24,13 @@ layer direction (validation sits above metrics, metrics above core).
 Honest limitation -- the benchmark block is ``None`` until the caller supplies an
 OHLCV frame
 ------------------------------------------------------------------------------
-The state store deliberately persists no candles: it keeps orders, fills,
-positions, equity points, round-trips and profile status, nothing else.  A
-benchmark curve, on the other hand, needs prices.  :meth:`Monitor.benchmark`
+The state store deliberately persists no candles *beyond a bounded window*: it keeps
+orders, fills, positions, equity points, round-trips and profile status, plus the
+most recent candles of each profile through
+:meth:`~trading_platform.realtime.store.StateStore.append_candle` and
+:meth:`~trading_platform.realtime.store.StateStore.candle_series` (the retention is
+:data:`~trading_platform.realtime.store.CANDLE_WINDOW` rows per profile), and nothing
+else.  A benchmark curve, on the other hand, needs prices.  :meth:`Monitor.benchmark`
 therefore answers ``None`` when no frame is passed (the HTTP contract renders it
 as ``"benchmark": null``) and only builds the comparison when the caller -- the
 CLI, the orchestrator or a test -- hands it the OHLCV frame of the profile.  That

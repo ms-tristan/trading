@@ -20,12 +20,22 @@
  */
 
 import type {
+  Candle,
+  CandlesPayload,
+  CatalogPayload,
+  CatalogSymbol,
+  ControlPayload,
+  CreateProfileBody,
+  CreateProfilePayload,
+  DeletePayload,
   EquityPayload,
   HealthPayload,
   KillSwitchPayload,
+  LifecyclePayload,
   MetricsPayload,
   OrdersPayload,
   PositionsPayload,
+  ProfileControl,
   ProfilesPayload,
   ProfileSnapshot,
   TradesPayload,
@@ -134,19 +144,21 @@ function httpMessage(status: number, raw: string): string {
 }
 
 interface RequestInit_ {
-  method: 'GET' | 'POST';
+  method: 'GET' | 'POST' | 'DELETE';
   baseUrl?: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   headers?: Record<string, string>;
   body?: string;
+  /** Query string appended to the request URL only (never to the error path). */
+  query?: string;
   validate?: (payload: unknown) => boolean;
   /** Secret scrubbed from every message this request may raise. */
   secret?: string;
 }
 
 async function performRequest<T>(path: string, init: RequestInit_): Promise<T> {
-  const url = apiUrl(path, init.baseUrl);
+  const url = apiUrl(init.query === undefined ? path : `${path}${init.query}`, init.baseUrl);
   const impl = init.fetchImpl ?? (typeof fetch === 'function' ? fetch : undefined);
   if (impl === undefined) {
     throw new ApiError('network', `network error calling ${path}: fetch is unavailable`, { path });
@@ -439,6 +451,88 @@ function isKillSwitchPayload(value: unknown): boolean {
   );
 }
 
+/** A run mode is one of the two documented values. */
+function isRunMode(value: unknown): boolean {
+  return value === 'paper' || value === 'live';
+}
+
+/** `GET /api/profiles/{id}/candles` — one persisted OHLCV candle. */
+export function isCandle(value: unknown): value is Candle {
+  return (
+    isRecord(value) &&
+    isString(value.profile_id) &&
+    isString(value.timestamp) &&
+    isNumberOrNull(value.open) &&
+    isNumberOrNull(value.high) &&
+    isNumberOrNull(value.low) &&
+    isNumberOrNull(value.close) &&
+    isNumberOrNull(value.volume) &&
+    isBoolean(value.closed)
+  );
+}
+
+/** Body of `GET /api/profiles/{id}/candles`. */
+export function isCandlesPayload(value: unknown): value is CandlesPayload {
+  return isRecord(value) && isArrayOf(value.candles, isCandle) && isNumber(value.count);
+}
+
+/** One entry of the catalog symbol list. */
+export function isCatalogSymbol(value: unknown): value is CatalogSymbol {
+  return (
+    isRecord(value) &&
+    isString(value.symbol) &&
+    isString(value.base) &&
+    isString(value.quote)
+  );
+}
+
+/** Body of `GET /api/catalog`. */
+export function isCatalogPayload(value: unknown): value is CatalogPayload {
+  return (
+    isRecord(value) &&
+    isArrayOf(value.symbols, isCatalogSymbol) &&
+    isArrayOf(value.strategies, isString) &&
+    isArrayOf(value.timeframes, isString) &&
+    isArrayOf(value.modes, isRunMode)
+  );
+}
+
+/** One per-profile control entry of `GET /api/control`. */
+export function isProfileControl(value: unknown): value is ProfileControl {
+  return (
+    isRecord(value) &&
+    isString(value.profile_id) &&
+    isBoolean(value.paused) &&
+    isBoolean(value.running)
+  );
+}
+
+/** Body of `GET /api/control`. */
+export function isControlPayload(value: unknown): value is ControlPayload {
+  return (
+    isRecord(value) &&
+    isBoolean(value.engine_running) &&
+    isBoolean(value.read_only) &&
+    isBoolean(value.mutable) &&
+    isArrayOf(value.profiles, isProfileControl)
+  );
+}
+
+/** Body of a successful pause or resume call. */
+export function isLifecyclePayload(value: unknown): value is LifecyclePayload {
+  return isRecord(value) && isProfileSnapshot(value.profile) && isBoolean(value.paused);
+}
+
+/** Body of a successful `POST /api/profiles`: `{profile}`, never `paused`. */
+export function isCreateProfilePayload(value: unknown): value is CreateProfilePayload {
+  return isRecord(value) && isProfileSnapshot(value.profile);
+}
+
+/** Body of a successful `DELETE /api/profiles/{id}`. */
+export function isDeletePayload(value: unknown): value is DeletePayload {
+  return isRecord(value) && isString(value.profile_id) && value.deleted === true;
+}
+
 /** Run `validate` and raise the documented `'malformed'` error otherwise. */
 function expectShape<T>(
   payload: unknown,
@@ -542,6 +636,47 @@ export async function fetchKillSwitch(
   return expectShape<KillSwitchPayload>(payload, isKillSwitchPayload, path);
 }
 
+/**
+ * `GET /api/profiles/{id}/candles?limit=N` — the persisted candle window of one
+ * profile, oldest first. `limit` is optional server-side and capped there; the
+ * caller asks for the window it renders.
+ */
+export async function fetchCandles(
+  profileId: string,
+  limit: number,
+  options: RequestOptions = {},
+): Promise<CandlesPayload> {
+  const path = `/api/profiles/${encodeURIComponent(profileId)}/candles`;
+  const payload = await performRequest<unknown>(path, {
+    method: 'GET',
+    baseUrl: options.baseUrl,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    query: `?limit=${limit}`,
+    validate: isCandlesPayload,
+  });
+  return payload as CandlesPayload;
+}
+
+/** `GET /api/catalog` — symbols, strategies, timeframes and modes of the pickers. */
+export async function fetchCatalog(options: RequestOptions = {}): Promise<CatalogPayload> {
+  const path = '/api/catalog';
+  const payload = await requestJson<unknown>(path, options);
+  return expectShape<CatalogPayload>(payload, isCatalogPayload, path);
+}
+
+/**
+ * `GET /api/control` — engine/read-only status and the per-profile pause state.
+ *
+ * Read-only by design: this route needs no operator token and stays available in
+ * `realtime serve` mode.
+ */
+export async function fetchControl(options: RequestOptions = {}): Promise<ControlPayload> {
+  const path = '/api/control';
+  const payload = await requestJson<unknown>(path, options);
+  return expectShape<ControlPayload>(payload, isControlPayload, path);
+}
+
 // ---------------------------------------------------------------------------
 // mutating route
 // ---------------------------------------------------------------------------
@@ -572,4 +707,124 @@ export async function postKillSwitch(
     secret: options.operatorToken,
   });
   return payload as KillSwitchPayload;
+}
+
+/**
+ * Build the shared init of a mutating call: JSON content type, the operator
+ * token header, and the token registered as the secret to scrub from every
+ * message the request may raise.
+ */
+function mutationInit(
+  options: MutatingRequestOptions,
+  mutation: {
+    method: 'POST' | 'DELETE';
+    body?: string;
+    query?: string;
+    validate: (payload: unknown) => boolean;
+  },
+): RequestInit_ {
+  return {
+    method: mutation.method,
+    baseUrl: options.baseUrl,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    headers: {
+      'Content-Type': 'application/json',
+      [OPERATOR_TOKEN_HEADER]: options.operatorToken,
+    },
+    body: mutation.body,
+    query: mutation.query,
+    validate: mutation.validate,
+    secret: options.operatorToken,
+  };
+}
+
+/**
+ * `POST /api/profiles/{id}/pause` — stop opening new positions.
+ *
+ * The profile keeps managing the position it already holds: the stop loss stays
+ * active and exits are still evaluated. The token is never logged, never part of
+ * a URL and never rendered.
+ */
+export async function pauseProfile(
+  profileId: string,
+  options: MutatingRequestOptions,
+): Promise<LifecyclePayload> {
+  const path = `/api/profiles/${encodeURIComponent(profileId)}/pause`;
+  const payload = await performRequest<unknown>(
+    path,
+    mutationInit(options, { method: 'POST', body: JSON.stringify({}), validate: isLifecyclePayload }),
+  );
+  return payload as LifecyclePayload;
+}
+
+/** `POST /api/profiles/{id}/resume` — let the profile open positions again. */
+export async function resumeProfile(
+  profileId: string,
+  options: MutatingRequestOptions,
+): Promise<LifecyclePayload> {
+  const path = `/api/profiles/${encodeURIComponent(profileId)}/resume`;
+  const payload = await performRequest<unknown>(
+    path,
+    mutationInit(options, { method: 'POST', body: JSON.stringify({}), validate: isLifecyclePayload }),
+  );
+  return payload as LifecyclePayload;
+}
+
+/**
+ * `DELETE /api/profiles/{id}` — flatten the profile and remove it.
+ *
+ * The server closes every open order and the open position at market before it
+ * removes anything; a refused flattening leaves the profile in place and answers
+ * an error the dashboard displays verbatim.
+ */
+export async function deleteProfile(
+  profileId: string,
+  options: MutatingRequestOptions,
+): Promise<DeletePayload> {
+  const path = `/api/profiles/${encodeURIComponent(profileId)}`;
+  const payload = await performRequest<unknown>(
+    path,
+    mutationInit(options, { method: 'DELETE', validate: isDeletePayload }),
+  );
+  return payload as DeletePayload;
+}
+
+/**
+ * `POST /api/profiles` — create a profile and start it.
+ *
+ * Optional fields are omitted from the body when the caller leaves them out, so
+ * the server applies its own defaults. Duplicate id -> 409, unknown strategy or
+ * unsupported timeframe -> 400: both are surfaced verbatim.
+ *
+ * The server answers `201 {profile}` — creation carries no `paused` field, unlike
+ * pause/resume (`{profile, paused}`).
+ */
+export async function createProfile(
+  body: CreateProfileBody,
+  options: MutatingRequestOptions,
+): Promise<CreateProfilePayload> {
+  const path = '/api/profiles';
+  const request: Record<string, unknown> = {
+    profile_id: body.profile_id,
+    symbol: body.symbol,
+    timeframe: body.timeframe,
+    strategy: body.strategy,
+    mode: body.mode,
+  };
+  if (body.initial_balance !== undefined) {
+    request.initial_balance = body.initial_balance;
+  }
+  if (body.params !== undefined) {
+    request.params = body.params;
+  }
+  const payload = await performRequest<unknown>(
+    path,
+    mutationInit(options, {
+      method: 'POST',
+      body: JSON.stringify(request),
+      validate: isCreateProfilePayload,
+    }),
+  );
+  return payload as CreateProfilePayload;
 }

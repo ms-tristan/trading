@@ -11,7 +11,8 @@
  *   cheap payloads that must react immediately;
  * * the **detail loop** (`detailIntervalMs`, 5x slower) refreshes the
  *   SQLite-backed, metric-heavy payloads: equity curve, positions, trades,
- *   orders and metrics.
+ *   orders and metrics. The candle chart polls on that same cadence through
+ *   `CandlestickPanel`, so the page never runs a third rhythm.
  *
  * A single {@link LiveToolbar} drives both, a single error banner combines both
  * failures, and a failed poll never clears the screen: the last known good
@@ -20,6 +21,7 @@
 
 import { useCallback } from 'react';
 
+import { CandlestickPanel } from '@/components/charts/candlestick-panel';
 import { EquityChart } from '@/components/charts/equity-chart';
 import { KillSwitchPanel } from '@/components/kill-switch/kill-switch-panel';
 import { Card } from '@/components/ui/card';
@@ -163,6 +165,13 @@ export function ProfileLive({
       >
         <EquityChart points={detail.data.equity.points} ariaLabel={`Equity curve of ${profileId}`} />
       </Card>
+
+      <CandlestickPanel
+        profileId={profileId}
+        positions={detail.data.positions}
+        trades={detail.data.trades}
+        detailIntervalMs={detailIntervalMs}
+      />
 
       <Card
         title="Open positions"

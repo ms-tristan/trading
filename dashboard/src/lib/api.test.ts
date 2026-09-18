@@ -4,7 +4,12 @@ import {
   ApiError,
   OPERATOR_TOKEN_HEADER,
   apiUrl,
+  createProfile,
+  deleteProfile,
   errorMessage,
+  fetchCandles,
+  fetchCatalog,
+  fetchControl,
   fetchEquity,
   fetchHealth,
   fetchKillSwitch,
@@ -14,14 +19,23 @@ import {
   fetchProfile,
   fetchProfiles,
   fetchTrades,
+  pauseProfile,
   postKillSwitch,
   requestJson,
+  resumeProfile,
+  type MutatingRequestOptions,
   type RequestOptions,
 } from './api';
 import type {
+  CandlesPayload,
+  CatalogPayload,
+  ControlPayload,
+  CreateProfileBody,
+  DeletePayload,
   EquityPayload,
   HealthPayload,
   KillSwitchPayload,
+  LifecyclePayload,
   MetricsPayload,
   OrdersPayload,
   PositionsPayload,
@@ -327,7 +341,7 @@ describe('HTTP failures', () => {
     );
 
     await expect(
-      postKillSwitch({ engage: true, reason: 'test' }, { fetchImpl: impl, operatorToken: 'tok' }),
+      postKillSwitch({ engage: true, reason: 'test' }, { fetchImpl: impl, operatorToken: 'unit-test-secret' }),
     ).rejects.toMatchObject({
       kind: 'http',
       status: 403,
@@ -508,7 +522,7 @@ describe('postKillSwitch', () => {
     const { impl } = recordingFetch(jsonResponse({ kill_switch: 'yes' }));
 
     await expect(
-      postKillSwitch({ engage: true, reason: 'test' }, { fetchImpl: impl, operatorToken: 'tok' }),
+      postKillSwitch({ engage: true, reason: 'test' }, { fetchImpl: impl, operatorToken: 'unit-test-secret' }),
     ).rejects.toMatchObject({ kind: 'malformed', path: '/api/kill-switch' });
   });
 });
@@ -567,5 +581,435 @@ describe('requestJson', () => {
       { ok: true },
     );
     expect(calls[0]?.url).toBe('/api/custom');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// candles, catalog and profile lifecycle (additive part of the contract)
+// ---------------------------------------------------------------------------
+
+const candle = {
+  profile_id: 'alpha',
+  timestamp: '2024-01-01T00:00:00+00:00',
+  open: 42000,
+  high: 42500,
+  low: 41800,
+  close: 42400,
+  volume: 12.5,
+  closed: true,
+};
+
+const candles: CandlesPayload = { candles: [candle], count: 1 };
+
+const catalog: CatalogPayload = {
+  symbols: [
+    { symbol: 'BTC/USDT', base: 'BTC', quote: 'USDT' },
+    { symbol: 'ETH/USDT', base: 'ETH', quote: 'USDT' },
+  ],
+  strategies: ['basic'],
+  timeframes: ['1m', '5m', '1h'],
+  modes: ['paper', 'live'],
+};
+
+const control: ControlPayload = {
+  engine_running: true,
+  read_only: false,
+  mutable: true,
+  profiles: [{ profile_id: 'alpha', paused: false, running: true }],
+};
+
+const lifecycle: LifecyclePayload = { profile, paused: true };
+
+const deleted: DeletePayload = { profile_id: 'alpha', deleted: true };
+
+const createBody: CreateProfileBody = {
+  profile_id: 'beta',
+  symbol: 'BTC/USDT',
+  timeframe: '1h',
+  strategy: 'basic',
+  mode: 'paper',
+};
+
+const createdBody = JSON.stringify({
+  profile_id: 'beta',
+  symbol: 'BTC/USDT',
+  timeframe: '1h',
+  strategy: 'basic',
+  mode: 'paper',
+});
+
+describe('fetchCandles', () => {
+  it('requests the bounded candle window and returns it', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse(candles));
+
+    await expect(fetchCandles('alpha', 500, { fetchImpl: impl })).resolves.toEqual(candles);
+
+    expect(calls[0]?.url).toBe('/api/profiles/alpha/candles?limit=500');
+    expect(calls[0]?.init?.method).toBe('GET');
+    expect(calls[0]?.init?.cache).toBe('no-store');
+  });
+
+  it('percent-encodes the profile id and keeps the limit in the query', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse(candles));
+
+    await fetchCandles('a b/c', 250, { fetchImpl: impl });
+
+    expect(calls[0]?.url).toBe('/api/profiles/a%20b%2Fc/candles?limit=250');
+  });
+
+  it('reports the failing path without the query string', async () => {
+    const { impl } = recordingFetch(jsonResponse({ error: "unknown profile: 'ghost'" }, 404));
+
+    await expect(fetchCandles('ghost', 500, { fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'http',
+      status: 404,
+      path: '/api/profiles/ghost/candles',
+      message: "unknown profile: 'ghost'",
+    });
+  });
+
+  it('rejects a payload whose count is not a number', async () => {
+    const { impl } = recordingFetch(jsonResponse({ candles: [candle], count: '1' }));
+
+    await expect(fetchCandles('alpha', 500, { fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/profiles/alpha/candles',
+    });
+  });
+
+  it('rejects a candle with a renamed field', async () => {
+    const { impl } = recordingFetch(
+      jsonResponse({ candles: [{ ...candle, close: undefined, last: 42400 }], count: 1 }),
+    );
+
+    await expect(fetchCandles('alpha', 500, { fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+    });
+  });
+
+  it('rejects a candle missing the closed flag', async () => {
+    const { impl } = recordingFetch(jsonResponse({ candles: [{ ...candle, closed: undefined }] }));
+
+    await expect(fetchCandles('alpha', 500, { fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+    });
+  });
+
+  it('accepts a candle whose prices were never recorded (null)', async () => {
+    const empty = {
+      profile_id: 'alpha',
+      timestamp: '2024-01-01T00:00:00+00:00',
+      open: null,
+      high: null,
+      low: null,
+      close: null,
+      volume: null,
+      closed: false,
+    };
+    const { impl } = recordingFetch(jsonResponse({ candles: [empty], count: 1 }));
+
+    await expect(fetchCandles('alpha', 10, { fetchImpl: impl })).resolves.toEqual({
+      candles: [empty],
+      count: 1,
+    });
+  });
+
+  it('normalises an unreachable server', async () => {
+    await expect(
+      fetchCandles('alpha', 500, { fetchImpl: failingFetch(new TypeError('fetch failed')) }),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      status: null,
+      message: expect.stringContaining('network error calling /api/profiles/alpha/candles'),
+    });
+  });
+});
+
+describe('fetchCatalog', () => {
+  it('requests the catalog and returns every picker list', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse(catalog));
+
+    await expect(fetchCatalog({ fetchImpl: impl })).resolves.toEqual(catalog);
+
+    expect(calls[0]?.url).toBe('/api/catalog');
+    expect(calls[0]?.init?.method).toBe('GET');
+    expect(calls[0]?.init?.cache).toBe('no-store');
+  });
+
+  it('rejects a symbol without its quote currency', async () => {
+    const { impl } = recordingFetch(
+      jsonResponse({ ...catalog, symbols: [{ symbol: 'BTC/USDT', base: 'BTC' }] }),
+    );
+
+    await expect(fetchCatalog({ fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/catalog',
+    });
+  });
+
+  it('rejects an unknown run mode', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...catalog, modes: ['paper', 'sandbox'] }));
+
+    await expect(fetchCatalog({ fetchImpl: impl })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+
+  it('rejects a strategies list that is not a list of strings', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...catalog, strategies: [42] }));
+
+    await expect(fetchCatalog({ fetchImpl: impl })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+});
+
+describe('fetchControl', () => {
+  it('requests the control state and returns it', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse(control));
+
+    await expect(fetchControl({ fetchImpl: impl })).resolves.toEqual(control);
+
+    expect(calls[0]?.url).toBe('/api/control');
+    expect(calls[0]?.init?.method).toBe('GET');
+    expect(calls[0]?.init?.cache).toBe('no-store');
+  });
+
+  it('rejects a payload missing the mutability flag', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...control, mutable: undefined }));
+
+    await expect(fetchControl({ fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/control',
+    });
+  });
+
+  it('rejects a profile entry that is not an object', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...control, profiles: ['alpha'] }));
+
+    await expect(fetchControl({ fetchImpl: impl })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+
+  it('normalises an unreachable server', async () => {
+    await expect(
+      fetchControl({ fetchImpl: failingFetch(new TypeError('fetch failed')) }),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: expect.stringContaining('network error calling /api/control'),
+    });
+  });
+});
+
+describe('profile lifecycle routes', () => {
+  interface MutationCase {
+    name: string;
+    call: (options: MutatingRequestOptions) => Promise<unknown>;
+    /** The same call on a profile id that must be percent-encoded. */
+    callEncoded: (options: MutatingRequestOptions) => Promise<unknown>;
+    url: string;
+    method: string;
+    body: string | undefined;
+    payload: unknown;
+    /** A 2xx body that must be refused as `'malformed'`. */
+    malformed: unknown;
+    /** The response of {@link callEncoded}. */
+    encodedPayload: unknown;
+  }
+
+  const mutationCases: MutationCase[] = [
+    {
+      name: 'pauseProfile',
+      call: (options) => pauseProfile('alpha', options),
+      callEncoded: (options) => pauseProfile('a b/c', options),
+      url: '/api/profiles/alpha/pause',
+      method: 'POST',
+      body: '{}',
+      payload: lifecycle,
+      malformed: { profile: 'nope', paused: true },
+      encodedPayload: lifecycle,
+    },
+    {
+      name: 'resumeProfile',
+      call: (options) => resumeProfile('alpha', options),
+      callEncoded: (options) => resumeProfile('a b/c', options),
+      url: '/api/profiles/alpha/resume',
+      method: 'POST',
+      body: '{}',
+      payload: { profile, paused: false },
+      malformed: { profile, paused: 'yes' },
+      encodedPayload: lifecycle,
+    },
+    {
+      name: 'deleteProfile',
+      call: (options) => deleteProfile('alpha', options),
+      callEncoded: (options) => deleteProfile('a b/c', options),
+      url: '/api/profiles/alpha',
+      method: 'DELETE',
+      body: undefined,
+      payload: deleted,
+      malformed: { profile_id: 'alpha', deleted: false },
+      encodedPayload: { profile_id: 'a b/c', deleted: true },
+    },
+    {
+      name: 'createProfile',
+      call: (options) => createProfile(createBody, options),
+      callEncoded: (options) => createProfile({ ...createBody, profile_id: 'a b/c' }, options),
+      url: '/api/profiles',
+      method: 'POST',
+      body: createdBody,
+      payload: { profile },
+      malformed: { profile: { profile_id: 'beta' } },
+      encodedPayload: lifecycle,
+    },
+  ];
+
+  it.each(mutationCases)(
+    '$name sends the token and the JSON headers, and returns the new state',
+    async ({ call, url, method, body, payload }) => {
+      const { impl, calls } = recordingFetch(jsonResponse(payload));
+
+      await expect(call({ fetchImpl: impl, operatorToken: 'secret-token' })).resolves.toEqual(payload);
+
+      expect(calls[0]?.url).toBe(url);
+      expect(calls[0]?.init?.method).toBe(method);
+      expect(calls[0]?.init?.cache).toBe('no-store');
+      expect(calls[0]?.init?.body).toBe(body);
+
+      const headers = calls[0]?.init?.headers as Record<string, string>;
+      expect(headers['Content-Type']).toBe('application/json');
+      expect(headers[OPERATOR_TOKEN_HEADER]).toBe('secret-token');
+    },
+  );
+
+  it.each(mutationCases)(
+    '$name carries a profile id that needs escaping',
+    async ({ callEncoded, encodedPayload, url }) => {
+      const { impl, calls } = recordingFetch(jsonResponse(encodedPayload));
+
+      await callEncoded({ fetchImpl: impl, operatorToken: 'unit-test-secret' });
+
+      if (url === '/api/profiles') {
+        // A creation carries the identifier in its body, never in the path.
+        expect(calls[0]?.url).toBe('/api/profiles');
+        expect(calls[0]?.init?.body).toContain('"profile_id":"a b/c"');
+        return;
+      }
+      expect(calls[0]?.url).toContain('a%20b%2Fc');
+    },
+  );
+
+  it.each(mutationCases)('$name surfaces the 403 refusal verbatim', async ({ call }) => {
+    const { impl } = recordingFetch(
+      jsonResponse({ error: 'missing or invalid operator token' }, 403),
+    );
+
+    await expect(call({ fetchImpl: impl, operatorToken: 'unit-test-secret' })).rejects.toMatchObject({
+      kind: 'http',
+      status: 403,
+      message: 'missing or invalid operator token',
+    });
+  });
+
+  it.each(mutationCases)('$name surfaces a 409 conflict verbatim', async ({ call }) => {
+    const { impl } = recordingFetch(
+      jsonResponse({ error: "profile already exists: 'alpha'" }, 409),
+    );
+
+    await expect(call({ fetchImpl: impl, operatorToken: 'unit-test-secret' })).rejects.toMatchObject({
+      kind: 'http',
+      status: 409,
+      message: "profile already exists: 'alpha'",
+    });
+  });
+
+  it.each(mutationCases)(
+    '$name rejects a 2xx payload that does not match the expected shape',
+    async ({ call, malformed }) => {
+      const { impl } = recordingFetch(jsonResponse(malformed));
+
+      await expect(call({ fetchImpl: impl, operatorToken: 'unit-test-secret' })).rejects.toMatchObject({
+        kind: 'malformed',
+      });
+    },
+  );
+
+  it('rejects a delete acknowledgement that does not confirm the deletion', async () => {
+    const { impl } = recordingFetch(jsonResponse({ profile_id: 'alpha', deleted: false }));
+
+    await expect(deleteProfile('alpha', { fetchImpl: impl, operatorToken: 'unit-test-secret' })).rejects.toMatchObject({
+      kind: 'malformed',
+    });
+  });
+
+  it.each(mutationCases)('$name never leaks the operator token', async ({ call }) => {
+    const token = 'super-secret-token';
+    const failing = failingFetch(new Error(`connection refused for token ${token}`));
+
+    const failure = await call({ fetchImpl: failing, operatorToken: token }).catch(
+      (error: unknown) => error,
+    );
+
+    const message = errorMessage(failure);
+    expect(message).not.toContain(token);
+    expect(message).toContain('***');
+  });
+
+  it.each(mutationCases)('$name never leaks the token from an HTTP error body', async ({ call }) => {
+    const token = 'super-secret-token';
+    const { impl } = recordingFetch(jsonResponse({ error: `invalid token ${token}` }, 403));
+
+    const failure = await call({ fetchImpl: impl, operatorToken: token }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(errorMessage(failure)).not.toContain(token);
+  });
+
+  it.each(mutationCases)('$name falls back to the status line for a non-JSON body', async ({ call }) => {
+    const { impl } = recordingFetch(jsonResponse('<html>boom</html>', 500));
+
+    await expect(call({ fetchImpl: impl, operatorToken: 'unit-test-secret' })).rejects.toMatchObject({
+      kind: 'http',
+      status: 500,
+      message: 'HTTP 500',
+    });
+  });
+
+  it('omits the optional fields of a creation the caller left out', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse({ profile }));
+
+    await createProfile(createBody, { fetchImpl: impl, operatorToken: 'unit-test-secret' });
+
+    expect(calls[0]?.init?.body).toBe(createdBody);
+  });
+
+  it('sends the optional balance and strategy parameters when provided', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse({ profile }));
+
+    await createProfile(
+      {
+        ...createBody,
+        initial_balance: 25000,
+        params: { fast_period: 10, use_stops: true, label: 'scalp' },
+      },
+      { fetchImpl: impl, operatorToken: 'unit-test-secret' },
+    );
+
+    expect(calls[0]?.init?.body).toBe(
+      JSON.stringify({
+        profile_id: 'beta',
+        symbol: 'BTC/USDT',
+        timeframe: '1h',
+        strategy: 'basic',
+        mode: 'paper',
+        initial_balance: 25000,
+        params: { fast_period: 10, use_stops: true, label: 'scalp' },
+      }),
+    );
+  });
+
+  it('sends no body on delete', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse(deleted));
+
+    await deleteProfile('alpha', { fetchImpl: impl, operatorToken: 'unit-test-secret' });
+
+    expect(calls[0]?.init?.method).toBe('DELETE');
+    expect(calls[0]?.init?.body).toBeUndefined();
   });
 });

@@ -143,11 +143,13 @@ class FakeStream:
         block: bool = False,
         reconnect_count: int = 0,
         history_override: pd.DataFrame | None = None,
+        closed: bool = True,
     ) -> None:
         self.frame = make_frame() if frame is None else frame
         self.cursor = int(cursor)
         self.block = bool(block)
         self._history_override = history_override
+        self.closed = bool(closed)
         self.started = 0
         self.stopped = 0
         self.calls = 0
@@ -174,7 +176,7 @@ class FakeStream:
             return None
         event = candle_at(self.frame, self.cursor)
         self.cursor += 1
-        return event
+        return event if self.closed else replace(event, closed=False)
 
     async def history(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         if self._history_override is not None:
@@ -204,6 +206,7 @@ class FakeStore:
         self.orders = list(orders or [])
         self.statuses: list[tuple[str, ProfileStatus, str]] = []
         self.equity: list[EquityPoint] = []
+        self.candles: list[tuple[CandleEvent, str]] = []
         self.appended_trades: list[tuple[TradeRecord, str]] = []
         self.marked: list[tuple[str, pd.Timestamp]] = []
         self.profiles: list[ProfileConfig] = []
@@ -231,6 +234,22 @@ class FakeStore:
     def mark_candle_processed(self, profile_id: str, timestamp: pd.Timestamp) -> None:
         self.marked.append((profile_id, pd.Timestamp(timestamp)))
         self.last_processed = pd.Timestamp(timestamp)
+
+    def append_candle(self, candle: CandleEvent, *, profile_id: str) -> bool:
+        """Record one processed candle, mirroring the store's upsert answer."""
+        known = any(
+            stored.timestamp == candle.timestamp and stored_profile == profile_id
+            for stored, stored_profile in self.candles
+        )
+        self.candles.append((candle, profile_id))
+        return not known
+
+    def candle_series(self, profile_id: str, limit: int = 1000) -> list[CandleEvent]:
+        return [candle for candle, owner in self.candles if owner == profile_id][: int(limit)]
+
+    def candles_of(self, profile_id: str = "btc-paper") -> list[CandleEvent]:
+        """Return the recorded candles of one profile, in append order."""
+        return [candle for candle, owner in self.candles if owner == profile_id]
 
     def save_status(self, profile_id: str, status: ProfileStatus, detail: str = "") -> None:
         self.statuses.append((profile_id, status, detail))
@@ -1557,3 +1576,282 @@ def test_broker_ack_and_candle_helpers_are_not_needed_by_the_runner() -> None:
     """A sanity check of the frozen vocabulary the runner builds on."""
     ack = BrokerAck(client_order_id="x", accepted=True, state=OrderState.FILLED)
     assert ack.to_dict()["state"] == "filled"
+
+
+# ---------------------------------------------------------------------------
+# candle persistence: the tick appends exactly what it processed
+# ---------------------------------------------------------------------------
+
+
+def test_a_processed_candle_is_appended_verbatim(install: Any) -> None:
+    """The candle row is the event the tick decided on, field for field."""
+    install(mode="hold")
+    stream = FakeStream()
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(stream=stream, store=store)
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    expected = candle_at(stream.frame, 1)
+    assert decision is not None
+    assert store.candles == [(expected, "btc-paper")]
+    stored = store.candles_of()[0]
+    assert stored.timestamp == decision.timestamp
+    assert stored.open == pytest.approx(float(expected.open))
+    assert stored.high == pytest.approx(float(expected.high))
+    assert stored.low == pytest.approx(float(expected.low))
+    assert stored.close == pytest.approx(float(expected.close))
+    assert stored.volume == pytest.approx(float(expected.volume))
+    assert stored.closed is True
+    assert store.candle_series("btc-paper") == [expected]
+    assert store.candle_series("eth-paper") == []
+
+
+def test_a_candle_still_forming_keeps_its_closed_flag(install: Any) -> None:
+    """No filtering: an open candle is persisted with ``closed=False``, verbatim."""
+    install(mode="hold")
+    stream = FakeStream(closed=False)
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(stream=stream, store=store)
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    run(scenario())
+    stored = store.candles_of()[0]
+    assert stored.closed is False
+    assert stored.timestamp == pd.Timestamp(stream.frame.index[1])
+
+
+def test_a_tick_that_decides_nothing_appends_no_candle(install: Any) -> None:
+    """No candle, a stale candle, an incomplete warm-up and a blocked order write nothing."""
+    install(mode="entry_long", stop_loss=90.0)
+
+    empty = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(store=empty, stream=FakeStream(cursor=99))
+
+    async def no_candle() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(no_candle()) is None
+    assert empty.candles == []
+
+    frame = make_frame()
+    stale = FakeStore(last_processed=pd.Timestamp(frame.index[1]))
+    runner, _stream, _gateway, _store, _clock = build(
+        store=stale, stream=FakeStream(frame, cursor=1)
+    )
+
+    async def skipped() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(skipped()) is None
+    assert stale.candles == []
+
+    warmup = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(
+        store=warmup, stream=FakeStream(history_override=pd.DataFrame())
+    )
+
+    async def incomplete() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(incomplete()) is None
+    assert warmup.candles == []
+
+    refused = FakeStore()
+    gateway = FakeGateway(error=RiskLimitExceededError("max_order_notional exceeded"))
+    runner, _stream, _gateway, _store, _clock = build(store=refused, gateway=gateway)
+
+    async def blocked() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(blocked())
+    assert decision is not None
+    assert decision.blocked is True
+    assert refused.candles == []
+    assert refused.equity == []
+    assert refused.marked == []
+
+
+# ---------------------------------------------------------------------------
+# the entry gate: pause stops entries and nothing else
+# ---------------------------------------------------------------------------
+
+
+def test_pause_turns_an_entry_signal_into_a_hold(install: Any, logs: Any) -> None:
+    """A paused profile opens nothing, and its tick still publishes everything."""
+    install(mode="entry_long", stop_loss=90.0)
+    stream = FakeStream()
+    store = FakeStore()
+    gateway = FakeGateway()
+    runner, _stream, _gateway, _store, _clock = build(stream=stream, gateway=gateway, store=store)
+    runner.pause()
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    expected = pd.Timestamp(stream.frame.index[1])
+    assert decision is not None
+    assert decision.action is SignalAction.HOLD
+    assert decision.direction is None
+    assert decision.reason == "profile is paused"
+    assert decision.blocked is False
+    assert decision.quantity == 0.0
+    assert decision.client_order_id == ""
+    assert decision.reference_price == pytest.approx(float(stream.frame.iloc[1]["close"]))
+    assert gateway.submissions == []
+    assert runner.paused is True
+
+    # a paused tick is a HOLD, never a blocked decision: it publishes its candle,
+    # its equity point, its watermark and a healthy status
+    assert store.marked == [("btc-paper", expected)]
+    assert len(store.equity) == 1
+    assert store.equity[0].timestamp == expected
+    assert store.candles_of() == [candle_at(stream.frame, 1)]
+    assert store.status_values()[-1] == "running"
+    assert runner.health().status is ProfileStatus.RUNNING
+    assert runner.counters().candles_processed == 1
+    assert "entry_ignored" in events(logs)
+
+
+def test_pause_does_not_suppress_the_stop_loss(install: Any) -> None:
+    """The stop stays active: pausing never leaves an open position unmanaged."""
+    install(mode="hold")
+    frame = make_frame(low=90.0)
+    store = FakeStore()
+    gateway = FakeGateway(position=make_position(stop_price=95.0, quantity=0.5))
+    runner, _stream, _gateway, _store, _clock = build(
+        stream=FakeStream(frame, cursor=1), gateway=gateway, store=store
+    )
+    runner.pause()
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.action is SignalAction.STOP_LOSS
+    assert decision.reason == ExitReason.STOP_LOSS.value
+    request, reference, context = gateway.submissions[0]
+    assert request.side is OrderSide.SELL
+    assert request.quantity == pytest.approx(0.5)
+    assert reference == pytest.approx(95.0)
+    assert context["closes_position"] is True
+    assert runner.paused is True
+    assert store.candles_of() == [candle_at(frame, 1)]
+    assert len(store.marked) == 1
+
+
+def test_pause_does_not_suppress_an_exit_signal(install: Any) -> None:
+    """Exits are still routed while the profile is paused."""
+    install(mode="exit_long")
+    store = FakeStore()
+    gateway = FakeGateway(position=make_position(stop_price=50.0))
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway, store=store)
+    runner.pause()
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.action is SignalAction.EXIT_LONG
+    request, _reference, context = gateway.submissions[0]
+    assert request.reason == ExitReason.SIGNAL.value
+    assert context["closes_position"] is True
+    assert store.candles_of() != []
+
+
+def test_pause_does_not_suppress_an_entry_while_a_position_is_open(install: Any) -> None:
+    """The already-open case keeps its own reason: the position guard answers first."""
+    install(mode="entry_long")
+    gateway = FakeGateway(position=make_position(stop_price=50.0))
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway)
+    runner.pause()
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.action is SignalAction.HOLD
+    assert decision.reason == "a position is already open"
+    assert gateway.submissions == []
+
+
+def test_pause_also_gates_a_short_entry(install: Any) -> None:
+    """The mirror branch of the short entry honours the same gate."""
+    install(mode="entry_short", allow_short=True, stop_loss=90.0)
+    gateway = FakeGateway()
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway)
+    runner.pause()
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.action is SignalAction.HOLD
+    assert decision.reason == "profile is paused"
+    assert gateway.submissions == []
+
+
+def test_resume_restores_the_entry_order(install: Any, logs: Any) -> None:
+    """``resume`` re-opens the gate: the next entry signal is routed again."""
+    install(mode="entry_long", stop_loss=90.0)
+    store = FakeStore()
+    gateway = FakeGateway()
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway, store=store)
+    runner.pause()
+
+    async def scenario() -> Any:
+        await runner.start()
+        paused = await runner.run_once()
+        runner.resume()
+        resumed = await runner.run_once()
+        return paused, resumed
+
+    paused, resumed = run(scenario())
+    assert paused is not None
+    assert paused.action is SignalAction.HOLD
+    assert resumed is not None
+    assert resumed.action is SignalAction.ENTER_LONG
+    assert len(gateway.submissions) == 1
+    assert gateway.submissions[0][0].client_order_id == resumed.client_order_id
+    assert runner.paused is False
+    assert len(store.candles) == 2
+    assert "profile_resumed" in events(logs)
+
+
+def test_pause_and_resume_are_idempotent_and_logged(install: Any, logs: Any) -> None:
+    """The gate is a plain flag: repeating either call changes nothing."""
+    install(mode="hold")
+    runner, _stream, _gateway, _store, _clock = build()
+
+    assert runner.paused is False
+    runner.resume()  # resuming a running profile is a no-op
+    runner.pause()
+    runner.pause()
+    assert runner.paused is True
+    runner.resume()
+    runner.resume()
+    assert runner.paused is False
+
+    recorded = events(logs)
+    assert recorded.count("profile_paused") == 1
+    assert recorded.count("profile_resumed") == 1

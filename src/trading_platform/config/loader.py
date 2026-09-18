@@ -11,13 +11,17 @@ of :class:`~trading_platform.config.models.ProfileConfig`), ``realtime`` and
 ``monitoring``.  :func:`load_profiles`, :func:`load_realtime_config` and
 :func:`load_monitoring_config` read that one file; each of them ignores the keys
 it does not own, so a run, a monitoring-only server and a pre-flight check all
-consume the same document.
+consume the same document.  :func:`save_profiles` owns the write side: it replaces
+the ``profiles`` key and preserves every other root key, atomically.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Mapping
+import os
+import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -41,6 +45,7 @@ __all__ = [
     "load_profiles",
     "load_realtime_config",
     "override_params",
+    "save_profiles",
 ]
 
 _JSON_SUFFIXES = (".json",)
@@ -274,6 +279,69 @@ def load_profiles(path: str | Path) -> list[ProfileConfig]:
         seen.add(profile.id)
         profiles.append(profile)
     return profiles
+
+
+def save_profiles(path: str | Path, profiles: Sequence[ProfileConfig]) -> Path:
+    """Rewrite the ``profiles`` key of the profiles document ``path``, atomically.
+
+    The profiles file is the on-disk **source of truth** of the running platform, so
+    the create/delete routes rewrite it while the engine keeps running.  The document
+    is therefore never truncated in place: the existing payload is read first, only
+    its ``profiles`` key is replaced, and the result is written to a temporary file
+    of the same directory which is then moved onto the target with :func:`os.replace`
+    -- an atomic rename on every supported platform.  A crash between the two steps
+    leaves the original file untouched, and a reader never observes a half-written
+    document.
+
+    Every other root key (``realtime``, ``monitoring``) is preserved **verbatim**: a
+    caller that owns only the profile list must not silently drop the engine
+    settings that share the document.
+
+    Parameters
+    ----------
+    path:
+        JSON profiles file (``.json`` only, like :func:`load_profiles`).  It must
+        already exist: this function updates a document, it never invents one.
+    profiles:
+        The profiles to declare, in the order they must appear.  An empty sequence
+        is written as an empty list; whether that is a legal platform is the
+        caller's rule and :func:`load_profiles` still refuses to read it.
+
+    Returns
+    -------
+    Path
+        The written path.
+
+    Raises
+    ------
+    ConfigError
+        The document cannot be read (missing file, wrong extension, invalid JSON),
+        or it cannot be written (unwritable directory, failing rename).  The
+        original file is left untouched and the temporary file is removed.
+    """
+    target = Path(path)
+    payload = _read_payload(target)
+    payload["profiles"] = [profile.model_dump(mode="json") for profile in profiles]
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temporary: Path | None = None
+    try:
+        handle, name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+        )
+        temporary = Path(name)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # ``Path.replace`` *is* ``os.replace``: an atomic rename on every supported
+        # platform, which is what makes the rewrite all-or-nothing for a reader.
+        temporary.replace(target)
+    except OSError as exc:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise ConfigError(f"cannot write profiles file {target}: {exc}") from exc
+    return target
 
 
 def _strip_section_prefix(overrides: Mapping[str, Any], key: str) -> dict[str, Any]:

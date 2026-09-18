@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from trading_platform.config import (
     load_config,
     override_params,
 )
+from trading_platform.config.loader import load_profiles, save_profiles
+from trading_platform.config.models import ProfileConfig
 from trading_platform.core.constants import DEFAULT_TIMEFRAME
 from trading_platform.core.errors import ConfigError
 
@@ -362,3 +365,133 @@ def test_override_params_on_an_empty_mapping_returns_an_equal_copy() -> None:
     updated = override_params(cfg, {})
     assert updated == cfg
     assert updated is not cfg
+
+
+# ---------------------------------------------------------------------------
+# save_profiles: the on-disk source of truth of a running platform
+# ---------------------------------------------------------------------------
+
+
+def profiles_document(tmp_path: Path, identifiers: list[str]) -> Path:
+    """Write a profiles document carrying profiles, realtime and monitoring keys."""
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "id": identifier,
+                        "symbol": "BTC/USDT",
+                        "timeframe": "1h",
+                        "strategy": "basic",
+                        "mode": "paper",
+                        "initial_balance": 1000.0,
+                    }
+                    for identifier in identifiers
+                ],
+                "realtime": {"state_db": str(tmp_path / "state.db"), "history_candles": 42},
+                "monitoring": {"host": "127.0.0.1", "port": 8099},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_save_profiles_round_trips_the_rewritten_list(tmp_path: Path) -> None:
+    """Two profiles out, the very same two models in."""
+    path = profiles_document(tmp_path, ["aaa-paper", "bbb-paper"])
+    rewritten = [
+        ProfileConfig(id="ccc-paper", symbol="ETH/USDT", mode="paper"),
+        ProfileConfig(id="ddd-paper", symbol="SOL/USDT", timeframe="4h", initial_balance=250.0),
+    ]
+    assert save_profiles(path, rewritten) == path
+    assert save_profiles(str(path), rewritten) == path
+    assert load_profiles(path) == rewritten
+
+
+def test_save_profiles_preserves_every_other_root_key_verbatim(tmp_path: Path) -> None:
+    """The engine and the server must not lose their settings to a profile edit."""
+    path = profiles_document(tmp_path, ["aaa-paper"])
+    before = json.loads(path.read_text(encoding="utf-8"))
+    save_profiles(path, [ProfileConfig(id="aaa-paper", symbol="BTC/USDT")])
+    text = path.read_text(encoding="utf-8")
+    after = json.loads(text)
+    assert after["realtime"] == before["realtime"]
+    assert after["monitoring"] == before["monitoring"]
+    assert sorted(after) == ["monitoring", "profiles", "realtime"]
+    assert text.startswith("{\n")
+    assert text.endswith("\n")
+    assert list(after) == sorted(after)  # pretty, sorted keys, like dump_config
+
+
+def test_save_profiles_adds_then_removes_a_profile(tmp_path: Path) -> None:
+    """The exact sequence the create and delete routes perform."""
+    path = profiles_document(tmp_path, ["aaa-paper"])
+    first = load_profiles(path)
+    created = ProfileConfig(id="bbb-paper", symbol="ETH/USDT")
+    save_profiles(path, [*first, created])
+    assert [item.id for item in load_profiles(path)] == ["aaa-paper", "bbb-paper"]
+    save_profiles(path, load_profiles(path)[:1])
+    assert [item.id for item in load_profiles(path)] == ["aaa-paper"]
+
+
+def test_save_profiles_never_validates_the_empty_list(tmp_path: Path) -> None:
+    """Writing an empty list is allowed; reading it back is still refused."""
+    path = profiles_document(tmp_path, ["aaa-paper"])
+    save_profiles(path, [])
+    assert json.loads(path.read_text(encoding="utf-8"))["profiles"] == []
+    with pytest.raises(ConfigError, match="declares no profile"):
+        load_profiles(path)
+
+
+def test_save_profiles_is_atomic_when_the_rename_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing rename leaves the original file byte-identical, and no temporary."""
+    path = profiles_document(tmp_path, ["aaa-paper", "bbb-paper"])
+    original = path.read_bytes()
+    real_replace = os.replace
+
+    def failing_replace(source: object, target: object, *args: object, **kwargs: object) -> None:
+        if Path(str(target)) == path:
+            raise OSError("read-only file system")
+        real_replace(source, target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(ConfigError) as excinfo:
+        save_profiles(path, [ProfileConfig(id="aaa-paper", symbol="BTC/USDT")])
+    assert f"cannot write profiles file {path}" in str(excinfo.value)
+    assert path.read_bytes() == original
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["profiles.json"]
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a root process ignores the directory permissions",
+)
+def test_save_profiles_reports_an_unwritable_directory(tmp_path: Path) -> None:
+    """A directory that refuses the temporary file aborts without touching the file."""
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    path = directory / "profiles.json"
+    path.write_text(json.dumps({"profiles": []}), encoding="utf-8")
+    original = path.read_bytes()
+    directory.chmod(0o500)
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            save_profiles(path, [ProfileConfig(id="aaa-paper", symbol="BTC/USDT")])
+        assert f"cannot write profiles file {path}" in str(excinfo.value)
+        assert path.read_bytes() == original
+        assert sorted(item.name for item in directory.iterdir()) == ["profiles.json"]
+    finally:
+        directory.chmod(0o700)
+
+
+def test_save_profiles_refuses_a_document_it_cannot_read(tmp_path: Path) -> None:
+    """Saving updates a document; it never invents one."""
+    with pytest.raises(ConfigError, match="not found"):
+        save_profiles(tmp_path / "missing.json", [ProfileConfig(id="aaa", symbol="BTC/USDT")])

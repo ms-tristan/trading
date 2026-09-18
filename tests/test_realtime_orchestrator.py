@@ -25,18 +25,24 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from trading_platform.config.loader import load_profiles
 from trading_platform.config.models import (
     MonitoringConfig,
     ProfileConfig,
     RealtimeConfig,
     RiskLimitsConfig,
 )
-from trading_platform.core.errors import MarketStreamError, ProfileError
+from trading_platform.core.errors import ConfigError, MarketStreamError, ProfileError
+from trading_platform.core.models import Direction
 from trading_platform.realtime import runner as runner_module
 from trading_platform.realtime.broker import PaperBroker
 from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.models import (
+    BrokerAck,
     CandleEvent,
+    OrderSide,
+    OrderState,
+    OrderType,
     PlatformSnapshot,
     ProfileSnapshot,
     ProfileStatus,
@@ -220,8 +226,14 @@ class _ScriptedStrategy(Strategy):
         columns = ["entry_long", "exit_long", "entry_short", "exit_short", "stop_loss"]
         frame = pd.DataFrame(False, index=data.index, columns=columns)
         frame["stop_loss"] = float("nan")
-        if str(self.flag.get("mode") or params.mode) == "entry_long":
+        mode = str(self.flag.get("mode") or params.mode)
+        if mode == "entry_long":
             frame.loc[data.index[-1], "entry_long"] = True
+            stop = self.flag.get("stop_loss")
+            if stop is not None:
+                frame.loc[data.index[-1], "stop_loss"] = float(stop)
+        elif mode == "exit_long":
+            frame.loc[data.index[-1], "exit_long"] = True
         return ensure_signal_frame(frame, data.index)
 
 
@@ -817,4 +829,558 @@ def test_the_hold_mode_of_the_scripted_strategy_never_opens(tmp_path: Path) -> N
     assert decisions[0].action is SignalAction.HOLD
     assert decisions[0].blocked is False
     assert len(store.equity_curve("btc-paper")) == 1
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# 14. runtime profile control: pause, resume, delete and create
+# ---------------------------------------------------------------------------
+
+
+def write_profiles(path: Path, profiles: list[ProfileConfig]) -> Path:
+    """Write a minimal profiles document (``profiles`` + the two section keys)."""
+    path.write_text(
+        json.dumps(
+            {
+                "profiles": [item.model_dump(mode="json") for item in profiles],
+                "realtime": {"state_db": str(path.parent / "state.db")},
+                "monitoring": {"port": 0},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+class RefusingFlattenBroker(PaperBroker):
+    """A venue that refuses the market order flattening a deleted profile."""
+
+    def submit(self, request: Any, *, reference_price: float) -> BrokerAck:
+        if request.reason == "profile deleted":
+            return BrokerAck(
+                client_order_id=request.client_order_id,
+                accepted=False,
+                state=OrderState.REJECTED,
+                reason="venue closed",
+            )
+        return super().submit(request, reference_price=reference_price)
+
+
+class SilentFlattenBroker(PaperBroker):
+    """A venue that acknowledges the flattening order without ever filling it."""
+
+    def submit(self, request: Any, *, reference_price: float) -> BrokerAck:
+        if request.reason == "profile deleted":
+            return BrokerAck(
+                client_order_id=request.client_order_id,
+                accepted=True,
+                state=OrderState.SUBMITTED,
+                broker_order_id="silent-order",
+            )
+        return super().submit(request, reference_price=reference_price)
+
+
+def scripted(monkeypatch: pytest.MonkeyPatch, flag: dict[str, Any]) -> None:
+    """Replace the strategy resolution of the runner by the scripted one."""
+    strategy = _ScriptedStrategy({}, flag=flag)
+    monkeypatch.setattr(runner_module, "resolve_strategy", lambda _profile: strategy)
+
+
+def test_pause_profile_closes_the_entry_gate_and_keeps_the_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused profile stops opening, keeps exiting, and resumes on demand."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, [profile("btc-paper", SYMBOL_BTC)]
+    )
+
+    async def scenario() -> dict[str, Any]:
+        opening = await orchestrator.run_once()
+        paused = await orchestrator.pause_profile("btc-paper")
+        measured: dict[str, Any] = {
+            "opening": opening,
+            "paused": paused,
+            "gate": (
+                orchestrator.runner("btc-paper").paused,  # type: ignore[union-attr]
+                store.get_meta("paused:btc-paper"),
+            ),
+        }
+        flag["mode"] = "exit_long"
+        measured["closing"] = await orchestrator.run_once()
+        measured["flat"] = store.list_positions("btc-paper")
+        flag["mode"] = "entry_long"
+        measured["blocked"] = await orchestrator.run_once()
+        measured["orders_while_paused"] = len(store.list_orders("btc-paper"))
+        measured["resumed"] = await orchestrator.resume_profile("btc-paper")
+        measured["reopened"] = await orchestrator.run_once()
+        measured["open_again"] = store.list_positions("btc-paper")
+        measured["orders_after_resume"] = len(store.list_orders("btc-paper"))
+        return measured
+
+    measured = run(scenario())
+    assert measured["opening"][0].action is SignalAction.ENTER_LONG
+    assert measured["paused"].profile_id == "btc-paper"
+    assert measured["paused"].status is ProfileStatus.RUNNING
+    assert measured["gate"] == (True, "1")
+    # the exit path is *not* gated: the open position stays managed while paused
+    assert measured["closing"][0].action is SignalAction.EXIT_LONG
+    assert measured["flat"] == []
+    # the entry path is gated, and the tick still publishes its decision
+    assert measured["blocked"][0].action is SignalAction.HOLD
+    assert measured["blocked"][0].reason == "profile is paused"
+    assert measured["orders_while_paused"] == 2
+    assert measured["resumed"].status is ProfileStatus.RUNNING
+    assert measured["reopened"][0].action is SignalAction.ENTER_LONG
+    assert len(measured["open_again"]) == 1
+    assert measured["orders_after_resume"] == 3
+    assert store.get_meta("paused:btc-paper") == "0"
+    assert orchestrator.runner("btc-paper").paused is False  # type: ignore[union-attr]
+    store.close()
+
+
+def test_a_paused_profile_still_honours_the_stop_of_its_open_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The static stop is evaluated before the entry gate, so it fires while paused."""
+    flag: dict[str, Any] = {"mode": "entry_long", "stop_loss": 101.5}
+    scripted(monkeypatch, flag)
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, [profile("btc-paper", SYMBOL_BTC)]
+    )
+
+    async def scenario() -> Any:
+        await orchestrator.run_once()
+        positions = store.list_positions("btc-paper")
+        await orchestrator.pause_profile("btc-paper")
+        flag["mode"] = "hold"
+        decision = await orchestrator.run_once()
+        return positions, decision
+
+    positions, decision = run(scenario())
+    assert len(positions) == 1
+    assert positions[0].stop_price == pytest.approx(101.5)
+    assert decision is not None
+    assert decision[0].action is SignalAction.STOP_LOSS
+    assert store.list_positions("btc-paper") == []
+    orders = store.list_orders("btc-paper")
+    assert len(orders) == 2
+    assert {order.side for order in orders} == {OrderSide.BUY, OrderSide.SELL}
+    assert orchestrator.runner("btc-paper").paused is True  # type: ignore[union-attr]
+    store.close()
+
+
+def test_pausing_an_unknown_or_stopped_profile_is_refused(tmp_path: Path) -> None:
+    """An unknown id and a profile without a runner are two distinct failures."""
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        [profile("btc-paper", SYMBOL_BTC), profile("sol-paper", "SOL/USDT", enabled=False)],
+    )
+    run(orchestrator.run_once())
+    with pytest.raises(ProfileError) as unknown:
+        run(orchestrator.pause_profile("nope"))
+    assert str(unknown.value) == "unknown profile: 'nope'"
+    with pytest.raises(ProfileError) as stopped:
+        run(orchestrator.pause_profile("sol-paper"))
+    assert str(stopped.value) == "profile 'sol-paper' is not running"
+    with pytest.raises(ProfileError) as unknown_resume:
+        run(orchestrator.resume_profile("nope"))
+    assert str(unknown_resume.value) == "unknown profile: 'nope'"
+    with pytest.raises(ProfileError) as stopped_resume:
+        run(orchestrator.resume_profile("sol-paper"))
+    assert str(stopped_resume.value) == "profile 'sol-paper' is not running"
+    store.close()
+
+
+def test_the_pause_flag_survives_a_restart(tmp_path: Path) -> None:
+    """A pause is persisted, and the restart re-pauses the runner it rebuilds."""
+    profiles = [profile("btc-paper", SYMBOL_BTC)]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+    run(orchestrator.run_once())
+    run(orchestrator.pause_profile("btc-paper"))
+    store.close()
+
+    restarted, reopened, _clock, _streams = build_orchestrator(tmp_path, profiles)
+    run(restarted.run_once())
+    assert restarted.runner("btc-paper").paused is True  # type: ignore[union-attr]
+    assert restarted.control_state()["profiles"] == [
+        {"profile_id": "btc-paper", "paused": True, "running": True}
+    ]
+    reopened.close()
+
+
+def test_control_state_reports_paused_and_running_per_profile(tmp_path: Path) -> None:
+    """The two flags are independent: a paused profile is still supervised."""
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+
+    async def scenario() -> Any:
+        await orchestrator.start()
+        running = orchestrator.control_state()
+        paused = await orchestrator.pause_profile("btc-paper")
+        after = orchestrator.control_state()
+        return running, paused, after
+
+    running, paused, after = run(scenario())
+    assert running["profiles"] == [
+        {"profile_id": "btc-paper", "paused": False, "running": True},
+        {"profile_id": "eth-paper", "paused": False, "running": True},
+    ]
+    assert paused.status is ProfileStatus.RUNNING
+    assert after["profiles"] == [
+        {"profile_id": "btc-paper", "paused": True, "running": True},
+        {"profile_id": "eth-paper", "paused": False, "running": True},
+    ]
+    store.close()
+
+
+def test_candle_series_reads_the_persisted_window(tmp_path: Path) -> None:
+    """The engine persists every processed candle; the orchestrator reads them back."""
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, [profile("btc-paper", SYMBOL_BTC)]
+    )
+    run(orchestrator.run_once())
+    candles = orchestrator.candle_series("btc-paper", 10)
+    assert len(candles) == 1
+    assert candles[0].profile_id == "btc-paper"
+    assert candles[0].close == pytest.approx(101.0)
+    assert candles[0].closed is True
+
+    store.append_candle(
+        CandleEvent(
+            symbol=SYMBOL_BTC,
+            timeframe="1h",
+            timestamp=pd.Timestamp("2024-01-01T07:00:00Z"),
+            open=110.0,
+            high=160.0,
+            low=109.0,
+            close=150.0,
+            volume=3.0,
+        ),
+        profile_id="btc-paper",
+    )
+    series = orchestrator.candle_series("btc-paper", 10)
+    assert [row.close for row in series] == [101.0, 150.0]
+    assert len(orchestrator.candle_series("btc-paper", 1)) == 1
+    assert orchestrator.candle_series("nope", 10) == []
+    store.close()
+
+
+def test_delete_profile_flattens_before_it_removes_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open position is closed at market, persisted, and only then forgotten."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+
+    async def scenario() -> Any:
+        await orchestrator.run_once()
+        positions = store.list_positions("btc-paper")
+        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        return positions, removed
+
+    positions, removed = run(scenario())
+    assert len(positions) == 1
+    quantity = float(positions[0].quantity)
+    assert quantity > 0.0
+    assert removed == "btc-paper"
+
+    orders = store.list_orders("btc-paper")
+    flatten = [order for order in orders if order.side is OrderSide.SELL]
+    assert len(orders) == 2
+    assert len(flatten) == 1
+    assert flatten[0].type is OrderType.MARKET
+    assert flatten[0].quantity == pytest.approx(quantity)
+    assert flatten[0].price is None
+    assert flatten[0].mode is RunMode.PAPER
+    assert flatten[0].state is OrderState.FILLED
+    assert store.list_positions("btc-paper") == []
+    trades = store.list_trades("btc-paper")
+    assert len(trades) == 1
+    assert trades[0].direction is Direction.LONG
+
+    assert "btc-paper" not in orchestrator.profile_ids()
+    assert orchestrator.profile_snapshot("btc-paper") is None
+    assert orchestrator.profile_config("btc-paper") is None
+    assert [item.id for item in orchestrator.profiles] == ["eth-paper"]
+    assert [item.id for item in load_profiles(path)] == ["eth-paper"]
+    assert orchestrator.control_state()["profiles"] == [
+        {"profile_id": "eth-paper", "paused": False, "running": True}
+    ]
+    store.close()
+
+
+def test_delete_profile_refuses_an_unknown_profile(tmp_path: Path) -> None:
+    """Deleting what does not exist changes nothing."""
+    profiles = [profile("btc-paper", SYMBOL_BTC)]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+    before = path.read_bytes()
+    run(orchestrator.run_once())
+    with pytest.raises(ProfileError) as excinfo:
+        run(orchestrator.delete_profile("nope", profiles_path=path))
+    assert str(excinfo.value) == "unknown profile: 'nope'"
+    assert path.read_bytes() == before
+    assert orchestrator.profile_ids() == ["btc-paper"]
+    store.close()
+
+
+def test_delete_profile_refuses_the_last_profile(tmp_path: Path) -> None:
+    """An engine requires at least one profile, so the last one is not deletable."""
+    profiles = [profile("btc-paper", SYMBOL_BTC)]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+    before = path.read_bytes()
+    run(orchestrator.run_once())
+    with pytest.raises(ProfileError) as excinfo:
+        run(orchestrator.delete_profile("btc-paper", profiles_path=path))
+    assert str(excinfo.value) == (
+        "cannot delete the last profile: the engine requires at least one profile"
+    )
+    assert path.read_bytes() == before
+    assert orchestrator.profile_ids() == ["btc-paper"]
+    assert orchestrator.profile_config("btc-paper") is not None
+    store.close()
+
+
+def test_delete_profile_keeps_everything_when_the_venue_refuses_the_flatten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused flattening order aborts the deletion: a profile is never orphaned."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+
+    def venues(target: ProfileConfig) -> PaperBroker:
+        return RefusingFlattenBroker(
+            clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
+            initial_balance=float(target.initial_balance),
+            seed=7,
+        )
+
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, broker_factory=venues
+    )
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+    run(orchestrator.run_once())
+    before = path.read_bytes()
+    with pytest.raises(ProfileError, match="could not be flattened"):
+        run(orchestrator.delete_profile("btc-paper", profiles_path=path))
+    assert path.read_bytes() == before
+    assert orchestrator.profile_ids() == ["btc-paper", "eth-paper"]
+    assert [item.id for item in load_profiles(path)] == ["btc-paper", "eth-paper"]
+    assert len(store.list_positions("btc-paper")) == 1
+    store.close()
+
+
+def test_delete_profile_keeps_everything_when_the_position_stays_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An acknowledged but unfilled flattening order is detected on the re-read."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+
+    def venues(target: ProfileConfig) -> PaperBroker:
+        return SilentFlattenBroker(
+            clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
+            initial_balance=float(target.initial_balance),
+            seed=7,
+        )
+
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, broker_factory=venues
+    )
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+    run(orchestrator.run_once())
+    before = path.read_bytes()
+    with pytest.raises(ProfileError) as excinfo:
+        run(orchestrator.delete_profile("btc-paper", profiles_path=path))
+    assert str(excinfo.value) == (
+        "cannot delete profile 'btc-paper': the open position could not be flattened"
+    )
+    assert path.read_bytes() == before
+    assert orchestrator.profile_ids() == ["btc-paper", "eth-paper"]
+    assert len(store.list_positions("btc-paper")) == 1
+    store.close()
+
+
+def test_add_profile_starts_it_and_rewrites_the_document(tmp_path: Path) -> None:
+    """A created profile is persisted, built, started and visible immediately."""
+    base = profile("btc-paper", SYMBOL_BTC)
+    orchestrator, store, _clock, streams = build_orchestrator(tmp_path, [base])
+    path = write_profiles(tmp_path / "profiles.json", [base])
+    created = ProfileConfig(
+        id="sol-paper",
+        symbol="SOL/USDT",
+        timeframe="15m",
+        strategy="basic",
+        mode="paper",
+        initial_balance=500.0,
+    )
+
+    async def scenario() -> Any:
+        await orchestrator.run_once()
+        return await orchestrator.add_profile(created, profiles_path=path)
+
+    snapshot = run(scenario())
+    assert snapshot.profile_id == "sol-paper"
+    assert snapshot.symbol == "SOL/USDT"
+    assert snapshot.timeframe == "15m"
+    assert snapshot.status is ProfileStatus.RUNNING
+    assert [stream.symbol for stream in streams] == [SYMBOL_BTC, "SOL/USDT"]
+    assert streams[1].started == 1
+    assert "sol-paper" in orchestrator._started_ids  # the documented running flag
+    assert orchestrator.runner("sol-paper") is not None
+    assert orchestrator.profile_config("sol-paper") is created
+    assert orchestrator.profile_ids() == ["btc-paper", "sol-paper"]
+    assert [item.id for item in load_profiles(path)] == ["btc-paper", "sol-paper"]
+    assert [item.id for item in store.load_profiles()] == ["btc-paper", "sol-paper"]
+    assert orchestrator.control_state()["profiles"] == [
+        {"profile_id": "btc-paper", "paused": False, "running": True},
+        {"profile_id": "sol-paper", "paused": False, "running": True},
+    ]
+    with pytest.raises(ProfileError) as excinfo:
+        run(orchestrator.add_profile(created, profiles_path=path))
+    assert str(excinfo.value) == "profile already exists: 'sol-paper'"
+    assert [item.id for item in load_profiles(path)] == ["btc-paper", "sol-paper"]
+    store.close()
+
+
+def test_add_profile_reports_a_document_it_cannot_write(tmp_path: Path) -> None:
+    """A write failure aborts the creation with the registry exactly as it was."""
+    base = profile("btc-paper", SYMBOL_BTC)
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, [base])
+    run(orchestrator.run_once())
+    with pytest.raises(ConfigError, match="not found"):
+        run(
+            orchestrator.add_profile(
+                ProfileConfig(id="sol-paper", symbol="SOL/USDT"),
+                profiles_path=tmp_path / "missing.json",
+            )
+        )
+    assert orchestrator.profile_ids() == ["btc-paper"]
+    assert orchestrator.profile_config("sol-paper") is None
+    assert [item.id for item in store.load_profiles()] == ["btc-paper"]
+    store.close()
+
+
+def test_add_profile_requires_a_running_engine(tmp_path: Path) -> None:
+    """A profile cannot be appended to a platform that never prepared its wiring."""
+    base = profile("btc-paper", SYMBOL_BTC)
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, [base])
+    path = write_profiles(tmp_path / "profiles.json", [base])
+    with pytest.raises(ProfileError) as excinfo:
+        run(
+            orchestrator.add_profile(
+                ProfileConfig(id="sol-paper", symbol="SOL/USDT"), profiles_path=path
+            )
+        )
+    assert str(excinfo.value) == "the engine is not running"
+    assert [item.id for item in load_profiles(path)] == ["btc-paper"]
+    store.close()
+
+
+def test_delete_profile_stops_only_the_deleted_profile(tmp_path: Path) -> None:
+    """One profile leaves the platform; its neighbours keep running and ticking."""
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    orchestrator, store, _clock, streams = build_orchestrator(tmp_path, profiles)
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+
+    async def scenario() -> Any:
+        await orchestrator.start()
+        await asyncio.sleep(_SETTLE)
+        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        state = orchestrator.control_state()
+        surviving = orchestrator._tasks.get("eth-paper")
+        assert surviving is not None
+        alive = not surviving.done()
+        survivor_ticks = streams[1].calls
+        statuses = (
+            store.load_status("eth-paper").status,  # type: ignore[union-attr]
+            store.load_status("btc-paper").status,  # type: ignore[union-attr]
+        )
+        await asyncio.sleep(_SETTLE)
+        return removed, state, alive, survivor_ticks, streams[1].calls, statuses
+
+    removed, state, alive, before, after, statuses = run(scenario())
+    assert removed == "btc-paper"
+    assert [stream.stopped for stream in streams] == [1, 0]
+    assert all(stream.started == 1 for stream in streams)
+    assert state["profiles"] == [{"profile_id": "eth-paper", "paused": False, "running": True}]
+    assert alive is True
+    assert after >= before >= 1  # the survivor kept polling its stream
+    assert statuses == (ProfileStatus.RUNNING, ProfileStatus.STOPPED)
+    assert [item.id for item in load_profiles(path)] == ["eth-paper"]
+    store.close()
+
+
+def test_control_state_survives_a_store_that_cannot_answer(tmp_path: Path) -> None:
+    """The pause/run read model never breaks the dashboard, closed store included."""
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, [profile("btc-paper", SYMBOL_BTC)]
+    )
+    store.close()
+    assert orchestrator.control_state()["profiles"] == [
+        {"profile_id": "btc-paper", "paused": False, "running": False}
+    ]
+
+
+class HalfFilledEntryBroker(PaperBroker):
+    """A venue that fills an entry only halfway, and every exit completely.
+
+    The remainder of the entry stays *working* at the venue and would be completed
+    by a later poll -- which is exactly the exposure the deletion must cancel before
+    it flattens anything.
+    """
+
+    def _immediate_fill_quantity(self, request: Any) -> float:
+        if request.side is OrderSide.BUY:
+            return float(request.quantity) / 2.0
+        return float(request.quantity)
+
+
+def test_delete_profile_cancels_the_working_orders_before_it_flattens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resting venue order is cancelled first, so it can never re-open exposure."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+
+    def venues(target: ProfileConfig) -> PaperBroker:
+        return HalfFilledEntryBroker(
+            clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
+            initial_balance=float(target.initial_balance),
+            seed=7,
+        )
+
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, broker_factory=venues
+    )
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+
+    async def scenario() -> Any:
+        await orchestrator.run_once()
+        runner = orchestrator.runner("btc-paper")
+        assert runner is not None
+        working = runner.gateway.open_orders()
+        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        return working, runner.gateway.open_orders(), removed
+
+    working, still_working, removed = run(scenario())
+    assert removed == "btc-paper"
+    # the entry was only half filled: the venue was holding the rest of the order
+    assert len(working) == 1
+    assert working[0].state is OrderState.PARTIALLY_FILLED
+    assert still_working == []
+    assert store.list_positions("btc-paper") == []
+    assert [item.id for item in load_profiles(path)] == ["eth-paper"]
     store.close()

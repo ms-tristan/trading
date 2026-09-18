@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 
+import { ProfileActions } from '@/components/profile/profile-actions';
 import { StatTile, type StatTrend } from '@/components/ui/stat-tile';
 import { StatusBadge, profileStatusTone } from '@/components/ui/status-badge';
 import { cn } from '@/lib/cn';
@@ -129,6 +130,8 @@ export function ProfileHeader({ profile, health, killSwitch, className }: Profil
             />
           </div>
         </div>
+
+        <ProfileActions profileId={profile.profile_id} className="mt-lg" />
 
         <div className="grid grid-cols-1 gap-lg sm:grid-cols-2 lg:grid-cols-4">
           <StatTile

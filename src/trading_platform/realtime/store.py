@@ -32,6 +32,11 @@ points, profile state, trades).  Profile specifications use the pydantic
 ``model_dump(mode="json")`` / ``model_validate`` pair.  Whenever a timestamp is part
 of a natural key it is *also* written to an indexable ISO-8601 UTC ``TEXT`` column,
 so ordering and lookups never depend on the JSON blob.
+
+Candles are the one exception to that JSON rule: they are stored as plain numeric
+columns (one row per profile and timestamp, see :class:`CandleRow`) and the store
+keeps only the most recent :data:`CANDLE_WINDOW` rows of each profile, so the chart
+surface has real price history without ever letting the database grow without bound.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
@@ -55,6 +60,7 @@ from trading_platform.core.errors import StateStoreError
 from trading_platform.core.models import TradeRecord
 from trading_platform.realtime.clock import Clock, SystemClock
 from trading_platform.realtime.models import (
+    CandleEvent,
     EquityPoint,
     Fill,
     Order,
@@ -65,12 +71,24 @@ from trading_platform.realtime.models import (
     status_error,
 )
 
-__all__ = ["SCHEMA_VERSION", "SqliteStateStore", "StateStore"]
+__all__ = ["CANDLE_WINDOW", "SCHEMA_VERSION", "CandleRow", "SqliteStateStore", "StateStore"]
 
 logger = logging.getLogger(__name__)
 
 #: Schema version written into the ``schema_version`` table by this build.
-SCHEMA_VERSION: int = 1
+#:
+#: History: ``1`` was the first shipped schema (profiles, orders, fills, positions,
+#: equity, trades, status, meta); ``2`` adds the bounded ``candles`` table.
+SCHEMA_VERSION: int = 2
+
+#: How many candles the store keeps **per profile** (the bounded retention window).
+#:
+#: The live engine appends the candle it just processed on every tick, so without a
+#: bound the database would grow by one row per profile and per timeframe for ever.
+#: :meth:`SqliteStateStore.append_candle` therefore prunes, inside the very same
+#: transaction as the insert, everything older than the most recent
+#: ``CANDLE_WINDOW`` rows of the profile.
+CANDLE_WINDOW: int = 1000
 
 #: Prefix of the ``meta`` key holding the persisted :class:`ProfileState` payload.
 _PROFILE_STATE_PREFIX = "profile_state:"
@@ -117,6 +135,13 @@ _DDL: tuple[str, ...] = (
         "profile_id TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL, "
         "last_candle_at TEXT, updated_at TEXT NOT NULL)"
     ),
+    (
+        "CREATE TABLE IF NOT EXISTS candles ("
+        "profile_id TEXT NOT NULL, timestamp TEXT NOT NULL, open REAL NOT NULL, "
+        "high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL, "
+        "closed INTEGER NOT NULL, PRIMARY KEY(profile_id, timestamp))"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_candles_profile ON candles(profile_id, timestamp)",
 )
 
 _T = TypeVar("_T")
@@ -125,6 +150,33 @@ _T = TypeVar("_T")
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CandleRow:
+    """One persisted candle of one profile (the row behind ``GET .../candles``)."""
+
+    profile_id: str
+    timestamp: pd.Timestamp
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    closed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable mapping with one key per field."""
+        return {
+            "profile_id": str(self.profile_id),
+            "timestamp": pd.Timestamp(self.timestamp).isoformat(),
+            "open": float(self.open),
+            "high": float(self.high),
+            "low": float(self.low),
+            "close": float(self.close),
+            "volume": float(self.volume),
+            "closed": bool(self.closed),
+        }
 
 
 def _utc_iso(value: pd.Timestamp | str) -> str:
@@ -329,6 +381,14 @@ class StateStore(Protocol):
         """Record a processed candle, keeping the maximum timestamp seen."""
         ...
 
+    def append_candle(self, candle: CandleEvent, *, profile_id: str) -> bool:
+        """Append one processed candle; return ``False`` when it was already known."""
+        ...
+
+    def candle_series(self, profile_id: str, limit: int = CANDLE_WINDOW) -> list[CandleRow]:
+        """Return the candles of a profile, oldest first, at most ``limit`` of them."""
+        ...
+
     def profile_state(self, profile_id: str) -> ProfileState:
         """Return the state of a profile, falling back to a stopped default."""
         ...
@@ -429,6 +489,11 @@ class SqliteStateStore:
         try:
             conn = self._new_connection()
             self._apply_pragmas(conn)
+            # v1 -> v2 forward migration, additive only: ``_create_schema`` runs
+            # first and every statement is ``CREATE TABLE/INDEX IF NOT EXISTS``, so a
+            # database deployed at version 1 simply gains the empty ``candles`` table
+            # (and its index) here, while every existing table, column and row is left
+            # untouched; ``_check_schema_version`` then bumps the stored version to 2.
             self._create_schema(conn)
             self._check_schema_version(conn)
         except BaseException:
@@ -1022,6 +1087,98 @@ class SqliteStateStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, stamped),
             )
+
+    # -- candles ------------------------------------------------------------
+
+    def append_candle(self, candle: CandleEvent, *, profile_id: str) -> bool:
+        """Append the candle a profile just processed; ``False`` when it was known.
+
+        One row per ``(profile_id, timestamp)``, carrying the OHLCV values and the
+        ``closed`` flag.  Re-appending the same candle refreshes its values in place
+        (so a forming candle replayed by a restart converges on its final values) and
+        reports ``False``, exactly like the other idempotent writers of this store.
+
+        The insert and the prune of everything older than the most recent
+        :data:`CANDLE_WINDOW` rows of the profile share **one** transaction, so the
+        table can never grow without bound and can never be observed un-pruned.  A
+        profile is the retention unit: pruning one never touches another.
+        """
+        timestamp = _utc_iso(candle.timestamp)
+        with self._write("append_candle") as conn:
+            known = (
+                conn.execute(
+                    "SELECT 1 FROM candles WHERE profile_id = ? AND timestamp = ?",
+                    (profile_id, timestamp),
+                ).fetchone()
+                is not None
+            )
+            conn.execute(
+                "INSERT INTO candles "
+                "(profile_id, timestamp, open, high, low, close, volume, closed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(profile_id, timestamp) DO UPDATE SET "
+                "open = excluded.open, high = excluded.high, low = excluded.low, "
+                "close = excluded.close, volume = excluded.volume, closed = excluded.closed",
+                (
+                    profile_id,
+                    timestamp,
+                    float(candle.open),
+                    float(candle.high),
+                    float(candle.low),
+                    float(candle.close),
+                    float(candle.volume),
+                    int(bool(candle.closed)),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM candles WHERE profile_id = ? AND timestamp NOT IN "
+                "(SELECT timestamp FROM candles WHERE profile_id = ? "
+                "ORDER BY timestamp DESC LIMIT ?)",
+                (profile_id, profile_id, int(CANDLE_WINDOW)),
+            )
+            return not known
+
+    def candle_series(self, profile_id: str, limit: int = CANDLE_WINDOW) -> list[CandleRow]:
+        """Return the persisted candles of a profile, **oldest first**.
+
+        The read queries the most recent ``limit`` rows (the cheapest plan on the
+        ``(profile_id, timestamp)`` key) and reverses them, so the caller always gets
+        a chronology it can plot directly.  A non-positive ``limit`` and an unknown
+        profile both answer ``[]``.
+        """
+        if limit <= 0:
+            return []
+        rows = self._fetchall(
+            "candle_series",
+            "SELECT profile_id, timestamp, open, high, low, close, volume, closed "
+            "FROM candles WHERE profile_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (profile_id, int(limit)),
+        )
+        series: list[CandleRow] = []
+        for row in rows:
+            timestamp = _parse_timestamp(
+                row["timestamp"],
+                operation="candle_series",
+                key=f"{profile_id}:{row['timestamp']}",
+            )
+            if timestamp is None:  # pragma: no cover - the column is NOT NULL
+                raise StateStoreError(
+                    f"state store read failed (candle_series): missing timestamp for {profile_id}"
+                )
+            series.append(
+                CandleRow(
+                    profile_id=str(row["profile_id"]),
+                    timestamp=timestamp,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row["volume"]),
+                    closed=bool(row["closed"]),
+                )
+            )
+        series.reverse()
+        return series
 
 
 def _iso_or_none(value: pd.Timestamp | None) -> str | None:

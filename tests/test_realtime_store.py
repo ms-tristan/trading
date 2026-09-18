@@ -31,6 +31,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -40,6 +41,7 @@ from trading_platform.core.errors import StateStoreError
 from trading_platform.core.models import Direction, ExitReason, TradeRecord
 from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.models import (
+    CandleEvent,
     EquityPoint,
     Fill,
     Order,
@@ -51,7 +53,13 @@ from trading_platform.realtime.models import (
     ProfileStatus,
     RunMode,
 )
-from trading_platform.realtime.store import SCHEMA_VERSION, SqliteStateStore, StateStore
+from trading_platform.realtime.store import (
+    CANDLE_WINDOW,
+    SCHEMA_VERSION,
+    CandleRow,
+    SqliteStateStore,
+    StateStore,
+)
 
 #: A fixed anchor: every test starts the virtual clock here.
 START = pd.Timestamp("2024-01-01T00:00:00Z")
@@ -198,6 +206,41 @@ def make_trade(*, exit_minutes: int = 60, pnl: float = 120.0) -> TradeRecord:
     )
 
 
+def make_candle(
+    minutes: int = 0,
+    *,
+    close: float = 41_100.0,
+    closed: bool = True,
+    symbol: str = "BTC/USDT",
+) -> CandleEvent:
+    """Build one candle as the live engine emits it."""
+    return CandleEvent(
+        symbol=symbol,
+        timeframe="1h",
+        timestamp=stamp(minutes),
+        open=close - 50.0,
+        high=close + 25.0,
+        low=close - 75.0,
+        close=close,
+        volume=12.5,
+        closed=closed,
+    )
+
+
+def make_candle_row(candle: CandleEvent, *, profile_id: str = "btc-paper") -> CandleRow:
+    """Return the :class:`CandleRow` a stored ``candle`` must decode back to."""
+    return CandleRow(
+        profile_id=profile_id,
+        timestamp=candle.timestamp,
+        open=float(candle.open),
+        high=float(candle.high),
+        low=float(candle.low),
+        close=float(candle.close),
+        volume=float(candle.volume),
+        closed=bool(candle.closed),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. nominal round-trip of every StateStore member
 # ---------------------------------------------------------------------------
@@ -213,9 +256,11 @@ def test_store_satisfies_the_protocol(store: SqliteStateStore) -> None:
 def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
     """Pin the seam the other packages consume: no member added, none forgotten."""
     expected = {
+        "append_candle",
         "append_equity",
         "append_fill",
         "append_trade",
+        "candle_series",
         "close",
         "delete_position",
         "equity_curve",
@@ -908,6 +953,8 @@ def test_every_method_requires_initialize(db_path: Path) -> None:
         ("set_meta", lambda: store.set_meta("key", "value")),
         ("last_processed_candle", lambda: store.last_processed_candle("btc-paper")),
         ("mark_candle_processed", lambda: store.mark_candle_processed("btc-paper", stamp(1))),
+        ("append_candle", lambda: store.append_candle(make_candle(), profile_id="btc-paper")),
+        ("candle_series", lambda: store.candle_series("btc-paper")),
         ("profile_state", lambda: store.profile_state("btc-paper")),
     ]
 
@@ -1049,3 +1096,342 @@ def test_profile_state_of_a_deleted_profile_never_raises(store: SqliteStateStore
 
     assert store.profile_state("btc-paper").status is ProfileStatus.RUNNING
     assert store.profile_state("").status is ProfileStatus.STOPPED
+
+
+# ---------------------------------------------------------------------------
+# 10. candles: the bounded history the live engine appends
+# ---------------------------------------------------------------------------
+
+#: Every domain table of the schema (the ``candles`` table is deliberately absent:
+#: the v1 fixture below must reproduce the schema build 1 actually shipped).
+_DOMAIN_TABLES = (
+    "profiles",
+    "orders",
+    "fills",
+    "positions",
+    "equity",
+    "trades",
+    "status",
+    "meta",
+)
+
+#: The complete DDL of schema version 1, verbatim (no ``candles`` table).
+_V1_DDL: tuple[str, ...] = (
+    "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    (
+        "CREATE TABLE IF NOT EXISTS profiles ("
+        "profile_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    ),
+    (
+        "CREATE TABLE IF NOT EXISTS orders ("
+        "client_order_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, symbol TEXT NOT NULL, "
+        "state TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_orders_profile ON orders(profile_id, created_at)",
+    (
+        "CREATE TABLE IF NOT EXISTS fills ("
+        "fill_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL, profile_id TEXT NOT NULL, "
+        "payload TEXT NOT NULL, timestamp TEXT NOT NULL)"
+    ),
+    (
+        "CREATE TABLE IF NOT EXISTS positions ("
+        "profile_id TEXT NOT NULL, symbol TEXT NOT NULL, payload TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL, PRIMARY KEY(profile_id, symbol))"
+    ),
+    (
+        "CREATE TABLE IF NOT EXISTS equity ("
+        "profile_id TEXT NOT NULL, timestamp TEXT NOT NULL, equity REAL NOT NULL, "
+        "payload TEXT NOT NULL, PRIMARY KEY(profile_id, timestamp))"
+    ),
+    (
+        "CREATE TABLE IF NOT EXISTS trades ("
+        "profile_id TEXT NOT NULL, trade_id TEXT NOT NULL, payload TEXT NOT NULL, "
+        "exit_time TEXT NOT NULL, PRIMARY KEY(profile_id, trade_id))"
+    ),
+    (
+        "CREATE TABLE IF NOT EXISTS status ("
+        "profile_id TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL, "
+        "last_candle_at TEXT, updated_at TEXT NOT NULL)"
+    ),
+)
+
+
+def write_version_1_database(db_path: Path, *, version: int = 1) -> None:
+    """Create a deployed version-1 database with one real row per table.
+
+    The rows are written by hand, exactly as build 1 wrote them, so the migration
+    test can compare them byte for byte afterwards.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = make_profile("btc-paper", mode="live")
+    order = make_order()
+    fill = make_fill()
+    position = make_position()
+    point = make_equity()
+    trade = make_trade()
+    state = ProfileState(
+        profile_id="btc-paper",
+        status=ProfileStatus.RUNNING,
+        mode=RunMode.LIVE,
+        last_candle_at=stamp(5),
+        lag_seconds=1.5,
+        last_error=None,
+        reconnect_count=2,
+        updated_at=stamp(6),
+    )
+    connection = sqlite3.connect(db_path)
+    try:
+        for statement in _V1_DDL:
+            connection.execute(statement)
+        connection.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        connection.execute(
+            "INSERT INTO profiles (profile_id, payload, updated_at) VALUES (?, ?, ?)",
+            (
+                "btc-paper",
+                json.dumps(profile.model_dump(mode="json"), sort_keys=True),
+                "2024-01-01",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO orders (client_order_id, profile_id, symbol, state, payload, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                order.client_order_id,
+                "btc-paper",
+                "BTC/USDT",
+                order.state.value,
+                json.dumps(order.to_dict(), sort_keys=True),
+                "2024-01-01T00:00:00+00:00",
+                "2024-01-01T00:01:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO fills (fill_id, client_order_id, profile_id, payload, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                fill.fill_id,
+                fill.client_order_id,
+                "btc-paper",
+                json.dumps(fill.to_dict(), sort_keys=True),
+                "2024-01-01T00:02:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO positions (profile_id, symbol, payload, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                "btc-paper",
+                "BTC/USDT",
+                json.dumps(position.to_dict(), sort_keys=True),
+                "2024-01-01T00:03:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO equity (profile_id, timestamp, equity, payload) VALUES (?, ?, ?, ?)",
+            (
+                "btc-paper",
+                "2024-01-01T00:04:00+00:00",
+                float(point.equity),
+                json.dumps(point.to_dict(), sort_keys=True),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO trades (profile_id, trade_id, payload, exit_time) VALUES (?, ?, ?, ?)",
+            (
+                "btc-paper",
+                "btc-paper-trade-1",
+                json.dumps(trade.to_dict(), sort_keys=True),
+                "2024-01-01T01:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO status (profile_id, status, detail, last_candle_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "btc-paper",
+                "running",
+                "last candle 2024-01-01T00:05:00+00:00",
+                "2024-01-01T00:05:00+00:00",
+                "2024-01-01T00:06:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ("last_candle:btc-paper", "2024-01-01T00:05:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ("profile_state:btc-paper", json.dumps(state.to_dict(), sort_keys=True)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def table_snapshot(db_path: Path) -> dict[str, list[tuple[Any, ...]]]:
+    """Return every row of every domain table, as plain tuples."""
+    with raw_connection(db_path) as conn:
+        return {
+            table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}")]
+            for table in _DOMAIN_TABLES
+        }
+
+
+def test_append_candle_stores_the_processed_candle(store: SqliteStateStore) -> None:
+    candle = make_candle(7, close=41_234.5)
+    forming = make_candle(8, close=41_300.0, closed=False)
+
+    assert store.append_candle(candle, profile_id="btc-paper") is True
+    assert store.append_candle(forming, profile_id="btc-paper") is True
+
+    series = store.candle_series("btc-paper")
+    assert series == [make_candle_row(candle), make_candle_row(forming)]
+    stored = series[0]
+    assert isinstance(stored, CandleRow)
+    assert stored.profile_id == "btc-paper"
+    assert stored.timestamp == stamp(7)
+    assert stored.open == pytest.approx(float(candle.open))
+    assert stored.high == pytest.approx(float(candle.high))
+    assert stored.low == pytest.approx(float(candle.low))
+    assert stored.close == pytest.approx(41_234.5)
+    assert stored.volume == pytest.approx(12.5)
+    assert stored.closed is True
+    # the ``closed`` flag of a candle still forming is stored verbatim, never forced
+    assert series[1].closed is False
+    assert stored.to_dict() == {
+        "profile_id": "btc-paper",
+        "timestamp": stamp(7).isoformat(),
+        "open": float(candle.open),
+        "high": float(candle.high),
+        "low": float(candle.low),
+        "close": 41_234.5,
+        "volume": 12.5,
+        "closed": True,
+    }
+
+
+def test_candles_of_another_profile_are_invisible(store: SqliteStateStore) -> None:
+    store.append_candle(make_candle(1), profile_id="btc-paper")
+    store.append_candle(make_candle(1, symbol="ETH/USDT"), profile_id="eth-paper")
+
+    assert [row.profile_id for row in store.candle_series("btc-paper")] == ["btc-paper"]
+    assert [row.profile_id for row in store.candle_series("eth-paper")] == ["eth-paper"]
+    assert store.candle_series("never-seen") == []
+
+
+def test_candle_series_is_oldest_first(store: SqliteStateStore) -> None:
+    for minutes in (2, 0, 1):
+        store.append_candle(make_candle(minutes), profile_id="btc-paper")
+
+    series = store.candle_series("btc-paper")
+    assert [row.timestamp for row in series] == [stamp(0), stamp(1), stamp(2)]
+
+
+def test_append_candle_is_idempotent_and_refreshes_in_place(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    assert store.append_candle(make_candle(3, close=100.0), profile_id="btc-paper") is True
+    assert store.append_candle(make_candle(3, close=101.0), profile_id="btc-paper") is False
+    # the same instant of another profile is a different row, and a brand new one
+    assert store.append_candle(make_candle(3, symbol="ETH/USDT"), profile_id="eth-paper") is True
+
+    series = store.candle_series("btc-paper")
+    assert len(series) == 1
+    assert series[0].close == pytest.approx(101.0)
+    assert store.candle_series("eth-paper")[0].close == pytest.approx(
+        float(make_candle(3, symbol="ETH/USDT").close)
+    )
+
+    with raw_connection(db_path) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM candles").fetchone()
+    assert rows is not None
+    assert rows[0] == 2
+
+
+def test_the_candle_window_keeps_only_the_most_recent_candles(store: SqliteStateStore) -> None:
+    total = CANDLE_WINDOW + 25
+    for minutes in range(total):
+        store.append_candle(make_candle(minutes), profile_id="btc-paper")
+
+    series = store.candle_series("btc-paper", limit=CANDLE_WINDOW + 1)
+    assert len(series) == CANDLE_WINDOW
+    assert series[0].timestamp == stamp(25)
+    assert series[-1].timestamp == stamp(total - 1)
+    assert series == store.candle_series("btc-paper")
+
+
+def test_candle_series_limit_boundaries(store: SqliteStateStore) -> None:
+    for minutes in range(3):
+        store.append_candle(make_candle(minutes), profile_id="btc-paper")
+
+    assert store.candle_series("btc-paper", limit=0) == []
+    assert store.candle_series("btc-paper", limit=-1) == []
+    assert len(store.candle_series("btc-paper", limit=CANDLE_WINDOW + 100)) == 3
+    assert [row.timestamp for row in store.candle_series("btc-paper", limit=2)] == [
+        stamp(1),
+        stamp(2),
+    ]
+    assert store.candle_series("never-seen") == []
+
+
+def test_a_version_1_database_is_migrated_to_version_2_without_touching_a_row(
+    db_path: Path, clock: ManualClock
+) -> None:
+    write_version_1_database(db_path)
+    before = table_snapshot(db_path)
+    assert all(rows for rows in before.values()), "the fixture must hold one row per table"
+
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    try:
+        # (a) every pre-existing row is still there, byte for byte
+        assert table_snapshot(db_path) == before
+        # (b) the stored version is now the one of this build
+        with raw_connection(db_path) as conn:
+            versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
+        assert versions == [SCHEMA_VERSION] == [2]
+        # (c) the migrated file accepts a candle, and the old data still decodes
+        candle = make_candle(9)
+        assert store.append_candle(candle, profile_id="btc-paper") is True
+        assert store.candle_series("btc-paper") == [make_candle_row(candle)]
+        assert [item.id for item in store.load_profiles()] == ["btc-paper"]
+        assert store.get_order("btc-paper-BTC_USDT-20240101T000000Z-0000") is not None
+        assert store.profile_state("btc-paper").status is ProfileStatus.RUNNING
+        assert store.last_processed_candle("btc-paper") == stamp(5)
+    finally:
+        store.close()
+
+
+def test_a_database_newer_than_this_build_is_still_refused(
+    db_path: Path, clock: ManualClock
+) -> None:
+    write_version_1_database(db_path, version=SCHEMA_VERSION + 1)
+    before = table_snapshot(db_path)
+
+    store = SqliteStateStore(db_path, clock=clock)
+    with pytest.raises(StateStoreError) as excinfo:
+        store.initialize()
+    assert str(excinfo.value) == (
+        f"state database {db_path} uses schema version {SCHEMA_VERSION + 1}, "
+        f"newer than the supported {SCHEMA_VERSION}"
+    )
+    assert store.is_initialized() is False
+    # a refused database is never touched: neither its rows nor its version
+    assert table_snapshot(db_path) == before
+    with raw_connection(db_path) as conn:
+        versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
+    assert versions == [SCHEMA_VERSION + 1]
+
+
+def test_a_broken_candles_table_is_reported_as_a_store_error(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    store.append_candle(make_candle(1), profile_id="btc-paper")
+    with raw_connection(db_path) as conn:
+        conn.execute("DROP TABLE candles")
+
+    with pytest.raises(StateStoreError, match=r"state store read failed \(candle_series\)"):
+        store.candle_series("btc-paper")
+    with pytest.raises(StateStoreError, match=r"state store write failed \(append_candle\)"):
+        store.append_candle(make_candle(2), profile_id="btc-paper")

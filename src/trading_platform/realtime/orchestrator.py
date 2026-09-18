@@ -40,6 +40,24 @@ and handing the profile to the one
 :class:`~trading_platform.realtime.gateway.ExecutionGateway`.  The mechanical
 guarantee of that separation lives in the gateway (the broker-mode assertion) and in
 the live gate; here there is only wiring.
+
+Runtime profile control
+-----------------------
+The platform is not frozen once started: :meth:`RealtimeOrchestrator.pause_profile`,
+:meth:`RealtimeOrchestrator.resume_profile`,
+:meth:`RealtimeOrchestrator.delete_profile` and
+:meth:`RealtimeOrchestrator.add_profile` mutate it while it runs.  Every one of them
+is a coroutine, so they all execute **inside the engine loop**: they can never
+interleave with a candle being processed, and the registry dictionaries are only
+ever written from that loop (the threaded HTTP layer reaches them through
+:class:`~trading_platform.realtime.control.RuntimeProfileController`, which marshals
+the coroutine onto the loop).  Two semantics are worth restating because they are the
+product rules, not implementation details: *pausing* only closes the entry gate --
+the static stop of an open position and every exit signal keep being evaluated, so
+nothing is left unmanaged -- and *deleting* flattens the open position through the
+gateway before anything is removed, so a profile is never removed while it is still
+exposed.  Both are persisted (the pause flag in the ``meta`` table, the profile list
+in the profiles document) and survive a restart.
 """
 
 from __future__ import annotations
@@ -51,24 +69,41 @@ import logging
 import os
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
+from trading_platform.config.loader import load_profiles, save_profiles
 from trading_platform.config.models import MonitoringConfig, ProfileConfig, RealtimeConfig
-from trading_platform.core.errors import MarketStreamError, ProfileError, RealtimeError
-from trading_platform.core.models import TradeRecord
+from trading_platform.core.errors import (
+    BrokerError,
+    ConfigError,
+    GatewayError,
+    KillSwitchActiveError,
+    MarketStreamError,
+    OrderRejectedError,
+    ProfileError,
+    RealtimeError,
+    RiskLimitExceededError,
+)
+from trading_platform.core.models import Direction, TradeRecord
 from trading_platform.realtime.clock import Clock
 from trading_platform.realtime.models import (
     EngineCounters,
     EquityPoint,
+    OrderRequest,
+    OrderSide,
+    OrderType,
     PlatformSnapshot,
+    Position,
     ProfileHealth,
     ProfileSnapshot,
     ProfileState,
     ProfileStatus,
     RunMode,
     TradeSignalDecision,
+    new_client_order_id,
 )
 from trading_platform.realtime.observability import LOGGER_NAME, log_event
 
@@ -81,7 +116,7 @@ if TYPE_CHECKING:
         RiskManager,
     )
     from trading_platform.realtime.runner import ProfileRunner
-    from trading_platform.realtime.store import StateStore
+    from trading_platform.realtime.store import CandleRow, StateStore
     from trading_platform.realtime.stream import MarketStream
 
 __all__ = [
@@ -105,6 +140,21 @@ BrokerFactory = Callable[[ProfileConfig], "Broker"]
 _UNHEALTHY_STATUSES: frozenset[ProfileStatus] = frozenset(
     {ProfileStatus.DEGRADED, ProfileStatus.ERROR, ProfileStatus.HALTED}
 )
+
+#: Prefix of the ``meta`` key holding the persisted pause flag of one profile.
+#:
+#: The flag lives in the existing free-form ``meta`` table (values ``"1"`` for
+#: paused and ``"0"`` for running), so pausing a profile needs **no schema change**
+#: and survives a process restart: :meth:`RealtimeOrchestrator._build_runner` reads
+#: it back and re-pauses the runner it just built.
+_PAUSED_META_PREFIX = "paused:"
+
+#: Sequence number of the market order that flattens a profile being deleted.
+#:
+#: The client order id of that order is built from the deletion instant and this
+#: sequence, so a delete replayed after a restart produces the same identifier and
+#: the gateway answers it idempotently instead of sending a second order.
+_DELETE_ORDER_SEQUENCE = 0
 
 
 def make_risk_manager(
@@ -267,7 +317,7 @@ class RealtimeOrchestrator:
         self._runners: dict[str, ProfileRunner] = {}
         self._streams: dict[str, MarketStream] = {}
         self._reports: dict[str, bool] = {}
-        self._tasks: list[asyncio.Task[None]] = []
+        self._tasks: dict[str, asyncio.Task[None]] = {}
         self._started_ids: set[str] = set()
         self._kill_switch: KillSwitch | None = None
         self._monotonic_start: float | None = None
@@ -316,8 +366,9 @@ class RealtimeOrchestrator:
             self._started_at = pd.Timestamp(self._clock.now())
         for profile_id in runner_ids:
             await self._start_runner(profile_id)
-            task = asyncio.create_task(self._supervise(self._runners[profile_id]))
-            self._tasks.append(task)
+            self._tasks[profile_id] = asyncio.create_task(
+                self._supervise(self._runners[profile_id])
+            )
         log_event(
             _LOGGER,
             "platform_started",
@@ -328,7 +379,7 @@ class RealtimeOrchestrator:
 
     async def stop(self) -> None:
         """Cancel every profile, await them, persist ``STOPPED`` and close the store."""
-        tasks = list(self._tasks)
+        tasks = list(self._tasks.values())
         self._tasks.clear()
         for task in tasks:
             task.cancel()
@@ -378,7 +429,7 @@ class RealtimeOrchestrator:
     async def run_forever(self) -> None:
         """Start every profile and wait until they all stop."""
         await self.start()
-        tasks = list(self._tasks)
+        tasks = list(self._tasks.values())
         if tasks:
             await asyncio.gather(*tasks)
 
@@ -469,6 +520,190 @@ class RealtimeOrchestrator:
         )
         return state
 
+    # -- runtime profile control --------------------------------------------
+
+    def profile_config(self, profile_id: str) -> ProfileConfig | None:
+        """Return the definition of one profile, or ``None`` when it is unknown."""
+        return self._by_id.get(str(profile_id))
+
+    def control_state(self) -> dict[str, Any]:
+        """Return the pause/run state of every profile of the platform.
+
+        The payload is deliberately tiny and synchronous: it is the answer the
+        dashboard refreshes after a lifecycle command, so it can never be stale in a
+        way the operator would notice.  ``running`` means "the orchestrator started
+        this profile", ``paused`` means "its entry gate is closed" -- the two are
+        independent, because a paused profile is still supervised and still manages
+        its open position.
+        """
+        return {
+            "profiles": [
+                {
+                    "profile_id": profile_id,
+                    "paused": self._paused(profile_id),
+                    "running": profile_id in self._started_ids,
+                }
+                for profile_id in self.profile_ids()
+            ]
+        }
+
+    def candle_series(self, profile_id: str, limit: int) -> list[CandleRow]:
+        """Return the persisted candles of a profile, oldest first.
+
+        Part of the read model the monitoring layer consumes: the orchestrator is
+        therefore a valid :class:`~trading_platform.web.routes.SnapshotProvider` for
+        the candles route in both an engine run and a read-only ``realtime serve``.
+        """
+        self._ensure_store()
+        return self._store.candle_series(profile_id, limit)
+
+    async def pause_profile(self, profile_id: str) -> ProfileSnapshot:
+        """Close the entry gate of one running profile, durably.
+
+        The profile keeps its stream, its runner and its supervision: it stops
+        opening **new** positions, while the static stop of an open position and
+        every exit signal keep being evaluated, so nothing is ever left unmanaged.
+        The flag is persisted before returning, so a process restart resumes paused.
+
+        Raises
+        ------
+        ProfileError
+            The profile is unknown, or it is not running right now.
+        """
+        resolved = str(profile_id)
+        if resolved not in self._by_id:
+            raise ProfileError(f"unknown profile: {profile_id!r}")
+        runner = self._runners.get(resolved)
+        if runner is None:
+            raise ProfileError(f"profile {profile_id!r} is not running")
+        self._ensure_store()
+        runner.pause()
+        self._store.set_meta(_PAUSED_META_PREFIX + resolved, "1")
+        log_event(_LOGGER, "profile_pause_requested", profile_id=resolved)
+        return self._require_snapshot(profile_id)
+
+    async def resume_profile(self, profile_id: str) -> ProfileSnapshot:
+        """Re-open the entry gate of one running profile, durably.
+
+        The mirror of :meth:`pause_profile`, including the persisted flag.
+
+        Raises
+        ------
+        ProfileError
+            The profile is unknown, or it is not running right now.
+        """
+        resolved = str(profile_id)
+        if resolved not in self._by_id:
+            raise ProfileError(f"unknown profile: {profile_id!r}")
+        runner = self._runners.get(resolved)
+        if runner is None:
+            raise ProfileError(f"profile {profile_id!r} is not running")
+        self._ensure_store()
+        runner.resume()
+        self._store.set_meta(_PAUSED_META_PREFIX + resolved, "0")
+        log_event(_LOGGER, "profile_resume_requested", profile_id=resolved)
+        return self._require_snapshot(profile_id)
+
+    async def delete_profile(self, profile_id: str, *, profiles_path: str | Path) -> str:
+        """Flatten, stop and forget one profile; return the removed identifier.
+
+        The order of the operations is the safety property of this method, not an
+        implementation detail:
+
+        1. the profile must exist, and it must not be the last one of the platform
+           (an engine with no profile cannot run);
+        2. the open exposure is closed **through the execution gateway**, before
+           anything is removed: every working order is cancelled and the open
+           position is flattened with one market order.  A failure at this step
+           aborts the deletion and changes nothing at all -- a profile is never
+           removed while it is still exposed;
+        3. the profiles document is rewritten, so a write failure aborts with the
+           file and the running engine still consistent;
+        4. only then is the profile stopped (supervise task, runner and stream) and
+           forgotten by the registry, the store flag included.
+
+        Parameters
+        ----------
+        profile_id:
+            Profile to delete.
+        profiles_path:
+            The profiles document -- the on-disk source of truth -- rewritten
+            atomically without the deleted profile.
+
+        Raises
+        ------
+        ProfileError
+            Unknown profile, last profile of the platform, or a position that could
+            not be flattened.  In every case nothing else was modified.
+        ConfigError
+            The profiles document could not be rewritten; nothing was removed then
+            either.
+        """
+        resolved = str(profile_id)
+        profile = self._by_id.get(resolved)
+        if profile is None:
+            raise ProfileError(f"unknown profile: {profile_id!r}")
+        remaining = [item for item in self._profiles if str(item.id) != resolved]
+        if not remaining:
+            raise ProfileError(
+                "cannot delete the last profile: the engine requires at least one profile"
+            )
+        runner = self._runners.get(resolved)
+        if runner is not None:
+            self._flatten_profile(profile, runner)
+        await asyncio.to_thread(save_profiles, profiles_path, remaining)
+        await self._stop_profile(resolved)
+        self._runners.pop(resolved, None)
+        self._streams.pop(resolved, None)
+        self._reports.pop(resolved, None)
+        self._started_ids.discard(resolved)
+        self._profiles = tuple(item for item in self._profiles if str(item.id) != resolved)
+        self._by_id.pop(resolved, None)
+        self._store.set_meta(_PAUSED_META_PREFIX + resolved, "0")
+        log_event(_LOGGER, "profile_deleted", profile_id=resolved, profiles=len(self._profiles))
+        return resolved
+
+    async def add_profile(
+        self, profile: ProfileConfig, *, profiles_path: str | Path
+    ) -> ProfileSnapshot:
+        """Persist, build and start one new profile; return its snapshot.
+
+        The profiles document is written **before** the in-memory registry is
+        touched, so a failed write leaves the platform exactly as it was.  The new
+        profile is then saved in the store, built by the regular wiring
+        (:meth:`_build_runner`, reconciliation included) and started, which is what
+        makes it appear on the dashboard without a restart.
+
+        Parameters
+        ----------
+        profile:
+            The definition to add; its identifier must be free.
+        profiles_path:
+            The profiles document rewritten atomically with the new profile.
+
+        Raises
+        ------
+        ProfileError
+            The platform is not running (no prepared wiring, no stream factory), or
+            the identifier is already declared.
+        """
+        resolved = str(profile.id)
+        factory = self._stream_factory
+        if not self._prepared or factory is None:
+            raise ProfileError("the engine is not running")
+        if resolved in self._by_id or resolved in self._declared_ids(profiles_path):
+            raise ProfileError(f"profile already exists: {profile.id!r}")
+        self._ensure_store()
+        await asyncio.to_thread(save_profiles, profiles_path, [*self._profiles, profile])
+        self._store.save_profile(profile)
+        self._by_id[resolved] = profile
+        self._profiles = (*self._profiles, profile)
+        self._build_runner(profile, factory)
+        await self._start_runner(resolved)
+        self._tasks[resolved] = asyncio.create_task(self._supervise(self._runners[resolved]))
+        log_event(_LOGGER, "profile_added", profile_id=resolved, profiles=len(self._profiles))
+        return self._require_snapshot(profile.id)
+
     # -- wiring -------------------------------------------------------------
 
     def _prepare_runners(self) -> list[str]:
@@ -536,6 +771,11 @@ class RealtimeOrchestrator:
             )
         self._streams[profile_id] = runner.stream
         self._runners[profile_id] = runner
+        if self._store.get_meta(_PAUSED_META_PREFIX + profile_id) == "1":
+            # The operator paused this profile before the restart: the entry gate is
+            # closed again here, before the first tick, so a restart can never open a
+            # position the operator asked not to open.
+            runner.pause()
 
     def _seed_paper_cash(self, profile: ProfileConfig, broker: Broker) -> None:
         """Re-seed a simulated venue with the cash the durable state remembers (D7).
@@ -631,6 +871,161 @@ class RealtimeOrchestrator:
             log_event(_LOGGER, "stream_shutdown_timeout", level=logging.ERROR)
 
     # -- internals ----------------------------------------------------------
+
+    def _require_snapshot(self, profile_id: str) -> ProfileSnapshot:
+        """Return the snapshot of a profile the caller already resolved."""
+        snapshot = self.profile_snapshot(profile_id)
+        if snapshot is None:  # pragma: no cover - defensive: the id was resolved
+            raise ProfileError(f"unknown profile: {profile_id!r}")
+        return snapshot
+
+    def _paused(self, profile_id: str) -> bool:
+        """Return whether the entry gate of a profile is closed.
+
+        A running profile answers from its runner (the live truth); a profile with
+        no runner answers from the persisted flag, so the dashboard shows the same
+        state before and after a restart.
+        """
+        runner = self._runners.get(profile_id)
+        if runner is not None:
+            return bool(runner.paused)
+        try:
+            return self._store.get_meta(_PAUSED_META_PREFIX + profile_id) == "1"
+        except RealtimeError:  # a store that was never opened cannot answer
+            return False
+
+    @staticmethod
+    def _declared_ids(profiles_path: str | Path) -> set[str]:
+        """Return the identifiers the profiles document declares (empty when unreadable).
+
+        The file is the source of truth, so it is consulted before adding a profile:
+        an identifier that a concurrent editor added on disk must be refused too.  An
+        unreadable document is not reported here -- the write that follows owns that
+        failure and reports it with the document in hand.
+        """
+        try:
+            return {str(item.id) for item in load_profiles(profiles_path)}
+        except ConfigError:
+            return set()
+
+    def _flatten_profile(self, profile: ProfileConfig, runner: ProfileRunner) -> None:
+        """Cancel the working orders and flatten the open position, before any removal.
+
+        The flattening goes through the *existing* execution gateway, so it obeys the
+        same risk manager, the same live gate and the same idempotency keys as every
+        other order of the profile.  A profile whose exposure could not be closed is
+        never deleted: the caller gets a
+        :class:`~trading_platform.core.errors.ProfileError` and nothing was changed.
+        """
+        from trading_platform.realtime.gateway import FLAT_EPSILON
+
+        profile_id = str(profile.id)
+        gateway = runner.gateway
+        for order in gateway.open_orders():
+            gateway.cancel(order.client_order_id)
+        position = gateway.position()
+        if position is not None and abs(float(position.quantity)) > FLAT_EPSILON:
+            self._submit_flatten(profile, runner, position)
+            gateway.poll()
+            trade = gateway.closed_trade()
+            if trade is not None:
+                self._store.append_trade(trade, profile_id=profile_id)
+        remaining = gateway.position()
+        if remaining is not None and abs(float(remaining.quantity)) > FLAT_EPSILON:
+            raise ProfileError(
+                f"cannot delete profile {profile_id!r}: the open position could not be flattened"
+            )
+
+    def _submit_flatten(
+        self, profile: ProfileConfig, runner: ProfileRunner, position: Position
+    ) -> None:
+        """Route the single market order that closes the whole open position."""
+        profile_id = str(profile.id)
+        gateway = runner.gateway
+        fields = gateway.snapshot_fields()
+        stamp = pd.Timestamp(self._clock.now())
+        equity = float(fields.get("equity", 0.0))
+        signed = float(position.quantity)
+        mark = 0.0 if not signed else float(fields.get("position_value", 0.0)) / signed
+        reference_price = float(position.average_price) if mark <= 0.0 else mark
+        request = OrderRequest(
+            profile_id=profile_id,
+            client_order_id=new_client_order_id(
+                profile_id, str(profile.symbol), stamp, _DELETE_ORDER_SEQUENCE
+            ),
+            symbol=str(profile.symbol),
+            side=(
+                OrderSide.SELL if Direction(position.direction) is Direction.LONG else OrderSide.BUY
+            ),
+            type=OrderType.MARKET,
+            quantity=abs(signed),
+            price=None,
+            stop_price=None,
+            mode=RunMode(profile.mode),
+            reason="profile deleted",
+            created_at=stamp,
+        )
+        try:
+            gateway.submit(
+                request,
+                reference_price=reference_price,
+                equity=equity,
+                open_positions=int(fields.get("open_positions", 0)),
+                position_notional=abs(float(fields.get("position_value", 0.0))),
+                daily_pnl=float(fields.get("daily_pnl", 0.0)),
+                daily_trades=int(fields.get("daily_trades", 0)),
+                peak_equity=float(fields.get("peak_equity", equity)),
+                closes_position=True,
+            )
+        except (
+            BrokerError,
+            RiskLimitExceededError,
+            KillSwitchActiveError,
+            OrderRejectedError,
+            GatewayError,
+        ) as exc:
+            raise ProfileError(
+                f"cannot delete profile {profile_id!r}: the open position could not be flattened"
+            ) from exc
+
+    async def _stop_profile(self, profile_id: str) -> None:
+        """Cancel the supervise task of one profile, then stop its runner and stream.
+
+        The shutdown of the stream is best-effort and bounded, exactly like the
+        platform-wide :meth:`_stop_streams`: a stream that refuses to stop must not
+        abort a deletion whose configuration file was already rewritten.
+        """
+        timeout = float(self._realtime.stream_poll_timeout_seconds)
+        task = self._tasks.pop(profile_id, None)
+        if task is not None:
+            task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True), timeout=timeout
+                )
+            except TimeoutError:  # pragma: no cover - a task refusing to stop
+                log_event(
+                    _LOGGER,
+                    "profile_shutdown_timeout",
+                    level=logging.ERROR,
+                    profile_id=profile_id,
+                    timeout=timeout,
+                )
+        runner = self._runners.get(profile_id)
+        if runner is not None:
+            await runner.stop()
+        stream = self._streams.get(profile_id)
+        if stream is not None:
+            try:
+                await asyncio.wait_for(stream.stop(), timeout=timeout)
+            except TimeoutError:  # pragma: no cover - a stream refusing to stop
+                log_event(
+                    _LOGGER,
+                    "profile_stream_shutdown_timeout",
+                    level=logging.ERROR,
+                    profile_id=profile_id,
+                    timeout=timeout,
+                )
 
     def _enabled_ids(self) -> list[str]:
         """Return the ids of the enabled profiles, sorted."""

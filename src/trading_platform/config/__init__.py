@@ -17,6 +17,7 @@ from trading_platform.config.loader import (
     load_profiles,
     load_realtime_config,
     override_params,
+    save_profiles,
 )
 from trading_platform.config.models import (
     AppConfig,
@@ -55,4 +56,5 @@ __all__ = [
     "load_profiles",
     "load_realtime_config",
     "override_params",
+    "save_profiles",
 ]

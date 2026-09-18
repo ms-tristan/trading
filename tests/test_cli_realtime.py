@@ -20,6 +20,7 @@ define their scenario locally instead of reaching into another work package.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
 import os
@@ -27,7 +28,8 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,9 @@ from typer.testing import CliRunner
 from trading_platform.cli import app, main
 from trading_platform.config import MonitoringConfig, RealtimeConfig
 from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.realtime.catalog import default_catalog_body
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.store import SqliteStateStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -735,3 +740,163 @@ def test_monitoring_config_defaults_are_documented_values() -> None:
 
     assert monitoring.host == "127.0.0.1"
     assert monitoring.refresh_seconds == 2.0
+
+
+# ---------------------------------------------------------------------------
+# 5. the profile surface of the monitoring server (catalog, candles, lifecycle)
+# ---------------------------------------------------------------------------
+
+
+def seed_state_store(database: Path, profiles_path: Path) -> None:
+    """Persist the profiles of ``profiles_path`` into a **fresh** state database.
+
+    The store then knows both profiles and holds **no** candle: it is the exact
+    state ``realtime serve`` reads after a deployment that never ran a tick.
+    """
+    from trading_platform.config import load_profiles
+
+    store = SqliteStateStore(database, clock=ManualClock(datetime.fromisoformat(ANCHOR)))
+    store.initialize()
+    try:
+        for definition in load_profiles(profiles_path):
+            store.save_profile(definition)
+    finally:
+        store.close()
+
+
+def http_call(
+    server: Any,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Perform one loopback request against ``server`` with an explicit timeout."""
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5.0)
+    try:
+        connection.request(method, path, body=body, headers=dict(headers or {}))
+        response = connection.getresponse()
+        raw = response.read()
+        return response.status, json.loads(raw.decode("utf-8"))
+    finally:
+        connection.close()
+
+
+def test_serve_answers_the_catalog_candles_and_control_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``realtime serve`` exposes the whole read surface over persisted state."""
+    from trading_platform.web import server as server_module
+
+    path = write_profiles(tmp_path)
+    seed_state_store(tmp_path / "state.db", path)
+    observed: dict[str, Any] = {}
+
+    def bounded(server: Any, *, block: bool = True) -> None:
+        """Serve for real, run the calls, then stop deterministically."""
+        observed["read_only"] = server.router.read_only
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        thread.start()
+        try:
+            observed["catalog"] = http_call(server, "GET", "/api/catalog")
+            observed["candles"] = http_call(server, "GET", "/api/profiles/btc-paper/candles")
+            observed["control"] = http_call(server, "GET", "/api/control")
+            observed["pause"] = http_call(
+                server, "POST", "/api/profiles/btc-paper/pause", body=b"{}"
+            )
+            observed["delete"] = http_call(server, "DELETE", "/api/profiles/btc-paper")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+
+    monkeypatch.setattr(server_module, "serve", bounded)
+    result = invoke("realtime", "serve", "--profiles", str(path), "--json", "--port", "0")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert set(payload) == SERVE_KEYS
+    assert observed["read_only"] is True
+
+    status, catalog = observed["catalog"]
+    assert status == 200
+    expected = default_catalog_body("USDT")
+    assert catalog == expected
+    assert catalog["symbols"], "the offline fallback must offer the picker some symbols"
+    for entry in catalog["symbols"]:
+        assert sorted(entry) == ["base", "quote", "symbol"]
+
+    status, candles = observed["candles"]
+    assert status == 200
+    assert candles == {"candles": [], "count": 0}
+
+    status, control = observed["control"]
+    assert status == 200
+    assert control == {
+        "engine_running": False,
+        "read_only": True,
+        "mutable": False,
+        "profiles": [],
+    }
+
+    for name in ("pause", "delete"):
+        status, body = observed[name]
+        assert status == 403, name
+        assert body == {"error": "mutations are disabled on this server"}, name
+
+
+def test_run_wires_the_controller_and_the_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``realtime run`` hands both lifecycle seams to the monitoring server."""
+    from trading_platform.realtime.catalog import MarketCatalog
+    from trading_platform.realtime.control import RuntimeProfileController
+    from trading_platform.realtime.orchestrator import RealtimeOrchestrator
+    from trading_platform.web import server as server_module
+
+    path = write_profiles(tmp_path)
+    recorded: dict[str, Any] = {}
+    real_create_server = server_module.create_server
+
+    def recording_create_server(provider: Any, **kwargs: Any) -> Any:
+        recorded["provider"] = provider
+        recorded.update(kwargs)
+        return real_create_server(provider, **kwargs)
+
+    async def run_forever(self: RealtimeOrchestrator) -> None:
+        """One real tick, then return: no live engine is ever started."""
+        await self.run_once()
+
+    monkeypatch.setattr(server_module, "create_server", recording_create_server)
+    monkeypatch.setattr(RealtimeOrchestrator, "run_forever", run_forever)
+
+    result = invoke("realtime", "run", "--profiles", str(path), "--json", "--port", "0")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert set(payload) == RUN_KEYS
+    assert recorded["read_only"] is False
+
+    controller = recorded["controller"]
+    catalog = recorded["catalog"]
+    assert isinstance(controller, RuntimeProfileController)
+    assert isinstance(catalog, MarketCatalog)
+    assert controller.profiles_path == path
+    assert controller.bound is True, "the controller must be bound to the engine loop"
+    assert catalog.exchange == "binance"
+    assert catalog.quote == "USDT"
+    assert catalog.catalog()["symbols"] == default_catalog_body("USDT")["symbols"]
+    assert hasattr(recorded["provider"], "candle_series")
+
+
+def test_the_catalog_venue_comes_from_the_profiles() -> None:
+    """The quote of a profile is what the picker is asked to list."""
+    from trading_platform.cli import _realtime_catalog_venue
+    from trading_platform.config import ProfileConfig
+
+    assert _realtime_catalog_venue(()) == ("binance", "USDT")
+    eth = ProfileConfig(id="eth-eur", symbol="ETH/EUR", timeframe="1h")
+    assert _realtime_catalog_venue([eth]) == ("binance", "EUR")

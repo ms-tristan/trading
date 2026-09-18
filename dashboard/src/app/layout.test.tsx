@@ -42,4 +42,11 @@ describe('RootLayout', () => {
       'HTTP polling every 2 seconds · read-only by default · a local-network monitoring surface',
     );
   });
+
+  it('links to the profile creation route next to the brand link', () => {
+    const html = renderLayout();
+    expect(html).toContain('href="/profiles/new"');
+    expect(html).toContain('New profile');
+    expect(html).toContain('aria-label="Profiles"');
+  });
 });

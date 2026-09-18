@@ -57,11 +57,13 @@ REALTIME_SECTIONS = (
     "## 5. Web API reference",
     "## 6. The three commands",
     "## 7. What is NOT proven",
+    "## 8. Profile lifecycle and candle history",
 )
 
 #: Routes the web-API table must enumerate.  The server is a pure JSON API: it
 #: serves no HTML page and no static asset, so the table carries the API rows
-#: only -- the read counterpart of the kill switch included.
+#: only -- the read counterpart of the kill switch included, plus the candle
+#: history, the two picker routes and the four profile lifecycle routes.
 REALTIME_ROUTES = (
     "GET /api/health",
     "GET /api/profiles",
@@ -71,8 +73,15 @@ REALTIME_ROUTES = (
     "GET /api/profiles/{id}/orders",
     "GET /api/profiles/{id}/positions",
     "GET /api/profiles/{id}/metrics",
+    "GET /api/profiles/{id}/candles",
+    "GET /api/catalog",
+    "GET /api/control",
     "GET /api/kill-switch",
     "POST /api/kill-switch",
+    "POST /api/profiles",
+    "POST /api/profiles/{id}/pause",
+    "POST /api/profiles/{id}/resume",
+    "DELETE /api/profiles/{id}",
 )
 
 _MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
@@ -439,3 +448,92 @@ def test_the_legacy_documentation_pages_stay_french(page: Path) -> None:
 
     # a French page of this size cannot contain zero accented words
     assert any(word in text for word in ("é", "è", "à", "ù", "ê", "ç"))
+
+
+# ---------------------------------------------------------------------------
+# 10. the profile surface: lifecycle semantics, candle history, French pages
+# ---------------------------------------------------------------------------
+
+
+def test_realtime_page_documents_the_lifecycle_and_candle_rules() -> None:
+    """§8 states the pause/delete/create semantics precisely, not by allusion."""
+    text = read(REALTIME)
+    assert "## 8. Profile lifecycle and candle history" in text
+    section = text.split("## 8. Profile lifecycle and candle history", 1)[1]
+
+    # pause: the entry gate closes, the open position stays supervised
+    assert "opening new positions" in section
+    assert "never** left unmanaged" in section
+    assert "stop of the open position" in section
+    # ... and the flag is durable, exposed by /api/control, never by ProfileSnapshot
+    assert "meta" in section
+    assert "GET /api/control" in section
+    assert "frozen" in section
+    assert 'status: "running"' in section
+    # delete: flatten at market first, rewrite the file atomically, refuse the last
+    assert "at market" in section
+    assert "execution gateway" in section
+    assert "last** profile" in section
+    assert "atomically" in section
+    assert "os.replace" in section
+    # create: validated against the catalog, started immediately
+    assert "catalog" in section
+    assert "started" in section
+    assert "409" in section
+    # candles: a bounded window, served in both modes
+    assert "1000" in section
+    assert "realtime serve" in section
+    # the documented error mapping of the four mutations
+    for status in ("400", "409", "503"):
+        assert status in section
+
+
+def test_realtime_page_corrects_the_candle_honesty_note() -> None:
+    """The old 'the store keeps no candle' limitation is corrected on the page."""
+    text = read(REALTIME)
+    section = text.split("## 8. Profile lifecycle and candle history", 1)[1]
+
+    assert "**no** candle at all" in section
+    assert "bounded candle history" in section
+    # ... while the decision rule itself is *not* relaxed
+    assert "skipped" in section
+
+
+def test_architecture_documents_the_new_surface_in_french() -> None:
+    """The French inventory gains the candles table, the two seams and the routes."""
+    text = read(ARCHITECTURE)
+
+    assert "### 4.12 Cycle de vie des profils, catalogue et historique de bougies" in text
+    for token in (
+        "`candles`",
+        "`SCHEMA_VERSION`",
+        "realtime/catalog.py",
+        "realtime/control.py",
+        "`MarketCatalog`",
+        "`RuntimeProfileController`",
+        "asyncio.run_coroutine_threadsafe",
+        "GET /api/profiles/{id}/candles",
+        "GET /api/catalog",
+        "GET /api/control",
+        "POST /api/profiles",
+        "DELETE /api/profiles/{id}",
+    ):
+        assert token in text, f"architecture.md does not document {token!r}"
+
+
+def test_usage_documents_the_new_endpoints_in_french() -> None:
+    """The French usage page shows the new calls and the dashboard actions."""
+    text = read(USAGE)
+
+    assert "### 11.8 Cycle de vie des profils et historique de bougies" in text
+    for token in (
+        "/api/catalog",
+        "/api/control",
+        "/api/profiles/btc-paper/candles",
+        "/api/profiles/btc-paper/pause",
+        "/api/profiles/btc-paper/resume",
+        "X-Operator-Token",
+        "DELETE",
+        "chandeliers japonais",
+    ):
+        assert token in text, f"usage.md does not document {token!r}"

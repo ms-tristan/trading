@@ -27,8 +27,14 @@ import pandas as pd
 import pytest
 
 from trading_platform.config.models import MonitoringConfig, ProfileConfig
-from trading_platform.core.errors import MonitoringError, StateStoreError
+from trading_platform.core.errors import (
+    ConfigError,
+    MonitoringError,
+    ProfileError,
+    StateStoreError,
+)
 from trading_platform.core.models import Direction, ExitReason, TradeRecord
+from trading_platform.realtime.catalog import default_catalog_body
 from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.models import (
     EngineCounters,
@@ -46,9 +52,14 @@ from trading_platform.realtime.models import (
     RunMode,
 )
 from trading_platform.realtime.monitor import Monitor
+from trading_platform.realtime.store import CandleRow
 from trading_platform.web import routes as web_routes
 from trading_platform.web.routes import (
+    CANDLE_ROUTE_DEFAULT_LIMIT,
+    CANDLE_ROUTE_MAX_LIMIT,
+    CatalogProvider,
     HttpResponse,
+    ProfileController,
     Router,
     SnapshotProvider,
     operator_token_from_env,
@@ -104,6 +115,21 @@ PROFILE_KEYS = sorted(
     ]
 )
 KILL_SWITCH_KEYS = ["changed_at", "kill_switch", "reason"]
+
+#: Exact keys of ``GET /api/catalog`` and of one symbol entry.
+CATALOG_KEYS = ["modes", "strategies", "symbols", "timeframes"]
+CATALOG_SYMBOL_KEYS = ["base", "quote", "symbol"]
+
+#: Exact keys of ``GET /api/control`` and of one profile entry.
+CONTROL_KEYS = ["engine_running", "mutable", "profiles", "read_only"]
+CONTROL_PROFILE_KEYS = ["paused", "profile_id", "running"]
+
+#: Exact keys of ``GET /api/profiles/{id}/candles`` and of one candle.
+CANDLES_KEYS = ["candles", "count"]
+CANDLE_KEYS = ["close", "closed", "high", "low", "open", "profile_id", "timestamp", "volume"]
+
+#: Malformed values of the ``limit`` query parameter (all answered with a 400).
+MALFORMED_LIMITS = ["limit=0", "limit=-1", "limit=abc", "limit=", "limit=1.5", "limit=%20"]
 
 
 def payload_of(response: HttpResponse) -> dict[str, Any]:
@@ -199,6 +225,37 @@ class FakeKillSwitchState:
     source: str = "api"
 
 
+@dataclass(frozen=True)
+class FakeCandle:
+    """Local stand-in of a persisted candle row (duck-typed by the route)."""
+
+    profile_id: str
+    timestamp: Any
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    closed: bool
+
+
+def make_candles(profile_id: str, count: int) -> list[FakeCandle]:
+    """Build ``count`` deterministic candles, oldest first, the last one open."""
+    return [
+        FakeCandle(
+            profile_id=profile_id,
+            timestamp=pd.Timestamp(START + timedelta(hours=step)),
+            open=100.0 + step,
+            high=105.0 + step,
+            low=95.0 + step,
+            close=101.0 + step,
+            volume=10.0 + step,
+            closed=step < count - 1,
+        )
+        for step in range(count)
+    ]
+
+
 @dataclass
 class FakeProvider:
     """Local implementation of :class:`SnapshotProvider` (no orchestrator)."""
@@ -221,6 +278,9 @@ class FakeProvider:
     kill_state_form: str = "dataclass"
     engaged_calls: list[str] = field(default_factory=list)
     released_calls: int = 0
+    candles: Mapping[str, Sequence[Any]] = field(default_factory=dict)
+    candle_error: Exception | None = None
+    candle_calls: list[tuple[str, int]] = field(default_factory=list)
 
     def snapshot(self) -> PlatformSnapshot:
         if self.snapshot_error is not None:
@@ -242,6 +302,12 @@ class FakeProvider:
             if profile.profile_id == profile_id:
                 return profile
         return None
+
+    def candle_series(self, profile_id: str, limit: int) -> Sequence[Any]:
+        self.candle_calls.append((profile_id, limit))
+        if self.candle_error is not None:
+            raise self.candle_error
+        return list(self.candles.get(profile_id, ()))[:limit]
 
     def engage_kill_switch(self, reason: str) -> Any:
         self.engaged_calls.append(reason)
@@ -271,6 +337,84 @@ class FakeProvider:
             reason=self.kill_switch_reason,
             changed_at=self.kill_switch_changed_at,
         )
+
+
+@dataclass
+class FakeCatalog:
+    """Local implementation of :class:`CatalogProvider` (never a network call)."""
+
+    body: dict[str, Any] = field(
+        default_factory=lambda: {
+            "symbols": [{"symbol": "BTC/USDT", "base": "BTC", "quote": "USDT"}],
+            "strategies": ["basic"],
+            "timeframes": ["1m", "5m"],
+            "modes": ["paper", "live"],
+        }
+    )
+    error: Exception | None = None
+    calls: int = 0
+
+    def catalog(self) -> Mapping[str, Any]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return dict(self.body)
+
+
+@dataclass
+class FakeController:
+    """Local implementation of :class:`ProfileController`, recording every call."""
+
+    profiles: tuple[ProfileSnapshot, ...] = ()
+    paused: bool = False
+    failure: Exception | None = None
+    control_failure: Exception | None = None
+    pause_calls: list[str] = field(default_factory=list)
+    resume_calls: list[str] = field(default_factory=list)
+    delete_calls: list[str] = field(default_factory=list)
+    create_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _maybe_fail(self) -> None:
+        if self.failure is not None:
+            raise self.failure
+
+    def _snapshot(self, profile_id: str) -> ProfileSnapshot:
+        for profile in self.profiles:
+            if profile.profile_id == profile_id:
+                return profile
+        return make_profile_snapshot(profile_id, "BTC/USDT")
+
+    def pause_profile(self, profile_id: str) -> Any:
+        self.pause_calls.append(profile_id)
+        self._maybe_fail()
+        self.paused = True
+        return self._snapshot(profile_id)
+
+    def resume_profile(self, profile_id: str) -> Any:
+        self.resume_calls.append(profile_id)
+        self._maybe_fail()
+        self.paused = False
+        return self._snapshot(profile_id)
+
+    def delete_profile(self, profile_id: str) -> Any:
+        self.delete_calls.append(profile_id)
+        self._maybe_fail()
+        return profile_id
+
+    def create_profile(self, payload: Mapping[str, Any]) -> Any:
+        self.create_calls.append(dict(payload))
+        self._maybe_fail()
+        return self._snapshot(str(payload.get("profile_id", "")))
+
+    def control_state(self) -> Mapping[str, Any]:
+        if self.control_failure is not None:
+            raise self.control_failure
+        return {
+            "profiles": [
+                {"profile_id": profile.profile_id, "paused": self.paused, "running": True}
+                for profile in self.profiles
+            ]
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -452,8 +596,15 @@ def provider() -> FakeProvider:
                 mode=RunMode.LIVE,
                 status=ProfileStatus.DEGRADED,
             ),
-        )
+        ),
+        candles={PROFILE_A: make_candles(PROFILE_A, 4)},
     )
+
+
+@pytest.fixture
+def controller(provider: FakeProvider) -> FakeController:
+    """Runtime controller exposing the two deterministic profiles."""
+    return FakeController(profiles=provider.profiles)
 
 
 def build_router(
@@ -464,6 +615,8 @@ def build_router(
     read_only: bool = True,
     operator_token: str | None = None,
     version: str = "0.1.0",
+    controller: ProfileController | None = None,
+    catalog: CatalogProvider | None = None,
 ) -> Router:
     """Build a router over the local fakes."""
     return Router(
@@ -474,6 +627,8 @@ def build_router(
         operator_token=operator_token,
         version=version,
         clock=clock,
+        controller=controller,
+        catalog=catalog,
     )
 
 
@@ -739,19 +894,29 @@ def test_unknown_routes_are_a_documented_404(router: Router, path: str) -> None:
     assert payload_of(response) == {"error": f"not found: {path}"}
 
 
-@pytest.mark.parametrize("path", ["/api/health", "/api/profiles", f"/api/profiles/{PROFILE_A}"])
-def test_post_on_a_get_route_is_405_with_an_allow_header(router: Router, path: str) -> None:
+@pytest.mark.parametrize(
+    "path,allow",
+    [
+        ("/api/health", "GET, HEAD"),
+        (f"/api/profiles/{PROFILE_A}", "GET, HEAD, DELETE"),
+    ],
+)
+def test_post_on_a_get_route_is_405_with_an_allow_header(
+    router: Router, path: str, allow: str
+) -> None:
+    """``POST`` is refused wherever it is not a route, with the documented ``Allow``."""
     response = router.handle("POST", path, body=b"{}")
     assert response.status == 405
     assert payload_of(response) == {"error": "method not allowed"}
-    assert header_value(response, "Allow") == "GET, HEAD"
+    assert header_value(response, "Allow") == allow
 
 
 @pytest.mark.parametrize("method", ["PUT", "DELETE", "PATCH"])
 def test_unsupported_methods_are_405(router: Router, method: str) -> None:
+    """The collection answers ``GET``/``HEAD`` and -- since the creation route -- ``POST``."""
     response = router.handle(method, "/api/profiles")
     assert response.status == 405
-    assert header_value(response, "Allow") == "GET, HEAD"
+    assert header_value(response, "Allow") == "GET, HEAD, POST"
 
 
 def test_unsupported_method_on_an_unknown_path_is_404(router: Router) -> None:
@@ -1191,3 +1356,874 @@ def test_the_router_never_exposes_the_token(
     )
     assert "top-secret-token" not in response.body.decode()
     assert "top-secret-token" not in repr(router)
+
+
+# ---------------------------------------------------------------------------
+# candle history: GET /api/profiles/{id}/candles
+# ---------------------------------------------------------------------------
+
+#: An operator token distinct from every other literal of this module.
+TOKEN = "s3cret-operator-token"
+
+#: Every lifecycle command, as ``(method, path, body)``.
+LIFECYCLE_CALLS = [
+    ("POST", f"/api/profiles/{PROFILE_A}/pause", b"{}"),
+    ("POST", f"/api/profiles/{PROFILE_A}/resume", b"{}"),
+    ("DELETE", f"/api/profiles/{PROFILE_A}", b""),
+    (
+        "POST",
+        "/api/profiles",
+        json.dumps(
+            {
+                "profile_id": "sol-paper",
+                "symbol": "SOL/USDT",
+                "timeframe": "15m",
+                "strategy": "basic",
+                "mode": "paper",
+            }
+        ).encode(),
+    ),
+]
+
+#: The three lifecycle commands addressed to an unknown profile.
+UNKNOWN_LIFECYCLE_CALLS = [
+    ("POST", f"/api/profiles/{UNKNOWN_PROFILE}/pause", b"{}"),
+    ("POST", f"/api/profiles/{UNKNOWN_PROFILE}/resume", b"{}"),
+    ("DELETE", f"/api/profiles/{UNKNOWN_PROFILE}", b""),
+]
+
+#: A complete, valid creation body (the optional fields are left out).
+CREATE_BODY: dict[str, Any] = {
+    "profile_id": "sol-paper",
+    "symbol": "SOL/USDT",
+    "timeframe": "15m",
+    "strategy": "basic",
+    "mode": "paper",
+}
+
+AUTH = {"X-Operator-Token": TOKEN}
+
+
+class ReadOnlyProvider:
+    """A provider with **no** engine behind it -- the shape of ``realtime serve``."""
+
+    def __init__(self, candles: Mapping[str, Sequence[Any]]) -> None:
+        self._candles = dict(candles)
+        self.candle_calls: list[tuple[str, int]] = []
+
+    def snapshot(self) -> PlatformSnapshot:
+        return PlatformSnapshot(
+            profiles=(),
+            generated_at=pd.Timestamp(START),
+            kill_switch=False,
+        )
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "profiles_total": 0,
+            "profiles_running": 0,
+            "uptime_seconds": 0.0,
+        }
+
+    def profile_snapshot(self, profile_id: str) -> ProfileSnapshot | None:
+        return make_profile_snapshot(profile_id, "BTC/USDT")
+
+    def candle_series(self, profile_id: str, limit: int) -> Sequence[Any]:
+        self.candle_calls.append((profile_id, limit))
+        return list(self._candles.get(profile_id, ()))[:limit]
+
+    def kill_switch_state(self) -> Any:
+        return {"engaged": False, "reason": "", "changed_at": None}
+
+    def engage_kill_switch(self, reason: str) -> Any:  # pragma: no cover - read-only
+        raise MonitoringError("this provider is read-only")
+
+    def release_kill_switch(self) -> Any:  # pragma: no cover - read-only
+        raise MonitoringError("this provider is read-only")
+
+
+def test_candles_payload_has_exactly_the_documented_keys(router: Router) -> None:
+    """``{candles, count}``, oldest first, one documented key set per candle."""
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles")
+    assert response.status == 200
+    body = payload_of(response)
+    assert sorted(body) == CANDLES_KEYS
+    assert body["count"] == 4
+    assert len(body["candles"]) == 4
+    for candle in body["candles"]:
+        assert sorted(candle) == CANDLE_KEYS
+        assert candle["profile_id"] == PROFILE_A
+        assert isinstance(candle["closed"], bool)
+    stamps = [datetime.fromisoformat(candle["timestamp"]) for candle in body["candles"]]
+    assert stamps == sorted(stamps), "the series must be oldest first"
+    assert stamps[0] == START
+    assert body["candles"][0]["open"] == 100.0
+    assert body["candles"][0]["high"] == 105.0
+    assert body["candles"][0]["low"] == 95.0
+    assert body["candles"][0]["close"] == 101.0
+    assert body["candles"][0]["volume"] == 10.0
+    assert body["candles"][0]["closed"] is True
+    assert body["candles"][3]["closed"] is False
+
+
+def test_candles_of_an_unknown_profile_are_the_documented_404(router: Router) -> None:
+    response = router.handle("GET", f"/api/profiles/{UNKNOWN_PROFILE}/candles")
+    assert response.status == 404
+    assert payload_of(response) == {"error": f"unknown profile: {UNKNOWN_PROFILE!r}"}
+
+
+def test_candles_of_a_profile_without_history_are_200_and_empty(router: Router) -> None:
+    response = router.handle("GET", f"/api/profiles/{PROFILE_B}/candles")
+    assert response.status == 200
+    assert payload_of(response) == {"candles": [], "count": 0}
+
+
+def test_the_candle_limit_defaults_to_the_documented_value(
+    router: Router, provider: FakeProvider
+) -> None:
+    assert CANDLE_ROUTE_DEFAULT_LIMIT == 500
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles")
+    assert response.status == 200
+    assert provider.candle_calls == [(PROFILE_A, CANDLE_ROUTE_DEFAULT_LIMIT)]
+
+
+def test_the_candle_limit_is_honoured(router: Router, provider: FakeProvider) -> None:
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query="limit=2")
+    assert response.status == 200
+    body = payload_of(response)
+    assert body["count"] == 2
+    assert provider.candle_calls == [(PROFILE_A, 2)]
+    assert [candle["open"] for candle in body["candles"]] == [100.0, 101.0]
+
+
+def test_the_candle_limit_above_the_cap_is_clamped(router: Router, provider: FakeProvider) -> None:
+    assert CANDLE_ROUTE_MAX_LIMIT == 1000
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query="limit=999999")
+    assert response.status == 200
+    assert provider.candle_calls == [(PROFILE_A, CANDLE_ROUTE_MAX_LIMIT)]
+
+
+@pytest.mark.parametrize("query", MALFORMED_LIMITS)
+def test_a_malformed_candle_limit_is_the_documented_400(
+    router: Router, provider: FakeProvider, query: str
+) -> None:
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query=query)
+    assert response.status == 400
+    assert payload_of(response) == {
+        "error": "malformed query parameter: 'limit' must be a positive integer"
+    }
+    assert provider.candle_calls == [], "a refused request never reaches the provider"
+
+
+def test_an_unrelated_query_parameter_is_ignored(router: Router, provider: FakeProvider) -> None:
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query="other=1&limit=3")
+    assert response.status == 200
+    assert provider.candle_calls == [(PROFILE_A, 3)]
+    provider.candle_calls.clear()
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query="other=1")
+    assert response.status == 200
+    assert provider.candle_calls == [(PROFILE_A, CANDLE_ROUTE_DEFAULT_LIMIT)]
+
+
+def test_the_candles_route_works_without_an_engine(manual_clock: ManualClock) -> None:
+    """The route only knows the provider seam: persisted state is enough."""
+    provider = ReadOnlyProvider({PROFILE_A: make_candles(PROFILE_A, 2)})
+    router = build_router(provider, Monitor(make_store(), clock=manual_clock), manual_clock)
+    body = payload_of(router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query="limit=1"))
+    assert body["count"] == 1
+    assert provider.candle_calls == [(PROFILE_A, 1)]
+    assert payload_of(router.handle("GET", "/api/control")) == {
+        "engine_running": False,
+        "read_only": True,
+        "mutable": False,
+        "profiles": [],
+    }
+    assert payload_of(router.handle("GET", "/api/catalog")) == default_catalog_body()
+
+
+def test_the_real_candle_row_travels_unchanged(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The row the engine persists (``realtime.store.CandleRow``) is accepted as is."""
+    row = CandleRow(
+        profile_id=PROFILE_A,
+        timestamp=pd.Timestamp(START),
+        open=100.0,
+        high=110.0,
+        low=90.0,
+        close=105.0,
+        volume=3.5,
+        closed=True,
+    )
+    provider.candles = {PROFILE_A: [row]}
+    router = build_router(provider, monitor, manual_clock)
+    candle = payload_of(router.handle("GET", f"/api/profiles/{PROFILE_A}/candles"))["candles"][0]
+    assert candle == {
+        "profile_id": PROFILE_A,
+        "timestamp": pd.Timestamp(START).isoformat(),
+        "open": 100.0,
+        "high": 110.0,
+        "low": 90.0,
+        "close": 105.0,
+        "volume": 3.5,
+        "closed": True,
+    }
+
+
+def test_non_finite_candle_values_never_reach_the_wire(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    provider.candles = {
+        PROFILE_A: [
+            FakeCandle(
+                PROFILE_A,
+                pd.Timestamp(START),
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+                1.0,
+                2.0,
+                True,
+            )
+        ]
+    }
+    router = build_router(provider, monitor, manual_clock)
+    response = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles")
+    text = response.body.decode()
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    candle = payload_of(response)["candles"][0]
+    assert candle["open"] is None
+    assert candle["high"] is None
+    assert candle["low"] is None
+    assert candle["close"] == 1.0
+
+
+def test_head_on_the_candles_route_answers_like_get(router: Router, provider: FakeProvider) -> None:
+    reference = router.handle("GET", f"/api/profiles/{PROFILE_A}/candles", query="limit=2")
+    response = router.handle("HEAD", f"/api/profiles/{PROFILE_A}/candles", query="limit=2")
+    assert response.status == reference.status == 200
+    assert response.content_type == reference.content_type
+    assert response.body == b""
+    assert provider.candle_calls == [(PROFILE_A, 2), (PROFILE_A, 2)]
+
+
+# ---------------------------------------------------------------------------
+# the catalog: GET /api/catalog
+# ---------------------------------------------------------------------------
+
+
+def test_the_static_catalog_answers_without_a_provider(router: Router) -> None:
+    """No catalog seam at all: the documented static fallback answers, never a 500."""
+    response = router.handle("GET", "/api/catalog")
+    assert response.status == 200
+    body = payload_of(response)
+    assert sorted(body) == CATALOG_KEYS
+    assert body == default_catalog_body()
+    assert body["strategies"] == ["basic"]
+    assert body["modes"] == ["paper", "live"]
+    assert body["timeframes"], "the picker needs at least one timeframe"
+    assert body["symbols"], "the picker needs at least one symbol"
+    for entry in body["symbols"]:
+        assert sorted(entry) == CATALOG_SYMBOL_KEYS
+
+
+def test_an_injected_catalog_wins(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    catalog = FakeCatalog()
+    router = build_router(provider, monitor, manual_clock, catalog=catalog)
+    response = router.handle("GET", "/api/catalog")
+    assert response.status == 200
+    assert payload_of(response) == catalog.body
+    assert catalog.calls == 1
+
+
+def test_a_failing_catalog_provider_falls_back_to_the_static_catalog(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    catalog = FakeCatalog(error=RuntimeError("the venue is unreachable"))
+    router = build_router(provider, monitor, manual_clock, catalog=catalog)
+    response = router.handle("GET", "/api/catalog")
+    assert response.status == 200
+    assert payload_of(response) == default_catalog_body()
+    assert catalog.calls == 1
+
+
+def test_a_malformed_catalog_provider_falls_back_to_the_static_catalog(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    class MalformedCatalog(FakeCatalog):
+        def catalog(self) -> Mapping[str, Any]:
+            return cast("Any", ["not", "a", "mapping"])
+
+    router = build_router(provider, monitor, manual_clock, catalog=MalformedCatalog())
+    response = router.handle("GET", "/api/catalog")
+    assert response.status == 200
+    assert payload_of(response) == default_catalog_body()
+
+
+def test_the_catalog_is_served_without_an_engine(manual_clock: ManualClock) -> None:
+    provider = ReadOnlyProvider({})
+    router = build_router(provider, Monitor(make_store(), clock=manual_clock), manual_clock)
+    assert router.handle("GET", "/api/catalog").status == 200
+
+
+# ---------------------------------------------------------------------------
+# runtime control: GET /api/control
+# ---------------------------------------------------------------------------
+
+
+def test_the_control_payload_has_exactly_the_documented_keys(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+    controller: FakeController,
+) -> None:
+    router = build_router(
+        provider,
+        monitor,
+        manual_clock,
+        read_only=False,
+        operator_token=TOKEN,
+        controller=controller,
+    )
+    response = router.handle("GET", "/api/control")
+    assert response.status == 200
+    body = payload_of(response)
+    assert sorted(body) == CONTROL_KEYS
+    assert body["engine_running"] is True
+    assert body["read_only"] is False
+    assert body["mutable"] is True
+    assert [entry["profile_id"] for entry in body["profiles"]] == [PROFILE_A, PROFILE_B]
+    for entry in body["profiles"]:
+        assert sorted(entry) == CONTROL_PROFILE_KEYS
+        assert entry["paused"] is False
+        assert entry["running"] is True
+
+
+@pytest.mark.parametrize(
+    "read_only,token,with_controller,engine_running,mutable",
+    [
+        (True, None, True, True, False),
+        (False, TOKEN, False, False, False),
+        (False, "", True, True, False),
+        (False, TOKEN, True, True, True),
+    ],
+)
+def test_the_control_truth_table(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+    controller: FakeController,
+    read_only: bool,
+    token: str | None,
+    with_controller: bool,
+    engine_running: bool,
+    mutable: bool,
+) -> None:
+    router = build_router(
+        provider,
+        monitor,
+        manual_clock,
+        read_only=read_only,
+        operator_token=token,
+        controller=controller if with_controller else None,
+    )
+    body = payload_of(router.handle("GET", "/api/control"))
+    assert body["engine_running"] is engine_running
+    assert body["read_only"] is read_only
+    assert body["mutable"] is mutable
+    assert bool(body["profiles"]) is with_controller
+
+
+def test_control_without_a_controller_is_an_empty_list(router: Router) -> None:
+    assert payload_of(router.handle("GET", "/api/control")) == {
+        "engine_running": False,
+        "read_only": True,
+        "mutable": False,
+        "profiles": [],
+    }
+
+
+def test_a_failing_controller_never_turns_control_into_a_500(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+) -> None:
+    controller = FakeController(
+        profiles=provider.profiles, control_failure=RuntimeError("the registry is gone")
+    )
+    router = build_router(provider, monitor, manual_clock, controller=controller)
+    response = router.handle("GET", "/api/control")
+    assert response.status == 200
+    body = payload_of(response)
+    assert body["engine_running"] is True
+    assert body["profiles"] == []
+
+
+# ---------------------------------------------------------------------------
+# profile lifecycle: pause, resume, delete and create
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def writable(
+    provider: FakeProvider,
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    controller: FakeController,
+) -> Router:
+    """A writable router carrying the operator token, a controller and a catalog."""
+    return build_router(
+        provider,
+        monitor,
+        manual_clock,
+        read_only=False,
+        operator_token=TOKEN,
+        controller=controller,
+        catalog=FakeCatalog(),
+    )
+
+
+@pytest.fixture
+def read_only_with_controller(
+    provider: FakeProvider,
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    controller: FakeController,
+) -> Router:
+    """A read-only server that *does* carry a controller (the strongest refusal)."""
+    return build_router(
+        provider,
+        monitor,
+        manual_clock,
+        read_only=True,
+        operator_token=TOKEN,
+        controller=controller,
+    )
+
+
+def test_pause_returns_the_resulting_profile_state(
+    writable: Router, controller: FakeController
+) -> None:
+    response = writable.handle("POST", f"/api/profiles/{PROFILE_A}/pause", body=b"{}", headers=AUTH)
+    assert response.status == 200
+    body = payload_of(response)
+    assert sorted(body) == ["paused", "profile"]
+    assert body["paused"] is True
+    assert body["profile"] == make_profile_snapshot(PROFILE_A, "BTC/USDT").to_dict()
+    assert controller.pause_calls == [PROFILE_A]
+
+
+def test_resume_returns_the_resulting_profile_state(
+    writable: Router, controller: FakeController
+) -> None:
+    response = writable.handle(
+        "POST", f"/api/profiles/{PROFILE_A}/resume", body=b"{}", headers=AUTH
+    )
+    assert response.status == 200
+    body = payload_of(response)
+    assert sorted(body) == ["paused", "profile"]
+    assert body["paused"] is False
+    assert body["profile"] == make_profile_snapshot(PROFILE_A, "BTC/USDT").to_dict()
+    assert controller.resume_calls == [PROFILE_A]
+
+
+def test_delete_returns_the_removed_identifier(
+    writable: Router, controller: FakeController
+) -> None:
+    response = writable.handle("DELETE", f"/api/profiles/{PROFILE_A}", headers=AUTH)
+    assert response.status == 200
+    assert sorted(payload_of(response)) == ["deleted", "profile_id"]
+    assert payload_of(response) == {"profile_id": PROFILE_A, "deleted": True}
+    assert controller.delete_calls == [PROFILE_A]
+
+
+def test_create_forwards_the_documented_body_and_answers_201(
+    writable: Router, controller: FakeController
+) -> None:
+    payload: dict[str, Any] = {
+        **CREATE_BODY,
+        "profile_id": "sol-paper",
+        "initial_balance": 2500,
+        "params": {"ema_fast": 9, "use_stops": True, "label": "scalp"},
+    }
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+    assert response.status == 201
+    body = payload_of(response)
+    assert sorted(body) == ["profile"]
+    assert body["profile"]["profile_id"] == "sol-paper"
+    assert len(controller.create_calls) == 1
+    forwarded = controller.create_calls[0]
+    assert forwarded == {
+        **CREATE_BODY,
+        "profile_id": "sol-paper",
+        "initial_balance": 2500.0,
+        "params": {"ema_fast": 9, "use_stops": True, "label": "scalp"},
+    }
+
+
+@pytest.mark.parametrize("method,path,body", LIFECYCLE_CALLS)
+def test_a_read_only_server_refuses_every_lifecycle_route(
+    read_only_with_controller: Router,
+    controller: FakeController,
+    method: str,
+    path: str,
+    body: bytes,
+) -> None:
+    response = read_only_with_controller.handle(method, path, body=body, headers=AUTH)
+    assert response.status == 403
+    assert payload_of(response) == {"error": "mutations are disabled on this server"}
+    assert controller.pause_calls == []
+    assert controller.resume_calls == []
+    assert controller.delete_calls == []
+    assert controller.create_calls == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        None,
+        {},
+        {"X-Operator-Token": "wrong"},
+        {"X-Operator-Token": ""},
+        {"Authorization": "Bearer " + TOKEN},
+    ],
+)
+@pytest.mark.parametrize("method,path,body", LIFECYCLE_CALLS)
+def test_every_lifecycle_route_requires_the_operator_token(
+    writable: Router,
+    controller: FakeController,
+    method: str,
+    path: str,
+    body: bytes,
+    headers: dict[str, str] | None,
+) -> None:
+    response = writable.handle(method, path, body=body, headers=headers)
+    assert response.status == 403
+    assert payload_of(response) == {"error": "missing or invalid operator token"}
+    assert TOKEN not in response.body.decode()
+    assert all(TOKEN not in f"{key}{value}" for key, value in response.headers)
+    assert controller.pause_calls == []
+    assert controller.resume_calls == []
+    assert controller.delete_calls == []
+    assert controller.create_calls == []
+
+
+@pytest.mark.parametrize("method,path,body", LIFECYCLE_CALLS)
+def test_a_writable_server_without_a_controller_refuses_lifecycle_routes(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+    method: str,
+    path: str,
+    body: bytes,
+) -> None:
+    """No seam, no command: the same 403 a read-only server answers."""
+    router = build_router(provider, monitor, manual_clock, read_only=False, operator_token=TOKEN)
+    response = router.handle(method, path, body=body, headers=AUTH)
+    assert response.status == 403
+    assert payload_of(response) == {"error": "mutations are disabled on this server"}
+
+
+def test_a_writable_server_without_a_configured_token_refuses_lifecycle_routes(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+    controller: FakeController,
+) -> None:
+    router = build_router(
+        provider,
+        monitor,
+        manual_clock,
+        read_only=False,
+        operator_token="",
+        controller=controller,
+    )
+    response = router.handle("POST", "/api/profiles", body=json.dumps(CREATE_BODY).encode())
+    assert response.status == 403
+    assert payload_of(response) == {"error": "mutations are disabled on this server"}
+    assert controller.create_calls == []
+
+
+@pytest.mark.parametrize("method,path,body", UNKNOWN_LIFECYCLE_CALLS)
+def test_lifecycle_routes_on_an_unknown_profile_are_the_documented_404(
+    writable: Router,
+    controller: FakeController,
+    method: str,
+    path: str,
+    body: bytes,
+) -> None:
+    response = writable.handle(method, path, body=body, headers=AUTH)
+    assert response.status == 404
+    assert payload_of(response) == {"error": f"unknown profile: {UNKNOWN_PROFILE!r}"}
+    assert controller.pause_calls == []
+    assert controller.resume_calls == []
+    assert controller.delete_calls == []
+
+
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (MonitoringError("the engine is not running: profile control is unavailable"), 503),
+        (ProfileError("profile already exists: 'sol-paper'"), 409),
+        (ConfigError("unknown strategy: 'nope' (available: basic)"), 400),
+    ],
+)
+@pytest.mark.parametrize("method,path,body", LIFECYCLE_CALLS)
+def test_lifecycle_failures_are_mapped_onto_their_status_code(
+    writable: Router,
+    controller: FakeController,
+    method: str,
+    path: str,
+    body: bytes,
+    error: Exception,
+    status: int,
+) -> None:
+    controller.failure = error
+    response = writable.handle(method, path, body=body, headers=AUTH)
+    assert response.status == status
+    assert payload_of(response) == {"error": str(error)}
+    assert "Traceback" not in response.body.decode()
+
+
+def test_an_unexpected_lifecycle_failure_keeps_the_500_boundary(
+    writable: Router, controller: FakeController
+) -> None:
+    controller.failure = RuntimeError("boom")
+    response = writable.handle("POST", f"/api/profiles/{PROFILE_A}/pause", body=b"{}", headers=AUTH)
+    assert response.status == 500
+    assert payload_of(response) == {"error": "RuntimeError: boom"}
+    assert "Traceback" not in response.body.decode()
+
+
+@pytest.mark.parametrize(
+    "body,message",
+    [
+        (b"not json at all", "malformed request body: not valid JSON"),
+        (b"", "malformed request body: expected a JSON object"),
+        (b"[]", "malformed request body: expected a JSON object"),
+        (b"null", "malformed request body: expected a JSON object"),
+        (b'"a string"', "malformed request body: expected a JSON object"),
+        (
+            json.dumps({**CREATE_BODY, "extra": 1}).encode(),
+            "malformed request body: unexpected field 'extra'",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "id": "sol-paper"}).encode(),
+            "malformed request body: unexpected field 'id'",
+        ),
+        (
+            json.dumps(
+                {key: value for key, value in CREATE_BODY.items() if key != "profile_id"}
+            ).encode(),
+            "malformed request body: 'profile_id' must be a string",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "symbol": 3}).encode(),
+            "malformed request body: 'symbol' must be a string",
+        ),
+        (
+            json.dumps(
+                {key: value for key, value in CREATE_BODY.items() if key != "timeframe"}
+            ).encode(),
+            "malformed request body: 'timeframe' must be a string",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "strategy": None}).encode(),
+            "malformed request body: 'strategy' must be a string",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "mode": "dry-run"}).encode(),
+            "malformed request body: 'mode' must be 'paper' or 'live'",
+        ),
+        (
+            json.dumps(
+                {key: value for key, value in CREATE_BODY.items() if key != "mode"}
+            ).encode(),
+            "malformed request body: 'mode' must be 'paper' or 'live'",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "initial_balance": 0}).encode(),
+            "malformed request body: 'initial_balance' must be a positive number",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "initial_balance": -5}).encode(),
+            "malformed request body: 'initial_balance' must be a positive number",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "initial_balance": "1000"}).encode(),
+            "malformed request body: 'initial_balance' must be a positive number",
+        ),
+        (
+            b'{"profile_id": "sol-paper", "symbol": "SOL/USDT", "timeframe": "15m", '
+            b'"strategy": "basic", "mode": "paper", "initial_balance": NaN}',
+            "malformed request body: 'initial_balance' must be a positive number",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "params": [1, 2]}).encode(),
+            "malformed request body: 'params' must be an object",
+        ),
+        (
+            json.dumps({**CREATE_BODY, "params": {"nested": {"a": 1}}}).encode(),
+            "malformed request body: 'params' must be an object",
+        ),
+    ],
+)
+def test_the_create_body_validation_messages_are_exact(
+    writable: Router, controller: FakeController, body: bytes, message: str
+) -> None:
+    response = writable.handle("POST", "/api/profiles", body=body, headers=AUTH)
+    assert response.status == 400
+    assert payload_of(response) == {"error": message}
+    assert controller.create_calls == [], "a rejected request never reaches the controller"
+
+
+@pytest.mark.parametrize(
+    "method,path,allow",
+    [
+        ("HEAD", f"/api/profiles/{PROFILE_A}/pause", "POST"),
+        ("GET", f"/api/profiles/{PROFILE_A}/pause", "POST"),
+        ("DELETE", f"/api/profiles/{PROFILE_A}/pause", "POST"),
+        ("HEAD", f"/api/profiles/{PROFILE_A}/resume", "POST"),
+        ("PUT", f"/api/profiles/{PROFILE_A}/resume", "POST"),
+        ("POST", "/api/catalog", "GET, HEAD"),
+        ("POST", "/api/control", "GET, HEAD"),
+        ("POST", f"/api/profiles/{PROFILE_A}/candles", "GET, HEAD"),
+        ("POST", f"/api/profiles/{PROFILE_A}", "GET, HEAD, DELETE"),
+        ("PUT", f"/api/profiles/{PROFILE_A}", "GET, HEAD, DELETE"),
+        ("DELETE", f"/api/profiles/{PROFILE_A}/equity", "GET, HEAD"),
+    ],
+)
+def test_the_wrong_method_on_a_new_route_is_405_with_its_allow_header(
+    router: Router, method: str, path: str, allow: str
+) -> None:
+    response = router.handle(method, path, body=b"{}")
+    assert response.status == 405
+    assert payload_of(response) == {"error": "method not allowed"}
+    assert header_value(response, "Allow") == allow
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/catalog/",
+        "/api/catalog/extra",
+        "/api/control/extra",
+        f"/api/profiles/{PROFILE_A}/pause/extra",
+        f"/api/profiles/{PROFILE_A}/CANDLES",
+        f"/api/profiles/{PROFILE_A}/candles/",
+    ],
+)
+def test_the_new_unknown_paths_are_a_documented_404(router: Router, path: str) -> None:
+    response = router.handle("GET", path)
+    assert response.status == 404
+    assert payload_of(response) == {"error": f"not found: {path}"}
+    assert header_value(response, "Allow") is None
+
+
+def test_allowed_methods_covers_every_new_path(router: Router) -> None:
+    assert router.allowed_methods("/api/catalog") == ("GET", "HEAD")
+    assert router.allowed_methods("/api/control") == ("GET", "HEAD")
+    assert router.allowed_methods(f"/api/profiles/{PROFILE_A}/candles") == ("GET", "HEAD")
+    assert router.allowed_methods("/api/profiles") == ("GET", "HEAD", "POST")
+    assert router.allowed_methods(f"/api/profiles/{PROFILE_A}") == ("GET", "HEAD", "DELETE")
+    assert router.allowed_methods(f"/api/profiles/{PROFILE_A}/pause") == ("POST",)
+    assert router.allowed_methods(f"/api/profiles/{PROFILE_A}/resume") == ("POST",)
+    assert router.allowed_methods("/api/catalog/extra") == ()
+    assert router.allowed_methods(f"/api/profiles/{PROFILE_A}/pause/") == ()
+
+
+def test_the_operator_token_never_travels_back(writable: Router) -> None:
+    for method, path, body in LIFECYCLE_CALLS:
+        for headers in ({"X-Operator-Token": "wrong"}, AUTH):
+            response = writable.handle(method, path, body=body, headers=headers)
+            assert TOKEN not in response.body.decode()
+            assert all(TOKEN not in f"{key}{value}" for key, value in response.headers)
+    assert TOKEN not in repr(writable)
+
+
+# ---------------------------------------------------------------------------
+# the three seams of the web layer
+# ---------------------------------------------------------------------------
+
+
+def test_the_new_seams_are_protocols_with_the_documented_members() -> None:
+    assert getattr(CatalogProvider, "_is_protocol", False) is True
+    assert getattr(ProfileController, "_is_protocol", False) is True
+    assert hasattr(CatalogProvider, "catalog")
+    for member in (
+        "pause_profile",
+        "resume_profile",
+        "delete_profile",
+        "create_profile",
+        "control_state",
+    ):
+        assert hasattr(ProfileController, member), member
+    assert hasattr(SnapshotProvider, "candle_series")
+
+
+def test_the_package_exports_the_new_seams() -> None:
+    import trading_platform.web as web
+
+    assert web.CatalogProvider is CatalogProvider
+    assert web.ProfileController is ProfileController
+    assert "CatalogProvider" in web.__all__
+    assert "ProfileController" in web.__all__
+
+
+@pytest.mark.parametrize("path", ["/api/catalog", "/api/control", "/api/profiles"])
+def test_head_answers_the_new_platform_routes_like_get(router: Router, path: str) -> None:
+    reference = router.handle("GET", path)
+    response = router.handle("HEAD", path)
+    assert response.status == reference.status == 200
+    assert response.content_type == reference.content_type
+    assert response.headers == reference.headers
+    assert response.body == b""
+
+
+def test_a_controller_returning_a_plain_mapping_is_rendered_as_is(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The lifecycle payload is built from whatever the controller returned."""
+
+    class MappingController(FakeController):
+        def pause_profile(self, profile_id: str) -> Any:
+            return {"profile_id": profile_id, "status": "running"}
+
+    class ObjectController(FakeController):
+        def pause_profile(self, profile_id: str) -> Any:
+            return object()
+
+    profiles = (make_profile_snapshot(PROFILE_A, "BTC/USDT"),)
+    routers = [
+        build_router(
+            provider,
+            monitor,
+            manual_clock,
+            read_only=False,
+            operator_token=TOKEN,
+            controller=MappingController(profiles=profiles),
+        ),
+        build_router(
+            provider,
+            monitor,
+            manual_clock,
+            read_only=False,
+            operator_token=TOKEN,
+            controller=ObjectController(profiles=profiles),
+        ),
+    ]
+    mapping = payload_of(
+        routers[0].handle("POST", f"/api/profiles/{PROFILE_A}/pause", headers=AUTH)
+    )["profile"]
+    assert mapping == {"profile_id": PROFILE_A, "status": "running"}
+    rendered = payload_of(
+        routers[1].handle("POST", f"/api/profiles/{PROFILE_A}/pause", headers=AUTH)
+    )["profile"]
+    assert isinstance(rendered, str)
+    assert rendered.startswith("<object object at")

@@ -40,8 +40,19 @@ Frozen order of one tick (each step numbered as in the delivery brief)
 8. submit through the gateway, turning a risk/kill-switch/venue refusal into a
    blocked decision instead of a dead loop;
 9. poll the venue and persist a closed round trip;
-10. append the equity point, watermark the candle and publish the health;
+10. append the processed candle, the equity point, watermark the candle and publish
+    the health;
 11. return the decision.
+
+Pause semantics
+---------------
+``pause()`` is an **entry-only** gate: the profile stops opening new positions but
+keeps managing the one it holds -- the static stop is still checked intrabar and the
+exit signals are still routed, so no position is ever left unmanaged.  A paused tick
+that carries an entry signal is a ``HOLD`` (never a blocked decision): it still
+appends its candle, its equity point and its watermark, exactly like any other tick.
+The gate is plain in-memory state of the runner and never touches the store, the
+status, the strategy or the gateway; ``resume()`` clears it.
 
 Every ``await`` of a wait this module owns is bounded by an explicit
 ``asyncio.wait_for`` timeout, so no tick can hang.
@@ -283,6 +294,7 @@ class ProfileRunner:
         self._sequence = 0
         self._sequence_stamp: pd.Timestamp | None = None
         self._started_at: pd.Timestamp | None = None
+        self._paused = False
         self._peak_equity = float(profile.initial_balance)
         self._day_start_equity = float(profile.initial_balance)
         self._day: Any = None
@@ -309,6 +321,11 @@ class ProfileRunner:
     def gateway(self) -> ExecutionGateway:
         """Return the injected execution gateway."""
         return self._gateway
+
+    @property
+    def paused(self) -> bool:
+        """Return whether the entry gate of this profile is closed."""
+        return self._paused
 
     def counters(self) -> EngineCounters:
         """Return the counters of this profile, reconnect count included."""
@@ -442,6 +459,29 @@ class ProfileRunner:
         self._store.save_status(
             self.profile_id, ProfileStatus.DEGRADED, detail=self._degraded_detail
         )
+
+    # -- runtime control: the entry gate ------------------------------------
+
+    def pause(self) -> None:
+        """Stop opening new positions, keep managing the open one. Idempotent.
+
+        The gate is consulted **only** where an entry would be decided, so the
+        static stop of an open position and every exit signal keep working while the
+        profile is paused.  Nothing else is touched: no store write, no status
+        change (the profile stays ``RUNNING`` -- ``HALTED`` is a fault status and
+        would degrade ``/api/health``) and no gateway call.
+        """
+        if self._paused:
+            return
+        self._paused = True
+        log_event(_LOGGER, "profile_paused", profile_id=self.profile_id)
+
+    def resume(self) -> None:
+        """Re-open the entry gate of this profile. Idempotent, and the mirror of pause."""
+        if not self._paused:
+            return
+        self._paused = False
+        log_event(_LOGGER, "profile_resumed", profile_id=self.profile_id)
 
     async def run(self, *, max_iterations: int | None = None) -> None:
         """Loop over :meth:`run_once` until cancelled or ``max_iterations`` is met.
@@ -598,7 +638,9 @@ class ProfileRunner:
                 exit_reason=str(trade.exit_reason),
             )
 
-        # 10. publish the tick: equity point, watermark, status, counters.
+        # 10. publish the tick: the processed candle, the equity point, the
+        #     watermark, the status and the counters.
+        self._store.append_candle(candle, profile_id=self.profile_id)
         after = self._equity_state(stamp, float(candle.close))
         self._store.append_equity(
             EquityPoint(
@@ -775,6 +817,8 @@ class ProfileRunner:
         if _flag(row, "entry_long"):
             if position is not None:
                 return self._entry_while_open(close, position)
+            if self._paused:
+                return self._paused_plan(close)
             return _OrderPlan(
                 action=SignalAction.ENTER_LONG,
                 direction=Direction.LONG,
@@ -794,6 +838,8 @@ class ProfileRunner:
         if short_enabled and _flag(row, "entry_short"):
             if position is not None:
                 return self._entry_while_open(close, position)
+            if self._paused:
+                return self._paused_plan(close)
             return _OrderPlan(
                 action=SignalAction.ENTER_SHORT,
                 direction=Direction.SHORT,
@@ -834,6 +880,29 @@ class ProfileRunner:
             direction=None,
             reference_price=close,
             reason="a position is already open",
+        )
+
+    def _paused_plan(self, close: float) -> _OrderPlan:
+        """Turn an entry signal into a ``HOLD`` while the profile is paused.
+
+        The gate is entry-only: the caller reaches this helper *after* the static
+        stop of an open position and *only* from the two entry branches, so a paused
+        profile keeps managing what it holds.  The decision is a ``HOLD``, never a
+        blocked one, which is what makes the tick publish its candle, its equity
+        point and its watermark exactly like any other tick.
+        """
+        log_event(
+            _LOGGER,
+            "entry_ignored",
+            profile_id=self.profile_id,
+            symbol=str(self._profile.symbol),
+            reason="profile is paused",
+        )
+        return _OrderPlan(
+            action=SignalAction.HOLD,
+            direction=None,
+            reference_price=close,
+            reason="profile is paused",
         )
 
     @staticmethod

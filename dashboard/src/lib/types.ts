@@ -225,3 +225,99 @@ export interface ProfileDetailBundle {
   orders: OrdersPayload;
   metrics: MetricsPayload;
 }
+
+// ---------------------------------------------------------------------------
+// candle history, catalog and profile lifecycle (additive part of the contract)
+// ---------------------------------------------------------------------------
+
+/**
+ * One persisted candle of a profile, as `GET /api/profiles/{id}/candles`
+ * emits it. `closed` tells a finished candle from the still-forming one, and
+ * every price is `null` when the engine never recorded a finite value.
+ */
+export interface Candle {
+  profile_id: string;
+  timestamp: string;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume: number | null;
+  closed: boolean;
+}
+
+/** Body of `GET /api/profiles/{id}/candles?limit=N`, oldest candle first. */
+export interface CandlesPayload {
+  candles: Candle[];
+  count: number;
+}
+
+/** One tradable pair of the configured quote currency. */
+export interface CatalogSymbol {
+  symbol: string;
+  base: string;
+  quote: string;
+}
+
+/**
+ * Body of `GET /api/catalog`: everything the creation form needs to build its
+ * pickers. Every list is data-driven — the dashboard never hard-codes a symbol,
+ * a strategy name or a timeframe.
+ */
+export interface CatalogPayload {
+  symbols: CatalogSymbol[];
+  strategies: string[];
+  timeframes: string[];
+  modes: RunMode[];
+}
+
+/** Runtime control state of a single profile (`GET /api/control`). */
+export interface ProfileControl {
+  profile_id: string;
+  paused: boolean;
+  running: boolean;
+}
+
+/**
+ * Body of `GET /api/control`: whether the engine runs, whether the server is
+ * read-only, whether mutations are accepted, and the per-profile control state.
+ */
+export interface ControlPayload {
+  engine_running: boolean;
+  read_only: boolean;
+  mutable: boolean;
+  profiles: ProfileControl[];
+}
+
+/** Body of a successful pause or resume call. */
+export interface LifecyclePayload {
+  profile: ProfileSnapshot;
+  paused: boolean;
+}
+
+/**
+ * Body of a successful `POST /api/profiles`.
+ *
+ * Creation answers the started profile only: a brand new profile is never
+ * paused, so the route carries no `paused` field (unlike pause/resume).
+ */
+export interface CreateProfilePayload {
+  profile: ProfileSnapshot;
+}
+
+/** Body of a successful `DELETE /api/profiles/{id}`. */
+export interface DeletePayload {
+  profile_id: string;
+  deleted: true;
+}
+
+/** Body of `POST /api/profiles` — the profile the operator wants to create. */
+export interface CreateProfileBody {
+  profile_id: string;
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+  mode: RunMode;
+  initial_balance?: number;
+  params?: Record<string, number | string | boolean>;
+}

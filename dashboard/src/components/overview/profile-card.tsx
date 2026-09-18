@@ -15,7 +15,9 @@ import {
 } from 'lucide-react';
 import Link from 'next/link';
 
+import { ProfileActions } from '@/components/profile/profile-actions';
 import { StatusBadge, profileStatusTone, type StatusTone } from '@/components/ui/status-badge';
+import { cn } from '@/lib/cn';
 import {
   EMPTY_PLACEHOLDER,
   formatDuration,
@@ -33,6 +35,7 @@ import type { ProfileSnapshot, ProfileStatus, RunMode } from '@/lib/types';
 export interface ProfileCardProps {
   /** One profile as `GET /api/profiles` emits it. */
   profile: ProfileSnapshot;
+  className?: string;
 }
 
 const BADGE_ICON_CLASSES = 'size-3.5';
@@ -112,13 +115,15 @@ function Field({ label, value, children }: FieldProps) {
  * One profile of the live overview.
  *
  * The card is labelled by its heading, whose link goes to the per-profile detail
- * route; the rest of the card stays free of nested interactive content, so a
- * keyboard user never lands on a link wrapping a button. Every value carries an
- * explicit label, every state pairs its tone with a text label and an icon, and
- * every absent value renders the em dash placeholder — never `NaN`, `undefined`
- * or an empty cell.
+ * route; the heading stays free of nested interactive content, so a keyboard user
+ * never lands on a link wrapping a button. The footer renders the shared
+ * lifecycle island (pause, resume, delete) of the profile, exactly like the
+ * detail header, so both entry points offer the same controls. Every value
+ * carries an explicit label, every state pairs its tone with a text label and an
+ * icon, and every absent value renders the em dash placeholder — never `NaN`,
+ * `undefined` or an empty cell.
  */
-export function ProfileCard({ profile }: ProfileCardProps) {
+export function ProfileCard({ profile, className }: ProfileCardProps) {
   const mode = MODE_BADGES[profile.mode] ?? {
     label: textOrPlaceholder(profile.mode),
     tone: 'neutral' as StatusTone,
@@ -136,7 +141,10 @@ export function ProfileCard({ profile }: ProfileCardProps) {
   return (
     <article
       aria-labelledby={headingId(profile.profile_id)}
-      className="flex flex-col rounded-card border border-border bg-card p-xl text-card-foreground shadow-md"
+      className={cn(
+        'flex flex-col rounded-card border border-border bg-card p-xl text-card-foreground shadow-md',
+        className,
+      )}
     >
       <header className="flex flex-wrap items-start justify-between gap-md">
         <div className="min-w-0">
@@ -198,6 +206,10 @@ export function ProfileCard({ profile }: ProfileCardProps) {
           <span className="min-w-0 break-words">{textOrPlaceholder(lastError)}</span>
         </p>
       ) : null}
+
+      <footer className="mt-lg border-t border-border/60">
+        <ProfileActions profileId={profile.profile_id} className="mt-lg" />
+      </footer>
     </article>
   );
 }

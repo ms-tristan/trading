@@ -878,6 +878,42 @@ layer 7 serves a **pure JSON API**, and the monitoring UI is now the standalone
 Le détail route par route, les payloads et la cadence de sondage sont documentés
 dans [`docs/realtime.md`](realtime.md#5-web-api-reference).
 
+### 4.12 Cycle de vie des profils, catalogue et historique de bougies
+
+Le tableau de bord pilote quatre mutations, toutes protégées par le **même**
+jeton opérateur (`X-Operator-Token`) que le *kill switch* et toutes refusées avec
+le `403` documenté par un serveur en lecture seule (`realtime serve`, qui
+n'attache aucun contrôleur).
+
+- `realtime/store.py` ajoute une table **`candles`** bornée (une ligne par profil
+  et par horodatage, OHLCV plus l'indicateur *closed*) : le moteur y écrit chaque
+  bougie qu'il traite et le magasin ne conserve que les **1000** lignes les plus
+  récentes de chaque profil, élaguées dans la même transaction que l'ajout. La
+  migration est **additive** : une base déployée en version 1 gagne la table vide
+  sans perdre une seule ligne, et `SCHEMA_VERSION` vaut désormais `2`.
+- `realtime/catalog.py` (`MarketCatalog`) est la **seule** source des quatre
+  vocabulaires des sélecteurs : paires *spot* négociables de l'exchange pour la
+  devise de cotation configurée (lues par la couture exchange/`ccxt`, mises en
+  cache avec une durée de vie, et repli sur une table statique), noms de
+  stratégies du registre, timeframes triés du plus court au plus long, modes
+  `paper`/`live`. Il ne lève jamais : une venue injoignable dégrade la réponse au
+  lieu de produire une erreur.
+- `realtime/control.py` (`RuntimeProfileController`) est la **couture injectée**
+  entre le serveur HTTP, qui répond depuis un thread, et l'orchestrateur, qui est
+  asynchrone : chaque commande est renvoyée sur la boucle du moteur
+  (`asyncio.run_coroutine_threadsafe`, la boucle étant liée depuis la coroutine du
+  moteur), ce qui rend une mutation concurrente d'une bougie en cours de
+  traitement sûre, et ce qui garde la couche web importable **sans** moteur.
+- La couche 7 expose trois routes de lecture de plus
+  (`GET /api/profiles/{id}/candles`, `GET /api/catalog`, `GET /api/control`) et
+  quatre mutations (`POST /api/profiles`, `POST /api/profiles/{id}/pause`,
+  `POST /api/profiles/{id}/resume`, `DELETE /api/profiles/{id}`). **Pause** ferme
+  la porte d'entrée sans jamais laisser une position sans surveillance (le stop et
+  les sorties restent évalués) ; **delete** aplatit au marché, par la passerelle
+  d'exécution, **avant** de retirer quoi que ce soit, et échoue sans rien modifier
+  si l'aplatissement échoue. Le détail (payloads, codes d'erreur, sémantique) est
+  dans `docs/realtime.md` §5 et §8.
+
 ---
 
 ## 5. Contrat de données OHLCV
