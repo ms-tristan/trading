@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Local deployment of the real-time multi-profile platform.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml logs -f
+#   docker compose -f deploy/docker-compose.yml down          # keep the volumes
+#
+# The container serves PLAIN HTTP on 8080 and is published on the loopback
+# interface only (127.0.0.1:3030): TLS, HTTP Basic authentication, rate
+# limiting and fail2ban are the host nginx's job (see deploy/README.md).
+#
+# Credentials come from deploy/.env (git-ignored, mode 600) and are injected
+# through the environment -- the image itself contains no secret.
+# ---------------------------------------------------------------------------
+services:
+  trading-realtime:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.realtime
+    image: trading-realtime:latest
+    container_name: trading-realtime
+    restart: unless-stopped
+
+    env_file:
+      - .env
+    environment:
+      TB_LOG_LEVEL: INFO
+
+    ports:
+      - "127.0.0.1:3030:8080"
+
+    volumes:
+      # deployment profiles are read-only inside the container
+      - ./profiles.json:/app/deploy/profiles.json:ro
+      # durable state (SQLite database, kill-switch file, structured logs)
+      - trading-state:/app/data/realtime
+      # OHLCV cache (survives restarts, avoids re-downloading the warmup window)
+      - trading-cache:/app/data/cache
+
+    # the image healthcheck already probes GET /api/health on 8080
+    stop_grace_period: 30s
+
+volumes:
+  trading-state:
+  trading-cache:

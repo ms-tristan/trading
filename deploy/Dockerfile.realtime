@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Runtime image for the real-time multi-profile platform (layers 6 and 7).
+#
+#   build  -> python:3.11-slim + the package + the optional `exchange` extra
+#             (ccxt) so the polling market stream can reach a real exchange.
+#   run    -> `python -m trading_backtest realtime run --profiles ...`
+#             engine + monitoring dashboard on 0.0.0.0:8080 (HTTP, plain).
+#
+# TLS, authentication, rate limiting and fail2ban live in the host nginx
+# (see deploy/README.md): the container NEVER terminates TLS and is only
+# published on the loopback interface.
+#
+#   docker build -f deploy/Dockerfile.realtime -t trading-realtime:latest .
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# The image contains NO credential: the operator token and any live-exchange
+# key are injected through the environment at run time.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# 1. runtime dependencies (requirements.txt mirrors [project].dependencies)
+COPY requirements.txt ./
+
+# 2. the package and its deployment profiles; the `exchange` extra pulls ccxt
+#    (lazy-imported by trading_backtest.data / trading_backtest.realtime, so the
+#    test-suite never needs it but the deployed engine does)
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY config ./config
+COPY deploy ./deploy
+RUN python -m pip install --no-cache-dir . \
+    && python -m pip install --no-cache-dir "ccxt>=4.2.0" "requests>=2.31"
+
+# 3. never run as root; /app/data is a volume (state database, OHLCV cache, logs)
+RUN useradd --create-home --shell /bin/bash appuser \
+    && mkdir -p /app/data/realtime /app/data/cache \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8080
+
+# The monitoring API is the health surface of the whole platform.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).status == 200 else 1)"]
+
+ENTRYPOINT ["python", "-m", "trading_backtest"]
+CMD ["realtime", "run", "--profiles", "/app/deploy/profiles.json", "--host", "0.0.0.0", "--port", "8080"]

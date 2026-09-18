@@ -16,3 +16,13 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .scratch
+# ---- secrets: never bake a credential into an image layer ----
+.env
+.env.*
+!.env.example
+deploy/.env
+*.pem
+*.key
+*.db
+*.db-wal
+*.db-shm
