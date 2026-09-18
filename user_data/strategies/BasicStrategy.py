@@ -6,11 +6,11 @@ the file stem, so this alias cannot be a factory call: the literal ``class``
 statement below is what makes ``--strategy BasicStrategy`` resolve.
 
 Not a single indicator or entry/exit rule lives here: everything comes from
-``trading_backtest.strategy.freqtrade_basic``, which requires the optional
+``trading_platform.strategy.freqtrade_basic``, which requires the optional
 ``freqtrade`` extra.
 """
 
-from trading_backtest.strategy.freqtrade_basic import BasicFreqtradeStrategy
+from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy
 
 
 class BasicStrategy(BasicFreqtradeStrategy):

@@ -1,8 +1,8 @@
-"""Unit tests for the benchmark gate (``trading_backtest.validation.benchmark``).
+"""Unit tests for the benchmark gate (``trading_platform.validation.benchmark``).
 
 The gate answers a single question -- *did the strategy beat doing nothing?* --
 and it must answer it **before** the metrics package
-(``trading_backtest.metrics``) exists: every verdict test injects a duck-typed
+(``trading_platform.metrics``) exists: every verdict test injects a duck-typed
 comparison through ``comparison_fn`` and never imports that layer.  Only the
 integration tests at the end are guarded by ``pytest.importorskip`` and exercise
 the real ``compare_benchmark``.
@@ -27,16 +27,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.errors import ValidationLayerError
-from trading_backtest.validation.benchmark import (
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.errors import ValidationLayerError
+from trading_platform.validation.benchmark import (
     MIN_ALPHA,
     BenchmarkGateResult,
     validate_benchmark,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
-    from trading_backtest.core.models import BacktestResult, RunnerFn
+    from trading_platform.core.models import BacktestResult, RunnerFn
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -152,7 +152,7 @@ def stub_gate(
 
 
 def test_min_alpha_is_zero_float_and_exported() -> None:
-    import trading_backtest.validation as validation
+    import trading_platform.validation as validation
 
     assert MIN_ALPHA == 0.0
     assert isinstance(MIN_ALPHA, float)
@@ -163,23 +163,23 @@ def test_min_alpha_is_zero_float_and_exported() -> None:
 
 
 def test_validation_package_imports_without_the_metrics_layer(tmp_path: Path) -> None:
-    """``import trading_backtest.validation`` must not need the metrics layer."""
+    """``import trading_platform.validation`` must not need the metrics layer."""
     script = textwrap.dedent(
         """
         import sys
 
         class _BlockMetrics:
             def find_spec(self, name, path=None, target=None):
-                if name == "trading_backtest.metrics" or name.startswith("trading_backtest.metrics."):
+                if name == "trading_platform.metrics" or name.startswith("trading_platform.metrics."):
                     raise ModuleNotFoundError(f"blocked: {name}")
                 return None
 
         sys.meta_path.insert(0, _BlockMetrics())
-        import trading_backtest.validation as validation
+        import trading_platform.validation as validation
 
         assert callable(validation.validate_benchmark)
         assert validation.MIN_ALPHA == 0.0
-        assert "trading_backtest.metrics" not in sys.modules
+        assert "trading_platform.metrics" not in sys.modules
         print("ok")
         """
     )
@@ -206,8 +206,8 @@ def test_validation_package_imports_without_the_metrics_layer(tmp_path: Path) ->
 def test_none_variant_returns_none_without_touching_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.benchmark", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.benchmark", None)
     comparison = StubComparison(alpha=0.5, strategy_total_return=0.5, benchmark_total_return=0.0)
     recorder = RecordingComparison(comparison)
 
@@ -220,8 +220,8 @@ def test_none_variant_returns_none_without_touching_metrics(
 
 
 def test_missing_metrics_layer_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.benchmark", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.benchmark", None)
 
     with pytest.raises(ValidationLayerError, match="not importable"):
         validate_benchmark(object(), make_frame((100.0, 110.0)))
@@ -233,8 +233,8 @@ def test_missing_metrics_layer_is_reported(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_injected_comparison_fn_is_used_without_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.benchmark", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.benchmark", None)
     comparison = StubComparison(
         alpha=0.05,
         strategy_total_return=0.25,
@@ -493,7 +493,7 @@ def test_gate_result_is_frozen() -> None:
 
 
 def test_integration_gate_alpha_matches_the_sides(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame(RISING_CLOSES)
 
     gate = validate_benchmark(runner_stub(frame), frame)
@@ -514,7 +514,7 @@ def test_integration_gate_alpha_matches_the_sides(runner_stub: RunnerFn) -> None
 
 
 def test_integration_strategy_underperforms_a_rising_benchmark(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame(RISING_CLOSES)
 
     gate = validate_benchmark(runner_stub(frame), frame)
@@ -525,7 +525,7 @@ def test_integration_strategy_underperforms_a_rising_benchmark(runner_stub: Runn
 
 
 def test_integration_strategy_beats_a_falling_benchmark(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame(FALLING_CLOSES)
 
     gate = validate_benchmark(runner_stub(frame), frame)
@@ -540,7 +540,7 @@ def test_integration_strategy_beats_a_falling_benchmark(runner_stub: RunnerFn) -
 
 
 def test_integration_costs_are_charged_to_the_benchmark(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame(RISING_CLOSES)
     result = runner_stub(frame)
 
@@ -556,7 +556,7 @@ def test_integration_costs_are_charged_to_the_benchmark(runner_stub: RunnerFn) -
 
 
 def test_integration_cash_variant_has_no_beta(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame(RISING_CLOSES)
 
     gate = validate_benchmark(runner_stub(frame), frame, variant="cash")
@@ -573,7 +573,7 @@ def test_integration_cash_variant_has_no_beta(runner_stub: RunnerFn) -> None:
 
 
 def test_integration_two_candle_frame_has_no_beta(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame((100.0, 110.0))
 
     gate = validate_benchmark(runner_stub(frame), frame)
@@ -585,16 +585,16 @@ def test_integration_two_candle_frame_has_no_beta(runner_stub: RunnerFn) -> None
 
 
 def test_integration_none_variant_needs_no_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("trading_backtest.metrics")
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.benchmark", None)
+    pytest.importorskip("trading_platform.metrics")
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.benchmark", None)
     frame = make_frame(RISING_CLOSES)
 
     assert validate_benchmark(object(), frame, variant="none") is None
 
 
 def test_integration_propagates_metrics_errors(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
-    from trading_backtest.core.errors import MetricsError
+    pytest.importorskip("trading_platform.metrics")
+    from trading_platform.core.errors import MetricsError
 
     frame = make_frame(RISING_CLOSES)
 
@@ -604,7 +604,7 @@ def test_integration_propagates_metrics_errors(runner_stub: RunnerFn) -> None:
 
 
 def test_gate_result_keeps_the_backtest_result_type(runner_stub: RunnerFn) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
     frame = make_frame(RISING_CLOSES)
     result: BacktestResult = runner_stub(frame)
 

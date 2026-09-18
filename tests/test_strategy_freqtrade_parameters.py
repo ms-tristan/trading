@@ -7,8 +7,8 @@ the only tests touching the real library are guarded by
 Freqtrade is absent, and must stay green (``docs/testing-policy.md`` §1.2).
 
 The module is imported through its **own path**
-(``trading_backtest.strategy.freqtrade_parameters``) rather than through the
-``trading_backtest.strategy`` public namespace, which is owned by another work
+(``trading_platform.strategy.freqtrade_parameters``) rather than through the
+``trading_platform.strategy`` public namespace, which is owned by another work
 package.
 """
 
@@ -25,11 +25,11 @@ from typing import Any
 import pytest
 from pydantic import Field
 
-import trading_backtest.strategy.freqtrade_parameters as freqtrade_parameters
-from trading_backtest.core.errors import StrategyError
-from trading_backtest.strategy.base import Strategy, StrategyParams
-from trading_backtest.strategy.basic import BasicStrategy, BasicStrategyParams
-from trading_backtest.strategy.freqtrade_parameters import (
+import trading_platform.strategy.freqtrade_parameters as freqtrade_parameters
+from trading_platform.core.errors import StrategyError
+from trading_platform.strategy.base import Strategy, StrategyParams
+from trading_platform.strategy.basic import BasicStrategy, BasicStrategyParams
+from trading_platform.strategy.freqtrade_parameters import (
     FREQTRADE_DECIMALS,
     FREQTRADE_PARAM_SPACE,
     FREQTRADE_UNBOUNDED_HIGH_FACTOR,
@@ -38,7 +38,7 @@ from trading_backtest.strategy.freqtrade_parameters import (
     freqtrade_parameter_attributes,
     startup_candle_count_for,
 )
-from trading_backtest.strategy.registry import STRATEGIES
+from trading_platform.strategy.registry import STRATEGIES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -170,9 +170,9 @@ def test_the_strategy_layer_imports_without_freqtrade_in_a_real_subprocess() -> 
     script = (
         "import sys\n"
         "sys.modules['freqtrade'] = None\n"
-        "from trading_backtest.core.errors import StrategyError\n"
-        "from trading_backtest.strategy.basic import BasicStrategyParams\n"
-        "from trading_backtest.strategy.freqtrade_parameters import (\n"
+        "from trading_platform.core.errors import StrategyError\n"
+        "from trading_platform.strategy.basic import BasicStrategyParams\n"
+        "from trading_platform.strategy.freqtrade_parameters import (\n"
         "    freqtrade_param_specs,\n"
         "    freqtrade_parameter_attributes,\n"
         ")\n"
@@ -513,7 +513,7 @@ def test_parameter_attributes_without_freqtrade_raises_strategy_error(
     with pytest.raises(StrategyError) as excinfo:
         freqtrade_parameter_attributes(specs)
     assert "freqtrade is not installed" in str(excinfo.value)
-    assert "trading-backtest[freqtrade]" in str(excinfo.value)
+    assert "trading-platform[freqtrade]" in str(excinfo.value)
     assert not isinstance(excinfo.value, ImportError)
 
 
@@ -523,7 +523,7 @@ def test_parameter_attributes_raises_before_touching_the_specs(
     _simulate_missing_freqtrade(monkeypatch)
     with pytest.raises(StrategyError) as excinfo:
         freqtrade_parameter_attributes(())
-    assert "pip install 'trading-backtest[freqtrade]'" in str(excinfo.value)
+    assert "pip install 'trading-platform[freqtrade]'" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

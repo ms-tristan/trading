@@ -15,20 +15,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import (
+from trading_platform.core.errors import (
     ConfigError,
     DataDownloadError,
     DataValidationError,
     InsufficientDataError,
 )
-from trading_backtest.data.cache import OHLCVCache
-from trading_backtest.data.loader import (
+from trading_platform.data.cache import OHLCVCache
+from trading_platform.data.loader import (
     CcxtDataProvider,
     CsvDataProvider,
     MarketDataProvider,
     OHLCVLoader,
 )
-from trading_backtest.data.synthetic import make_ohlcv
+from trading_platform.data.synthetic import make_ohlcv
 
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "1h"
@@ -398,7 +398,7 @@ def test_ccxt_provider_without_ccxt_raises_data_download_error(
     with pytest.raises(DataDownloadError) as excinfo:
         CcxtDataProvider("binance")
     assert "ccxt is not installed" in str(excinfo.value)
-    assert "trading-backtest[exchange]" in str(excinfo.value)
+    assert "trading-platform[exchange]" in str(excinfo.value)
 
 
 def test_ccxt_provider_construction_when_ccxt_is_installed() -> None:

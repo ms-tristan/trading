@@ -13,7 +13,7 @@ downloaded by the test-suite (`docs/testing-policy.md` §1).
 
 ```bash
 .venv/bin/python -c "
-from trading_backtest.data.synthetic import make_trending_ohlcv
+from trading_platform.data.synthetic import make_trending_ohlcv
 f = make_trending_ohlcv(n=200, period=45, amplitude=8.0, seed=7, start='2023-01-01T00:00:00Z')
 o = f.copy(); o.insert(0, 'timestamp', o.index.strftime('%Y-%m-%dT%H:%M:%SZ'))
 o.to_csv('tests/fixtures/BTC_USDT-1h.csv', index=False, float_format='%.6f')"

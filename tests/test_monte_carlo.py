@@ -1,6 +1,6 @@
-"""Unit tests for the Monte Carlo layer (``trading_backtest.validation.monte_carlo``).
+"""Unit tests for the Monte Carlo layer (``trading_platform.validation.monte_carlo``).
 
-The input :class:`~trading_backtest.core.models.BacktestResult` objects are built
+The input :class:`~trading_platform.core.models.BacktestResult` objects are built
 **directly** from ``TradeRecord`` / ``BacktestResult`` (the strategy engine is
 never imported), and the expected statistics are recomputed independently from
 the returned ``returns`` list — with one closed-form case where the ordering of
@@ -15,15 +15,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import UTC
-from trading_backtest.core.errors import ValidationLayerError
-from trading_backtest.core.models import (
+from trading_platform.core.constants import UTC
+from trading_platform.core.errors import ValidationLayerError
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     TradeRecord,
 )
-from trading_backtest.validation.monte_carlo import (
+from trading_platform.validation.monte_carlo import (
     PERCENTILE_LABELS,
     SERIALISED_SIMULATIONS,
     MonteCarloResult,

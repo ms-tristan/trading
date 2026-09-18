@@ -12,8 +12,8 @@ Two groups, and the split is deliberate (``docs/testing-policy.md`` §1.2):
   stay green there.
 
 The module is imported through its **own path**
-(``trading_backtest.strategy.freqtrade_adapter``) rather than through the
-``trading_backtest.strategy`` public namespace, which is owned by another work
+(``trading_platform.strategy.freqtrade_adapter``) rather than through the
+``trading_platform.strategy`` public namespace, which is owned by another work
 package.
 
 The last guarded test is the integration one: it instantiates the adapter class
@@ -40,15 +40,15 @@ import pandas as pd
 import pytest
 from pydantic import Field
 
-from trading_backtest.core.errors import StrategyError
-from trading_backtest.freqtrade import DEFAULT_STRATEGY_NAME
-from trading_backtest.strategy.base import (
+from trading_platform.core.errors import StrategyError
+from trading_platform.freqtrade import DEFAULT_STRATEGY_NAME
+from trading_platform.strategy.base import (
     Strategy,
     StrategyParams,
     ensure_signal_frame,
     require_ohlcv_frame,
 )
-from trading_backtest.strategy.freqtrade_adapter import (
+from trading_platform.strategy.freqtrade_adapter import (
     FREQTRADE_DISABLED_ROI,
     FREQTRADE_INTERFACE_VERSION,
     FREQTRADE_ORDER_COLUMNS,
@@ -70,13 +70,13 @@ from trading_backtest.strategy.freqtrade_adapter import (
     make_freqtrade_strategy,
     validate_freqtrade_adapter_class,
 )
-from trading_backtest.strategy.freqtrade_parameters import FreqtradeParamSpec
-from trading_backtest.strategy.registry import STRATEGIES, get_strategy, register_strategy
+from trading_platform.strategy.freqtrade_parameters import FreqtradeParamSpec
+from trading_platform.strategy.registry import STRATEGIES, get_strategy, register_strategy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The module under test — read as text by the AST tests.
-MODULE_PATH = REPO_ROOT / "src" / "trading_backtest" / "strategy" / "freqtrade_adapter.py"
+MODULE_PATH = REPO_ROOT / "src" / "trading_platform" / "strategy" / "freqtrade_adapter.py"
 
 #: Real Binance cache used by the integration test (git-ignored: the test skips
 #: when it is absent, so a fresh clone stays green).
@@ -192,7 +192,7 @@ class ToggleParams(StrategyParams):
     """Parameters of :class:`ToggleStrategy`.
 
     ``label`` is a ``str`` field: Freqtrade has no scalar parameter object for it,
-    so :mod:`trading_backtest.strategy.freqtrade_parameters` leaves it unmapped —
+    so :mod:`trading_platform.strategy.freqtrade_parameters` leaves it unmapped —
     it is the documented candidate for a manual ``param_overrides`` entry.
     """
 
@@ -287,7 +287,7 @@ def registered_toggle() -> Iterator[type[Strategy]]:
 
 def test_public_api_is_the_frozen_alphabetical_list() -> None:
     """``__all__`` is exactly the frozen API, and it is sorted."""
-    import trading_backtest.strategy.freqtrade_adapter as module
+    import trading_platform.strategy.freqtrade_adapter as module
 
     frozen = [
         "FREQTRADE_DISABLED_ROI",
@@ -357,7 +357,7 @@ def test_freqtrade_is_imported_lazily_inside_functions() -> None:
 def test_importing_the_module_does_not_load_freqtrade() -> None:
     """Importing the adapter must not pull the optional extra in."""
     code = (
-        "import sys, trading_backtest.strategy.freqtrade_adapter as m;"
+        "import sys, trading_platform.strategy.freqtrade_adapter as m;"
         "print('freqtrade' in sys.modules, m.FREQTRADE_INTERFACE_VERSION)"
     )
     result = subprocess.run(
@@ -826,7 +826,7 @@ def test_make_freqtrade_strategy_without_the_extra(monkeypatch: pytest.MonkeyPat
         make_freqtrade_strategy("basic")
     message = str(excinfo.value)
     assert "freqtrade is not installed" in message
-    assert "trading-backtest[freqtrade]" in message
+    assert "trading-platform[freqtrade]" in message
 
 
 def test_validate_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -836,7 +836,7 @@ def test_validate_without_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
         validate_freqtrade_adapter_class(object)
     message = str(excinfo.value)
     assert "freqtrade is not installed" in message
-    assert "trading-backtest[freqtrade]" in message
+    assert "trading-platform[freqtrade]" in message
 
 
 def test_availability_is_restored_after_the_simulation() -> None:

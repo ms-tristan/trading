@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Runtime image for the standalone monitoring dashboard (Next.js 16, App
+# Router, standalone output).
+#
+#   build  -> node:24-alpine, `npm ci` then `next build`; the build context is
+#             the REPOSITORY ROOT (the dashboard lives in dashboard/):
+#               docker build -f deploy/Dockerfile.dashboard -t trading-dashboard:latest .
+#   run    -> `node server.js`, a real Node server on 0.0.0.0:3000 (never a
+#             static export).
+#
+# The browser always talks to the dashboard's own origin: next.config.ts
+# rewrites /api/:path* to API_ORIGIN, so there is no CORS preflight and the
+# X-Operator-Token header flows through untouched.
+#
+# API_ORIGIN is baked at build time: rewrites() is resolved when the Next
+# configuration is evaluated. Change it, then rebuild the image.
+#
+# TLS, authentication, rate limiting and fail2ban stay the host nginx's job
+# (see deploy/README.md): this container never terminates TLS and is published
+# on the loopback interface only.
+# ---------------------------------------------------------------------------
+
+FROM node:24-alpine AS deps
+WORKDIR /app
+# The lockfile is committed: `npm ci` is the only supported install, and it
+# brings nothing but the dashboard's own JavaScript dependencies.
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+
+FROM node:24-alpine AS builder
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=deps /app/node_modules ./node_modules
+COPY dashboard/ ./
+ARG API_ORIGIN=http://trading-realtime:8080
+ENV API_ORIGIN=$API_ORIGIN
+RUN npm run build
+
+FROM node:24-alpine AS runner
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+WORKDIR /app
+
+# never run as root; the standalone bundle is owned by this user
+RUN addgroup --system --gid 1001 nextjs \
+    && adduser --system --uid 1001 --ingroup nextjs --no-create-home nextjs \
+    && mkdir -p /app \
+    && chown -R nextjs:nextjs /app
+
+# `output: "standalone"` emits a self-contained server plus its node_modules;
+# the static assets are the only tree it does not inline. The app ships no
+# public/ directory of its own, so none is copied.
+COPY --from=builder --chown=nextjs:nextjs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nextjs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+# Node 24 has a global fetch: no curl, no wget, no extra package in the image.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD ["node", "-e", "fetch('http://127.0.0.1:3000/').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+
+CMD ["node", "server.js"]

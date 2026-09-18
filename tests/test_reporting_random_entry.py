@@ -1,14 +1,14 @@
 """Tests for the random-entry (``random_entry``) section of the reporting layer.
 
 The random-entry gate payload travels through the **existing** ``extras`` channel
-of :func:`~trading_backtest.reporting.builder.build_report`: no reporting API is
+of :func:`~trading_platform.reporting.builder.build_report`: no reporting API is
 added for it, the section is titled exactly like its ``extras`` key and it is
 inserted after the other sorted ``extras`` sections and before the
 ``Benchmark``/``Trades``/``Equity curve`` ones.
 
 The payload is *opaque data* for the reporting layer, so these tests build it by
 hand in the exact shape produced by
-``trading_backtest.validation.random_entry.RandomEntryGateResult.to_dict()``
+``trading_platform.validation.random_entry.RandomEntryGateResult.to_dict()``
 (top-level scalars, a nested ``percentiles`` mapping and a nested ``distribution``
 mapping holding the per-simulation ``returns`` list).  The validation and metrics
 implementations are therefore never imported here and the tests stay offline,
@@ -25,14 +25,14 @@ from typing import Any
 
 import pandas as pd
 
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.models import (
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     TradeRecord,
 )
-from trading_backtest.reporting import build_report, read_report, render_markdown, write_report
+from trading_platform.reporting import build_report, read_report, render_markdown, write_report
 
 BASE_TIMESTAMP = pd.Timestamp("2024-01-01T00:00:00Z")
 FIXED_TIME = datetime(2024, 6, 1, 12, 30, tzinfo=DATETIME_UTC)

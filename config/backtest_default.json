@@ -36,7 +36,33 @@
     "slippage": 0.0
   },
   "log_level": "INFO",
-  "project_name": "trading-backtest",
+  "monitoring": {
+    "host": "127.0.0.1",
+    "max_request_bytes": 65536,
+    "port": 8080,
+    "refresh_seconds": 2.0,
+    "request_timeout_seconds": 10.0
+  },
+  "project_name": "trading-platform",
+  "realtime": {
+    "allow_network": true,
+    "benchmark_variant": "buy_and_hold",
+    "cache_dir": "data/cache",
+    "csv_dir": null,
+    "data_dir": "data",
+    "format": "parquet",
+    "history_candles": 300,
+    "kill_switch_file": null,
+    "logs_dir": "data/realtime/logs",
+    "max_stream_reconnects": 5,
+    "poll_interval_seconds": 5.0,
+    "reconcile_interval_seconds": 60.0,
+    "reconnect_backoff_seconds": 1.0,
+    "risk_free_rate": 0.0,
+    "start_at": null,
+    "state_db": "data/realtime/state.db",
+    "stream_poll_timeout_seconds": 10.0
+  },
   "reporting": {
     "basename": "report",
     "formats": [

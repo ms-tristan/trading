@@ -26,9 +26,9 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from trading_backtest.cli import app
-from trading_backtest.config import dump_config, load_config
-from trading_backtest.reporting import read_report
+from trading_platform.cli import app
+from trading_platform.config import dump_config, load_config
+from trading_platform.reporting import read_report
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG = str(REPO_ROOT / "config" / "backtest_default.json")

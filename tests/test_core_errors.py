@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from trading_backtest.core.errors import (
+from trading_platform.core.errors import (
     ConfigError,
     DataDownloadError,
     DataError,
@@ -94,7 +94,7 @@ def test_data_validation_error_str_contains_message_and_issues() -> None:
     assert "naive index" in rendered
 
 
-def test_trading_backtest_error_accepts_issues() -> None:
+def test_trading_platform_error_accepts_issues() -> None:
     error = TradingBacktestError("boom", ["first", "second"])
     assert error.issues == ("first", "second")
     assert "first" in str(error)

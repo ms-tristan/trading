@@ -20,12 +20,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-import trading_backtest
-from trading_backtest.cli import app
-from trading_backtest.config import dump_config, load_config
-from trading_backtest.data import OHLCVCache
-from trading_backtest.data.synthetic import make_trending_ohlcv
-from trading_backtest.reporting import read_report
+import trading_platform
+from trading_platform.cli import app
+from trading_platform.config import dump_config, load_config
+from trading_platform.data import OHLCVCache
+from trading_platform.data.synthetic import make_trending_ohlcv
+from trading_platform.reporting import read_report
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG = str(REPO_ROOT / "config" / "backtest_default.json")
@@ -127,7 +127,7 @@ def test_version_prints_the_package_version() -> None:
     result = invoke("--version")
 
     assert result.exit_code == 0
-    assert result.output.strip() == trading_backtest.__version__
+    assert result.output.strip() == trading_platform.__version__
 
 
 def test_unknown_subcommand_is_a_usage_error() -> None:
@@ -176,7 +176,7 @@ def test_config_show_human_prints_the_configuration() -> None:
     result = invoke("config", "show", "--config", CONFIG)
 
     assert result.exit_code == 0, result.output
-    assert '"project_name": "trading-backtest"' in result.output
+    assert '"project_name": "trading-platform"' in result.output
 
 
 @pytest.mark.parametrize(
@@ -800,7 +800,7 @@ def test_data_download_requires_symbol_timeframe_and_window() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("module", ["trading_backtest", "trading_backtest.cli"])
+@pytest.mark.parametrize("module", ["trading_platform", "trading_platform.cli"])
 def test_python_dash_m_entry_points(module: str) -> None:
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
     completed = subprocess.run(
@@ -813,13 +813,13 @@ def test_python_dash_m_entry_points(module: str) -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == trading_backtest.__version__
+    assert completed.stdout.strip() == trading_platform.__version__
 
 
 def test_python_dash_m_help() -> None:
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
     completed = subprocess.run(
-        [sys.executable, "-m", "trading_backtest", "--help"],
+        [sys.executable, "-m", "trading_platform", "--help"],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
@@ -833,36 +833,36 @@ def test_python_dash_m_help() -> None:
 
 
 def test_console_script_entry_point() -> None:
-    script = shutil.which("trading-backtest")
+    script = shutil.which("trading-platform")
     if script is None:  # pragma: no cover - the package is not installed here
         pytest.skip("the console script is not installed in this environment")
 
     completed = subprocess.run([script, "--version"], capture_output=True, text=True, check=False)
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == trading_backtest.__version__
+    assert completed.stdout.strip() == trading_platform.__version__
 
 
 def test_cli_module_imports_without_the_heavy_layers(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
-        "trading_backtest.strategy",
-        "trading_backtest.validation",
-        "trading_backtest.metrics",
-        "trading_backtest.reporting",
+        "trading_platform.strategy",
+        "trading_platform.validation",
+        "trading_platform.metrics",
+        "trading_platform.reporting",
     ):
         monkeypatch.setitem(sys.modules, name, None)
-    monkeypatch.delitem(sys.modules, "trading_backtest.cli", raising=False)
+    monkeypatch.delitem(sys.modules, "trading_platform.cli", raising=False)
 
-    module = importlib.import_module("trading_backtest.cli")
+    module = importlib.import_module("trading_platform.cli")
 
     assert module.app is not None
     assert list(module.PAYLOAD_KEYS) == list(PAYLOAD_KEYS)
 
 
 def test_cli_enums_mirror_the_validation_layer() -> None:
-    from trading_backtest.cli import MONTE_CARLO_METHODS, WINDOW_MODES
-    from trading_backtest.validation import METHODS
-    from trading_backtest.validation import WINDOW_MODES as LAYER_WINDOW_MODES
+    from trading_platform.cli import MONTE_CARLO_METHODS, WINDOW_MODES
+    from trading_platform.validation import METHODS
+    from trading_platform.validation import WINDOW_MODES as LAYER_WINDOW_MODES
 
     assert sorted(mode.value for mode in WINDOW_MODES) == sorted(LAYER_WINDOW_MODES)
     assert sorted(method.value for method in MONTE_CARLO_METHODS) == sorted(METHODS)
@@ -874,7 +874,7 @@ def test_cli_enums_mirror_the_validation_layer() -> None:
 
 
 def test_main_returns_the_exit_codes(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
-    from trading_backtest.cli import main
+    from trading_platform.cli import main
 
     assert main(["--help"]) == 0
     assert main(["--version"]) == 0
@@ -914,7 +914,7 @@ def test_main_returns_the_exit_codes(capsys: pytest.CaptureFixture[str], tmp_pat
 
 
 def test_main_swallows_nothing_else(monkeypatch: pytest.MonkeyPatch) -> None:
-    from trading_backtest import cli
+    from trading_platform import cli
 
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("boom")
@@ -932,7 +932,7 @@ def test_main_renders_a_domain_error_escaping_a_command(
     from collections.abc import Iterator
     from contextlib import contextmanager
 
-    from trading_backtest import cli
+    from trading_platform import cli
 
     @contextmanager
     def pass_through(command: str, *, json_output: bool) -> Iterator[None]:

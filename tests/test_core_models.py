@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.models import (
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,

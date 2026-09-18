@@ -8,9 +8,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import ConfigError
-from trading_backtest.data.cache import OHLCVCache
-from trading_backtest.data.synthetic import make_ohlcv
+from trading_platform.core.errors import ConfigError
+from trading_platform.data.cache import OHLCVCache
+from trading_platform.data.synthetic import make_ohlcv
 
 
 @pytest.fixture(params=["parquet", "csv"])

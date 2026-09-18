@@ -33,7 +33,7 @@ d'efficacité du walk-forward, §4.3).
 ## 2. Contrôles qualité des données (avant toute chose)
 
 Un backtest sur des données douteuses est un backtest faux, souvent flatteur.
-`trading_backtest.data` exécute ces contrôles à la frontière et refuse une frame
+`trading_platform.data` exécute ces contrôles à la frontière et refuse une frame
 non conforme plutôt que de deviner — sauf le dernier, qui n'est pas implémenté :
 
 | Contrôle | Règle | Pourquoi |
@@ -46,7 +46,7 @@ non conforme plutôt que de deviner — sauf le dernier, qui n'est pas implémen
 | Volume | volume strictement positif | un volume nul ou négatif signale une donnée inversée |
 | Cohérence OHLC | `low <= min(open, close)` et `high >= max(open, close)` | détecte les données corrompues ou mal agrégées — **non implémenté** : à contrôler à la main, aucun code du projet ne teste cette règle |
 
-Les deux fonctions de `trading_backtest.data.validation` ne font pas la même
+Les deux fonctions de `trading_platform.data.validation` ne font pas la même
 chose : `ensure_ohlcv` **normalise** chaque frame (tri croissant, doublons
 supprimés avec `keep="last"`, index naïf localisé en UTC, index renommé
 `timestamp`, colonnes OHLCV castées en `float64`) et ne refuse que les entrées
@@ -816,7 +816,7 @@ d'entrées aléatoires situe. Rejouer la comparaison est une commande, pas une
 opinion :
 
 ```bash
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_btc_benchmark_e2e.json \
     --benchmark-variant random_entry --risk-free-rate 0.05
 ```

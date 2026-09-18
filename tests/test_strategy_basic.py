@@ -20,11 +20,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import SIGNAL_COLUMNS
-from trading_backtest.core.errors import StrategyError
-from trading_backtest.strategy.base import BOOL_SIGNAL_COLUMNS
-from trading_backtest.strategy.basic import BasicStrategy, BasicStrategyParams
-from trading_backtest.strategy.indicators import atr
+from trading_platform.core.constants import SIGNAL_COLUMNS
+from trading_platform.core.errors import StrategyError
+from trading_platform.strategy.base import BOOL_SIGNAL_COLUMNS
+from trading_platform.strategy.basic import BasicStrategy, BasicStrategyParams
+from trading_platform.strategy.indicators import atr
 
 START = "2024-01-01T00:00:00Z"
 

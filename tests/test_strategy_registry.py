@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import StrategyError
-from trading_backtest.strategy import registry
-from trading_backtest.strategy.base import Strategy, StrategyParams, ensure_signal_frame
-from trading_backtest.strategy.basic import BasicStrategy, BasicStrategyParams
+from trading_platform.core.errors import StrategyError
+from trading_platform.strategy import registry
+from trading_platform.strategy.base import Strategy, StrategyParams, ensure_signal_frame
+from trading_platform.strategy.basic import BasicStrategy, BasicStrategyParams
 
 #: The real registry, captured before any test can monkeypatch it.
 _GLOBAL_REGISTRY = registry.STRATEGIES

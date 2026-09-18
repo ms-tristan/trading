@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import DataValidationError
-from trading_backtest.data.synthetic import make_ohlcv
-from trading_backtest.data.validation import DataQualityReport, ensure_ohlcv, validate_ohlcv
+from trading_platform.core.errors import DataValidationError
+from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.data.validation import DataQualityReport, ensure_ohlcv, validate_ohlcv
 
 
 def _issues(report: DataQualityReport) -> str:
@@ -143,7 +143,7 @@ def test_missing_required_column_is_detected(ohlcv_frame: pd.DataFrame) -> None:
 
 
 def test_unknown_timeframe_raises_config_error(ohlcv_frame: pd.DataFrame) -> None:
-    from trading_backtest.core.errors import ConfigError
+    from trading_platform.core.errors import ConfigError
 
     with pytest.raises(ConfigError):
         validate_ohlcv(ohlcv_frame, timeframe="2h")

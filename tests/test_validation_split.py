@@ -1,4 +1,4 @@
-"""Unit tests for the IS/OOS splitting layer (``trading_backtest.validation.split``).
+"""Unit tests for the IS/OOS splitting layer (``trading_platform.validation.split``).
 
 Everything is offline and deterministic: the frames come from the shared
 synthetic generators and every expected value is derived by hand from the frame
@@ -13,13 +13,13 @@ from itertools import pairwise
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import (
+from trading_platform.core.errors import (
     DataValidationError,
     InsufficientDataError,
     ValidationLayerError,
 )
-from trading_backtest.data.synthetic import make_ohlcv
-from trading_backtest.validation.split import (
+from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.validation.split import (
     MIN_ROWS_PER_SLICE,
     Window,
     make_windows,

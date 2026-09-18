@@ -21,17 +21,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import trading_backtest.reporting as reporting_package
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.errors import ReportingError
-from trading_backtest.core.models import (
+import trading_platform.reporting as reporting_package
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.errors import ReportingError
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     TradeRecord,
 )
-from trading_backtest.metrics import METRIC_NAMES, MetricSet, compute_metrics
-from trading_backtest.reporting import (
+from trading_platform.metrics import METRIC_NAMES, MetricSet, compute_metrics
+from trading_platform.reporting import (
     Report,
     ReportBuilder,
     ReportSection,
@@ -768,8 +768,8 @@ def test_reporting_sources_never_import_the_validation_or_strategy_layers() -> N
 
     for module in sorted(package_dir.glob("*.py")):
         source = module.read_text(encoding="utf-8")
-        assert "trading_backtest.validation" not in source, module.name
-        assert "trading_backtest.strategy" not in source, module.name
+        assert "trading_platform.validation" not in source, module.name
+        assert "trading_platform.strategy" not in source, module.name
 
 
 def test_build_report_runs_in_a_fresh_interpreter_without_the_validation_layer(
@@ -784,8 +784,8 @@ def test_build_report_runs_in_a_fresh_interpreter_without_the_validation_layer(
 
         import pandas as pd
 
-        from trading_backtest.core.models import BacktestResult, TradeRecord, Direction, ExitReason
-        from trading_backtest.reporting import build_report, write_report
+        from trading_platform.core.models import BacktestResult, TradeRecord, Direction, ExitReason
+        from trading_platform.reporting import build_report, write_report
 
         index = pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="h", tz="UTC")
         equity = pd.Series([1000.0, 1010.0, 1020.0], index=index, name="equity")
@@ -822,8 +822,8 @@ def test_build_report_runs_in_a_fresh_interpreter_without_the_validation_layer(
         )
         paths = write_report(report, Path(sys.argv[1]))
         assert [path.name for path in paths] == ["report.md", "report.json"]
-        assert "trading_backtest.validation" not in sys.modules
-        assert "trading_backtest.strategy" not in sys.modules
+        assert "trading_platform.validation" not in sys.modules
+        assert "trading_platform.strategy" not in sys.modules
         print("ok")
         """
     )
