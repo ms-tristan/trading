@@ -1,192 +1,187 @@
-# Temps réel multi-profils
+# Real-time multi-profile
 
-Ce document décrit la plateforme temps réel livrée avec le squelette :
+This document describes the real-time platform delivered with the skeleton:
 
-- **`trading_backtest.realtime`** (couche 6) — moteur : flux de marché, courtier,
-  passerelle d'exécution, risque, persistance, orchestrateur, observabilité ;
-- **`trading_backtest.web`** (couche 7) — transport HTTP **bibliothèque standard
-  uniquement** et tableau de bord statique ;
-- **`trading_backtest.cli`** (couche 8) — les trois commandes
-  `realtime run`, `realtime serve` et `realtime check`.
+- **`trading_platform.realtime`** (layer 6) — engine: market streams, broker,
+  execution gateway, risk, persistence, orchestrator, observability;
+- **`trading_platform.web`** (layer 7) — HTTP transport using the **standard
+  library only** and a static dashboard;
+- **`trading_platform.cli`** (layer 8) — the three commands
+  `realtime run`, `realtime serve` and `realtime check`.
 
-Il complète [`docs/architecture.md`](architecture.md) (§3 pour les couches,
-§4.10 et §4.11 pour l'inventaire des interfaces gelées, §6.3 pour l'arbre des
-erreurs) et [`docs/usage.md`](usage.md) (exemples copiables).
+It complements [`docs/architecture.md`](architecture.md) (§3 for the layers,
+§4.10 and §4.11 for the inventory of frozen interfaces, §6.3 for the error tree)
+and [`docs/usage.md`](usage.md) (copy-pasteable examples).
 
 ---
 
-## 1. Qu'est-ce qu'un profil ?
+## 1. What is a profile?
 
-Un **profil** est une stratégie de trading autonome : `asset + stratégie +
-timeframe + paper/live + limites de risque`. Chaque profil est configuré,
-exécuté et surveillé **indépendamment** des autres ; N profils tournent dans le
-même processus, sur le même état persistant, sans partager ni positions ni
-compteurs.
+A **profile** is a self-contained trading strategy: `asset + strategy +
+timeframe + paper/live + risk limits`. Every profile is configured, run and
+monitored **independently** of the others; N profiles run inside the same
+process, on the same persistent state, sharing neither positions nor counters.
 
-Un profil est décrit par un objet JSON du fichier de profils (voir
-`config/profiles.example.json`) et validé par `config.models.ProfileConfig`,
-qui refuse toute clé inconnue (`extra="forbid"`) :
+A profile is described by one JSON object of the profiles file (see
+`config/profiles.example.json`) and validated by `config.models.ProfileConfig`,
+which rejects any unknown key (`extra="forbid"`):
 
-| Champ `ProfileConfig` | Rôle |
+| `ProfileConfig` field | Role |
 | --- | --- |
-| `id` | identité du profil (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`) : clé primaire de l'état et du journal |
-| `symbol` | paire négociée, par exemple `BTC/USDT` |
-| `timeframe` | `1m`, `5m`, `15m`, `30m`, `1h`, `4h` ou `1d` |
-| `strategy` | nom du registre `strategy.registry.get_strategy` (jamais réimplémentée) |
-| `params` | paramètres de la stratégie (mêmes conventions que `AppConfig`) |
-| `mode` | `paper` (simulé) ou `live` (réel, sous condition, voir §3) |
-| `initial_balance` | capital initial du profil |
-| `stake_amount` | montant engagé par entrée (défaut : tout le solde disponible) |
-| `exchange` | nom du lieu d'exécution |
-| `enabled` | un profil désactivé est persisté mais jamais démarré |
-| `warmup_candles` | nombre de bougies passées que la stratégie reçoit à chaque décision |
-| `poll_interval_seconds` | cadence de sondage propre au profil |
-| `risk` | bloc `RiskLimitsConfig` (§3) |
+| `id` | profile identity (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`): primary key of the state and of the log records |
+| `symbol` | traded pair, for example `BTC/USDT` |
+| `timeframe` | `1m`, `5m`, `15m`, `30m`, `1h`, `4h` or `1d` |
+| `strategy` | name in the `strategy.registry.get_strategy` registry (never reimplemented) |
+| `params` | strategy parameters (same conventions as `AppConfig`) |
+| `mode` | `paper` (simulated) or `live` (real, subject to a condition, see §3) |
+| `initial_balance` | initial capital of the profile |
+| `stake_amount` | amount committed per entry (default: the whole available balance) |
+| `exchange` | name of the execution venue |
+| `enabled` | a disabled profile is persisted but never started |
+| `warmup_candles` | number of past candles the strategy receives on every decision |
+| `poll_interval_seconds` | polling cadence specific to the profile |
+| `risk` | `RiskLimitsConfig` block (§3) |
 
-Le document complet porte trois clés racine : `profiles`, `realtime`
-(`RealtimeConfig` : base d'état, répertoires, provider CSV ou cache, ancre
-`start_at`, délais, reconnexions, benchmark) et `monitoring`
-(`MonitoringConfig` : `host`, `port`, `refresh_seconds`,
-`request_timeout_seconds`, `max_request_bytes`). Toute autre clé racine est
-refusée.
+The complete document carries three root keys: `profiles`, `realtime`
+(`RealtimeConfig`: state base, directories, CSV or cache provider, `start_at`
+anchor, delays, reconnections, benchmark) and `monitoring`
+(`MonitoringConfig`: `host`, `port`, `refresh_seconds`,
+`request_timeout_seconds`, `max_request_bytes`). Any other root key is
+rejected.
 
-## 2. Un seul chemin d'exécution pour paper et live
+## 2. One execution path for paper and live
 
-Il existe **une** `ExecutionGateway` et **un** `ProfileRunner`. Paper et live ne
-diffèrent que par trois choses :
+There is **one** `ExecutionGateway` and **one** `ProfileRunner`. Paper and live
+differ only in three things:
 
-1. **le courtier injecté** — `PaperBroker` (lieu simulé : exécution au prix de
-   référence ajusté du slippage, frais maison, remplissages partiels
-   déterministes pilotés par une graine explicite) ou `CcxtBroker` (lieu réel,
-   `import ccxt` **paresseux**, idempotent sur `clientOrderId`) ;
-2. **la porte live** (`LiveTradingGate`) — un profil `live` n'est armé que si
-   l'environnement porte exactement
-   `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK` ;
-3. **la configuration**.
+1. **the injected broker** — `PaperBroker` (simulated venue: execution at the
+   reference price adjusted for slippage, in-house fees, deterministic partial
+   fills driven by an explicit seed) or `CcxtBroker` (real venue, **lazy**
+   `import ccxt`, idempotent on `clientOrderId`);
+2. **the live gate** (`LiveTradingGate`) — a `live` profile is armed only if the
+   environment carries exactly
+   `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK`;
+3. **the configuration**.
 
-La passerelle ne contient **aucune** branche « si paper / si live » : elle route
-vers le `Broker` injecté. Le courtier papier est donc exercé par exactement les
-mêmes tests que le cycle de vie partagé.
+The gateway contains **no** "if paper / if live" branch: it routes to the
+injected `Broker`. The paper broker is therefore exercised by exactly the same
+tests as the shared life cycle.
 
-### 2.1 Équivalence temps réel / backtest
+### 2.1 Real-time / backtest equivalence
 
-Le contrat d'exécution est celui de `strategy.engine` : **la décision est
-évaluée à la clôture de la bougie `t` et exécutée à l'ouverture de `t+1`**, le
-slippage étant toujours défavorable au trader. En temps réel, la clôture de `t`
-**est** l'instant de déclenchement : le flux n'émet que des bougies fermées
-(`timestamp <= now - candle_delta(timeframe)`) et le prix de référence d'une
-décision est la **clôture de `t`** — soit l'ouverture de `t+1` à la granularité
-d'une bougie. Conséquence assumée : un profil live réagit **une frontière de
-timeframe après le signal**, exactement comme le moteur de backtest, et les deux
-moteurs ne produisent pas les mêmes chiffres (seuls les **signaux** sont le
-contrat).
+The execution contract is the one of `strategy.engine`: **the decision is
+evaluated at the close of candle `t` and executed at the open of `t+1`**,
+slippage always working against the trader. In real time, the close of `t`
+**is** the trigger instant: the stream emits only closed candles
+(`timestamp <= now - candle_delta(timeframe)`) and the reference price of a
+decision is the **close of `t`** — that is, the open of `t+1` at the granularity
+of one candle. Accepted consequence: a live profile reacts **one timeframe
+boundary after the signal**, exactly like the backtest engine, and the two
+engines do not produce the same numbers (only the **signals** are the contract).
 
-**Les flux vivants émettent la bougie fermée la plus récente, jamais une bougie
-ancienne.** `PollingMarketStream` et `CcxtProMarketStream` sautent les bougies
-dont la clôture était déjà connue au démarrage du moteur — ou pendant une
-indisponibilité — et le signalent par l'événement structuré
-`market_data.candles_skipped`. Ce n'est pas un détail d'implémentation : le
-moteur échauffe la stratégie sur `history()` (une fenêtre qui se termine
-**maintenant**) puis ajoute la bougie émise à cette fenêtre ; émettre la plus
-ancienne bougie de la fenêtre de rétrospection produisait une trame d'une seule
-ligne (`warmup_incomplete`) et, une fois la trame devenue assez longue, faisait
-décider le moteur sur une bougie vieille de plusieurs jours **en la remplissant
-au prix du jour**. Le rejeu déterministe d'une fenêtre passée est le rôle de
-`ReplayMarketStream` (`realtime run --once`, tests), jamais celui d'un flux
-vivant.
+**Live streams emit the most recent closed candle, never an old candle.**
+`PollingMarketStream` and `CcxtProMarketStream` skip the candles whose close was
+already known when the engine started — or during an outage — and report it
+through the structured event `market_data.candles_skipped`. This is not an
+implementation detail: the engine warms the strategy up on `history()` (a window
+that ends **now**) and then appends the emitted candle to that window; emitting
+the oldest candle of the lookback window produced a single-row frame
+(`warmup_incomplete`) and, once the frame had grown long enough, made the engine
+decide on a candle several days old **while filling it at the current day's
+price**. Deterministic replay of a past window is the job of
+`ReplayMarketStream` (`realtime run --once`, tests), never that of a live
+stream.
 
-### 2.2 Réutilisation obligatoire
+### 2.2 Mandatory reuse
 
-Le moteur temps réel **n'implémente aucune formule**. Il assemble :
+The real-time engine **implements no formula**. It assembles:
 
-- les stratégies du registre (`strategy.registry.get_strategy` + `Strategy.run`) ;
-- les données (`data.loader` fournisseurs et `data.cache`) et
-  `data.validation.ensure_ohlcv` pour **chaque** trame entrant dans le moteur ;
-- les métriques et benchmarks (`metrics.compute_metrics`,
+- the strategies of the registry (`strategy.registry.get_strategy` + `Strategy.run`);
+- the data (`data.loader` providers and `data.cache`) and
+  `data.validation.ensure_ohlcv` for **every** frame entering the engine;
+- the metrics and benchmarks (`metrics.compute_metrics`,
   `metrics.compute_benchmark`, `metrics.compare_benchmark`, `benchmark_alpha`,
-  `validation.validate_benchmark`) via le read model `realtime.monitor` ;
-- les modèles de domaine (`core.models.TradeRecord`, `BacktestResult`) ;
-- la couche de configuration pydantic ;
-- le pont Freqtrade (`strategy.freqtrade_adapter.make_freqtrade_strategy`),
-  exposé par `realtime.strategies.freqtrade_strategy_for(profile)` (import
-  paresseux, rend `None` quand l'extra est absent) : **la même définition de
-  profil peut être remise à Freqtrade sans changement**.
+  `validation.validate_benchmark`) through the `realtime.monitor` read model;
+- the domain models (`core.models.TradeRecord`, `BacktestResult`);
+- the pydantic configuration layer;
+- the Freqtrade bridge (`strategy.freqtrade_adapter.make_freqtrade_strategy`),
+  exposed by `realtime.strategies.freqtrade_strategy_for(profile)` (lazy import,
+  returns `None` when the extra is absent): **the same profile definition can be
+  handed to Freqtrade unchanged**.
 
-## 3. Le modèle de sûreté
+## 3. The safety model
 
-1. **Opt-in explicite du live.** Un profil `live` exige à la fois
-   `mode: "live"` **et** `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK` ;
-   sinon `LiveTradingForbiddenError`.
-2. **Secrets uniquement par l'environnement.** `TB_LIVE_API_KEY` /
-   `TB_LIVE_API_SECRET` / `TB_LIVE_API_PASSWORD`, ou par profil
-   `TB_PROFILE_<ID>_API_KEY` / `_API_SECRET`. Les modèles de configuration
-   n'ont **aucun** champ de credential : un profil contenant `api_key` échoue
-   bruyamment (`ConfigError`). `ExchangeCredentials.__repr__` et chaque
-   journalisation structurée masquent les secrets.
-3. **Limites par profil, évaluées avant l'appel au courtier**
-   (`RiskLimitsConfig` → `RiskLimits`) : `max_position_notional`,
+1. **Explicit live opt-in.** A `live` profile requires both `mode: "live"` **and**
+   `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK`; otherwise
+   `LiveTradingForbiddenError`.
+2. **Secrets from the environment only.** `TB_LIVE_API_KEY` /
+   `TB_LIVE_API_SECRET` / `TB_LIVE_API_PASSWORD`, or, per profile,
+   `TB_PROFILE_<ID>_API_KEY` / `_API_SECRET`. The configuration models have
+   **no** credential field: a profile containing `api_key` fails loudly
+   (`ConfigError`). `ExchangeCredentials.__repr__` and every structured log
+   entry mask secrets.
+3. **Per-profile limits, evaluated before the call to the broker**
+   (`RiskLimitsConfig` → `RiskLimits`): `max_position_notional`,
    `max_order_notional`, `max_open_positions`, `max_daily_loss`,
-   `max_drawdown_pct`, `max_daily_trades`. L'ordre d'évaluation est gelé et le
-   **premier** échec gagne ; chaque refus est journalisé avec sa raison, et le
-   profil n'est pas watermarqué (le refus est une décision, pas un plantage).
-4. **Kill switch global** (`KillSwitch`), sous trois formes : fichier
-   (`realtime.kill_switch_file`), environnement, et API (`POST /api/kill-switch`).
-   Il arrête tous les profils, **n'annule rien en silence**, et il est persisté
-   dans l'état : un redémarrage ne le remet pas à zéro. Un kill switch forcé par
-   un fichier ou l'environnement ne peut pas être libéré par l'API.
-5. **Séparation paper/live infalsifiable.** Un profil papier ne peut **jamais**
-   être routé vers un courtier réel : le mode fait partie de l'identité du
-   profil et de chaque ordre persisté, et le courtier vérifie son propre mode.
+   `max_drawdown_pct`, `max_daily_trades`. The evaluation order is frozen and the
+   **first** failure wins; every rejection is logged with its reason, and the
+   profile is not watermarked (a rejection is a decision, not a crash).
+4. **Global kill switch** (`KillSwitch`), in three forms: file
+   (`realtime.kill_switch_file`), environment, and API (`POST /api/kill-switch`).
+   It stops every profile, **cancels nothing silently**, and it is persisted in
+   the state: a restart does not reset it. A kill switch forced by a file or by
+   the environment cannot be released through the API.
+5. **Unforgeable paper/live separation.** A paper profile can **never** be routed
+   to a real broker: the mode is part of the identity of the profile and of every
+   persisted order, and the broker checks its own mode.
 
-## 4. Persistance, redémarrage et réconciliation
+## 4. Persistence, restart and reconciliation
 
-- L'état vit dans **un seul fichier SQLite** (`realtime.state_db`, défaut
-  `data/realtime/state.db`, ignoré par git), en mode WAL, une connexion par
-  thread appelant, **toutes les écritures en transaction**.
-- Chaque écriture est **idempotente** : UPSERT sur clé naturelle, et l'identifiant
-  de commande est **déterministe** — `new_client_order_id(profile_id, symbol,
-  candle_timestamp, sequence)` — donc la même décision produit toujours le même
-  `client_order_id`. Un redémarrage entre la soumission et le remplissage ne
-  double **jamais** un ordre.
-- La **dernière bougie traitée** est persistée par profil : un redémarrage ne
-  rejoue pas une bougie et n'en saute pas non plus.
-- Au démarrage, l'orchestrateur **réconcilie** l'état local contre le lieu
-  d'exécution (`Broker.reconcile()`) et marque le profil `degraded` en cas
-  d'écart. Les remplissages sont réconciliés à intervalle borné
+- The state lives in **a single SQLite file** (`realtime.state_db`, default
+  `data/realtime/state.db`, ignored by git), in WAL mode, one connection per
+  calling thread, **every write inside a transaction**.
+- Every write is **idempotent**: UPSERT on the natural key, and the order
+  identifier is **deterministic** — `new_client_order_id(profile_id, symbol,
+  candle_timestamp, sequence)` — so the same decision always produces the same
+  `client_order_id`. A restart between submission and fill **never** duplicates
+  an order.
+- The **last processed candle** is persisted per profile: a restart neither
+  replays a candle nor skips one.
+- On startup, the orchestrator **reconciles** the local state against the
+  execution venue (`Broker.reconcile()`) and marks the profile `degraded` in case
+  of a discrepancy. Fills are reconciled at a bounded interval
   (`realtime.reconcile_interval_seconds`).
-- Le magasin est **mono-écrivain** : un second orchestrateur sur le même fichier
-  échoue avec `StateStoreError` (verrou `flock` posé sur `<base>.lock`). Ce
-  verrou est **consultatif** : il protège deux `SqliteStateStore`, pas un
-  processus tiers qui écrirait dans le fichier en contournant le magasin. Une
-  version de schéma plus récente lève également `StateStoreError` au lieu
-  d'écrire à l'aveugle.
-- Un écart de réconciliation sur un lieu **en mémoire** est attendu après un
-  redémarrage : le courtier papier ne connaît pas les ordres qu'il n'a pas vus,
-  donc le profil repart en `degraded` — l'état local, lui, est intact et rien
-  n'est re-soumis. C'est le comportement documenté de D7, pas une perte de
-  données.
-- Un lieu **simulé** n'a pas de mémoire : après un redémarrage, son cash repart
-  du solde initial alors que la position est restaurée depuis le magasin.
-  L'orchestrateur **réamorce donc le cash du courtier papier** avec le dernier
-  point d'equity persisté (`PaperBroker.restore_cash`) avant la première bougie,
-  sans quoi la position serait comptée deux fois et le tableau de bord
-  afficherait une equity que la courbe persistée contredit. Un lieu **réel**
-  n'est jamais réamorcé : il publie son propre solde
-  (`CcxtBroker.fetch_balance`).
+- The store is **single-writer**: a second orchestrator on the same file fails
+  with `StateStoreError` (a `flock` lock taken on `<base>.lock`). This lock is
+  **advisory**: it protects two `SqliteStateStore` instances, not a third-party
+  process that would write into the file while bypassing the store. A newer
+  schema version also raises `StateStoreError` instead of writing blindly.
+- A reconciliation discrepancy on an **in-memory** venue is expected after a
+  restart: the paper broker does not know the orders it has not seen, so the
+  profile starts again as `degraded` — the local state itself is intact and
+  nothing is resubmitted. This is the documented behaviour of D7, not a data
+  loss.
+- A **simulated** venue has no memory: after a restart, its cash starts again
+  from the initial balance while the position is restored from the store. The
+  orchestrator therefore **reseeds the paper broker's cash** with the last
+  persisted equity point (`PaperBroker.restore_cash`) before the first candle,
+  without which the position would be counted twice and the dashboard would show
+  an equity that the persisted curve contradicts. A **real** venue is never
+  reseeded: it publishes its own balance (`CcxtBroker.fetch_balance`).
 
-## 5. Reference de l'API web
+## 5. Web API reference
 
-Serveur `http.server.ThreadingHTTPServer`, JSON partout, horodatages ISO-8601
-UTC, **aucun NaN ni Infinity** dans un payload. Les seuls actifs statiques
-servis sont `app.js` et `styles.css` (liste blanche fixe : toute traversée de
-chemin répond 404). Le tableau de bord **sonde** `GET /api/profiles` toutes les
-2 secondes (`monitoring.refresh_seconds`) et dessine les courbes d'equity en
-`canvas`/SVG en ligne, sans bibliothèque.
+Server `http.server.ThreadingHTTPServer`, JSON everywhere, UTC ISO-8601
+timestamps, **no NaN and no Infinity** in any payload. The only static assets
+served are `app.js` and `styles.css` (fixed allow-list: any path traversal
+answers 404). The dashboard **polls** `GET /api/profiles` every 2 seconds
+(`monitoring.refresh_seconds`) and draws the equity curves with inline
+`canvas`/SVG, without any library.
 
-| Méthode et route | Réponse 200 | Erreurs |
+| Method and route | 200 response | Errors |
 | --- | --- | --- |
-| `GET /` | tableau de bord HTML | 404 |
-| `GET /static/{asset}` | `app.js` ou `styles.css` | 404 (actif inconnu ou traversée) |
+| `GET /` | HTML dashboard | 404 |
+| `GET /static/{asset}` | `app.js` or `styles.css` | 404 (unknown asset or traversal) |
 | `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at}` | — |
 | `GET /api/profiles` | `{profiles: [ProfileSnapshot…], generated_at}` | — |
 | `GET /api/profiles/{id}` | `ProfileSnapshot` | 404 `{error}` |
@@ -195,107 +190,99 @@ chemin répond 404). Le tableau de bord **sonde** `GET /api/profiles` toutes les
 | `GET /api/profiles/{id}/orders` | `{orders: [...]}` | 404 |
 | `GET /api/profiles/{id}/positions` | `{positions: [...]}` | 404 |
 | `GET /api/profiles/{id}/metrics` | `{metrics: {...}, benchmark: {...} \| null, generated_at}` | 404 |
-| `POST /api/kill-switch` | corps `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` | 400 corps malformé, 403 jeton absent/invalide, 403 serveur en lecture seule |
+| `POST /api/kill-switch` | body `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` | 400 malformed body, 403 missing/invalid token, 403 server in read-only mode |
 
-`realtime serve` ouvre la base d'état en lecture/écriture de schéma : si le
-fichier n'existe pas encore, il est **créé** (schéma vide) et le tableau de bord
-affiche une plateforme sans profil. Lancez d'abord `realtime run --once` pour
-peupler l'état avant de le servir.
+`realtime serve` opens the state database in schema read/write mode: if the file
+does not exist yet, it is **created** (empty schema) and the dashboard shows a
+platform with no profile. Run `realtime run --once` first to populate the state
+before serving it.
 
-Codes transverses : `400` requête malformée, `404` route ou profil inconnu,
-`405` méthode incorrecte (avec en-tête `Allow`), `500` avec `{error}` — **jamais**
-de trace sur le réseau. Le jeton opérateur unique vient de `TB_OPERATOR_TOKEN`
-(comparaison en temps constant) ; sans jeton configuré, les routes mutantes
-refusent **tout** le monde. Un serveur démarré par `realtime serve` est
-**lecture seule** : `POST /api/kill-switch` répond 403.
+Cross-cutting codes: `400` malformed request, `404` unknown route or profile,
+`405` wrong method (with an `Allow` header), `500` with `{error}` — **never** a
+trace on the network. The single operator token comes from `TB_OPERATOR_TOKEN`
+(constant-time comparison); with no token configured, the mutating routes refuse
+**everybody**. A server started by `realtime serve` is **read-only**:
+`POST /api/kill-switch` answers 403.
 
-## 6. Les trois commandes
+## 6. The three commands
 
 ```bash
-# pré-vol statique : ne passe AUCUN ordre et ne touche PAS au réseau
-trading-backtest realtime check --profiles config/profiles.example.json --json
+# static pre-flight: passes NO order and does NOT touch the network
+trading realtime check --profiles config/profiles.example.json --json
 
-# moteur + tableau de bord
-trading-backtest realtime run --profiles config/profiles.example.json
-trading-backtest realtime run --profiles config/profiles.example.json --host 127.0.0.1 --port 8080
+# engine + dashboard
+trading realtime run --profiles config/profiles.example.json
+trading realtime run --profiles config/profiles.example.json --host 127.0.0.1 --port 8080
 
-# un seul tick déterministe (ancre realtime.start_at), puis sortie 0
-trading-backtest realtime run --profiles config/profiles.example.json --once --json
+# a single deterministic tick (realtime.start_at anchor), then exit 0
+trading realtime run --profiles config/profiles.example.json --once --json
 
-# surveillance seule, en lecture seule, sur l'état persisté
-trading-backtest realtime serve --profiles config/profiles.example.json --port 8080
+# monitoring only, read-only, on the persisted state
+trading realtime serve --profiles config/profiles.example.json --port 8080
 ```
 
-Payloads (clés exactes) :
+Payloads (exact keys):
 
 - `realtime check` → `{command: "realtime-check", ok, config_path, state_db,
   state_db_writable, kill_switch, profiles: [{id, symbol, timeframe, strategy,
   mode, ok, issues, credentials_present, live_gate_allowed, risk}], issues}`.
-  La clé **`issues` de premier niveau** porte les problèmes *de plateforme*
-  (document illisible, répertoire d'état non inscriptible) ; les `issues` de
-  chaque profil portent les problèmes *du profil*. Sortie `1` dès qu'un profil ne
-  peut pas démarrer.
+  The **top-level `issues` key** carries the *platform* problems (unreadable
+  document, non-writable state directory); the `issues` of each profile carry the
+  *profile's* problems. Exit `1` as soon as one profile cannot start.
 - `realtime run` / `run --once` → `{command: "realtime-run", ok, config_path,
   state_db, profiles: [ProfileSnapshot…], decisions: [TradeSignalDecision…],
-  url}`. `url` vaut `null` avec `--once` et `http://host:port/` sinon ; `--once`
-  ne démarre **aucun** serveur.
+  url}`. `url` is `null` with `--once` and `http://host:port/` otherwise; `--once`
+  starts **no** server.
 - `realtime serve` → `{command: "realtime-serve", ok, config_path, state_db,
   profiles: [ProfileSnapshot…], url}`.
 
-En mode `--json`, l'URL de démarrage est annoncée sur **stderr** : stdout ne
-contient qu'un seul objet JSON. `SIGINT` arrête proprement le serveur et le
-moteur, puis sort avec le code `0`.
+In `--json` mode, the startup URL is announced on **stderr**: stdout contains
+only a single JSON object. `SIGINT` stops the server and the engine cleanly, then
+exits with code `0`.
 
-**Journalisation.** `realtime run` et `realtime serve` installent les journaux
-JSON structurés de la couche (`observability.configure_logging`) : un flux sur
-**stderr** et un fichier durable `realtime-YYYYMMDD.log` sous
-`realtime.logs_dir`. Le niveau se règle par `TB_LOG_LEVEL` (`INFO` par défaut).
-Sans cette installation, les événements de la couche retombent sur le *handler*
-de dernier recours de l'interpréteur, qui n'affiche que le **nom** de l'événement
-au niveau `WARNING` et au-dessus — un opérateur lit alors `profile_crashed` sans
-l'erreur, sans le profil et sans le symbole, et ne voit jamais un seul
-`candle_processed`.
+**Logging.** `realtime run` and `realtime serve` install the layer's structured
+JSON logs (`observability.configure_logging`): one stream on **stderr** and one
+durable file `realtime-YYYYMMDD.log` under `realtime.logs_dir`. The level is set
+by `TB_LOG_LEVEL` (`INFO` by default). Without that installation, the events of
+the layer fall back on the interpreter's last-resort *handler*, which prints only
+the **name** of the event at level `WARNING` and above — an operator then reads
+`profile_crashed` without the error, without the profile and without the symbol,
+and never sees a single `candle_processed`.
 
-L'horloge : `realtime.start_at` arme un `ManualClock` (replay déterministe)
-sinon `SystemClock` est utilisé. Le `ManualClock` injecté par la CLI **rend la
-main à la boucle d'événements** après chaque `sleep` : le moteur ne se cadence
-que par `Clock.sleep`, donc un manuel non coopératif affamerait la boucle, ses
-minuteurs (`asyncio.wait_for`) ne se déclencheraient plus et `SIGINT` ne serait
-jamais délivré. Contrepartie assumée : un `run` **ancré** rejoue l'historique
-aussi vite que le CPU le permet (c'est du backfill), ce n'est pas un suivi du
-temps réel.
+The clock: `realtime.start_at` arms a `ManualClock` (deterministic replay),
+otherwise `SystemClock` is used. The `ManualClock` injected by the CLI **hands
+control back to the event loop** after every `sleep`: the engine paces itself
+only through `Clock.sleep`, so a non-cooperative manual clock would starve the
+loop, its timers (`asyncio.wait_for`) would no longer fire and `SIGINT` would
+never be delivered. Accepted trade-off: an **anchored** `run` replays history as
+fast as the CPU allows (it is backfill), it is not a live follow-up of real time.
 
-## 7. Ce qui n'est PAS prouvé
+## 7. What is NOT proven
 
-- Le tableau de bord **sonde** en HTTP toutes les 2 secondes : il n'y a **ni
-  WebSocket ni ASGI** (décision « bibliothèque standard uniquement »), donc pas
-  de *push*, et la latence d'affichage est bornée par la cadence de sondage.
-- L'authentification se limite à un **jeton opérateur unique** : c'est une
-  surface de **surveillance pour réseau de confiance**, pas une interface
-  exposable sur Internet.
-- Les remplissages sont réconciliés sur un **intervalle de sondage borné** :
-  entre deux sondages, l'état local peut retarder sur le lieu d'exécution. En
-  mode papier, les remplissages partiels sont **simulés de façon déterministe**
-  (graine explicite) et ne modélisent **pas** un carnet d'ordres réel.
-- Les décisions sont prises sur des bougies **fermées** uniquement : un profil
-  live réagit une frontière de timeframe après le signal, exactement comme le
-  moteur de backtest.
-- Les bougies clôturées **avant** le démarrage du moteur (ou pendant une
-  indisponibilité) sont **sautées**, pas rejouées : un flux vivant ne rattrape
-  pas son retard bougie par bougie. Un redémarrage reprend donc à la première
-  bougie qui se clôture après lui — la raison est écrite en §2.1, et
-  l'événement `market_data.candles_skipped` dit exactement combien de bougies
-  ont été ignorées et sur quelle plage.
-- **Aucun** financement, emprunt, levier ou type d'ordre spécifique à un
-  exchange n'est modélisé (les ordres sont des ordres au marché, éventuellement
-  limites touchées).
-- Le trading **live est implémenté mais il n'est PAS exercé contre un vrai
-  exchange par la suite de tests** : les tests couvrent le courtier papier, la
-  porte live, les limites de risque et les chemins d'erreur, jamais un ordre
-  réel.
-- Le magasin SQLite est **mono-écrivain** : un second orchestrateur sur le même
-  fichier lève `StateStoreError` (comportement testé, pas une garantie de
-  partage).
-- `realtime check` atteste l'**absence** de credentials, pas leur validité : il
-  n'ouvre aucune connexion, donc un couple clé/secret invalide ne sera détecté
-  qu'au premier appel réel du courtier.
+- The dashboard **polls** over HTTP every 2 seconds: there is **neither
+  WebSocket nor ASGI** (the "standard library only" decision), hence no *push*,
+  and the display latency is bounded by the polling cadence.
+- Authentication is limited to a **single operator token**: this is a
+  **monitoring surface for a trusted network**, not an interface that can be
+  exposed on the Internet.
+- Fills are reconciled on a **bounded polling interval**: between two polls, the
+  local state may lag behind the execution venue. In paper mode, the partial
+  fills are **simulated deterministically** (explicit seed) and do **not** model
+  a real order book.
+- Decisions are taken on **closed** candles only: a live profile reacts one
+  timeframe boundary after the signal, exactly like the backtest engine.
+- Candles closed **before** the engine started (or during an outage) are
+  **skipped**, not replayed: a live stream does not catch up candle by candle. A
+  restart therefore resumes at the first candle that closes after it — the reason
+  is written in §2.1, and the `market_data.candles_skipped` event says exactly
+  how many candles were ignored and over which range.
+- **No** funding, borrowing, leverage or exchange-specific order type is
+  modelled (orders are market orders, possibly touched limits).
+- **Live trading is implemented but it is NOT exercised against a real exchange
+  by the test suite**: the tests cover the paper broker, the live gate, the risk
+  limits and the error paths, never a real order.
+- The SQLite store is **single-writer**: a second orchestrator on the same file
+  raises `StateStoreError` (tested behaviour, not a guarantee of sharing).
+- `realtime check` attests the **absence** of credentials, not their validity: it
+  opens no connection, so an invalid key/secret pair will only be detected at the
+  first real call to the broker.

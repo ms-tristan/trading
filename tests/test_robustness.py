@@ -1,4 +1,4 @@
-"""Unit tests for the parametric robustness layer (``trading_backtest.validation.robustness``).
+"""Unit tests for the parametric robustness layer (``trading_platform.validation.robustness``).
 
 The sweep is driven by local fake runners whose metric is a pure function of the
 parameters, so every summary statistic (mean, population std, min/max, stability,
@@ -15,15 +15,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import ValidationLayerError
-from trading_backtest.core.models import (
+from trading_platform.core.errors import ValidationLayerError
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     RunnerFn,
     TradeRecord,
 )
-from trading_backtest.validation.robustness import (
+from trading_platform.validation.robustness import (
     DEFAULT_BEST_COUNT,
     RobustnessPoint,
     RobustnessResult,
@@ -438,7 +438,7 @@ def test_parameter_sweep_wraps_runner_failures(ohlcv_frame: pd.DataFrame) -> Non
 def test_parameter_sweep_requires_a_contract_frame() -> None:
     runner, _ = _score_runner(lambda params: 0.0)
 
-    from trading_backtest.core.errors import DataValidationError
+    from trading_platform.core.errors import DataValidationError
 
     with pytest.raises(DataValidationError):
         parameter_sweep(

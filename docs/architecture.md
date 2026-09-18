@@ -17,7 +17,7 @@ Il complète :
 
 1. **Modulaire** — chaque responsabilité (données, stratégie, exécution,
    validation, métriques, restitution, orchestration) vit dans un paquet isolé
-   — l'exécution est le sous-module `trading_backtest.strategy.engine` — et ne
+   — l'exécution est le sous-module `trading_platform.strategy.engine` — et ne
    dépend que des couches inférieures.
 2. **Robuste** — le domaine est modélisé par des objets typés (dataclasses
    gelées pour `core`, modèles pydantic pour `config`), les entrées sont
@@ -50,9 +50,9 @@ Trading/
 │   ├── realtime.md                   # temps réel multi-profils : profils, sûreté, API, limites
 │   ├── usage.md                      # guide d'usage (install, CLI, rapports, Docker)
 │   └── testing-policy.md             # politique de tests et de couverture (gelé)
-├── src/trading_backtest/
+├── src/trading_platform/
 │   ├── __init__.py                   # exports publics et version du paquet
-│   ├── __main__.py                   # point d'entrée `python -m trading_backtest`
+│   ├── __main__.py                   # point d'entrée `python -m trading_platform`
 │   ├── core/
 │   │   ├── constants.py              # constantes partagées (timeframes, colonnes OHLCV, UTC)
 │   │   ├── models.py                 # modèles de domaine : TradeRecord, BacktestResult, RunnerFn
@@ -134,7 +134,7 @@ un sous-module de `validation`.
 
 Les découpages internes (`split.py` / `walk_forward.py` / …) sont des détails
 d'implémentation : ce qui est **gelé**, ce sont les chemins de paquets
-(`trading_backtest.<paquet>`) et les symboles listés au §4.
+(`trading_platform.<paquet>`) et les symboles listés au §4.
 
 **`user_data/` reste l'état de Freqtrade** — OHLCV téléchargé, résultats de
 backtest, bases SQLite, stratégies engendrées — et demeure **git-ignoré** : la
@@ -186,22 +186,22 @@ bas de cette liste.**
 
 | Couche | Paquet | Peut importer |
 | --- | --- | --- |
-| 1 | `trading_backtest.core` | la bibliothèque standard, `pandas` |
-| 2 | `trading_backtest.config`, `trading_backtest.data`, `trading_backtest.freqtrade` | couche 1 |
-| 3 | `trading_backtest.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_backtest.metrics` | couches 1–2 (`strategy.engine` importe `config` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
-| 4 | `trading_backtest.reporting` | couches 1–3 (`core` et `metrics`) |
-| 5 | `trading_backtest.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
-| 6 | `trading_backtest.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) |
-| 7 | `trading_backtest.web` | couches 1–6, **bibliothèque standard seule** (HTTP + tableau de bord ; il ne connaît de la plateforme que la couture `SnapshotProvider`) |
-| 8 | `trading_backtest.cli` | couches 1–7 (plus `freqtrade` pour valider une config Freqtrade) |
+| 1 | `trading_platform.core` | la bibliothèque standard, `pandas` |
+| 2 | `trading_platform.config`, `trading_platform.data`, `trading_platform.freqtrade` | couche 1 |
+| 3 | `trading_platform.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_platform.metrics` | couches 1–2 (`strategy.engine` importe `config` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
+| 4 | `trading_platform.reporting` | couches 1–3 (`core` et `metrics`) |
+| 5 | `trading_platform.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
+| 6 | `trading_platform.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) |
+| 7 | `trading_platform.web` | couches 1–6, **bibliothèque standard seule** (HTTP + tableau de bord ; il ne connaît de la plateforme que la couture `SnapshotProvider`) |
+| 8 | `trading_platform.cli` | couches 1–7 (plus `freqtrade` pour valider une config Freqtrade) |
 
-> **`trading_backtest.cli` a déménagé de la couche 6 à la couche 8.** La CLI
+> **`trading_platform.cli` a déménagé de la couche 6 à la couche 8.** La CLI
 > importe désormais `realtime` (couche 6) et `web` (couche 7) dans le corps de ses
 > commandes : la garder en couche 6 aurait été un import **ascendant interdit**.
 > Les couches 1 à 5 sont inchangées, seul le haut de la pile a grandi. La règle
 > est **mécaniquement testée** : `tests/test_cli_realtime.py` prouve dans un
-> sous-processus qu'importer `trading_backtest.cli` ne met **ni**
-> `trading_backtest.realtime` **ni** `trading_backtest.web` dans `sys.modules`.
+> sous-processus qu'importer `trading_platform.cli` ne met **ni**
+> `trading_platform.realtime` **ni** `trading_platform.web` dans `sys.modules`.
 
 Conséquences pratiques :
 
@@ -227,19 +227,19 @@ Conséquences pratiques :
 ### 3.1 Décision de couches — l'adaptateur Freqtrade ne crée **aucune** arête
 
 L'adaptateur Freqtrade (§4.9) est la brique 1 de la trajectoire vers le temps
-réel multi-profils, et la brique 2 est arrivée : `trading_backtest.realtime`
-(couche 6) et `trading_backtest.web` (couche 7) existent désormais. Ce qui change
+réel multi-profils, et la brique 2 est arrivée : `trading_platform.realtime`
+(couche 6) et `trading_platform.web` (couche 7) existent désormais. Ce qui change
 ici, et pourquoi :
 
 - le bloc de l'adaptateur lui-même reste **en couche 3** : les quatre modules
-  `trading_backtest.strategy.freqtrade_parameters`, `freqtrade_stoploss`,
+  `trading_platform.strategy.freqtrade_parameters`, `freqtrade_stoploss`,
   `freqtrade_adapter` et `freqtrade_basic` ne bougent pas, et
-  `trading_backtest.strategy` -> `trading_backtest.freqtrade` reste un import
+  `trading_platform.strategy` -> `trading_platform.freqtrade` reste un import
   **descendant** (couche 3 -> couche 2), parfaitement légal ;
-- `trading_backtest.freqtrade` **conserve sa règle de liaison actuelle** : ce
-  paquet n'importe que `trading_backtest.core` et **n'importe jamais
+- `trading_platform.freqtrade` **conserve sa règle de liaison actuelle** : ce
+  paquet n'importe que `trading_platform.core` et **n'importe jamais
   `freqtrade`** (c'est son docstring). Déplacer l'adaptateur *dans*
-  `trading_backtest.freqtrade` serait un import **ascendant** (couche 2 ->
+  `trading_platform.freqtrade` serait un import **ascendant** (couche 2 ->
   couche 3) et falsifierait ce docstring : **c'est refusé** ;
 - **les seules arêtes ajoutées** sont `realtime` -> `strategy` / `data` /
   `metrics` (couche 6 -> couches 3 et 2, donc **descendantes**) et
@@ -258,7 +258,7 @@ ici, et pourquoi :
   `CcxtProMarketStream`.
 
 Autrement dit : la logique métier (indicateurs, règles d'entrée/sortie) reste
-écrite **une seule fois** dans `trading_backtest.strategy`, et l'adaptateur comme
+écrite **une seule fois** dans `trading_platform.strategy`, et l'adaptateur comme
 le moteur temps réel se contentent de **traduire** entre les deux contrats. Ils
 ne dupliquent rien.
 
@@ -269,7 +269,7 @@ ne dupliquent rien.
 Ces symboles et signatures constituent le contrat entre paquets. Toute
 évolution doit être répercutée ici **dans la même modification**.
 
-### 4.1 Configuration — `trading_backtest.config`
+### 4.1 Configuration — `trading_platform.config`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -289,7 +289,7 @@ Sous-modèles exposés (tous en `extra="forbid"`) : `ExchangeConfig`,
 Les variables d'environnement `TB_` (délimiteur `__`) surchargent le fichier :
 `TB_DATA__TIMEFRAME=4h`, `TB_BACKTEST__INITIAL_BALANCE=2500`.
 
-### 4.2 Données — `trading_backtest.data`
+### 4.2 Données — `trading_platform.data`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -315,7 +315,7 @@ du paquet. Avec `allow_network=False`, le provider n'est **jamais** appelé et u
 défaut de cache lève `InsufficientDataError` — c'est ce qui garantit qu'un run
 de test ne peut pas sortir sur le réseau.
 
-### 4.3 Exécution — `trading_backtest.strategy.engine`
+### 4.3 Exécution — `trading_platform.strategy.engine`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -324,7 +324,7 @@ de test ne peut pas sortir sur le réseau.
 | `run_backtest` | `run_backtest(strategy, data, *, initial_balance=10000.0, fee_rate=0.001, slippage=0.0, stake_amount=None, symbol="UNKNOWN/USDT", timeframe="1h", allow_short=None, params_id="") -> BacktestResult` | exécute une **instance** de stratégie sur une frame (`strategy` et `data` sont positionnels) |
 | `run_backtest_on_config` | `run_backtest_on_config(cfg: AppConfig, data, *, params=None, symbol=None) -> BacktestResult` | exécute la stratégie décrite par la configuration : `params` surcharge `cfg.strategy.params`, le reste vient de `cfg.backtest.*` / `cfg.exchange.*` / `cfg.data.timeframe` |
 
-### 4.4 Stratégies — `trading_backtest.strategy`
+### 4.4 Stratégies — `trading_platform.strategy`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -341,7 +341,7 @@ de test ne peut pas sortir sur le réseau.
 | `freqtrade_available` | `freqtrade_available() -> bool` | `True` si le paquet externe `freqtrade` est importable — import **paresseux**, jamais au chargement du paquet |
 | `BasicFreqtradeStrategy` | `make_freqtrade_strategy("basic")` ; `BASIC_FREQTRADE_STRATEGY_NAME = "BasicStrategy"` | la classe concrète chargeable par nom qui expose la stratégie maison `basic` à Freqtrade |
 
-### 4.4.1 Inventaire de l'adaptateur Freqtrade — `trading_backtest.strategy.freqtrade_*`
+### 4.4.1 Inventaire de l'adaptateur Freqtrade — `trading_platform.strategy.freqtrade_*`
 
 Ces symboles sont **gelés** comme les précédents. Ils appartiennent tous à la
 couche 3 et ne sont utilisés que par le chemin d'exposition à Freqtrade (§4.9).
@@ -376,7 +376,7 @@ l'helper natif — avec l'erreur explicite `StrategyError` quand l'extra
 documentation désigne donc bien l'API **amont**, pas un symbole maison
 supplémentaire.
 
-### 4.5 Validation — `trading_backtest.validation`
+### 4.5 Validation — `trading_platform.validation`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -399,7 +399,7 @@ Seuils gelés : `is_robust = (positive_ratio >= 0.7) and (robust_ratio >= 0.5)`
 Tous les tirages aléatoires passent un `random_seed` explicite : deux exécutions
 identiques donnent des résultats identiques.
 
-### 4.6 Métriques — `trading_backtest.metrics`
+### 4.6 Métriques — `trading_platform.metrics`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -408,9 +408,9 @@ identiques donnent des résultats identiques.
 | `metric_value` | `metric_value(result: BacktestResult, name: str, *, timeframe: str = "1h", risk_free_rate: float = 0.0) -> float` | une seule métrique, par nom — seam utilisé par `validation` |
 | `METRIC_NAMES` | tuple de 23 noms, ordre gelé : `total_return`, `cagr`, `sharpe_ratio`, `sortino_ratio`, `max_drawdown`, `max_drawdown_duration`, `calmar_ratio`, `volatility`, `win_rate`, `profit_factor`, `expectancy`, `avg_trade_pnl`, `avg_win`, `avg_loss`, `largest_win`, `largest_loss`, `n_trades`, `exposure`, `best_trade_pct`, `worst_trade_pct`, `recovery_factor`, `total_fees`, `final_balance` | noms canoniques ; `TRADE_METRIC_NAMES` liste le sous-ensemble qui n'a de sens qu'avec au moins un trade |
 | `MetricSet.to_dict` / `as_dict` | `to_dict() -> {"values": {...}}` (clés triées), `as_dict() -> dict[str, float]` | payload JSON-able |
-| `drawdown_series`, `max_drawdown`, `drawdown_duration`, `drawdown_table` | module `trading_backtest.metrics.drawdown` : `drawdown_series(equity) -> pd.Series`, `max_drawdown(equity) -> float`, `drawdown_duration(equity) -> int`, `drawdown_table(equity, *, top: int = 5) -> list[dict]` | statistiques de drawdown réutilisables hors d'un `BacktestResult` |
+| `drawdown_series`, `max_drawdown`, `drawdown_duration`, `drawdown_table` | module `trading_platform.metrics.drawdown` : `drawdown_series(equity) -> pd.Series`, `max_drawdown(equity) -> float`, `drawdown_duration(equity) -> int`, `drawdown_table(equity, *, top: int = 5) -> list[dict]` | statistiques de drawdown réutilisables hors d'un `BacktestResult` |
 
-### 4.7 Restitution — `trading_backtest.reporting`
+### 4.7 Restitution — `trading_platform.reporting`
 
 | Symbole | Signature clé | Rôle |
 | --- | --- | --- |
@@ -420,28 +420,28 @@ identiques donnent des résultats identiques.
 | `write_report` | `write_report(report: Report, output_dir: Path, *, formats: Sequence[str] = ("markdown", "json"), basename: str = "report") -> list[Path]` | écrit les formats demandés et rend leurs chemins ; `SUPPORTED_FORMATS = {"markdown": ".md", "json": ".json"}` |
 | `read_report` | `read_report(path: str \| Path) -> dict[str, Any]` | relit un rapport JSON et lève `ReportingError` s'il est absent ou invalide |
 
-### 4.8 CLI — `trading_backtest.cli`
+### 4.8 CLI — `trading_platform.cli`
 
 | Commande | Options (toutes les commandes acceptent aussi `--json`) | Rôle |
 | --- | --- | --- |
-| `trading-backtest backtest` | `--config/-c` (obligatoire), `--symbol`, `--timeframe`, `--start`, `--end`, `--data-file`, `--output-dir`, `--formats`, `--no-network` | backtest unique |
-| `trading-backtest walk-forward` | options de `backtest` + `--windows`, `--is-ratio`, `--mode`, `--metric` | walk-forward sur les fenêtres de `validation.make_windows` |
-| `trading-backtest robustness` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--metric`, `--max-combinations`, `--output-dir`, `--formats`, `--no-network` (pas de `--start`/`--end`) | balayage paramétrique du `validation.robustness_grid` (grille vide ⇒ `strategy.PARAM_SPACE` de la stratégie) |
-| `trading-backtest monte-carlo` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--simulations`, `--method`, `--seed`, `--output-dir`, `--formats` (pas de `--no-network`) | Monte Carlo sur les trades d'un backtest |
-| `trading-backtest data download` | `--config`, `--symbol`, `--timeframe`, `--start`, `--end` (tous obligatoires) | téléchargement OHLCV vers le cache — seule commande qui peut sortir sur le réseau |
-| `trading-backtest config show` / `config validate` | `--config/-c` | affiche la configuration effective / valide un fichier `AppConfig` **ou** Freqtrade (type détecté automatiquement) |
-| `trading-backtest realtime run` | `--profiles/-p` (obligatoire), `--host`, `--port` (0 = port éphémère), `--once`, `--json` | démarre le moteur **et** le serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
-| `trading-backtest realtime serve` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--json` | surveillance **lecture seule** sur l'état persisté, sans moteur ; les routes mutantes répondent 403 |
-| `trading-backtest realtime check` | `--profiles/-p` (obligatoire), `--json` | pré-vol statique : validité de la config, présence des credentials, porte live, limites de risque, inscriptibilité de la base d'état ; ne passe **aucun** ordre et ne touche **pas** au réseau ; sortie `1` dès qu'un profil ne peut pas démarrer |
+| `trading backtest` | `--config/-c` (obligatoire), `--symbol`, `--timeframe`, `--start`, `--end`, `--data-file`, `--output-dir`, `--formats`, `--no-network` | backtest unique |
+| `trading walk-forward` | options de `backtest` + `--windows`, `--is-ratio`, `--mode`, `--metric` | walk-forward sur les fenêtres de `validation.make_windows` |
+| `trading robustness` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--metric`, `--max-combinations`, `--output-dir`, `--formats`, `--no-network` (pas de `--start`/`--end`) | balayage paramétrique du `validation.robustness_grid` (grille vide ⇒ `strategy.PARAM_SPACE` de la stratégie) |
+| `trading monte-carlo` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--simulations`, `--method`, `--seed`, `--output-dir`, `--formats` (pas de `--no-network`) | Monte Carlo sur les trades d'un backtest |
+| `trading data download` | `--config`, `--symbol`, `--timeframe`, `--start`, `--end` (tous obligatoires) | téléchargement OHLCV vers le cache — seule commande qui peut sortir sur le réseau |
+| `trading config show` / `config validate` | `--config/-c` | affiche la configuration effective / valide un fichier `AppConfig` **ou** Freqtrade (type détecté automatiquement) |
+| `trading realtime run` | `--profiles/-p` (obligatoire), `--host`, `--port` (0 = port éphémère), `--once`, `--json` | démarre le moteur **et** le serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
+| `trading realtime serve` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--json` | surveillance **lecture seule** sur l'état persisté, sans moteur ; les routes mutantes répondent 403 |
+| `trading realtime check` | `--profiles/-p` (obligatoire), `--json` | pré-vol statique : validité de la config, présence des credentials, porte live, limites de risque, inscriptibilité de la base d'état ; ne passe **aucun** ordre et ne touche **pas** au réseau ; sortie `1` dès qu'un profil ne peut pas démarrer |
 
 Les trois commandes `realtime` ont leurs propres ensembles de clés JSON
 (`realtime-check`, puis `realtime-run`/`realtime-serve`) : elles ne passent pas
 par `PAYLOAD_KEYS`. Ces payloads sont documentés mot pour mot dans
-[`docs/realtime.md`](realtime.md#6-les-trois-commandes) et
+[`docs/realtime.md`](realtime.md#6-the-three-commands) et
 [`docs/usage.md`](usage.md).
 
-Le point d'entrée console est `trading-backtest = trading_backtest.cli:main`
-(déclaré dans `pyproject.toml`) ; `python -m trading_backtest …`
+Le point d'entrée console est `trading = trading_platform.cli:main` (`trading-backtest` reste déclaré comme **alias** de la même fonction)
+(déclaré dans `pyproject.toml`) ; `python -m trading_platform …`
 (`__main__.py`) est strictement équivalent. Détail des options :
 [`docs/usage.md`](usage.md#4-exemples-cli).
 
@@ -450,7 +450,7 @@ Le point d'entrée console est `trading-backtest = trading_backtest.cli:main`
 L'adaptateur est la brique 1 de la trajectoire vers le temps réel multi-profils
 (un profil = actif + stratégie + timeframe + paper/live). Son principe tient en
 une phrase : **les indicateurs et les règles d'entrée/sortie restent écrits dans
-`trading_backtest.strategy`**, et l'adaptateur ne fait que **traduire** entre
+`trading_platform.strategy`**, et l'adaptateur ne fait que **traduire** entre
 deux contrats — celui du moteur maison et celui de
 `freqtrade.strategy.IStrategy`. Aucune règle métier n'est recopiée.
 
@@ -669,7 +669,7 @@ dans [`docs/backtesting-methodology.md`](backtesting-methodology.md).
 
 ---
 
-### 4.10 Le temps réel — `trading_backtest.realtime`
+### 4.10 Le temps réel — `trading_platform.realtime`
 
 Le moteur exécute **N profils concurrents** (`asset + stratégie + timeframe +
 paper/live + limites de risque`) dans une seule boucle d'événements `asyncio`.
@@ -850,7 +850,7 @@ remplis / rejetés, bougies traitées, reconnexions, refus de risque) sont expos
 par le read model ; chaque profil porte son état explicite (`status`,
 `last_candle_at`, `lag_seconds`, `last_error`, `reconnect_count`).
 
-### 4.11 La couche web — `trading_backtest.web`
+### 4.11 La couche web — `trading_platform.web`
 
 Couche **7**, **bibliothèque standard uniquement** : `http.server.ThreadingHTTPServer`
 `+ json + sqlite3 + asyncio + logging + threading`. Aucun WebSocket, aucun ASGI,
@@ -877,7 +877,7 @@ aucune dépendance tierce, aucun CDN et aucune étape de build : le tableau de b
   routes `GET` répondent, la mutation est refusée (403).
 
 Le détail route par route, les payloads et la cadence de sondage sont documentés
-dans [`docs/realtime.md`](realtime.md#5-reference-de-lapi-web).
+dans [`docs/realtime.md`](realtime.md#5-web-api-reference).
 
 ---
 
@@ -920,12 +920,12 @@ index = pd.date_range("2022-01-01", periods=500, freq="1h", tz="UTC", name="time
 ```
 
 Les tests n'utilisent que des données synthétiques
-(`trading_backtest.data.synthetic`) ou des CSV de `tests/fixtures/` : **aucun
+(`trading_platform.data.synthetic`) ou des CSV de `tests/fixtures/` : **aucun
 téléchargement réel** dans la suite de tests.
 
 ---
 
-## 6. Modèles de domaine — `trading_backtest.core`
+## 6. Modèles de domaine — `trading_platform.core`
 
 Deux modèles structurent tout le projet. Ce sont des **dataclasses gelées**
 (`frozen=True`) ou quasi immuables, sans dépendance autre que `pandas`, et
@@ -984,7 +984,7 @@ Les résultats de validation (`WalkForwardResult`, `RobustnessResult`,
 `MonteCarloResult`) suivent le même principe : un modèle typé **plus** un
 `to_dict()` JSON-able.
 
-### 6.3 Erreurs — `trading_backtest.core.errors`
+### 6.3 Erreurs — `trading_platform.core.errors`
 
 Toute erreur levée par le projet dérive de `TradingBacktestError`, ce qui donne
 à la CLI une surface d'erreur unique. Le message porte une description courte,
@@ -1088,11 +1088,11 @@ paires `(timestamp, valeur)` sérialisables.
 | Besoin | Point d'extension |
 | --- | --- |
 | Nouvelle stratégie | hériter de `Strategy` (en implémentant `prepare` et `signals`, et en déclarant `ParamsModel` / `PARAM_SPACE`) et décorer la classe avec `@register_strategy`, puis référencer `cls.name` dans `strategy.name` de la configuration |
-| Nouvel indicateur | fonction pure ajoutée à `trading_backtest.strategy.indicators`, sans effet de bord |
+| Nouvel indicateur | fonction pure ajoutée à `trading_platform.strategy.indicators`, sans effet de bord |
 | Nouvelle métrique | entrée ajoutée au dictionnaire `values` de `compute_metrics` + nom ajouté à `METRIC_NAMES` (l'ordre de `METRIC_NAMES` est l'ordre de calcul ; le tableau du rapport markdown trie les clés par ordre alphabétique) |
 | Nouvel exécuteur | fonction conforme à `RunnerFn`, passée aux fonctions de validation (`walk_forward`, `parameter_sweep`) à la place de `make_runner(cfg)` |
-| Nouveau mode de validation | nouveau module dans `trading_backtest.validation`, exposé par la CLI, sans toucher au moteur |
-| Nouvel exchange | implémentation dans `trading_backtest.data`, l'import `ccxt` restant paresseux |
+| Nouveau mode de validation | nouveau module dans `trading_platform.validation`, exposé par la CLI, sans toucher au moteur |
+| Nouvel exchange | implémentation dans `trading_platform.data`, l'import `ccxt` restant paresseux |
 | Nouveau format de rapport | branche supplémentaire dans `write_report`, activée par `reporting.formats` |
 | Exposer une stratégie à Freqtrade | **aucun code par stratégie** : `make_freqtrade_strategy(<nom enregistré>)` rend la classe `IStrategy` générique (§4.9.2), puis une déclaration de classe d'**une ligne** dans `user_data/strategies/<ClassName>.py`. Résolveur de shim : le texte du fichier doit contenir `class <Name>(` et `__module__` doit valoir le *stem* du fichier |
 
@@ -1133,7 +1133,7 @@ Limites **restantes** de la brique Freqtrade (§4.9) — elles sont assumées et
 La brique multi-profils existe désormais (§4.10, §4.11) et elle est **honnête**
 sur ce qui n'est **PAS prouvé** : la liste ci-dessous dit exactement ce que la
 suite de tests ne démontre pas. Elle est reprise mot pour mot dans
-[`docs/realtime.md`](realtime.md#7-ce-qui-nest-pas-prouvé) :
+[`docs/realtime.md`](realtime.md#7-what-is-not-proven) :
 
 - **le tableau de bord sonde en HTTP toutes les 2 s** (`monitoring.refresh_seconds`)
   et il n'y a **ni WebSocket ni ASGI** : c'est le prix de la décision

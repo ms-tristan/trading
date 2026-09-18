@@ -35,20 +35,20 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
-from trading_backtest.cli import app
-from trading_backtest.config import (
+from trading_platform.cli import app
+from trading_platform.config import (
     MonitoringConfig,
     RealtimeConfig,
     load_profiles,
     load_realtime_config,
 )
-from trading_backtest.data.synthetic import make_ohlcv
-from trading_backtest.realtime.clock import ManualClock, SystemClock
-from trading_backtest.realtime.monitor import Monitor
-from trading_backtest.realtime.orchestrator import RealtimeOrchestrator
-from trading_backtest.realtime.store import SqliteStateStore
-from trading_backtest.realtime.stream import PollingMarketStream
-from trading_backtest.web.server import create_server, start_in_thread
+from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.realtime.clock import ManualClock, SystemClock
+from trading_platform.realtime.monitor import Monitor
+from trading_platform.realtime.orchestrator import RealtimeOrchestrator
+from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.realtime.stream import PollingMarketStream
+from trading_platform.web.server import create_server, start_in_thread
 
 RUNNER = CliRunner()
 
@@ -494,7 +494,7 @@ def test_the_global_kill_switch_halts_the_whole_platform_end_to_end(tmp_path: Pa
 
 def test_a_second_writer_on_the_same_state_file_is_refused(tmp_path: Path) -> None:
     """The documented single-writer rule: one process owns the state database."""
-    from trading_backtest.core.errors import StateStoreError
+    from trading_platform.core.errors import StateStoreError
 
     path = write_scenario(tmp_path)
     database = tmp_path / "state.db"
@@ -566,7 +566,7 @@ def wall_clock_calls(source: Path) -> list[str]:
 
 def test_no_realtime_module_reads_the_wall_clock_directly() -> None:
     """The mechanical time test: only ``clock.py`` may read the system time."""
-    root = Path(__file__).resolve().parents[1] / "src" / "trading_backtest"
+    root = Path(__file__).resolve().parents[1] / "src" / "trading_platform"
     offenders: list[str] = []
     for package in ("realtime", "web"):
         for source in sorted((root / package).rglob("*.py")):
@@ -581,7 +581,7 @@ def test_no_realtime_module_reads_the_wall_clock_directly() -> None:
 
 def test_the_dashboard_static_assets_are_shipped_and_offline(tmp_path: Path) -> None:
     """The dashboard renders with no CDN, no build step and no external asset."""
-    static = Path(__file__).resolve().parents[1] / "src" / "trading_backtest" / "web" / "static"
+    static = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web" / "static"
     for name in ("index.html", "app.js", "styles.css"):
         assert (static / name).is_file()
     html = (static / "index.html").read_text(encoding="utf-8")

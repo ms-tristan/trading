@@ -3,8 +3,8 @@
 Everything here is offline and deterministic.  The four foreign seams -- the market
 stream, the gateway, the store and the strategy registry -- are replaced by the
 local fakes defined below, so this package never reaches into the internals of
-another one.  Time is a :class:`~trading_backtest.realtime.clock.ManualClock`, the
-signals are scripted by a real :class:`~trading_backtest.strategy.base.Strategy`
+another one.  Time is a :class:`~trading_platform.realtime.clock.ManualClock`, the
+signals are scripted by a real :class:`~trading_platform.strategy.base.Strategy`
 subclass, and every coroutine runs under an explicit ``asyncio.wait_for`` bound so
 that a hung implementation fails the suite instead of hanging it.
 
@@ -25,16 +25,16 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import ProfileConfig, RiskLimitsConfig
-from trading_backtest.core.errors import (
+from trading_platform.config.models import ProfileConfig, RiskLimitsConfig
+from trading_platform.core.errors import (
     KillSwitchActiveError,
     OrderRejectedError,
     RiskLimitExceededError,
 )
-from trading_backtest.core.models import Direction, ExitReason, TradeRecord
-from trading_backtest.realtime import runner as runner_module
-from trading_backtest.realtime.clock import ManualClock, SystemClock
-from trading_backtest.realtime.models import (
+from trading_platform.core.models import Direction, ExitReason, TradeRecord
+from trading_platform.realtime import runner as runner_module
+from trading_platform.realtime.clock import ManualClock, SystemClock
+from trading_platform.realtime.models import (
     BrokerAck,
     CandleEvent,
     EngineCounters,
@@ -50,10 +50,10 @@ from trading_backtest.realtime.models import (
     RunMode,
     SignalAction,
 )
-from trading_backtest.realtime.observability import LOGGER_NAME, Counters
-from trading_backtest.realtime.runner import ProfileRunner
-from trading_backtest.realtime.store import SqliteStateStore
-from trading_backtest.strategy.base import Strategy, StrategyParams, ensure_signal_frame
+from trading_platform.realtime.observability import LOGGER_NAME, Counters
+from trading_platform.realtime.runner import ProfileRunner
+from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.strategy.base import Strategy, StrategyParams, ensure_signal_frame
 
 TIMEOUT = 5.0
 
@@ -676,7 +676,7 @@ def test_a_restart_reproduces_the_same_client_order_id(install: Any) -> None:
 
 def test_the_sequence_increments_inside_one_candle() -> None:
     """Two orders of the same candle share the timestamp and differ by sequence."""
-    from trading_backtest.realtime.models import new_client_order_id
+    from trading_platform.realtime.models import new_client_order_id
 
     stamp = pd.Timestamp("2024-01-01T01:00:00Z")
     first = new_client_order_id("btc-paper", SYMBOL, stamp, 0)
@@ -1107,33 +1107,69 @@ def test_the_pacing_sleep_survives_when_the_interval_equals_the_timeout(
     assert runner.health().status is not ProfileStatus.ERROR
 
 
-def test_a_restart_never_accumulates_the_stopped_prefix(install: Any, tmp_path: Path) -> None:
-    """``stopped after:`` is written once, however many times the platform restarts.
+def test_a_restart_drops_the_previous_process_error(
+    install: Any, logs: Any, tmp_path: Path
+) -> None:
+    """A profile that starts again reports no error until *it* fails.
 
-    The persisted ``STOPPED`` detail *is* the ``last_error`` restored on the next
-    start, so N restarts used to store ``stopped after: stopped after: ...`` in
-    front of the real error -- a status field growing without bound in the store the
-    dashboard reads.  The real SQLite store is used on purpose: it is the component
-    that carries the persisted detail back into ``last_error``.
+    Regression test for the deployed dashboard, which showed
+    ``last error: stopped after: TimeoutError`` next to a healthy ``running`` badge:
+    the error of the previous process was restored on every start and never cleared,
+    so the page kept repeating a failure that was already over (and the ``stopped
+    after:`` prefix accumulated one copy per restart).
+
+    The real SQLite store is used on purpose: it is the component that carries the
+    persisted state across a restart.
     """
     install(mode="hold")
     clock = ManualClock(datetime(2024, 1, 1, 2, 0, tzinfo=UTC))
     store = SqliteStateStore(tmp_path / "state.db", clock=clock)
     store.initialize()
     try:
-        for cycle in range(3):
-            runner, _stream, _gateway, _store, _clock = build(store=store, clock=clock)  # type: ignore[arg-type]
-            if cycle == 0:
-                runner.mark_crashed(RuntimeError("the venue vanished"))
-            else:
-                # a restart: ``start`` restores the persisted detail as last_error
-                run(runner.start())
-            run(runner.stop())
-            status = store.load_status("btc-paper")
-            assert status is not None
-            assert status.last_error == "stopped after: RuntimeError: the venue vanished"
+        crashed, _stream, _gateway, _store, _clock = build(store=store, clock=clock)  # type: ignore[arg-type]
+        run(crashed.start())
+        crashed.mark_crashed(RuntimeError("the venue vanished"))
+        run(crashed.stop())
+
+        # the failure is the error of the profile, stored once and without a prefix
+        assert store.load_status("btc-paper").last_error == "RuntimeError: the venue vanished"
+
+        # a restart is a fresh health statement: the previous error is history
+        restarted, _stream, _gateway, _store, _clock = build(store=store, clock=clock)  # type: ignore[arg-type]
+        run(restarted.start())
+        assert restarted.health().last_error is None
+        assert store.load_status("btc-paper").last_error is None
+        assert "stale_error_cleared" in events(logs)
+
+        # ... while the reason it stopped stays in the durable structured log
+        run(restarted.stop())
+        assert restarted.health().last_error is None
+        assert store.load_status("btc-paper").last_error is None
+        cleared = [
+            record for record in logs if getattr(record, "event", "") == "stale_error_cleared"
+        ]
+        assert cleared, "the dropped error must be recorded, not silently lost"
+        context = getattr(cleared[0], "context", {})
+        assert "the venue vanished" in str(context.get("previous_error"))
     finally:
         store.close()
+
+
+def test_a_recovered_tick_clears_the_error(install: Any, logs: Any) -> None:
+    """A tick that runs to completion proves the condition is over."""
+    install(mode="hold")
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(store=store)
+
+    async def scenario() -> None:
+        await runner.start()
+        runner.mark_crashed(RuntimeError("transient venue failure"))
+        assert runner.health().last_error is not None
+        await runner.run_once()
+
+    run(scenario())
+    assert runner.health().last_error is None
+    assert "error_cleared" in events(logs)
 
 
 def test_cancelling_run_persists_stopped(install: Any, logs: Any) -> None:
@@ -1452,7 +1488,7 @@ def test_a_smaller_high_keeps_a_long_position_open() -> None:
 
 def test_the_runner_uses_the_real_registered_strategy(logs: Any) -> None:
     """With ``strategy="basic"`` the real indicators and rules are executed."""
-    from trading_backtest.realtime.strategies import freqtrade_strategy_for, resolve_strategy
+    from trading_platform.realtime.strategies import freqtrade_strategy_for, resolve_strategy
 
     real_profile = profile(strategy="basic", warmup_candles=40)
     strategy = resolve_strategy(real_profile)
@@ -1479,8 +1515,8 @@ def test_freqtrade_bridge_returns_none_when_the_extra_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The optional extra is never a hard failure of the realtime layer."""
-    from trading_backtest.realtime.strategies import freqtrade_strategy_for
-    from trading_backtest.strategy import freqtrade_adapter
+    from trading_platform.realtime.strategies import freqtrade_strategy_for
+    from trading_platform.strategy import freqtrade_adapter
 
     monkeypatch.setattr(freqtrade_adapter, "freqtrade_available", lambda: False)
     assert freqtrade_strategy_for(profile(strategy="basic")) is None
@@ -1488,8 +1524,8 @@ def test_freqtrade_bridge_returns_none_when_the_extra_is_missing(
 
 def test_the_freqtrade_bridge_exposes_the_real_strategy_when_available() -> None:
     """With the extra installed the very same profile is handed to Freqtrade."""
-    from trading_backtest.realtime.strategies import freqtrade_strategy_for
-    from trading_backtest.strategy.freqtrade_adapter import freqtrade_available
+    from trading_platform.realtime.strategies import freqtrade_strategy_for
+    from trading_platform.strategy.freqtrade_adapter import freqtrade_available
 
     result = freqtrade_strategy_for(profile(strategy="basic"))
     if freqtrade_available():
@@ -1501,7 +1537,7 @@ def test_the_freqtrade_bridge_exposes_the_real_strategy_when_available() -> None
 
 def test_strategy_names_exposes_the_registry() -> None:
     """The registry is the single source of truth for the available strategies."""
-    from trading_backtest.realtime.strategies import strategy_names
+    from trading_platform.realtime.strategies import strategy_names
 
     names = strategy_names()
     assert names == sorted(names)
@@ -1510,8 +1546,8 @@ def test_strategy_names_exposes_the_registry() -> None:
 
 def test_an_unknown_strategy_is_reported_loudly(install: Any) -> None:
     """The registry error is propagated, never swallowed."""
-    from trading_backtest.core.errors import StrategyError
-    from trading_backtest.realtime.strategies import resolve_strategy
+    from trading_platform.core.errors import StrategyError
+    from trading_platform.realtime.strategies import resolve_strategy
 
     with pytest.raises(StrategyError, match="unknown strategy"):
         resolve_strategy(profile(strategy="does-not-exist"))

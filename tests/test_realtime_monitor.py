@@ -22,18 +22,18 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import ProfileConfig, RealtimeConfig
-from trading_backtest.core.constants import (
+from trading_platform.config.models import ProfileConfig, RealtimeConfig
+from trading_platform.core.constants import (
     DEFAULT_FEE_RATE,
     DEFAULT_INITIAL_BALANCE,
     DEFAULT_SLIPPAGE,
     DEFAULT_TIMEFRAME,
 )
-from trading_backtest.core.errors import MonitoringError, StateStoreError
-from trading_backtest.core.models import BacktestResult, Direction, ExitReason, TradeRecord
-from trading_backtest.metrics import METRIC_NAMES, compare_benchmark, compute_metrics
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.models import (
+from trading_platform.core.errors import MonitoringError, StateStoreError
+from trading_platform.core.models import BacktestResult, Direction, ExitReason, TradeRecord
+from trading_platform.metrics import METRIC_NAMES, compare_benchmark, compute_metrics
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.models import (
     EngineCounters,
     EquityPoint,
     Order,
@@ -46,7 +46,7 @@ from trading_backtest.realtime.models import (
     ProfileStatus,
     RunMode,
 )
-from trading_backtest.realtime.monitor import Monitor, ProfileReport
+from trading_platform.realtime.monitor import Monitor, ProfileReport
 
 # ---------------------------------------------------------------------------
 # deterministic fixtures (no randomness, no wall clock)
@@ -674,7 +674,7 @@ def test_benchmark_variant_none_is_null() -> None:
 def test_benchmark_random_entry_goes_through_the_validation_layer() -> None:
     """Variant ``random_entry`` is answered by ``validate_random_entry``."""
     try:  # pragma: no cover - the validation layer always ships with this repo
-        from trading_backtest.validation.random_entry import validate_random_entry
+        from trading_platform.validation.random_entry import validate_random_entry
     except ImportError:  # pragma: no cover - defensive, mirrors the lazy import
         pytest.skip("the validation layer is not importable in this environment")
 
@@ -705,7 +705,7 @@ def test_benchmark_random_entry_goes_through_the_validation_layer() -> None:
 
 def test_gate_payload_matches_validate_benchmark() -> None:
     """The gate payload is the one produced by the validation layer."""
-    from trading_backtest.validation.benchmark import validate_benchmark
+    from trading_platform.validation.benchmark import validate_benchmark
 
     store = make_store()
     monitor = build_monitor(store)

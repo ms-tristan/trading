@@ -1,8 +1,8 @@
 """Tests of the execution gateway: the single order lifecycle shared by both modes.
 
 Everything here is offline and deterministic.  The three foreign seams
-(:class:`~trading_backtest.realtime.store.StateStore`,
-:class:`~trading_backtest.realtime.broker.Broker`) are replaced by the local fakes
+(:class:`~trading_platform.realtime.store.StateStore`,
+:class:`~trading_platform.realtime.broker.Broker`) are replaced by the local fakes
 defined below, so this package never depends on the internals of another package;
 the two tests that do exercise the real ``PaperBroker`` import it lazily inside the
 test body and skip when it is unavailable.
@@ -24,18 +24,18 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import ProfileConfig, RiskLimitsConfig
-from trading_backtest.core.errors import (
+from trading_platform.config.models import ProfileConfig, RiskLimitsConfig
+from trading_platform.core.errors import (
     GatewayError,
     KillSwitchActiveError,
     LiveTradingForbiddenError,
     OrderRejectedError,
     RiskLimitExceededError,
 )
-from trading_backtest.core.models import Direction, ExitReason, TradeRecord
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.gateway import ExecutionGateway
-from trading_backtest.realtime.models import (
+from trading_platform.core.models import Direction, ExitReason, TradeRecord
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.gateway import ExecutionGateway
+from trading_platform.realtime.models import (
     BrokerAck,
     BrokerEvent,
     BrokerEventType,
@@ -52,7 +52,7 @@ from trading_backtest.realtime.models import (
     ReconciliationReport,
     RunMode,
 )
-from trading_backtest.realtime.risk import (
+from trading_platform.realtime.risk import (
     KillSwitch,
     LiveTradingGate,
     RiskDecision,
@@ -60,7 +60,7 @@ from trading_backtest.realtime.risk import (
     RiskManager,
 )
 
-LOGGER_NAME = "trading_backtest.realtime.gateway"
+LOGGER_NAME = "trading_platform.realtime.gateway"
 
 #: Fixed instant every fake stamps its records with (no wall clock anywhere).
 TS = pd.Timestamp("2024-01-01T00:00:00Z")
@@ -1161,7 +1161,7 @@ def test_reconcile_logs_a_mismatch(caplog: pytest.LogCaptureFixture) -> None:
 
 
 def test_reconcile_against_the_real_paper_broker() -> None:
-    broker_module = pytest.importorskip("trading_backtest.realtime.broker")
+    broker_module = pytest.importorskip("trading_platform.realtime.broker")
     clock = ManualClock(pd.Timestamp(TS).to_pydatetime())
     real_broker = broker_module.PaperBroker(clock=clock, seed=0, partial_fill_probability=0.0)
     gateway, _, store, _ = build_gateway(broker=real_broker)
@@ -1189,7 +1189,7 @@ def test_reconcile_against_the_real_paper_broker() -> None:
 
 
 def test_paper_broker_shares_the_whole_lifecycle() -> None:
-    broker_module = pytest.importorskip("trading_backtest.realtime.broker")
+    broker_module = pytest.importorskip("trading_platform.realtime.broker")
     clock = ManualClock(pd.Timestamp(TS).to_pydatetime())
     real_broker = broker_module.PaperBroker(clock=clock, seed=7, partial_fill_probability=0.0)
     gateway, broker, store, _ = build_gateway(broker=real_broker)

@@ -29,9 +29,9 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import MonitoringConfig, ProfileConfig
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.models import (
+from trading_platform.config.models import MonitoringConfig, ProfileConfig
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.models import (
     EngineCounters,
     EquityPoint,
     PlatformSnapshot,
@@ -41,8 +41,9 @@ from trading_backtest.realtime.models import (
     ProfileStatus,
     RunMode,
 )
-from trading_backtest.realtime.monitor import Monitor
-from trading_backtest.web.server import (
+from trading_platform.realtime.monitor import Monitor
+from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.web.server import (
     MonitoringHandler,
     MonitoringServer,
     SnapshotProvider,
@@ -54,7 +55,7 @@ from trading_backtest.web.server import (
 
 PROFILE_A = "btc-paper"
 START = datetime(2024, 1, 1, tzinfo=UTC)
-STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "trading_backtest" / "web" / "static"
+STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web" / "static"
 CLIENT_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
 
@@ -296,7 +297,7 @@ def test_create_server_binds_an_ephemeral_loopback_port(
         assert built.server_address[0] == "127.0.0.1"
         assert built.router.read_only is True
         assert built.daemon_threads is True
-        assert MonitoringHandler.server_version == "trading-backtest-monitoring/0.1"
+        assert MonitoringHandler.server_version == "trading-platform-monitoring/0.1"
     finally:
         built.server_close()
 
@@ -607,20 +608,20 @@ def test_an_empty_body_on_the_mutating_route_is_a_400(
 def test_log_message_never_writes_to_stderr(
     server: MonitoringServer, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.INFO, logger="trading_backtest.web")
+    caplog.set_level(logging.INFO, logger="trading_platform.web")
     status, _, _ = http_request(server, "GET", "/api/health")
     assert status == 200
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
     assert any("GET /api/health" in record.getMessage() for record in caplog.records)
-    assert all(record.name == "trading_backtest.web" for record in caplog.records)
+    assert all(record.name == "trading_platform.web" for record in caplog.records)
 
 
 def test_a_transport_error_is_logged_and_not_printed_on_stderr(
     server: MonitoringServer, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.INFO, logger="trading_backtest.web")
+    caplog.set_level(logging.INFO, logger="trading_platform.web")
     with socket.create_connection(
         ("127.0.0.1", server.server_address[1]), timeout=CLIENT_TIMEOUT
     ) as client:
@@ -629,7 +630,7 @@ def test_a_transport_error_is_logged_and_not_printed_on_stderr(
         with contextlib.suppress(OSError):
             client.recv(4096)
     assert capsys.readouterr().err == ""
-    assert any(record.name == "trading_backtest.web" for record in caplog.records)
+    assert any(record.name == "trading_platform.web" for record in caplog.records)
 
 
 def test_shutdown_is_clean_and_bounded(provider: FakeProvider, monitor: Monitor) -> None:
@@ -679,3 +680,71 @@ def test_serve_blocking_runs_until_shutdown(provider: FakeProvider, monitor: Mon
         built.server_close()
         worker.join(timeout=SHUTDOWN_TIMEOUT)
         assert not worker.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# a polling browser must never exhaust the server
+# ---------------------------------------------------------------------------
+
+
+def test_a_polling_browser_never_exhausts_the_store_connections(tmp_path: Path) -> None:
+    """The dashboard's own polling must not leak a SQLite connection per request.
+
+    Regression test for the deployed dashboard going dark.  ``app.js`` polls five
+    routes every two seconds, three of which are read from the SQLite store
+    (``/equity``, ``/positions``, ``/trades``).  The store keeps one connection per
+    *caller thread* and retained every one of them, while ``ThreadingHTTPServer``
+    runs a thread per request -- so a browser left open leaked descriptors until the
+    container hit ``OSError: Too many open files`` and answered ``500`` to
+    everything, ``/`` included: the page itself stopped loading.
+
+    The client threads run *concurrently* on purpose: threads alive at the same time
+    necessarily have distinct ids, so the leak is visible on this host too (a
+    sequential loop is masked by the OS reusing one id).  The store is real here --
+    the local fake has no descriptors to leak -- and the routes are the ones the
+    dashboard actually polls.
+    """
+    clock = ManualClock(START)
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    store.initialize()
+    polled = (
+        "/api/health",
+        "/api/profiles",
+        f"/api/profiles/{PROFILE_A}/equity",
+        f"/api/profiles/{PROFILE_A}/positions",
+        f"/api/profiles/{PROFILE_A}/trades",
+    )
+    rounds = 4
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def poll(offset: int) -> None:
+        for index in range(rounds):
+            path = polled[(offset + index) % len(polled)]
+            status, _headers, _payload = http_request(started, "GET", path)
+            with statuses_lock:
+                statuses.append(status)
+
+    try:
+        built = build_server(FakeProvider(), Monitor(store, clock=clock), read_only=True)
+        with running(built) as started:
+            workers = [threading.Thread(target=poll, args=(index,)) for index in range(15)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=30)
+                assert worker.is_alive() is False
+
+            assert statuses == [200] * (len(workers) * rounds), sorted(set(statuses))
+            # one final store-backed poll: it is the moment the finished request
+            # threads are reaped
+            status, _headers, _payload = http_request(
+                started, "GET", f"/api/profiles/{PROFILE_A}/equity"
+            )
+            assert status == 200
+            assert store.connection_count <= 2, (
+                f"{store.connection_count} connections retained after "
+                f"{len(workers) * rounds} concurrent polls"
+            )
+    finally:
+        store.close()

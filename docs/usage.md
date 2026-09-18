@@ -67,20 +67,20 @@ local et rapport. Aucun accès réseau n'est nécessaire.
 python3.11 -m venv .venv && .venv/bin/python -m pip install -e ".[dev]"
 
 # 1. générer un jeu de données déterministe, hors ligne, sans cache ni exchange
-.venv/bin/python -c "from trading_backtest.data.synthetic import make_ohlcv; \
+.venv/bin/python -c "from trading_platform.data.synthetic import make_ohlcv; \
 make_ohlcv(8760, start='2022-01-01T00:00:00Z', timeframe='1h', seed=42).to_csv('btc.csv')"
 
 # 2. backtest complet sur ce CSV
-.venv/bin/python -m trading_backtest.cli backtest \
+.venv/bin/python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv
 
 # 3. walk-forward (le juge de paix)
-.venv/bin/python -m trading_backtest.cli walk-forward \
+.venv/bin/python -m trading_platform.cli walk-forward \
     --config config/backtest_default.json --data-file btc.csv
 ```
 
-Une fois le paquet installé, la commande console `trading-backtest …` est
-équivalente à `.venv/bin/python -m trading_backtest.cli …`. Les deux formes sont
+Une fois le paquet installé, la commande console `trading …` est
+équivalente à `.venv/bin/python -m trading_platform.cli …`. Les deux formes sont
 utilisées indifféremment dans ce document.
 
 ---
@@ -88,7 +88,7 @@ utilisées indifféremment dans ce document.
 ## 3. Anatomie de `config/backtest_default.json`
 
 Le fichier de configuration du moteur est un JSON unique, validé par
-`trading_backtest.config.AppConfig` (pydantic). **Toute clé inconnue est une
+`trading_platform.config.AppConfig` (pydantic). **Toute clé inconnue est une
 erreur** (`extra="forbid"`) ; toute clé absente prend sa valeur par défaut. Les
 valeurs ci-dessous sont celles du modèle `AppConfig` et du fichier livré
 `config/backtest_default.json`.
@@ -98,14 +98,14 @@ et délimiteur `__` :
 
 ```bash
 TB_DATA__TIMEFRAME=4h TB_BACKTEST__INITIAL_BALANCE=2500 \
-    python -m trading_backtest.cli backtest --config config/backtest_default.json
+    python -m trading_platform.cli backtest --config config/backtest_default.json
 ```
 
 ### 3.1 Racine
 
 | Clé | Défaut | Sens |
 | --- | --- | --- |
-| `project_name` | `"trading-backtest"` | nom affiché dans les rapports et les logs |
+| `project_name` | `"trading-platform"` | nom affiché dans les rapports et les logs |
 | `log_level` | `"INFO"` | `DEBUG`, `INFO`, `WARNING` ou `ERROR` |
 
 ### 3.2 `exchange` — marché et microstructure
@@ -203,7 +203,7 @@ la CLI utiliser `BasicStrategy.PARAM_SPACE`.
 
 ```json
 {
-  "project_name": "trading-backtest",
+  "project_name": "trading-platform",
   "log_level": "INFO",
   "exchange": {
     "name": "binance",
@@ -360,12 +360,12 @@ Deux exemples d'un run ponctuel, sans toucher au fichier de configuration :
 
 ```bash
 # benchmark au taux sans risque, taux réaliste 2023-2025 (T-bills US)
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --benchmark-variant risk_free --risk-free-rate 0.05
 
 # test de compétence : entrées aléatoires reproductibles (graine du config)
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --benchmark-variant random_entry --risk-free-rate 0.05
 ```
@@ -390,7 +390,7 @@ Le CSV doit respecter le contrat OHLCV (voir
 fabriquer un **hors ligne et déterministe** :
 
 ```bash
-.venv/bin/python -c "from trading_backtest.data.synthetic import make_ohlcv; \
+.venv/bin/python -c "from trading_platform.data.synthetic import make_ohlcv; \
 make_ohlcv(8760, start='2022-01-01T00:00:00Z', timeframe='1h', seed=42).to_csv('btc.csv')"
 ```
 
@@ -398,38 +398,38 @@ make_ohlcv(8760, start='2022-01-01T00:00:00Z', timeframe='1h', seed=42).to_csv('
 
 ```bash
 # CSV local : aucun réseau, aucun cache
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json \
     --data-file btc.csv --no-network
 
 # symbole, timeframe et sous-fenêtre explicites
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --symbol BTC/USDT --timeframe 1h \
     --start 2023-01-02T00:00:00Z --end 2023-01-06T00:00:00Z
 
 # sans --data-file : cache d'abord, puis téléchargement (extra exchange requis)
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json \
     --start 2023-01-01T00:00:00Z --end 2024-01-01T00:00:00Z
 
 # sortie machine : un objet JSON sur stdout, et un rapport markdown seulement
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --formats markdown --output-dir reports/runs --json
 
 # changer de timeframe ne demande aucune option : la config suffit
 TB_DATA__TIMEFRAME=4h TB_STRATEGY__TIMEFRAME=4h \
-    python -m trading_backtest.cli backtest \
+    python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv
 
 # comparer explicitement le run au buy & hold de la même fenêtre
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --benchmark
 
 # désactiver le benchmark : plus de section « Benchmark », plus de run.benchmark
-python -m trading_backtest.cli backtest \
+python -m trading_platform.cli backtest \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --no-benchmark
 ```
@@ -443,18 +443,18 @@ les clés sont `command`, `ok`, `symbol`, `timeframe`, `config_path`, `metrics`,
 ### 4.2 `walk-forward` — la validation temporelle
 
 ```bash
-python -m trading_backtest.cli walk-forward \
+python -m trading_platform.cli walk-forward \
     --config config/backtest_default.json \
     --data-file btc.csv --no-network
 
 # 8 fenêtres ancrées, 75 % in-sample, scorées sur le rendement total
-python -m trading_backtest.cli walk-forward \
+python -m trading_platform.cli walk-forward \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --windows 8 --is-ratio 0.75 --mode anchored --metric total_return
 
 # les mêmes réglages par variables d'environnement
 TB_VALIDATION__MODE=anchored TB_VALIDATION__N_WINDOWS=8 \
-    python -m trading_backtest.cli walk-forward \
+    python -m trading_platform.cli walk-forward \
     --config config/backtest_default.json --data-file btc.csv
 ```
 
@@ -469,12 +469,12 @@ Affiche `mode`, `n_windows`, `aggregate_is_metric`, `aggregate_oos_metric`,
 ### 4.3 `robustness` — balayage paramétrique
 
 ```bash
-python -m trading_backtest.cli robustness \
+python -m trading_platform.cli robustness \
     --config config/backtest_default.json \
     --data-file btc.csv --no-network
 
 # métrique cible et garde-fou de grille explicites
-python -m trading_backtest.cli robustness \
+python -m trading_platform.cli robustness \
     --config config/backtest_default.json --data-file btc.csv --no-network \
     --metric total_return --max-combinations 81
 ```
@@ -499,12 +499,12 @@ le détail de la grille (`points`) est dans `--json` et dans le rapport.
 ### 4.4 `monte-carlo` — distribution des résultats
 
 ```bash
-python -m trading_backtest.cli monte-carlo \
+python -m trading_platform.cli monte-carlo \
     --config config/backtest_default.json \
     --data-file btc.csv
 
 # variante : bootstrap de la courbe d'equity, 500 tirages, graine fixée
-python -m trading_backtest.cli monte-carlo \
+python -m trading_platform.cli monte-carlo \
     --config config/backtest_default.json --data-file btc.csv \
     --simulations 500 --method bootstrap_equity --seed 7
 
@@ -512,7 +512,7 @@ python -m trading_backtest.cli monte-carlo \
 TB_VALIDATION__MONTE_CARLO_METHOD=bootstrap_equity \
 TB_VALIDATION__N_MONTE_CARLO=5000 \
 TB_VALIDATION__RANDOM_SEED=7 \
-    python -m trading_backtest.cli monte-carlo \
+    python -m trading_platform.cli monte-carlo \
     --config config/backtest_default.json --data-file btc.csv
 ```
 
@@ -533,7 +533,7 @@ Cette commande est la **seule** qui a besoin du réseau, donc de l'extra
 `exchange`. Les quatre options de fenêtre sont **obligatoires** :
 
 ```bash
-python -m trading_backtest.cli data download \
+python -m trading_platform.cli data download \
     --config config/backtest_default.json \
     --symbol BTC/USDT --timeframe 1h \
     --start 2023-01-01T00:00:00Z --end 2024-01-01T00:00:00Z
@@ -553,14 +553,14 @@ le CSV avec `data.synthetic` (voir l'introduction du §4) et passez-le via
 
 ```bash
 # configuration effective, valeurs par défaut appliquées
-python -m trading_backtest.cli config show --config config/backtest_default.json
+python -m trading_platform.cli config show --config config/backtest_default.json
 
 # le même contenu en JSON
-python -m trading_backtest.cli config show \
+python -m trading_platform.cli config show \
     --config config/backtest_default.json --json
 
 # validation seule (code de sortie non nul si le fichier est invalide)
-python -m trading_backtest.cli config validate --config config/backtest_default.json
+python -m trading_platform.cli config validate --config config/backtest_default.json
 ```
 
 `config validate` est le premier réflexe en cas de doute : il vérifie les clés
@@ -702,11 +702,11 @@ exactement les mêmes commandes que `make check` en local.
 | `make test-cov` | la commande complète de `docs/testing-policy.md` §3 | tests + gate de couverture |
 | `make cov` | la même commande avec `--cov-report=html` | tests + rapport HTML `htmlcov/` |
 | `make check` | `lint` + `type-check` + `test-cov` | porte complète avant push |
-| `make backtest` | `python -m trading_backtest backtest --config $(CONFIG)` | backtest unique (`CONFIG=…` pour changer de fichier) |
-| `make walk-forward` | `python -m trading_backtest walk-forward --config $(CONFIG)` | walk-forward |
-| `make robustness` | `python -m trading_backtest robustness --config $(CONFIG)` | balayage paramétrique |
-| `make monte-carlo` | `python -m trading_backtest monte-carlo --config $(CONFIG)` | Monte Carlo |
-| `make data-download` | `python -m trading_backtest data download …` | remplissage du cache (seule cible qui utilise le réseau) |
+| `make backtest` | `python -m trading_platform backtest --config $(CONFIG)` | backtest unique (`CONFIG=…` pour changer de fichier) |
+| `make walk-forward` | `python -m trading_platform walk-forward --config $(CONFIG)` | walk-forward |
+| `make robustness` | `python -m trading_platform robustness --config $(CONFIG)` | balayage paramétrique |
+| `make monte-carlo` | `python -m trading_platform monte-carlo --config $(CONFIG)` | Monte Carlo |
+| `make data-download` | `python -m trading_platform data download …` | remplissage du cache (seule cible qui utilise le réseau) |
 | `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + tableau de bord (§11) |
 | `make docker-build` | `docker build` | construction de l'image |
 | `make docker-test` | `docker build --target test` puis `docker run … pytest tests --cov-fail-under=85` | suite complète dans le conteneur |
@@ -734,7 +734,7 @@ l'identique sur une autre machine.
 ```bash
 # construction (la dernière étape du Dockerfile est `test` : la suite tourne
 # pendant le build ; `docker build --target base` ne construit que le runtime)
-docker build -t trading-backtest:latest .
+docker build -t trading-platform:latest .
 
 # suite complète + gate de couverture dans le conteneur
 make docker-test
@@ -748,11 +748,11 @@ La reproductibilité conteneurisée est vérifiée localement avec
 `make docker-test`, à la demande.
 
 Pour rejouer un backtest dans le conteneur avec vos données : l'`ENTRYPOINT` de
-l'image est `python -m trading_backtest`, la commande se passe donc directement
+l'image est `python -m trading_platform`, la commande se passe donc directement
 en arguments.
 
 ```bash
-docker run --rm -v "$PWD/reports:/app/reports" trading-backtest:latest \
+docker run --rm -v "$PWD/reports:/app/reports" trading-platform:latest \
     backtest \
     --config config/backtest_default.json --data-file data/btc.csv
 ```
@@ -766,7 +766,7 @@ même chose :
 
 | Fichier | Consommateur | Rôle |
 | --- | --- | --- |
-| `config/backtest_default.json` | `trading_backtest.config.AppConfig` | configuration du **moteur de backtest** : données, stratégie, exécution, validation, rapports |
+| `config/backtest_default.json` | `trading_platform.config.AppConfig` | configuration du **moteur de backtest** : données, stratégie, exécution, validation, rapports |
 | `config/freqtrade_config.json` | Freqtrade | configuration d'un **bot** (exchange, `stake_currency`, `dry_run=false`, paires en liste blanche…) |
 | `config/freqtrade_dryrun.json` | Freqtrade | même chose avec `dry_run=true` : paper trading sur flux réel |
 
@@ -785,8 +785,8 @@ Points clés :
 
 ### 9.1 Exposer une stratégie à Freqtrade / dry-run
 
-La stratégie s'écrit **une seule fois** dans `trading_backtest.strategy` (voir
-[`docs/architecture.md`](architecture.md#49-ladaptateur-freqtrade--écrire-une-stratégie-une-fois-lexposer-deux-fois)
+La stratégie s'écrit **une seule fois** dans `trading_platform.strategy` (voir
+[`docs/architecture.md`](architecture.md#49-ladaptateur-freqtrade-écrire-une-stratégie-une-fois-lexposer-deux-fois)
 pour le contrat de traduction). L'exposition à Freqtrade se fait ensuite sans
 écrire de code métier.
 
@@ -842,7 +842,7 @@ sur la machine cible), pointez le répertoire explicitement avec
 Le backtest Freqtrade et le backtest maison **ne donnent pas les mêmes
 chiffres** : les signaux sont partagés, pas l'exécution. L'écart est documenté
 et attendu — voir le §4.9.4 de
-[`docs/architecture.md`](architecture.md#494-lécart-de-modèle-dexécution--écrit-noir-sur-blanc).
+[`docs/architecture.md`](architecture.md#494-lécart-de-modèle-dexécution-écrit-noir-sur-blanc).
 
 Parcours recommandé :
 
@@ -858,7 +858,7 @@ backtest  →  robustness  →  walk-forward  →  monte-carlo
 
 | Symptôme | Cause probable | Action |
 | --- | --- | --- |
-| `ConfigError` au démarrage | clé inconnue ou mal typée dans le JSON | `python -m trading_backtest.cli config validate --config …` |
+| `ConfigError` au démarrage | clé inconnue ou mal typée dans le JSON | `python -m trading_platform.cli config validate --config …` |
 | `DataValidationError` | colonne obligatoire absente, `NaN`, prix ou volume non positif, index non temporel, trous au-delà de `max_gap_factor` | corriger la source ; voir le contrat OHLCV dans [`docs/architecture.md`](architecture.md#5-contrat-de-données-ohlcv) (le tri, les doublons et un index naïf sont corrigés automatiquement par `ensure_ohlcv`) |
 | `InsufficientDataError` | historique trop court pour la fenêtre demandée | réduire `validation.n_windows` / `validation.in_sample_ratio` ou allonger `data.start` |
 | `DataDownloadError` | extra `exchange` absent ou API indisponible | `pip install -e ".[exchange]"` ou utiliser `--data-file` |
@@ -880,17 +880,17 @@ Le contrat complet (interfaces, API, limites assumées) est dans
 
 ```bash
 # pré-vol statique : ne passe AUCUN ordre, ne touche PAS au réseau
-python -m trading_backtest realtime check --profiles config/profiles.example.json
+python -m trading_platform realtime check --profiles config/profiles.example.json
 
 # un seul tick déterministe (ancre realtime.start_at), puis sortie 0
-python -m trading_backtest realtime run --profiles config/profiles.example.json --once --json
+python -m trading_platform realtime run --profiles config/profiles.example.json --once --json
 
 # moteur + tableau de bord (port 0 = port éphémère choisi par l'OS)
-python -m trading_backtest realtime run --profiles config/profiles.example.json \
+python -m trading_platform realtime run --profiles config/profiles.example.json \
     --host 127.0.0.1 --port 8080
 
 # surveillance seule, LECTURE SEULE, sur l'état déjà persisté
-python -m trading_backtest realtime serve --profiles config/profiles.example.json --port 8080
+python -m trading_platform realtime serve --profiles config/profiles.example.json --port 8080
 ```
 
 | Commande | Options | Rôle |
@@ -1091,7 +1091,7 @@ même fichier échoue avec `StateStoreError` (verrou de fichier), et une base
 
 ```bash
 # un tick, puis inspection directe de l'état persisté
-python -m trading_backtest realtime run --profiles config/profiles.example.json --once
+python -m trading_platform realtime run --profiles config/profiles.example.json --once
 sqlite3 data/realtime/state.db "select profile_id, timestamp, equity from equity;"
 sqlite3 data/realtime/state.db "select key, value from meta where key like 'last_candle%';"
 ```

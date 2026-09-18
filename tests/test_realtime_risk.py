@@ -1,7 +1,7 @@
 """Tests of the realtime safety layer: limits, kill switch and the live gate.
 
 Everything here is offline and deterministic: the clock is a
-:class:`~trading_backtest.realtime.clock.ManualClock` advanced explicitly, the
+:class:`~trading_platform.realtime.clock.ManualClock` advanced explicitly, the
 meta store is a local in-memory fake (this package never imports
 ``realtime.store``) and no test touches the network or the wall clock.
 """
@@ -16,11 +16,11 @@ from typing import Any
 
 import pytest
 
-from trading_backtest.config.models import ProfileConfig, RiskLimitsConfig
-from trading_backtest.core.errors import KillSwitchActiveError, LiveTradingForbiddenError
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.models import OrderRequest, OrderSide, OrderType, RunMode
-from trading_backtest.realtime.risk import (
+from trading_platform.config.models import ProfileConfig, RiskLimitsConfig
+from trading_platform.core.errors import KillSwitchActiveError, LiveTradingForbiddenError
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.models import OrderRequest, OrderSide, OrderType, RunMode
+from trading_platform.realtime.risk import (
     ENV_KILL_SWITCH,
     KILL_SWITCH_CHANGED_META_KEY,
     KILL_SWITCH_META_KEY,
@@ -34,7 +34,7 @@ from trading_backtest.realtime.risk import (
     RiskManager,
 )
 
-LOGGER_NAME = "trading_backtest.realtime.risk"
+LOGGER_NAME = "trading_platform.realtime.risk"
 
 
 # ---------------------------------------------------------------------------

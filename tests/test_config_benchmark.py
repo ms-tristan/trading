@@ -8,16 +8,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from trading_backtest import config as config_module
-from trading_backtest.config import (
+from trading_platform import config as config_module
+from trading_platform.config import (
     AppConfig,
     BenchmarkConfig,
     default_config,
     load_config,
 )
-from trading_backtest.config import models as config_models
-from trading_backtest.core.errors import ConfigError
-from trading_backtest.freqtrade import validate_freqtrade_config
+from trading_platform.config import models as config_models
+from trading_platform.core.errors import ConfigError
+from trading_platform.freqtrade import validate_freqtrade_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_ROOT / "config"

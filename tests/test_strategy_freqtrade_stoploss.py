@@ -1,4 +1,4 @@
-"""Tests of the per-candle stop-loss bridge (:mod:`trading_backtest.strategy.freqtrade_stoploss`).
+"""Tests of the per-candle stop-loss bridge (:mod:`trading_platform.strategy.freqtrade_stoploss`).
 
 Everything here is **offline and deterministic**:
 
@@ -22,10 +22,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import trading_backtest.strategy.freqtrade_stoploss as stoploss_module
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, SIGNAL_COLUMNS
-from trading_backtest.core.errors import ConfigError, StrategyError
-from trading_backtest.strategy.freqtrade_stoploss import (
+import trading_platform.strategy.freqtrade_stoploss as stoploss_module
+from trading_platform.core.constants import OHLCV_INDEX_NAME, SIGNAL_COLUMNS
+from trading_platform.core.errors import ConfigError, StrategyError
+from trading_platform.strategy.freqtrade_stoploss import (
     DEFAULT_FREQTRADE_STOPLOSS,
     FREQTRADE_STOPLOSS_COLUMN,
     candle_floor,
@@ -34,7 +34,7 @@ from trading_backtest.strategy.freqtrade_stoploss import (
     signal_candle_for,
     stoploss_ratio_from_absolute,
 )
-from trading_backtest.strategy.registry import get_strategy
+from trading_platform.strategy.registry import get_strategy
 
 MODULE_PATH = Path(str(stoploss_module.__file__))
 CACHE_PATH = Path("data/cache/binance/BTC_USDT/1h.parquet")
@@ -118,7 +118,7 @@ def test_freqtrade_is_imported_lazily_inside_the_ratio_helper() -> None:
 def test_import_of_the_module_does_not_load_freqtrade() -> None:
     """Importing the adapter support module must not pull the optional extra in."""
     code = (
-        "import sys, trading_backtest.strategy.freqtrade_stoploss as m;"
+        "import sys, trading_platform.strategy.freqtrade_stoploss as m;"
         "print('freqtrade' in sys.modules, m.FREQTRADE_STOPLOSS_COLUMN)"
     )
     import subprocess
@@ -209,7 +209,7 @@ def test_candle_floor(timestamp: object, timeframe: str, expected: str) -> None:
 
 @pytest.mark.parametrize("timeframe", ["2h", "1w", "", "1H"])
 def test_candle_floor_rejects_an_unsupported_timeframe(timeframe: str) -> None:
-    """The timeframe table of :mod:`trading_backtest.core.constants` is the only source."""
+    """The timeframe table of :mod:`trading_platform.core.constants` is the only source."""
     with pytest.raises(ConfigError):
         candle_floor("2023-01-01T12:00:00Z", timeframe)
 
@@ -358,7 +358,7 @@ def test_ratio_helper_without_freqtrade_raises_strategy_error(
         stoploss_ratio_from_absolute(100.0, 110.0, is_short=False)
     message = str(excinfo.value)
     assert "freqtrade is not installed" in message
-    assert "trading-backtest[freqtrade]" in message
+    assert "trading-platform[freqtrade]" in message
 
 
 # ---------------------------------------------------------------------------

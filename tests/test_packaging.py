@@ -15,7 +15,7 @@ import re
 import tomllib
 from pathlib import Path
 
-import trading_backtest
+import trading_platform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -28,7 +28,7 @@ REQUIREMENTS_DEV = REPO_ROOT / "requirements-dev.txt"
 REQUIREMENTS_FREQTRADE = REPO_ROOT / "requirements-freqtrade.txt"
 
 #: The FULL pytest command of docs/testing-policy.md section 3, byte for byte.
-COVERAGE_FLAGS = "--cov=trading_backtest --cov-report=term-missing --cov-report=xml"
+COVERAGE_FLAGS = "--cov=trading_platform --cov-report=term-missing --cov-report=xml"
 
 #: Coverage gate enforced by pyproject.toml and docker.
 COVERAGE_THRESHOLD = 85
@@ -111,15 +111,15 @@ def makefile_text() -> str:
 def test_pyproject_parses_and_version_matches_the_package() -> None:
     document = pyproject()
 
-    assert document["project"]["name"] == "trading-backtest"
-    assert document["project"]["version"] == trading_backtest.__version__
+    assert document["project"]["name"] == "trading-platform"
+    assert document["project"]["version"] == trading_platform.__version__
     assert document["project"]["requires-python"].startswith(">=3.11")
 
 
 def test_console_script_points_at_the_cli_main() -> None:
     document = pyproject()
 
-    assert document["project"]["scripts"]["trading-backtest"] == "trading_backtest.cli:main"
+    assert document["project"]["scripts"]["trading-backtest"] == "trading_platform.cli:main"
 
 
 def test_coverage_gate_is_wired_and_equals_85() -> None:
@@ -131,7 +131,7 @@ def test_coverage_gate_is_wired_and_equals_85() -> None:
         in document["tool"]["pytest"]["ini_options"]["addopts"]
     )
     assert document["tool"]["coverage"]["run"]["branch"] is False
-    assert document["tool"]["coverage"]["run"]["source"] == ["trading_backtest"]
+    assert document["tool"]["coverage"]["run"]["source"] == ["trading_platform"]
 
 
 def test_testing_policy_pins_the_full_command_and_the_threshold() -> None:
@@ -237,7 +237,7 @@ def test_makefile_pipeline_targets_use_the_cli() -> None:
     text = makefile_text()
 
     for command in ("backtest", "walk-forward", "robustness", "monte-carlo"):
-        assert f"$(PYTHON) -m trading_backtest {command} --config $(CONFIG)" in text
+        assert f"$(PYTHON) -m trading_platform {command} --config $(CONFIG)" in text
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +255,7 @@ def test_dockerfile_contract() -> None:
     assert "requirements-dev.txt" in text
     assert "pip install --no-cache-dir ." in text
     assert (
-        "RUN python -m pytest tests --cov=trading_backtest --cov-report=term-missing "
+        "RUN python -m pytest tests --cov=trading_platform --cov-report=term-missing "
         f"--cov-fail-under={COVERAGE_THRESHOLD}" in text
     )
     assert "PYTHONDONTWRITEBYTECODE=1" in text
@@ -268,7 +268,7 @@ def test_dockerfile_contract() -> None:
 def test_dockerfile_ends_with_the_cli_entrypoint() -> None:
     lines = [line for line in read(DOCKERFILE).splitlines() if line.strip()]
 
-    assert lines[-1] == 'ENTRYPOINT ["python", "-m", "trading_backtest"]'
+    assert lines[-1] == 'ENTRYPOINT ["python", "-m", "trading_platform"]'
 
 
 def test_dockerfile_test_stage_copies_the_suite() -> None:

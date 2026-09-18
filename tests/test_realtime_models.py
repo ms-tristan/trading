@@ -3,15 +3,15 @@
 Covers, offline and deterministically:
 
 * the twelve new error classes of the realtime branch and their exact edges;
-* the layer-1 rule (``trading_backtest.core.errors`` imports no project module);
+* the layer-1 rule (``trading_platform.core.errors`` imports no project module);
 * the frozen realtime vocabulary: frozen dataclasses, JSON-native ``to_dict()``
   payloads (no ``NaN``/``Inf``, no pandas object) and lossless ``from_dict()``;
-* :func:`trading_backtest.realtime.models.new_client_order_id`;
+* :func:`trading_platform.realtime.models.new_client_order_id`;
 * the ``Clock`` seam (``SystemClock``, ``ManualClock``);
 * the typed profile / realtime / monitoring configuration;
 * ``load_profiles`` / ``load_realtime_config`` / ``load_monitoring_config``;
 * ``config/profiles.example.json`` (no credential-ish key, valid as-is);
-* the lazy packaging of ``trading_backtest.realtime``.
+* the lazy packaging of ``trading_platform.realtime``.
 
 No network, no wall-clock dependency, no fixed TCP port, no shared fixture: every
 helper is local to this module.
@@ -38,7 +38,7 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-from trading_backtest.config import (
+from trading_platform.config import (
     AppConfig,
     MonitoringConfig,
     ProfileConfig,
@@ -50,8 +50,8 @@ from trading_backtest.config import (
     load_profiles,
     load_realtime_config,
 )
-from trading_backtest.core import errors as core_errors
-from trading_backtest.core.errors import (
+from trading_platform.core import errors as core_errors
+from trading_platform.core.errors import (
     BrokerError,
     BrokerUnavailableError,
     ConfigError,
@@ -67,9 +67,9 @@ from trading_backtest.core.errors import (
     StateStoreError,
     TradingBacktestError,
 )
-from trading_backtest.core.models import Direction
-from trading_backtest.realtime.clock import Clock, ManualClock, SystemClock
-from trading_backtest.realtime.models import (
+from trading_platform.core.models import Direction
+from trading_platform.realtime.clock import Clock, ManualClock, SystemClock
+from trading_platform.realtime.models import (
     BrokerAck,
     BrokerEvent,
     BrokerEventType,
@@ -264,19 +264,19 @@ def test_error_all_exports_are_sorted_and_complete() -> None:
 def test_core_errors_is_importable_without_any_project_import() -> None:
     code = (
         "import json, sys\n"
-        "import trading_backtest.core.errors\n"
-        "print(json.dumps(sorted(m for m in sys.modules if m.startswith('trading_backtest'))))\n"
+        "import trading_platform.core.errors\n"
+        "print(json.dumps(sorted(m for m in sys.modules if m.startswith('trading_platform'))))\n"
     )
     result = run_python(code)
     assert result.returncode == 0, result.stderr
     loaded = json.loads(result.stdout.strip().splitlines()[-1])
     assert loaded, "the subprocess must at least see the package under test"
     for module in loaded:
-        assert module == "trading_backtest" or module.startswith("trading_backtest.core"), (
-            f"importing trading_backtest.core.errors must not pull in {module}"
+        assert module == "trading_platform" or module.startswith("trading_platform.core"), (
+            f"importing trading_platform.core.errors must not pull in {module}"
         )
     for layer in ("config", "data", "realtime", "strategy", "metrics", "reporting", "web"):
-        assert f"trading_backtest.{layer}" not in loaded
+        assert f"trading_platform.{layer}" not in loaded
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +695,7 @@ def test_new_client_order_id_is_deterministic_and_timezone_agnostic() -> None:
 def test_new_client_order_id_does_not_read_the_wall_clock() -> None:
     code = (
         "import pandas as pd\n"
-        "from trading_backtest.realtime.models import new_client_order_id\n"
+        "from trading_platform.realtime.models import new_client_order_id\n"
         "print(new_client_order_id('btc-paper', 'BTC/USDT', pd.Timestamp('2024-01-01T00:00:00Z'), 0))\n"
     )
     result = run_python(code)
@@ -1152,14 +1152,14 @@ def test_gitignore_covers_the_realtime_runtime_state() -> None:
 def test_importing_the_package_is_lazy_and_side_effect_free() -> None:
     code = (
         "import json, sys\n"
-        "import trading_backtest.realtime as rt\n"
+        "import trading_platform.realtime as rt\n"
         "payload = {\n"
         "    'clock': rt.Clock.__name__,\n"
         "    'manual': rt.ManualClock.__name__,\n"
         "    'mode': rt.RunMode.PAPER.value,\n"
         "    'candle': rt.CandleEvent.__name__,\n"
         "    'gateway_exported': 'ExecutionGateway' in rt.__all__,\n"
-        "    'names': sorted(m for m in sys.modules if m.startswith('trading_backtest.realtime')),\n"
+        "    'names': sorted(m for m in sys.modules if m.startswith('trading_platform.realtime')),\n"
         "    'optional': sorted(m for m in ('ccxt', 'freqtrade') if m in sys.modules),\n"
         "}\n"
         "print(json.dumps(payload))\n"
@@ -1172,16 +1172,16 @@ def test_importing_the_package_is_lazy_and_side_effect_free() -> None:
     assert payload["mode"] == "paper"
     assert payload["candle"] == "CandleEvent"
     assert payload["gateway_exported"] is True
-    assert "trading_backtest.realtime.stream" not in payload["names"]
-    assert "trading_backtest.realtime.store" not in payload["names"]
-    assert "trading_backtest.realtime.broker" not in payload["names"]
-    assert "trading_backtest.realtime.gateway" not in payload["names"]
+    assert "trading_platform.realtime.stream" not in payload["names"]
+    assert "trading_platform.realtime.store" not in payload["names"]
+    assert "trading_platform.realtime.broker" not in payload["names"]
+    assert "trading_platform.realtime.gateway" not in payload["names"]
     assert payload["optional"] == []
 
 
 def test_lazy_map_targets_only_realtime_sibling_modules() -> None:
     """Every lazily exported name points at a submodule of the realtime package."""
-    from trading_backtest.realtime import _LAZY
+    from trading_platform.realtime import _LAZY
 
     assert _LAZY, "the lazy export map must not be empty"
     for name, module in _LAZY.items():
@@ -1207,11 +1207,11 @@ def test_lazy_getattr_resolves_a_sibling_module(monkeypatch: pytest.MonkeyPatch)
     """The lazy path (import + getattr) is exercised without needing the siblings."""
     import types
 
-    import trading_backtest.realtime as realtime
+    import trading_platform.realtime as realtime
 
-    fake = types.ModuleType("trading_backtest.realtime._fake_sibling")
+    fake = types.ModuleType("trading_platform.realtime._fake_sibling")
     fake.MarketStream = "resolved"  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "trading_backtest.realtime._fake_sibling", fake)
+    monkeypatch.setitem(sys.modules, "trading_platform.realtime._fake_sibling", fake)
     monkeypatch.setitem(realtime._LAZY, "MarketStream", "_fake_sibling")
     assert realtime.MarketStream == "resolved"
     assert "MarketStream" in dir(realtime)
@@ -1219,14 +1219,14 @@ def test_lazy_getattr_resolves_a_sibling_module(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:
-    import trading_backtest.realtime as realtime
+    import trading_platform.realtime as realtime
 
     with pytest.raises(AttributeError, match="has no attribute 'nope'"):
         _ = realtime.nope
 
 
 def test_realtime_models_module_exports_are_sorted() -> None:
-    from trading_backtest.realtime import models as realtime_models
+    from trading_platform.realtime import models as realtime_models
 
     assert realtime_models.__all__ == sorted(realtime_models.__all__)
     for name in realtime_models.__all__:
@@ -1234,7 +1234,7 @@ def test_realtime_models_module_exports_are_sorted() -> None:
 
 
 def test_realtime_models_and_clock_are_exported_eagerly() -> None:
-    import trading_backtest.realtime as realtime
+    import trading_platform.realtime as realtime
 
     for name in ("Clock", "ManualClock", "SystemClock", "RunMode", "CandleEvent", "Order"):
         assert name in realtime.__all__

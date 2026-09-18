@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from trading_backtest.realtime.models import EngineCounters
-from trading_backtest.realtime.observability import (
+from trading_platform.realtime.models import EngineCounters
+from trading_platform.realtime.observability import (
     LOGGER_NAME,
     Counters,
     JsonLogFormatter,
@@ -37,8 +37,8 @@ from trading_backtest.realtime.observability import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-REALTIME_DIR = SRC_ROOT / "trading_backtest" / "realtime"
-WEB_DIR = SRC_ROOT / "trading_backtest" / "web"
+REALTIME_DIR = SRC_ROOT / "trading_platform" / "realtime"
+WEB_DIR = SRC_ROOT / "trading_platform" / "web"
 
 #: A value that must never survive redaction.
 SENTINEL = "s3cr3t-API-KEY-0123456789"
@@ -106,7 +106,7 @@ def _records(capture: object) -> list[logging.LogRecord]:
 def test_json_formatter_emits_one_line_per_record(capture: object) -> None:
     """Every record becomes one line of valid JSON carrying the documented keys."""
     logger = logging.getLogger(LOGGER_NAME)
-    assert str(logger.name) == "trading_backtest.realtime"
+    assert str(logger.name) == "trading_platform.realtime"
     log_event(
         logger,
         "candle_processed",
@@ -424,10 +424,10 @@ def test_log_path_is_deterministic_for_a_date(tmp_path: Path) -> None:
 
 _IMPORT_PROBE = """
 import sys
-import trading_backtest.realtime.orchestrator
-import trading_backtest.realtime.runner
-import trading_backtest.realtime.observability
-import trading_backtest.realtime.strategies
+import trading_platform.realtime.orchestrator
+import trading_platform.realtime.runner
+import trading_platform.realtime.observability
+import trading_platform.realtime.strategies
 forbidden = [name for name in ("ccxt", "freqtrade") if name in sys.modules]
 print("FORBIDDEN:" + ",".join(forbidden))
 """

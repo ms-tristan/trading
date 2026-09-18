@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from trading_backtest.config import (
+from trading_platform.config import (
     AppConfig,
     BacktestConfig,
     DataConfig,
@@ -20,8 +20,8 @@ from trading_backtest.config import (
     load_config,
     override_params,
 )
-from trading_backtest.core.constants import DEFAULT_TIMEFRAME
-from trading_backtest.core.errors import ConfigError
+from trading_platform.core.constants import DEFAULT_TIMEFRAME
+from trading_platform.core.errors import ConfigError
 
 # ---------------------------------------------------------------------------
 # defaults
@@ -30,7 +30,7 @@ from trading_backtest.core.errors import ConfigError
 
 def test_root_defaults_are_exactly_the_documented_ones() -> None:
     cfg = default_config()
-    assert cfg.project_name == "trading-backtest"
+    assert cfg.project_name == "trading-platform"
     assert cfg.log_level == "INFO"
     assert AppConfig.model_config["env_prefix"] == "TB_"
     assert AppConfig.model_config["env_nested_delimiter"] == "__"
@@ -330,7 +330,7 @@ def test_dump_config_is_sorted_and_indented(tmp_path: Path) -> None:
     path = dump_config(default_config(), tmp_path / "config.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert list(payload) == sorted(payload)
-    assert payload["project_name"] == "trading-backtest"
+    assert payload["project_name"] == "trading-platform"
     assert payload["data"]["cache_dir"] == "data/cache"
 
 

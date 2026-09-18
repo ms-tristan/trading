@@ -1,9 +1,9 @@
 """Tests of the realtime orchestrator: N profiles, one platform.
 
 The orchestrator is the assembly point of the layer, so these tests use the **real**
-:class:`~trading_backtest.realtime.store.SqliteStateStore`,
-:class:`~trading_backtest.realtime.gateway.ExecutionGateway` and
-:class:`~trading_backtest.realtime.broker.PaperBroker` (all offline and
+:class:`~trading_platform.realtime.store.SqliteStateStore`,
+:class:`~trading_platform.realtime.gateway.ExecutionGateway` and
+:class:`~trading_platform.realtime.broker.PaperBroker` (all offline and
 deterministic) and inject only the two seams that would otherwise reach the outside
 world: the market stream and the venue adapter factory.  Nothing here binds a port,
 touches the network or reads the wall clock.
@@ -25,17 +25,17 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import (
+from trading_platform.config.models import (
     MonitoringConfig,
     ProfileConfig,
     RealtimeConfig,
     RiskLimitsConfig,
 )
-from trading_backtest.core.errors import MarketStreamError, ProfileError
-from trading_backtest.realtime import runner as runner_module
-from trading_backtest.realtime.broker import PaperBroker
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.models import (
+from trading_platform.core.errors import MarketStreamError, ProfileError
+from trading_platform.realtime import runner as runner_module
+from trading_platform.realtime.broker import PaperBroker
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.models import (
     CandleEvent,
     PlatformSnapshot,
     ProfileSnapshot,
@@ -45,14 +45,14 @@ from trading_backtest.realtime.models import (
     SignalAction,
     TradeSignalDecision,
 )
-from trading_backtest.realtime.orchestrator import (
+from trading_platform.realtime.orchestrator import (
     RealtimeOrchestrator,
     default_broker_factory,
     make_live_gate,
     make_risk_manager,
 )
-from trading_backtest.realtime.store import SqliteStateStore
-from trading_backtest.strategy.base import Strategy, StrategyParams, ensure_signal_frame
+from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.strategy.base import Strategy, StrategyParams, ensure_signal_frame
 
 TIMEOUT = 30.0
 
@@ -301,7 +301,7 @@ def build_orchestrator(
 @pytest.fixture
 def logs() -> Any:
     """Attach a capturing handler to the realtime logger for one test."""
-    logger = logging.getLogger("trading_backtest.realtime")
+    logger = logging.getLogger("trading_platform.realtime")
     records: list[logging.LogRecord] = []
 
     class _Handler(logging.Handler):
@@ -521,7 +521,7 @@ def test_the_kill_switch_blocks_every_profile_and_survives_a_restart(
 
 def test_the_kill_switch_can_be_forced_by_a_file(tmp_path: Path) -> None:
     """The file force wins and survives a release attempt."""
-    from trading_backtest.core.errors import KillSwitchActiveError
+    from trading_platform.core.errors import KillSwitchActiveError
 
     flag = tmp_path / "KILL"
     flag.write_text("operator\n", encoding="utf-8")
@@ -764,7 +764,7 @@ def test_make_live_gate_follows_the_environment() -> None:
 
 def test_make_risk_manager_carries_the_profile_limits() -> None:
     """The per-profile limits and the kill switch reach the manager."""
-    from trading_backtest.realtime.risk import KillSwitch
+    from trading_platform.realtime.risk import KillSwitch
 
     clock = ManualClock()
     target = profile(

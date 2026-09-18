@@ -1,7 +1,7 @@
 """Contract tests of the strategy base layer.
 
 The strategy used here is defined *inside* the test module on purpose: it must
-never import :mod:`trading_backtest.strategy.basic`, so the ABC contract is
+never import :mod:`trading_platform.strategy.basic`, so the ABC contract is
 pinned independently of any concrete strategy.
 """
 
@@ -14,9 +14,9 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-from trading_backtest.core.constants import SIGNAL_COLUMNS
-from trading_backtest.core.errors import StrategyError
-from trading_backtest.strategy.base import (
+from trading_platform.core.constants import SIGNAL_COLUMNS
+from trading_platform.core.errors import StrategyError
+from trading_platform.strategy.base import (
     BOOL_SIGNAL_COLUMNS,
     Strategy,
     StrategyParams,

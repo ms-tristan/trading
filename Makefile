@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# trading-backtest -- developer tasks
+# trading-platform -- developer tasks
 #
 # `make` (or `make help`) lists every target. The interpreter is the local
 # virtualenv when it exists and python3.11 otherwise, so the same Makefile
@@ -14,8 +14,8 @@ SHELL := /bin/bash
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python3.11; fi)
 
 CONFIG ?= config/backtest_default.json
-DOCKER_IMAGE ?= trading-backtest:latest
-DOCKER_TEST_IMAGE ?= trading-backtest:test
+DOCKER_IMAGE ?= trading-platform:latest
+DOCKER_TEST_IMAGE ?= trading-platform:test
 
 .DEFAULT_GOAL := help
 .PHONY: help venv install install-dev lint format type-check test test-cov cov check \
@@ -26,7 +26,7 @@ DOCKER_TEST_IMAGE ?= trading-backtest:test
 # ---------------------------------------------------------------------------
 
 help: ## Show this help (every target below is runnable)
-	@echo "trading-backtest -- available targets"
+	@echo "trading-platform -- available targets"
 	@echo ""
 	@echo "  make help           show this help"
 	@echo "  make venv           create the .venv virtualenv with python3.11"
@@ -81,10 +81,10 @@ test: ## Run the test-suite without the coverage gate
 	$(PYTHON) -m pytest tests -q
 
 test-cov: ## Run the test-suite with the coverage gate (docs/testing-policy.md section 3)
-	$(PYTHON) -m pytest tests --cov=trading_backtest --cov-report=term-missing --cov-report=xml
+	$(PYTHON) -m pytest tests --cov=trading_platform --cov-report=term-missing --cov-report=xml
 
 cov: ## Run the test-suite and write a browsable htmlcov/ report
-	$(PYTHON) -m pytest tests --cov=trading_backtest --cov-report=term-missing --cov-report=html
+	$(PYTHON) -m pytest tests --cov=trading_platform --cov-report=term-missing --cov-report=html
 
 check: lint type-check test-cov ## Full pre-push gate: lint + type-check + test-cov
 
@@ -93,24 +93,24 @@ check: lint type-check test-cov ## Full pre-push gate: lint + type-check + test-
 # ---------------------------------------------------------------------------
 
 backtest: ## Run a single backtest (CONFIG=... to override)
-	$(PYTHON) -m trading_backtest backtest --config $(CONFIG)
+	$(PYTHON) -m trading_platform backtest --config $(CONFIG)
 
 walk-forward: ## Run the walk-forward analysis
-	$(PYTHON) -m trading_backtest walk-forward --config $(CONFIG)
+	$(PYTHON) -m trading_platform walk-forward --config $(CONFIG)
 
 robustness: ## Run the parametric robustness sweep
-	$(PYTHON) -m trading_backtest robustness --config $(CONFIG)
+	$(PYTHON) -m trading_platform robustness --config $(CONFIG)
 
 monte-carlo: ## Run the Monte Carlo simulation
-	$(PYTHON) -m trading_backtest monte-carlo --config $(CONFIG)
+	$(PYTHON) -m trading_platform monte-carlo --config $(CONFIG)
 
 data-download: ## Fill the on-disk OHLCV cache (only network-using target)
-	$(PYTHON) -m trading_backtest data download --config $(CONFIG) \
+	$(PYTHON) -m trading_platform data download --config $(CONFIG) \
 		--symbol "$${SYMBOL:-BTC/USDT}" --timeframe "$${TIMEFRAME:-1h}" \
 		--start "$${START:-2023-01-01T00:00:00Z}" --end "$${END:-2024-01-01T00:00:00Z}"
 
 realtime: ## Run the realtime engine and the monitoring dashboard (PROFILES=... to override)
-	$(PYTHON) -m trading_backtest realtime run --profiles $${PROFILES:-config/profiles.example.json}
+	$(PYTHON) -m trading_platform realtime run --profiles $${PROFILES:-config/profiles.example.json}
 
 # ---------------------------------------------------------------------------
 # docker (reproducible environment)
@@ -122,7 +122,7 @@ docker-build: ## Build the docker image
 docker-test: ## Build the docker test stage, then run the full suite with the coverage gate
 	docker build --target test -t $(DOCKER_TEST_IMAGE) .
 	docker run --rm --entrypoint python $(DOCKER_TEST_IMAGE) -m pytest tests \
-		--cov=trading_backtest --cov-report=term-missing --cov-report=xml --cov-fail-under=85
+		--cov=trading_platform --cov-report=term-missing --cov-report=xml --cov-fail-under=85
 
 # ---------------------------------------------------------------------------
 # housekeeping

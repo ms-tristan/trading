@@ -2,7 +2,7 @@
 
 The strategy used is scripted (the exact candle of every signal is chosen by the
 test), so the expected fills, fees, sizes and exit reasons are derived by hand
-from the rules stated in :mod:`trading_backtest.strategy.engine`.
+from the rules stated in :mod:`trading_platform.strategy.engine`.
 """
 
 from __future__ import annotations
@@ -14,12 +14,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import SIGNAL_COLUMNS
-from trading_backtest.core.errors import InsufficientDataError, StrategyError
-from trading_backtest.core.models import BacktestResult, Direction, ExitReason
-from trading_backtest.strategy.base import Strategy, StrategyParams, require_ohlcv_frame
-from trading_backtest.strategy.basic import BasicStrategy
-from trading_backtest.strategy.engine import make_runner, run_backtest, run_backtest_on_config
+from trading_platform.core.constants import SIGNAL_COLUMNS
+from trading_platform.core.errors import InsufficientDataError, StrategyError
+from trading_platform.core.models import BacktestResult, Direction, ExitReason
+from trading_platform.strategy.base import Strategy, StrategyParams, require_ohlcv_frame
+from trading_platform.strategy.basic import BasicStrategy
+from trading_platform.strategy.engine import make_runner, run_backtest, run_backtest_on_config
 
 START = "2024-01-01T00:00:00Z"
 

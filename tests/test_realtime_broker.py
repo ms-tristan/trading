@@ -34,11 +34,11 @@ from typing import Any, ClassVar
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import BrokerError, BrokerUnavailableError
-from trading_backtest.realtime.broker import Broker, CcxtBroker, PaperBroker
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.credentials import ExchangeCredentials
-from trading_backtest.realtime.models import (
+from trading_platform.core.errors import BrokerError, BrokerUnavailableError
+from trading_platform.realtime.broker import Broker, CcxtBroker, PaperBroker
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.credentials import ExchangeCredentials
+from trading_platform.realtime.models import (
     BrokerAck,
     BrokerEvent,
     BrokerEventType,
@@ -1569,7 +1569,7 @@ def test_the_paper_broker_needs_no_optional_extra(monkeypatch: pytest.MonkeyPatc
 
 
 def test_the_broker_module_does_not_import_the_real_ccxt_at_module_scope() -> None:
-    source = Path("src/trading_backtest/realtime/broker.py").read_text(encoding="utf-8")
+    source = Path("src/trading_platform/realtime/broker.py").read_text(encoding="utf-8")
     imports = [
         line
         for line in source.splitlines()

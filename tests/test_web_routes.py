@@ -23,11 +23,11 @@ from typing import Any, cast
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import MonitoringConfig, ProfileConfig
-from trading_backtest.core.errors import MonitoringError, StateStoreError
-from trading_backtest.core.models import Direction, ExitReason, TradeRecord
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.models import (
+from trading_platform.config.models import MonitoringConfig, ProfileConfig
+from trading_platform.core.errors import MonitoringError, StateStoreError
+from trading_platform.core.models import Direction, ExitReason, TradeRecord
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.models import (
     EngineCounters,
     EquityPoint,
     Order,
@@ -42,8 +42,8 @@ from trading_backtest.realtime.models import (
     ProfileStatus,
     RunMode,
 )
-from trading_backtest.realtime.monitor import Monitor
-from trading_backtest.web.routes import (
+from trading_platform.realtime.monitor import Monitor
+from trading_platform.web.routes import (
     HttpResponse,
     Router,
     SnapshotProvider,
@@ -58,7 +58,7 @@ PROFILE_A = "btc-paper"
 PROFILE_B = "eth-live"
 UNKNOWN_PROFILE = "ghost"
 START = datetime(2024, 1, 1, tzinfo=UTC)
-STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "trading_backtest" / "web" / "static"
+STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "trading_platform" / "web" / "static"
 
 HEALTH_KEYS = [
     "checked_at",

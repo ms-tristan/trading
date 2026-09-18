@@ -4,7 +4,7 @@
 #
 #   build  -> python:3.11-slim + the package + the optional `exchange` extra
 #             (ccxt) so the polling market stream can reach a real exchange.
-#   run    -> `python -m trading_backtest realtime run --profiles ...`
+#   run    -> `python -m trading_platform realtime run --profiles ...`
 #             engine + monitoring dashboard on 0.0.0.0:8080 (HTTP, plain).
 #
 # TLS, authentication, rate limiting and fail2ban live in the host nginx
@@ -30,7 +30,7 @@ WORKDIR /app
 COPY requirements.txt ./
 
 # 2. the package and its deployment profiles; the `exchange` extra pulls ccxt
-#    (lazy-imported by trading_backtest.data / trading_backtest.realtime, so the
+#    (lazy-imported by trading_platform.data / trading_platform.realtime, so the
 #    test-suite never needs it but the deployed engine does)
 COPY pyproject.toml README.md ./
 COPY src ./src
@@ -51,5 +51,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).status == 200 else 1)"]
 
-ENTRYPOINT ["python", "-m", "trading_backtest"]
+ENTRYPOINT ["python", "-m", "trading_platform"]
 CMD ["realtime", "run", "--profiles", "/app/deploy/profiles.json", "--host", "0.0.0.0", "--port", "8080"]

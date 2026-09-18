@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Reproducible environment for the trading-backtest skeleton.
+# Reproducible environment for the trading-platform package.
 #
 #   base  -> runtime image: requirements.txt + the installed package
 #   test  -> base + dev dependencies + the full offline suite (85 % coverage gate)
@@ -9,9 +9,9 @@
 # download. Everything the suite touches is generated synthetically or read from
 # tests/fixtures/.
 #
-#   docker build -t trading-backtest:latest .            # base (+ test) image
-#   docker build --target test -t trading-backtest:test .# test stage only
-#   docker run --rm trading-backtest:latest backtest \
+#   docker build -t trading-platform:latest .            # base (+ test) image
+#   docker build --target test -t trading-platform:test .# test stage only
+#   docker run --rm trading-platform:latest backtest \
 #       --config config/backtest_default.json --data-file data/btc.csv
 # ---------------------------------------------------------------------------
 FROM python:3.11-slim AS base
@@ -61,11 +61,11 @@ COPY .github ./.github
 COPY requirements.txt requirements-dev.txt requirements-freqtrade.txt ./
 COPY Makefile Dockerfile .dockerignore pyproject.toml README.md ./
 
-RUN python -m pytest tests --cov=trading_backtest --cov-report=term-missing --cov-fail-under=85
+RUN python -m pytest tests --cov=trading_platform --cov-report=term-missing --cov-fail-under=85
 
 # the build-time run above wrote /app/.coverage as root: hand /app back to the
 # runtime user, which re-runs the same command through `make docker-test`
 RUN chown -R appuser:appuser /app
 USER appuser
 
-ENTRYPOINT ["python", "-m", "trading_backtest"]
+ENTRYPOINT ["python", "-m", "trading_platform"]

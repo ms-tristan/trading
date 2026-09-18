@@ -1,7 +1,7 @@
 """Tests of the persistent state store (work-package wp3).
 
 Everything here is offline and deterministic: each test owns a ``tmp_path``
-database, injects a :class:`~trading_backtest.realtime.clock.ManualClock` and never
+database, injects a :class:`~trading_platform.realtime.clock.ManualClock` and never
 touches the network.  Timestamps are explicit UTC instants, so two runs of the suite
 produce equivalent databases.
 
@@ -35,11 +35,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from trading_backtest.config.models import ProfileConfig
-from trading_backtest.core.errors import StateStoreError
-from trading_backtest.core.models import Direction, ExitReason, TradeRecord
-from trading_backtest.realtime.clock import ManualClock
-from trading_backtest.realtime.models import (
+from trading_platform.config.models import ProfileConfig
+from trading_platform.core.errors import StateStoreError
+from trading_platform.core.models import Direction, ExitReason, TradeRecord
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.models import (
     EquityPoint,
     Fill,
     Order,
@@ -51,7 +51,7 @@ from trading_backtest.realtime.models import (
     ProfileStatus,
     RunMode,
 )
-from trading_backtest.realtime.store import SCHEMA_VERSION, SqliteStateStore, StateStore
+from trading_platform.realtime.store import SCHEMA_VERSION, SqliteStateStore, StateStore
 
 #: A fixed anchor: every test starts the virtual clock here.
 START = pd.Timestamp("2024-01-01T00:00:00Z")
@@ -400,7 +400,8 @@ def test_status_round_trip(store: SqliteStateStore, clock: ManualClock) -> None:
     assert state is not None
     assert state.status is ProfileStatus.RUNNING
     assert state.last_candle_at == stamp(1)
-    assert state.last_error == "engine warm"
+    # the detail describes the *status*; it is not an error (see save_status)
+    assert state.last_error is None
     assert state.updated_at == START + timedelta(seconds=30)
     assert state == store.profile_state("btc-paper")
     assert store.load_status("unknown-profile") is None
@@ -418,6 +419,7 @@ def test_status_keeps_the_mode_of_the_saved_profile(db_path: Path, clock: Manual
 
 
 def test_status_preserves_lag_and_reconnect_count(store: SqliteStateStore) -> None:
+    """A status write keeps the rest of the health block, and clears a stale error."""
     degraded = ProfileState(
         profile_id="btc-paper",
         status=ProfileStatus.DEGRADED,
@@ -436,8 +438,41 @@ def test_status_preserves_lag_and_reconnect_count(store: SqliteStateStore) -> No
     assert state.status is ProfileStatus.RUNNING
     assert state.lag_seconds == 42.5
     assert state.reconnect_count == 7
-    assert state.last_error == "recovered"
-    assert state.last_candle_at == stamp(3)
+    # the profile is running again: the previous failure is history, not a status
+    assert state.last_error is None
+
+
+def test_the_last_error_is_only_ever_an_error(store: SqliteStateStore, db_path: Path) -> None:
+    """``ERROR`` sets it, a healthy status clears it, the detail never becomes it.
+
+    Regression test for the deployed dashboard: the detail of every status write
+    used to be stored as ``last_error``, so a healthy profile reported
+    ``last error: last candle 2024-01-05T23:00:00+00:00`` -- and after a restart it
+    reported the reason its *previous* process had stopped, for as long as the new
+    process had not failed.
+    """
+    store.save_status("btc-paper", ProfileStatus.ERROR, "BrokerError: venue refused")
+    assert store.profile_state("btc-paper").last_error == "BrokerError: venue refused"
+
+    store.save_status("btc-paper", ProfileStatus.STARTING, "starting")
+    assert store.profile_state("btc-paper").last_error is None
+
+    store.save_status("btc-paper", ProfileStatus.ERROR, "MarketStreamError: gone")
+    # a stop keeps the reason, it does not invent one from its own detail
+    store.save_status("btc-paper", ProfileStatus.STOPPED, "stopped after: MarketStreamError: gone")
+    assert store.profile_state("btc-paper").last_error == "MarketStreamError: gone"
+
+    # an error status without a message clears rather than storing an empty string
+    store.save_status("btc-paper", ProfileStatus.ERROR, "")
+    assert store.profile_state("btc-paper").last_error is None
+
+    # and the human-readable detail is still persisted on the status row
+    with raw_connection(db_path) as raw:
+        row = raw.execute(
+            "SELECT detail FROM status WHERE profile_id = ?", ("btc-paper",)
+        ).fetchone()
+    assert row is not None
+    assert row[0] == ""
 
 
 def test_meta_round_trip(store: SqliteStateStore) -> None:
@@ -770,6 +805,79 @@ def test_two_threads_can_write_through_one_store(store: SqliteStateStore) -> Non
 
     assert errors == []
     assert len(store.list_orders("btc-paper", limit=1000)) == 100
+
+
+def test_connections_of_finished_threads_are_reaped(store: SqliteStateStore) -> None:
+    """The retained connection set is bounded by the *live* threads, not by history.
+
+    Regression test for the file-descriptor exhaustion that took the deployed
+    dashboard down: ``http.server.ThreadingHTTPServer`` runs one thread per request,
+    the store hands one connection per caller thread, and every connection was
+    retained for the life of the process.  A browser polling every two seconds
+    therefore leaked descriptors until ``OSError: Too many open files`` made every
+    request answer ``500``.
+
+    The threads run *concurrently* on purpose: threads alive at the same time
+    necessarily have distinct thread ids, which makes the assertion independent of
+    the id-reuse behaviour of the host (a sequential loop can be masked by the OS
+    handing the same id to the next thread).
+    """
+    readers = 30
+
+    def reader(index: int) -> None:
+        store.load_status(f"profile-{index}")
+
+    threads = [threading.Thread(target=reader, args=(index,)) for index in range(readers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert thread.is_alive() is False
+
+    # one request from the main thread is what a polling server does constantly:
+    # it is the moment the finished threads' connections are reaped
+    store.load_status("after")
+
+    assert store.connection_count == 1, (
+        f"{store.connection_count} connections retained for {readers} finished threads"
+    )
+
+
+def test_a_live_thread_keeps_its_own_connection(store: SqliteStateStore) -> None:
+    """Reaping never closes a connection a live thread is using."""
+    opened = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def long_lived() -> None:
+        try:
+            store.load_status("long-lived")
+            opened.set()
+            release.wait(timeout=30)
+            # still usable after other threads died and were reaped
+            store.load_status("long-lived-again")
+        except BaseException as exc:  # pragma: no cover - only on a reaping bug
+            errors.append(exc)
+
+    thread = threading.Thread(target=long_lived)
+    thread.start()
+    assert opened.wait(timeout=30) is True
+    for index in range(5):  # short-lived threads, all reaped
+        short = threading.Thread(target=reader_probe, args=(store, index))
+        short.start()
+        short.join(timeout=30)
+    release.set()
+    thread.join(timeout=30)
+
+    assert errors == []
+    # exactly the two live users of the store: this test's thread and the
+    # long-lived one -- never one per finished thread
+    assert store.connection_count <= 2
+
+
+def reader_probe(store: SqliteStateStore, index: int) -> None:
+    """One read from a short-lived thread (used to trigger reaping)."""
+    store.load_status(f"short-{index}")
 
 
 # ---------------------------------------------------------------------------

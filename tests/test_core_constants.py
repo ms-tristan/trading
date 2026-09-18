@@ -8,8 +8,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-import trading_backtest
-from trading_backtest.core.constants import (
+import trading_platform
+from trading_platform.core.constants import (
     DEFAULT_FEE_RATE,
     DEFAULT_INITIAL_BALANCE,
     DEFAULT_SLIPPAGE,
@@ -25,7 +25,7 @@ from trading_backtest.core.constants import (
     periods_per_year,
     timeframe_minutes,
 )
-from trading_backtest.core.errors import ConfigError
+from trading_platform.core.errors import ConfigError
 
 TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
 
@@ -105,8 +105,8 @@ def test_unknown_timeframe_raises_config_error(function: object, timeframe: obje
 
 def test_package_version_matches_pyproject() -> None:
     """``__version__`` must equal ``[project].version`` of pyproject.toml."""
-    assert trading_backtest.__all__ == ["__version__"]
-    assert isinstance(trading_backtest.__version__, str)
+    assert trading_platform.__all__ == ["__version__"]
+    assert isinstance(trading_platform.__version__, str)
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
-    assert trading_backtest.__version__ == declared
+    assert trading_platform.__version__ == declared

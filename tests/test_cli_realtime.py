@@ -3,7 +3,7 @@
 Everything here is **offline, deterministic and bounded**:
 
 * the profiles documents live in ``tmp_path`` and drive the engine over a local
-  CSV cache (:class:`~trading_backtest.data.loader.CsvDataProvider`), so no test
+  CSV cache (:class:`~trading_platform.data.loader.CsvDataProvider`), so no test
   touches the network and ``TB_ALLOW_LIVE_TRADING`` is never needed;
 * ``realtime.start_at`` anchors a ``ManualClock``, which is what makes
   ``realtime run --once`` reproducible: the same command run twice produces the
@@ -34,9 +34,9 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from trading_backtest.cli import app, main
-from trading_backtest.config import MonitoringConfig, RealtimeConfig
-from trading_backtest.data.synthetic import make_ohlcv
+from trading_platform.cli import app, main
+from trading_platform.config import MonitoringConfig, RealtimeConfig
+from trading_platform.data.synthetic import make_ohlcv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -266,10 +266,10 @@ def test_a_missing_profiles_file_exits_one_without_a_traceback(tmp_path: Path) -
 
 
 def test_importing_the_cli_does_not_import_the_new_layers() -> None:
-    """``trading_backtest.cli`` must stay free of layers 6 and 7 at import time."""
+    """``trading_platform.cli`` must stay free of layers 6 and 7 at import time."""
     script = (
-        "import sys; import trading_backtest.cli; "
-        "print([name for name in ('trading_backtest.realtime', 'trading_backtest.web') "
+        "import sys; import trading_platform.cli; "
+        "print([name for name in ('trading_platform.realtime', 'trading_platform.web') "
         "if name in sys.modules])"
     )
     completed = subprocess.run(
@@ -293,7 +293,7 @@ def test_the_realtime_clock_is_yielding_and_keeps_virtual_time() -> None:
     delivered.  The helper injected by the CLI therefore advances the virtual
     time **and** yields once -- this test pins both halves of that contract.
     """
-    from trading_backtest.cli import _parse_moment, _realtime_clock
+    from trading_platform.cli import _parse_moment, _realtime_clock
 
     anchor = _parse_moment(ANCHOR, field="start_at")
     clock = _realtime_clock(RealtimeConfig(start_at=anchor.to_pydatetime()))
@@ -318,7 +318,7 @@ def test_the_realtime_clock_is_yielding_and_keeps_virtual_time() -> None:
 
 
 def test_an_unanchored_run_uses_the_system_clock() -> None:
-    from trading_backtest.cli import _realtime_clock
+    from trading_platform.cli import _realtime_clock
 
     clock = _realtime_clock(RealtimeConfig(start_at=None))
 
@@ -589,7 +589,7 @@ def test_run_once_turns_a_hanging_stream_into_a_domain_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every await is bounded: a stream that never answers fails loudly, it never hangs."""
-    from trading_backtest.realtime import stream as stream_module
+    from trading_platform.realtime import stream as stream_module
 
     async def never(self: Any, symbol: str, timeframe: str) -> None:
         await asyncio.sleep(30.0)
@@ -619,7 +619,7 @@ def test_serve_is_read_only_over_the_persisted_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``serve`` reads the SQLite file, binds an ephemeral port and stops cleanly."""
-    from trading_backtest.web import server as server_module
+    from trading_platform.web import server as server_module
 
     path = write_profiles(tmp_path)
     assert invoke("realtime", "run", "--profiles", str(path), "--once").exit_code == 0
@@ -662,7 +662,7 @@ def test_run_starts_the_monitoring_server_and_stops_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Server mode wires the engine and the dashboard, then shuts both down."""
-    from trading_backtest.realtime.orchestrator import RealtimeOrchestrator
+    from trading_platform.realtime.orchestrator import RealtimeOrchestrator
 
     path = write_profiles(tmp_path)
     client_order_ids: list[str] = []
@@ -694,7 +694,7 @@ def test_serve_announces_the_url_on_stderr_in_json_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``--json`` keeps stdout to exactly one JSON object."""
-    from trading_backtest.web import server as server_module
+    from trading_platform.web import server as server_module
 
     path = write_profiles(tmp_path)
     assert invoke("realtime", "run", "--profiles", str(path), "--once").exit_code == 0

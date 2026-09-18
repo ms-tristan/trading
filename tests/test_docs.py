@@ -1,6 +1,6 @@
 """Documentation and CI-workflow contract tests.
 
-Pure file-content assertions: no network, no import of ``trading_backtest``
+Pure file-content assertions: no network, no import of ``trading_platform``
 (see ``docs/testing-policy.md`` -- documentation is part of the delivered
 surface and must stay consistent with the frozen interfaces).
 """
@@ -24,7 +24,7 @@ CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 #: The FULL pytest command of docs/testing-policy.md section 3, byte for byte.
 FULL_PYTEST_COMMAND = (
-    "python -m pytest tests --cov=trading_backtest --cov-report=term-missing --cov-report=xml"
+    "python -m pytest tests --cov=trading_platform --cov-report=term-missing --cov-report=xml"
 )
 
 DOCUMENTED_PAGES = {
@@ -35,13 +35,13 @@ DOCUMENTED_PAGES = {
 }
 
 FROZEN_MODULES = (
-    "trading_backtest.config",
-    "trading_backtest.data",
-    "trading_backtest.strategy",
-    "trading_backtest.validation",
-    "trading_backtest.metrics",
-    "trading_backtest.reporting",
-    "trading_backtest.cli",
+    "trading_platform.config",
+    "trading_platform.data",
+    "trading_platform.strategy",
+    "trading_platform.validation",
+    "trading_platform.metrics",
+    "trading_platform.reporting",
+    "trading_platform.cli",
 )
 
 CLI_COMMANDS = ("backtest", "walk-forward", "robustness", "monte-carlo")

@@ -43,7 +43,7 @@
     "refresh_seconds": 2.0,
     "request_timeout_seconds": 10.0
   },
-  "project_name": "trading-backtest",
+  "project_name": "trading-platform",
   "realtime": {
     "allow_network": true,
     "benchmark_variant": "buy_and_hold",

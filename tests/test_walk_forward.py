@@ -1,4 +1,4 @@
-"""Unit tests for the walk-forward layer (``trading_backtest.validation.walk_forward``).
+"""Unit tests for the walk-forward layer (``trading_platform.validation.walk_forward``).
 
 The walk-forward engine is exercised with two kinds of runners:
 
@@ -8,7 +8,7 @@ The walk-forward engine is exercised with two kinds of runners:
   every expected number (per-window metrics, aggregate metrics, efficiency,
   consistency) can be asserted exactly.
 
-The file must run **before** the metrics package (``trading_backtest.metrics``)
+The file must run **before** the metrics package (``trading_platform.metrics``)
 exists: only the single real-metrics integration test is guarded by
 ``pytest.importorskip``, everything else injects ``metric_fn`` or a fake metrics
 module.
@@ -26,18 +26,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import UTC
-from trading_backtest.core.errors import ValidationLayerError
-from trading_backtest.core.models import (
+from trading_platform.core.constants import UTC
+from trading_platform.core.errors import ValidationLayerError
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     RunnerFn,
     TradeRecord,
 )
-from trading_backtest.data.synthetic import make_ohlcv
-from trading_backtest.validation.split import Window, make_windows
-from trading_backtest.validation.walk_forward import (
+from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.validation.split import Window, make_windows
+from trading_platform.validation.walk_forward import (
     CONSISTENCY_THRESHOLD,
     WalkForwardResult,
     _aggregate,
@@ -344,10 +344,10 @@ def test_unknown_metric_fails_before_any_runner_call(frame: pd.DataFrame) -> Non
 def test_unknown_metric_message_lists_the_available_metrics(
     monkeypatch: pytest.MonkeyPatch, frame: pd.DataFrame
 ) -> None:
-    module = types.ModuleType("trading_backtest.metrics")
+    module = types.ModuleType("trading_platform.metrics")
     module.METRIC_NAMES = ("sharpe_ratio", "total_return")  # type: ignore[attr-defined]
     module.metric_value = lambda result, name: 0.0  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", module)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", module)
     calls: list[pd.DataFrame] = []
 
     def _runner(data: pd.DataFrame, params: object = None) -> BacktestResult:
@@ -371,7 +371,7 @@ def test_metrics_layer_is_used_without_an_override(
     frame: pd.DataFrame,
     signature_style: str,
 ) -> None:
-    module = types.ModuleType("trading_backtest.metrics")
+    module = types.ModuleType("trading_platform.metrics")
     module.METRIC_NAMES = ("custom_score",)  # type: ignore[attr-defined]
     if signature_style == "result_first":
         module.metric_value = lambda result, name: float(result.n_trades) * 10.0  # type: ignore[attr-defined]
@@ -381,7 +381,7 @@ def test_metrics_layer_is_used_without_an_override(
         module.metric_value = lambda name: (  # type: ignore[attr-defined]
             lambda result: float(result.n_trades) * 10.0
         )
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", module)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", module)
 
     result = walk_forward(runner_stub, frame, metric="custom_score", n_windows=2)
 
@@ -414,14 +414,14 @@ def test_metric_call_order_handles_every_metric_value_signature() -> None:
 def test_missing_metrics_layer_is_reported(
     monkeypatch: pytest.MonkeyPatch, runner_stub: RunnerFn, frame: pd.DataFrame
 ) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
 
     with pytest.raises(ValidationLayerError, match="not importable"):
         walk_forward(runner_stub, frame, metric="sharpe_ratio", n_windows=2)
 
 
 def test_real_metrics_layer_integration(runner_stub: RunnerFn, frame: pd.DataFrame) -> None:
-    pytest.importorskip("trading_backtest.metrics")
+    pytest.importorskip("trading_platform.metrics")
 
     result = walk_forward(runner_stub, frame, metric="sharpe_ratio", n_windows=2)
 
@@ -478,7 +478,7 @@ def test_metric_errors_are_absorbed_for_trade_less_results(frame: pd.DataFrame) 
 
 
 def test_walk_forward_rejects_data_that_is_not_a_contract_frame(frame: pd.DataFrame) -> None:
-    from trading_backtest.core.errors import DataValidationError
+    from trading_platform.core.errors import DataValidationError
 
     with pytest.raises(DataValidationError):
         walk_forward(

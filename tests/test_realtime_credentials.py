@@ -27,8 +27,8 @@ from typing import Any
 
 import pytest
 
-from trading_backtest.core.errors import ProfileError
-from trading_backtest.realtime.credentials import (
+from trading_platform.core.errors import ProfileError
+from trading_platform.realtime.credentials import (
     ENV_LIVE_API_KEY,
     ENV_LIVE_API_PASSWORD,
     ENV_LIVE_API_SECRET,
@@ -114,7 +114,7 @@ def test_profile_env_prefix_sanitises_every_unsafe_character() -> None:
 
 
 def test_module_all_is_the_frozen_public_surface() -> None:
-    from trading_backtest.realtime import credentials as module
+    from trading_platform.realtime import credentials as module
 
     assert sorted(module.__all__) == sorted(
         [
@@ -359,8 +359,8 @@ def test_no_secret_ever_reaches_a_log_record(caplog: pytest.LogCaptureFixture) -
     assert credentials is not None
     secrets = known_secrets(environ)
 
-    with caplog.at_level(logging.DEBUG, logger="trading_backtest.realtime"):
-        logger = logging.getLogger("trading_backtest.realtime.broker")
+    with caplog.at_level(logging.DEBUG, logger="trading_platform.realtime"):
+        logger = logging.getLogger("trading_platform.realtime.broker")
         logger.info("credentials=%r", credentials)
         logger.info("payload=%s", json.dumps(credentials.to_dict()))
         logger.info("raw=%s", redact(repr(environ), secrets=secrets))

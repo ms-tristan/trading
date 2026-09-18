@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.errors import StrategyError
-from trading_backtest.strategy.indicators import atr, ema, rsi, true_range
+from trading_platform.core.errors import StrategyError
+from trading_platform.strategy.indicators import atr, ema, rsi, true_range
 
 START = "2024-01-01T00:00:00Z"
 

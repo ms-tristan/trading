@@ -45,14 +45,18 @@ REALTIME_ERRORS = (
 REALTIME_PROTOCOLS = ("Clock", "MarketStream", "Broker", "StateStore", "SnapshotProvider")
 
 #: Section titles ``docs/realtime.md`` must carry.
+#:
+#: ``docs/realtime.md`` is written in English: it was authored by the real-time
+#: delivery, and the pages that predate it (architecture, usage, methodology) stay
+#: French, which is why the language test below treats the two groups differently.
 REALTIME_SECTIONS = (
-    "## 1. Qu'est-ce qu'un profil",
-    "## 2. Un seul chemin d'exécution pour paper et live",
-    "## 3. Le modèle de sûreté",
-    "## 4. Persistance, redémarrage et réconciliation",
-    "## 5. Reference de l'API web",
-    "## 6. Les trois commandes",
-    "## 7. Ce qui n'est PAS prouvé",
+    "## 1. What is a profile?",
+    "## 2. One execution path for paper and live",
+    "## 3. The safety model",
+    "## 4. Persistence, restart and reconciliation",
+    "## 5. Web API reference",
+    "## 6. The three commands",
+    "## 7. What is NOT proven",
 )
 
 #: Routes the web-API table must enumerate.
@@ -106,16 +110,16 @@ def markdown_link_targets(text: str) -> list[str]:
 def test_architecture_mentions_both_new_layers() -> None:
     text = read(ARCHITECTURE)
 
-    assert "trading_backtest.realtime" in text
-    assert "trading_backtest.web" in text
+    assert "trading_platform.realtime" in text
+    assert "trading_platform.web" in text
 
 
 def test_architecture_layer_table_has_the_three_new_rows() -> None:
     text = read(ARCHITECTURE)
 
-    assert "| 6 | `trading_backtest.realtime` |" in text
-    assert "| 7 | `trading_backtest.web` |" in text
-    assert "| 8 | `trading_backtest.cli` |" in text
+    assert "| 6 | `trading_platform.realtime` |" in text
+    assert "| 7 | `trading_platform.web` |" in text
+    assert "| 8 | `trading_platform.cli` |" in text
     # the move is documented, not silently applied
     assert "déménagé de la couche 6 à la couche 8" in text
     # ... and the diagram carries the two new layers as well
@@ -257,16 +261,16 @@ def test_realtime_page_documents_the_three_commands_and_payloads() -> None:
 
 def test_realtime_page_states_what_is_not_proven() -> None:
     text = read(REALTIME)
-    section = text.split("## 7. Ce qui n'est PAS prouvé", 1)[1]
+    section = text.split("## 7. What is NOT proven", 1)[1]
 
     assert "WebSocket" in section
     assert "ASGI" in section
-    assert "jeton opérateur unique" in section
-    assert "carnet d'ordres" in section
-    assert "bougies **fermées**" in section or "fermées" in section
-    assert "levier" in section
-    assert "single-écrivain" in section or "mono-écrivain" in section
-    assert "PAS exercé contre un vrai" in section
+    assert "single operator token" in section
+    assert "order book" in section
+    assert "closed" in section
+    assert "leverage" in section
+    assert "single-writer" in section
+    assert "NOT exercised against a real" in section
 
 
 def test_every_relative_markdown_link_resolves() -> None:
@@ -317,7 +321,7 @@ def test_example_profiles_file_is_a_valid_profiles_document() -> None:
 
 
 def test_example_profiles_file_is_accepted_by_the_loader() -> None:
-    from trading_backtest.config import load_profiles
+    from trading_platform.config import load_profiles
 
     profiles = load_profiles(EXAMPLE_PROFILES)
 
@@ -396,9 +400,17 @@ def test_usage_keeps_the_tokens_the_existing_policy_asserts() -> None:
 
 
 @pytest.mark.parametrize("page", [ARCHITECTURE, USAGE, REALTIME])
-def test_documentation_pages_are_french_and_utf8(page: Path) -> None:
+def test_documentation_pages_are_utf8_and_not_empty(page: Path) -> None:
     text = read(page)
 
     assert text, f"{page.name} is empty"
+    assert len(text.splitlines()) > 100, f"{page.name} looks truncated"
+
+
+@pytest.mark.parametrize("page", [ARCHITECTURE, USAGE])
+def test_the_legacy_documentation_pages_stay_french(page: Path) -> None:
+    """The pages that predate the real-time delivery are French, and stay French."""
+    text = read(page)
+
     # a French page of this size cannot contain zero accented words
     assert any(word in text for word in ("é", "è", "à", "ù", "ê", "ç"))

@@ -8,7 +8,7 @@ resolves by class name.
 Two groups, and the split mirrors ``docs/testing-policy.md`` §1.2:
 
 * the **offline guards** — the re-export contract of
-  ``trading_backtest.strategy``, the "``freqtrade_basic`` is never imported from
+  ``trading_platform.strategy``, the "``freqtrade_basic`` is never imported from
   there" proof, the literal ``class`` statement of the shim and the ``.gitignore``
   rules that let the shim be tracked — need **no** Freqtrade at all, and they
   **must run on the CI**, which installs the ``.[dev]`` extra only;
@@ -42,17 +42,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import DEFAULT_TIMEFRAME
-from trading_backtest.freqtrade import DEFAULT_STRATEGY_NAME
-from trading_backtest.strategy import registry
+from trading_platform.core.constants import DEFAULT_TIMEFRAME
+from trading_platform.freqtrade import DEFAULT_STRATEGY_NAME
+from trading_platform.strategy import registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The concrete exposure module — read as text by the docstring/AST tests.
-MODULE_PATH = REPO_ROOT / "src" / "trading_backtest" / "strategy" / "freqtrade_basic.py"
+MODULE_PATH = REPO_ROOT / "src" / "trading_platform" / "strategy" / "freqtrade_basic.py"
 
 #: The public namespace of the strategy layer (the re-export contract).
-INIT_PATH = REPO_ROOT / "src" / "trading_backtest" / "strategy" / "__init__.py"
+INIT_PATH = REPO_ROOT / "src" / "trading_platform" / "strategy" / "__init__.py"
 
 #: The Freqtrade entry point: the file ``StrategyResolver`` scans.
 SHIM_PATH = REPO_ROOT / "user_data" / "strategies" / "BasicStrategy.py"
@@ -83,7 +83,7 @@ GITIGNORE_APPENDED = (
     "!user_data/strategies/BasicStrategy.py",
 )
 
-#: The public API of ``trading_backtest.strategy``, name for name.
+#: The public API of ``trading_platform.strategy``, name for name.
 EXPECTED_PUBLIC_API = [
     "BOOL_SIGNAL_COLUMNS",
     "ENGINE_VERSION",
@@ -140,8 +140,8 @@ class _FreqtradeBlocker:
 
 
 sys.meta_path.insert(0, _FreqtradeBlocker())
-import trading_backtest
-import trading_backtest.strategy as strategy
+import trading_platform
+import trading_platform.strategy as strategy
 
 print("OK", "freqtrade" in sys.modules, hasattr(strategy, "make_freqtrade_strategy"))
 """
@@ -212,22 +212,22 @@ def _resolved_shim_class() -> tuple[type, Path]:
 
 
 def test_strategy_namespace_reexports_the_adapter_api() -> None:
-    """``trading_backtest.strategy`` exposes the adapter, and only the agreed names."""
-    import trading_backtest.strategy as strategy
+    """``trading_platform.strategy`` exposes the adapter, and only the agreed names."""
+    import trading_platform.strategy as strategy
 
     assert strategy.__all__ == EXPECTED_PUBLIC_API
     for name in EXPECTED_PUBLIC_API:
-        assert hasattr(strategy, name), f"trading_backtest.strategy.{name} is missing"
+        assert hasattr(strategy, name), f"trading_platform.strategy.{name} is missing"
     for name in ADAPTER_REEXPORTS:
         assert getattr(strategy, name) is getattr(strategy.freqtrade_adapter, name)
-    assert strategy.freqtrade_adapter.__name__ == "trading_backtest.strategy.freqtrade_adapter"
+    assert strategy.freqtrade_adapter.__name__ == "trading_platform.strategy.freqtrade_adapter"
 
 
 def test_strategy_namespace_never_imports_freqtrade_basic() -> None:
     """The concrete module is never imported here: it needs the optional extra.
 
     ``freqtrade_basic`` builds its class at import time, so a top-level import of
-    it would make ``import trading_backtest`` fail on a ``.[dev]``-only checkout.
+    it would make ``import trading_platform`` fail on a ``.[dev]``-only checkout.
     The check is an AST one — a plain substring search would also match the
     docstring that *documents* the rule — plus a proof that the only textual
     mentions of the name live in that docstring.
@@ -250,7 +250,7 @@ def test_strategy_namespace_never_imports_freqtrade_basic() -> None:
 
 
 def test_importing_the_strategy_namespace_survives_a_missing_freqtrade() -> None:
-    """End-to-end proof: ``import trading_backtest.strategy`` works without the extra."""
+    """End-to-end proof: ``import trading_platform.strategy`` works without the extra."""
     result = subprocess.run(
         [sys.executable, "-c", _BLOCKED_FREQTRADE_CODE],
         capture_output=True,
@@ -275,7 +275,7 @@ def test_the_shim_carries_a_literal_class_statement() -> None:
     """
     source = SHIM_PATH.read_text(encoding="utf-8")
     assert SHIM_CLASS_STATEMENT in source
-    assert "from trading_backtest.strategy.freqtrade_basic import BasicFreqtradeStrategy" in source
+    assert "from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy" in source
     assert sorted(path.name for path in SHIM_PATH.parent.glob("*.py")) == ["BasicStrategy.py"]
     # No rule is recopied in the shim: the class body is the docstring only.
     tree = ast.parse(source)
@@ -305,7 +305,7 @@ def test_gitignore_allows_the_shim_and_keeps_the_readme_rule() -> None:
 def test_module_documents_the_optional_extra_and_the_name_resolution() -> None:
     """The module docstring states the two facts a user needs, and its API is frozen."""
     pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
-    from trading_backtest.strategy import freqtrade_basic
+    from trading_platform.strategy import freqtrade_basic
 
     docstring = freqtrade_basic.__doc__ or ""
     assert "freqtrade" in docstring and "extra" in docstring
@@ -320,7 +320,7 @@ def test_module_documents_the_optional_extra_and_the_name_resolution() -> None:
 def test_basic_strategy_name_is_the_freqtrade_layer_name() -> None:
     """``BASIC_FREQTRADE_STRATEGY_NAME`` is the single source of truth of the name."""
     pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
-    from trading_backtest.strategy.freqtrade_basic import BASIC_FREQTRADE_STRATEGY_NAME
+    from trading_platform.strategy.freqtrade_basic import BASIC_FREQTRADE_STRATEGY_NAME
 
     assert BASIC_FREQTRADE_STRATEGY_NAME == DEFAULT_STRATEGY_NAME == "BasicStrategy"
 
@@ -328,7 +328,7 @@ def test_basic_strategy_name_is_the_freqtrade_layer_name() -> None:
 def test_the_shipped_class_name_is_the_one_the_configurations_declare() -> None:
     """The generated class name matches ``config/freqtrade*.json`` (read-only check)."""
     pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
-    from trading_backtest.strategy.freqtrade_basic import BasicFreqtradeStrategy
+    from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy
 
     for path in FREQTRADE_CONFIGS:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -340,8 +340,8 @@ def test_the_shipped_class_is_a_valid_freqtrade_istrategy() -> None:
     pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
     from freqtrade.strategy import IStrategy
 
-    from trading_backtest.strategy.freqtrade_adapter import validate_freqtrade_adapter_class
-    from trading_backtest.strategy.freqtrade_basic import BasicFreqtradeStrategy
+    from trading_platform.strategy.freqtrade_adapter import validate_freqtrade_adapter_class
+    from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy
 
     assert issubclass(BasicFreqtradeStrategy, IStrategy)
     assert BasicFreqtradeStrategy.INTERFACE_VERSION == 3
@@ -361,7 +361,7 @@ def test_the_shipped_class_instantiates_with_the_empty_config() -> None:
     pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
     from freqtrade.strategy import IStrategy
 
-    from trading_backtest.strategy.freqtrade_basic import BasicFreqtradeStrategy
+    from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy
 
     instance = BasicFreqtradeStrategy({})
     assert isinstance(instance, IStrategy)
@@ -375,8 +375,8 @@ def test_the_three_populate_methods_render_the_freqtrade_signal_columns(
 ) -> None:
     """``populate_indicators`` / ``_entry_trend`` / ``_exit_trend`` produce Freqtrade's names."""
     pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
-    from trading_backtest.strategy.freqtrade_adapter import FREQTRADE_ORDER_COLUMNS
-    from trading_backtest.strategy.freqtrade_basic import BasicFreqtradeStrategy
+    from trading_platform.strategy.freqtrade_adapter import FREQTRADE_ORDER_COLUMNS
+    from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy
 
     instance = BasicFreqtradeStrategy({})
     frame = _freqtrade_frame(ohlcv_frame)
@@ -431,7 +431,7 @@ def test_a_factory_alias_file_cannot_be_resolved(tmp_path: Path) -> None:
 
     alias = tmp_path / "AliasStrategy.py"
     alias.write_text(
-        "from trading_backtest.strategy.freqtrade_adapter import make_freqtrade_strategy\n"
+        "from trading_platform.strategy.freqtrade_adapter import make_freqtrade_strategy\n"
         "\n"
         'AliasStrategy = make_freqtrade_strategy("basic", class_name="AliasStrategy")\n',
         encoding="utf-8",

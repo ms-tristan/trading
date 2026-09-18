@@ -1,4 +1,4 @@
-"""Tests for the drawdown metrics (``trading_backtest.metrics.drawdown``).
+"""Tests for the drawdown metrics (``trading_platform.metrics.drawdown``).
 
 Everything here is offline and deterministic: the curves are hand-built so the
 expected values are exact and can be checked by reading the test.
@@ -11,8 +11,8 @@ import math
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.metrics import (
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.metrics import (
     drawdown_duration,
     drawdown_series,
     drawdown_table,

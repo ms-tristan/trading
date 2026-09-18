@@ -4,7 +4,7 @@ The benchmark payload is *opaque data* kept by the reporting layer: these tests
 never import the benchmark/metrics implementation, only the reporting builder,
 renderer and writer, so they stay offline, deterministic and independent from the
 other work packages.  The single exception is the frozen
-:data:`trading_backtest.metrics.BENCHMARK_METRIC_NAMES` constant: the rows of the
+:data:`trading_platform.metrics.BENCHMARK_METRIC_NAMES` constant: the rows of the
 ``risk_free`` variant below are keyed by it so the side-by-side table is pinned
 against the very names the metrics layer emits, not against a copy of them.
 """
@@ -18,22 +18,22 @@ from pathlib import Path
 
 import pandas as pd
 
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.models import (
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     TradeRecord,
 )
-from trading_backtest.metrics import BENCHMARK_METRIC_NAMES
-from trading_backtest.reporting import (
+from trading_platform.metrics import BENCHMARK_METRIC_NAMES
+from trading_platform.reporting import (
     ReportBuilder,
     build_report,
     read_report,
     render_markdown,
     write_report,
 )
-from trading_backtest.reporting.builder import BENCHMARK_SECTION_TITLE
+from trading_platform.reporting.builder import BENCHMARK_SECTION_TITLE
 
 BASE_TIMESTAMP = pd.Timestamp("2024-01-01T00:00:00Z")
 FIXED_TIME = datetime(2024, 6, 1, 12, 30, tzinfo=DATETIME_UTC)

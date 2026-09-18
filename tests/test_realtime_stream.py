@@ -35,12 +35,12 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import REQUIRED_OHLCV_COLUMNS, candle_delta
-from trading_backtest.core.errors import MarketStreamError
-from trading_backtest.realtime import stream as stream_module
-from trading_backtest.realtime.clock import ManualClock, SystemClock
-from trading_backtest.realtime.models import CandleEvent
-from trading_backtest.realtime.stream import (
+from trading_platform.core.constants import REQUIRED_OHLCV_COLUMNS, candle_delta
+from trading_platform.core.errors import MarketStreamError
+from trading_platform.realtime import stream as stream_module
+from trading_platform.realtime.clock import ManualClock, SystemClock
+from trading_platform.realtime.models import CandleEvent
+from trading_platform.realtime.stream import (
     CcxtProMarketStream,
     CompositeMarketStream,
     MarketStream,

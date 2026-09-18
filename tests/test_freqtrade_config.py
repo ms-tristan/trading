@@ -11,10 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from trading_backtest.config import AppConfig, load_config
-from trading_backtest.core.constants import SUPPORTED_TIMEFRAMES
-from trading_backtest.core.errors import FreqtradeConfigError
-from trading_backtest.freqtrade import (
+from trading_platform.config import AppConfig, load_config
+from trading_platform.core.constants import SUPPORTED_TIMEFRAMES
+from trading_platform.core.errors import FreqtradeConfigError
+from trading_platform.freqtrade import (
     FREQTRADE_REQUIRED_KEYS,
     base_freqtrade_config,
     load_freqtrade_config,
@@ -308,7 +308,7 @@ def test_backtest_default_config_loads_as_an_appconfig() -> None:
     cfg = load_config(REPO_ROOT / "config" / "backtest_default.json")
 
     assert isinstance(cfg, AppConfig)
-    assert cfg.project_name == "trading-backtest"
+    assert cfg.project_name == "trading-platform"
     assert cfg.data.allow_network is True
     assert cfg.data.timeframe == "1h"
     assert cfg.reporting.formats == ["markdown", "json"]

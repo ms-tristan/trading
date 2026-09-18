@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.config import AppConfig
-from trading_backtest.core.errors import ConfigError
-from trading_backtest.core.models import BacktestResult, RunnerFn
-from trading_backtest.data.synthetic import make_flat_ohlcv, make_ohlcv, make_trending_ohlcv
+from trading_platform.config import AppConfig
+from trading_platform.core.errors import ConfigError
+from trading_platform.core.models import BacktestResult, RunnerFn
+from trading_platform.data.synthetic import make_flat_ohlcv, make_ohlcv, make_trending_ohlcv
 
 TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
 

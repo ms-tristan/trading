@@ -1,8 +1,8 @@
-"""Unit tests for the random-entry gate (``trading_backtest.validation.random_entry``).
+"""Unit tests for the random-entry gate (``trading_platform.validation.random_entry``).
 
 The gate answers the sharpest question of the whole framework -- *did the strategy
 beat luck?* -- and it must answer it **before** the metrics package
-(``trading_backtest.metrics``) exists: every verdict test injects a duck-typed
+(``trading_platform.metrics``) exists: every verdict test injects a duck-typed
 random-entry function through ``entry_fn`` and never imports that layer.  Only the
 integration test at the end is guarded by ``pytest.importorskip`` and exercises the
 real ``random_entry_benchmark``.
@@ -28,17 +28,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import DEFAULT_INITIAL_BALANCE, OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.errors import ValidationLayerError
-from trading_backtest.core.models import BacktestResult, Direction, ExitReason, TradeRecord
-from trading_backtest.validation.random_entry import (
+from trading_platform.core.constants import DEFAULT_INITIAL_BALANCE, OHLCV_INDEX_NAME, UTC
+from trading_platform.core.errors import ValidationLayerError
+from trading_platform.core.models import BacktestResult, Direction, ExitReason, TradeRecord
+from trading_platform.validation.random_entry import (
     MIN_P_VALUE,
     RandomEntryGateResult,
     validate_random_entry,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
-    from trading_backtest.metrics.random_entry import RandomEntryResult
+    from trading_platform.metrics.random_entry import RandomEntryResult
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -222,7 +222,7 @@ def assert_json_native(value: Any) -> None:
 
 
 def test_min_p_value_is_the_documented_threshold() -> None:
-    import trading_backtest.validation as validation
+    import trading_platform.validation as validation
 
     assert MIN_P_VALUE == 0.05
     assert isinstance(MIN_P_VALUE, float)
@@ -234,7 +234,7 @@ def test_min_p_value_is_the_documented_threshold() -> None:
 
 
 def test_validation_all_keeps_the_pre_existing_symbols() -> None:
-    import trading_backtest.validation as validation
+    import trading_platform.validation as validation
 
     pre_existing = {
         "MIN_ALPHA",
@@ -277,24 +277,24 @@ def test_random_entry_gate_has_no_risk_free_rate_parameter() -> None:
 
 
 def test_validation_package_imports_without_the_metrics_layer(tmp_path: Path) -> None:
-    """``import trading_backtest.validation`` must not need the metrics layer."""
+    """``import trading_platform.validation`` must not need the metrics layer."""
     script = textwrap.dedent(
         """
         import sys
 
         class _BlockMetrics:
             def find_spec(self, name, path=None, target=None):
-                if name == "trading_backtest.metrics" or name.startswith("trading_backtest.metrics."):
+                if name == "trading_platform.metrics" or name.startswith("trading_platform.metrics."):
                     raise ModuleNotFoundError(f"blocked: {name}")
                 return None
 
         sys.meta_path.insert(0, _BlockMetrics())
-        import trading_backtest.validation as validation
+        import trading_platform.validation as validation
 
         assert callable(validation.validate_random_entry)
         assert validation.MIN_P_VALUE == 0.05
         assert validation.RandomEntryFn is not None
-        assert "trading_backtest.metrics" not in sys.modules
+        assert "trading_platform.metrics" not in sys.modules
         print("ok")
         """
     )
@@ -314,16 +314,16 @@ def test_validation_package_imports_without_the_metrics_layer(tmp_path: Path) ->
 
 
 def test_missing_metrics_layer_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.random_entry", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.random_entry", None)
 
     with pytest.raises(ValidationLayerError, match="not importable"):
         validate_random_entry(object(), make_frame((100.0, 110.0)))
 
 
 def test_missing_metrics_layer_names_the_variant(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.random_entry", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.random_entry", None)
 
     with pytest.raises(ValidationLayerError, match="'random_entry'"):
         validate_random_entry(object(), make_frame((100.0, 110.0)))
@@ -335,8 +335,8 @@ def test_missing_metrics_layer_names_the_variant(monkeypatch: pytest.MonkeyPatch
 
 
 def test_injected_entry_fn_is_used_without_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics", None)
-    monkeypatch.setitem(sys.modules, "trading_backtest.metrics.random_entry", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics", None)
+    monkeypatch.setitem(sys.modules, "trading_platform.metrics.random_entry", None)
     distribution = StubDistribution()
     frame = make_frame((100.0, 101.0, 102.0))
     result = object()
@@ -535,7 +535,7 @@ def test_gate_result_is_frozen() -> None:
 
 
 def test_default_path_runs_the_real_random_entry_benchmark() -> None:
-    metrics_random_entry = pytest.importorskip("trading_backtest.metrics.random_entry")
+    metrics_random_entry = pytest.importorskip("trading_platform.metrics.random_entry")
     frame = wiggle_frame(60)
     result = make_result(frame)
 
@@ -560,7 +560,7 @@ def test_default_path_runs_the_real_random_entry_benchmark() -> None:
 
 
 def test_default_path_is_deterministic_for_a_fixed_seed() -> None:
-    metrics_random_entry = pytest.importorskip("trading_backtest.metrics.random_entry")
+    metrics_random_entry = pytest.importorskip("trading_platform.metrics.random_entry")
     frame = wiggle_frame(60)
     result = make_result(frame)
 
@@ -578,7 +578,7 @@ def test_default_path_is_deterministic_for_a_fixed_seed() -> None:
 
 def test_default_path_coheres_on_a_spiky_frame() -> None:
     """The gate stays coherent when a few candles carry all the return."""
-    pytest.importorskip("trading_backtest.metrics.random_entry")
+    pytest.importorskip("trading_platform.metrics.random_entry")
     steps = np.arange(60, dtype="float64")
     # a spiky frame: a few candles carry all the return, so random entries lose
     closes = 100.0 + steps + 40.0 * (np.abs(np.sin(steps)) > 0.97)
@@ -593,8 +593,8 @@ def test_default_path_coheres_on_a_spiky_frame() -> None:
 
 
 def test_default_path_propagates_metrics_errors() -> None:
-    pytest.importorskip("trading_backtest.metrics.random_entry")
-    from trading_backtest.core.errors import MetricsError
+    pytest.importorskip("trading_platform.metrics.random_entry")
+    from trading_platform.core.errors import MetricsError
 
     frame = wiggle_frame(60)
 
@@ -604,8 +604,8 @@ def test_default_path_propagates_metrics_errors() -> None:
 
 
 def test_default_path_rejects_an_out_of_range_simulation_count() -> None:
-    pytest.importorskip("trading_backtest.metrics.random_entry")
-    from trading_backtest.core.errors import MetricsError
+    pytest.importorskip("trading_platform.metrics.random_entry")
+    from trading_platform.core.errors import MetricsError
 
     frame = wiggle_frame(60)
 
@@ -614,8 +614,8 @@ def test_default_path_rejects_an_out_of_range_simulation_count() -> None:
 
 
 def test_gate_result_keeps_the_backtest_result_type() -> None:
-    pytest.importorskip("trading_backtest.metrics.random_entry")
-    from trading_backtest.metrics.random_entry import RandomEntryResult
+    pytest.importorskip("trading_platform.metrics.random_entry")
+    from trading_platform.metrics.random_entry import RandomEntryResult
 
     frame = wiggle_frame(60)
     result: BacktestResult = make_result(frame)

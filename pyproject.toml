@@ -3,13 +3,13 @@ requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"
 
 [project]
-name = "trading-backtest"
+name = "trading-platform"
 version = "0.1.0"
-description = "Modular, robust and scalable backtesting skeleton for trading strategies (Freqtrade-compatible)."
+description = "Trading platform: a modular backtesting engine and a real-time, multi-profile paper/live engine with a monitoring dashboard (Freqtrade-compatible)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
-authors = [{ name = "Trading Backtest Team" }]
+authors = [{ name = "Trading Platform Team" }]
 keywords = ["trading", "backtesting", "freqtrade", "walk-forward", "monte-carlo", "quant"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -55,14 +55,15 @@ all = [
 ]
 
 [project.scripts]
-trading-backtest = "trading_backtest.cli:main"
+trading = "trading_platform.cli:main"
+trading-backtest = "trading_platform.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/example/trading"
 Repository = "https://github.com/example/trading"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/trading_backtest"]
+packages = ["src/trading_platform"]
 
 # ---------------------------------------------------------------------------
 # pytest
@@ -82,7 +83,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # coverage -- the mechanical gate is fail_under = 85 (see docs/testing-policy.md)
 # ---------------------------------------------------------------------------
 [tool.coverage.run]
-source = ["trading_backtest"]
+source = ["trading_platform"]
 branch = false
 omit = ["*/__main__.py"]
 
@@ -142,10 +143,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["T20", "S101", "PLR2004"]
-"src/trading_backtest/cli.py" = ["T20"]  # rich console output is the CLI contract
+"src/trading_platform/cli.py" = ["T20"]  # rich console output is the CLI contract
 
 [tool.ruff.lint.isort]
-known-first-party = ["trading_backtest"]
+known-first-party = ["trading_platform"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -158,7 +159,7 @@ line-ending = "lf"
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
-files = ["src/trading_backtest"]
+files = ["src/trading_platform"]
 strict = true
 warn_unused_ignores = false
 warn_unused_configs = true

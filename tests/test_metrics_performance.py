@@ -1,4 +1,4 @@
-"""Tests for the locked performance metric set (``trading_backtest.metrics.performance``).
+"""Tests for the locked performance metric set (``trading_platform.metrics.performance``).
 
 The results are built **directly** from :class:`TradeRecord` /
 :class:`BacktestResult` -- no strategy, engine or validation module is imported --
@@ -13,15 +13,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.errors import ConfigError, MetricsError
-from trading_backtest.core.models import (
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.errors import ConfigError, MetricsError
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     TradeRecord,
 )
-from trading_backtest.metrics import (
+from trading_platform.metrics import (
     METRIC_NAMES,
     MetricSet,
     compute_metrics,

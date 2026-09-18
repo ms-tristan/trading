@@ -1,4 +1,4 @@
-"""Tests for the buy & hold benchmark (``trading_backtest.metrics.benchmark``).
+"""Tests for the buy & hold benchmark (``trading_platform.metrics.benchmark``).
 
 Everything here is offline and deterministic: the frames are synthetic and built
 in the test, and no strategy/validation/reporting module is imported -- the
@@ -17,14 +17,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import (
+from trading_platform.core.constants import (
     DEFAULT_INITIAL_BALANCE,
     OHLCV_INDEX_NAME,
     UTC,
 )
-from trading_backtest.core.errors import ConfigError, MetricsError
-from trading_backtest.core.models import BacktestResult
-from trading_backtest.metrics import (
+from trading_platform.core.errors import ConfigError, MetricsError
+from trading_platform.core.models import BacktestResult
+from trading_platform.metrics import (
     BENCHMARK_METRIC_NAMES,
     BENCHMARK_VARIANTS,
     CURVE_VARIANTS,
@@ -140,7 +140,7 @@ def test_module_constants_are_frozen() -> None:
 
 
 def test_metrics_package_exposes_every_new_symbol() -> None:
-    import trading_backtest.metrics as metrics
+    import trading_platform.metrics as metrics
 
     for name in (
         "BENCHMARK_METRIC_NAMES",

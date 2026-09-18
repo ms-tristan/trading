@@ -1,4 +1,4 @@
-# Runtime dependencies of the trading-backtest package.
+# Runtime dependencies of the trading-platform package.
 #
 # This file mirrors [project].dependencies of pyproject.toml (same names, same
 # ">=" floors) and exists for environments that install from a plain

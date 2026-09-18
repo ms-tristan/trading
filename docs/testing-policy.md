@@ -10,7 +10,7 @@ by any work package — every package may read it, no package may modify it.
 
 1. **No network access in tests.** No test may download market data, hit an exchange API, or call
    `ccxt`. All OHLCV data used by tests is generated synthetically
-   (`trading_backtest.data.synthetic`) or read from a CSV fixture checked into `tests/fixtures/`.
+   (`trading_platform.data.synthetic`) or read from a CSV fixture checked into `tests/fixtures/`.
 2. **No real Freqtrade dependency in tests.** `freqtrade` is an *optional* extra. The suite must be
    green with only `.[dev]` installed.
    * The guard goes **inside the test body** (`pytest.importorskip("freqtrade")`), never at module
@@ -56,11 +56,11 @@ from a clean checkout **without installing the project at all**.
 ## 3. The FULL command — must be green before any push
 
 ```bash
-.venv/bin/python -m pytest tests --cov=trading_backtest --cov-report=term-missing --cov-report=xml
+.venv/bin/python -m pytest tests --cov=trading_platform --cov-report=term-missing --cov-report=xml
 ```
 
 This is the exact command run by CI (`.github/workflows/ci.yml`) and by `make test-cov`.
-It **fails (exit code 1)** when total coverage of the `trading_backtest` package is below the
+It **fails (exit code 1)** when total coverage of the `trading_platform` package is below the
 threshold below — the gate is mechanical, not a convention.
 
 Equivalent commands:
@@ -121,10 +121,10 @@ Tests marked `network` are skipped by default and must stay skipped:
 ### 5.1 How coverage is measured
 
 ```bash
-.venv/bin/python -m pytest tests --cov=trading_backtest --cov-report=term-missing --cov-report=xml
+.venv/bin/python -m pytest tests --cov=trading_platform --cov-report=term-missing --cov-report=xml
 ```
 
-* `--cov=trading_backtest` restricts measurement to the shipped package (`src/trading_backtest`).
+* `--cov=trading_platform` restricts measurement to the shipped package (`src/trading_platform`).
 * `tests/` is never counted.
 * `*/__main__.py` is excluded (`[tool.coverage.run] omit`).
 * A machine-readable `coverage.xml` is written for CI/reporting; it is git-ignored.
@@ -139,7 +139,7 @@ addopts = "-ra --strict-markers --strict-config --cov-fail-under=85"
 fail_under = 85
 ```
 
-* Measurement is **line coverage** of `trading_backtest` (`branch = false`).
+* Measurement is **line coverage** of `trading_platform` (`branch = false`).
 * **Total coverage must be ≥ 85.00 %.** Below that, `pytest` exits non-zero and the build is red.
 * Ambition: every module ≥ 85 %; a module below 85 % must be compensated by others *and* justified
   in the work-package report. No module may ship at 0 %.
@@ -198,7 +198,7 @@ CI installs `.[dev]` only. A red CI on coverage is a **blocking** failure, not a
 
 ---
 
-## 8. Addendum — the realtime and web layers (`trading_backtest.realtime`, `trading_backtest.web`)
+## 8. Addendum — the realtime and web layers (`trading_platform.realtime`, `trading_platform.web`)
 
 **Status:** binding addendum, owned by the repository planning authority like the rest of this
 file. Written **once**, before the work packages of `feat/realtime-multi-profile-platform` start:
@@ -209,8 +209,8 @@ layers.
 
 ### 8.1 The gate is NOT redefined
 
-§3 (the FULL command) and §5.2 (`fail_under = 85`, measured on the **whole** `trading_backtest`
-package with `--cov=trading_backtest`) are **unchanged**. The new modules are measured by the very
+§3 (the FULL command) and §5.2 (`fail_under = 85`, measured on the **whole** `trading_platform`
+package with `--cov=trading_platform`) are **unchanged**. The new modules are measured by the very
 same run; there is no per-layer threshold, no exemption for the optional `ccxt` / `freqtrade`
 adapters and no change to `pyproject.toml` — which stays frozen (§1.4).
 

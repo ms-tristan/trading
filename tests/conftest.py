@@ -7,7 +7,7 @@ Design rules:
 
 * everything is **offline** and deterministic (synthetic data only);
 * tests marked ``network`` are skipped unless ``--run-network`` is given;
-* this module never imports ``trading_backtest.strategy``, ``.validation``,
+* this module never imports ``trading_platform.strategy``, ``.validation``,
   ``.metrics`` or ``.reporting`` (dependency direction: core/config/data first).
 """
 
@@ -21,16 +21,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.config import AppConfig
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, UTC
-from trading_backtest.core.models import (
+from trading_platform.config import AppConfig
+from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.models import (
     BacktestResult,
     Direction,
     ExitReason,
     RunnerFn,
     TradeRecord,
 )
-from trading_backtest.data.synthetic import make_flat_ohlcv, make_ohlcv, make_trending_ohlcv
+from trading_platform.data.synthetic import make_flat_ohlcv, make_ohlcv, make_trending_ohlcv
 
 # ---------------------------------------------------------------------------
 # command line / markers
@@ -63,14 +63,14 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 # global log isolation
 # ---------------------------------------------------------------------------
 
-REALTIME_LOGGER_NAME = "trading_backtest.realtime"
+REALTIME_LOGGER_NAME = "trading_platform.realtime"
 
 
 @pytest.fixture(autouse=True)
 def _restore_realtime_logger() -> Iterator[None]:
     """Restore the global realtime logger after every test.
 
-    ``python -m trading_backtest realtime run|serve`` installs the layer's
+    ``python -m trading_platform realtime run|serve`` installs the layer's
     structured logging on a module-global logger: a handler pair, a level and
     ``propagate = False``.  Several test files drive that CLI, and without this
     snapshot the first of them leaves the logger at ``INFO`` with propagation
@@ -186,12 +186,12 @@ def _params_id(params: dict[str, object] | None) -> str:
 
 @pytest.fixture
 def runner_stub() -> RunnerFn:
-    """A :data:`~trading_backtest.core.models.RunnerFn` built without any engine.
+    """A :data:`~trading_platform.core.models.RunnerFn` built without any engine.
 
     Given any OHLCV frame it returns a deterministic
-    :class:`~trading_backtest.core.models.BacktestResult` with three trades and a
+    :class:`~trading_platform.core.models.BacktestResult` with three trades and a
     flat-ish equity curve (one point per input candle).  It only relies on
-    ``trading_backtest.core``, so the validation layer (walk-forward, Monte
+    ``trading_platform.core``, so the validation layer (walk-forward, Monte
     Carlo, robustness) can be tested before the engine exists.
     """
     initial_balance = 10_000.0

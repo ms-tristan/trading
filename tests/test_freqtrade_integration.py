@@ -1,7 +1,7 @@
 """Integration tests of the adapter against **the real Freqtrade interface**.
 
 This is the proof of deliverable (b): the class produced by
-:func:`~trading_backtest.strategy.make_freqtrade_strategy` is instantiated for
+:func:`~trading_platform.strategy.make_freqtrade_strategy` is instantiated for
 real, driven over **real market data**, and its signals are cross-checked
 candle by candle against the ones the **house** engine renders on the very same
 data.  Nothing is simulated here: the objects under test are
@@ -70,8 +70,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_backtest.core.constants import OHLCV_INDEX_NAME, REQUIRED_OHLCV_COLUMNS, UTC
-from trading_backtest.strategy import (
+from trading_platform.core.constants import OHLCV_INDEX_NAME, REQUIRED_OHLCV_COLUMNS, UTC
+from trading_platform.strategy import (
     FREQTRADE_INTERFACE_VERSION,
     SIGNAL_TO_FREQTRADE_COLUMNS,
     get_strategy,
