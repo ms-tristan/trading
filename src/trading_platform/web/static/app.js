@@ -15,9 +15,21 @@
 "use strict";
 
 (function () {
-  var REFRESH_MS = 2000;
+  /* The polling cadence comes from the page itself (`data-refresh-seconds` on
+     <body>, written by the server from `monitoring.refresh_seconds`), so the
+     documented configuration knob actually drives the dashboard: it used to be a
+     constant that ignored the configuration entirely. */
+  var DEFAULT_REFRESH_SECONDS = 2;
   var MAX_TRADES = 10;
   var TOKEN_KEY = "tb.operator_token";
+
+  function refreshSeconds() {
+    var raw = document.body ? document.body.getAttribute("data-refresh-seconds") : null;
+    var seconds = parseFloat(raw);
+    return isFinite(seconds) && seconds >= 0.5 ? seconds : DEFAULT_REFRESH_SECONDS;
+  }
+
+  var REFRESH_MS = Math.round(refreshSeconds() * 1000);
 
   var elements = {
     status: document.getElementById("platform-status"),
@@ -309,49 +321,73 @@
     return section;
   }
 
-  function profileCard(profile) {
+  /* ------------------------------------------------------------------ */
+  /* one card per profile, built once and updated in place               */
+  /* ------------------------------------------------------------------ */
+
+  /* The cards are *not* rebuilt on every poll.  The first version called
+     `replaceChildren()` on the container every cycle, which destroyed and
+     recreated every card -- and with it the equity canvas and the detail block,
+     reset to "loading detail...".  On a fast local link that was an invisible
+     flash; on a slower one the cards spent most of each 2 s cycle blank, which is
+     exactly what "the page keeps reloading and shows no data" looks like.  A card
+     is now created once, keyed by profile id, and only its text nodes change. */
+
+  var cardsById = {};
+
+  function createField(label) {
+    var wrapper = el("div", "field");
+    wrapper.appendChild(el("span", "field-label", label));
+    var valueNode = el("span", "field-value", "-");
+    wrapper.appendChild(valueNode);
+    return { node: wrapper, valueNode: valueNode };
+  }
+
+  function setField(fieldHandle, value) {
+    var text = String(value === undefined || value === null || value === "" ? "-" : value);
+    if (fieldHandle.valueNode.textContent !== text) {
+      fieldHandle.valueNode.textContent = text;
+    }
+  }
+
+  function createCard(profile) {
     var card = el("article", "card");
+
     var head = el("header", "card-head");
     head.appendChild(el("h2", null, profile.profile_id));
-    head.appendChild(badge(profile.status, statusKind(profile.status)));
-    head.appendChild(badge(profile.mode, profile.mode === "live" ? "bad" : "ok"));
+    var statusBadge = badge(profile.status, statusKind(profile.status));
+    var modeBadge = badge(profile.mode, profile.mode === "live" ? "bad" : "ok");
+    head.appendChild(statusBadge);
+    head.appendChild(modeBadge);
     card.appendChild(head);
 
+    var fields = {
+      symbol: createField("symbol"),
+      timeframe: createField("timeframe"),
+      strategy: createField("strategy"),
+      equity: createField("equity"),
+      cash: createField("cash"),
+      positionValue: createField("position value"),
+      totalReturn: createField("return"),
+      trades: createField("trades"),
+      positions: createField("positions"),
+      lastCandle: createField("last candle"),
+      lag: createField("lag"),
+      reconnects: createField("reconnects")
+    };
     var facts = el("div", "facts");
-    facts.appendChild(field("symbol", profile.symbol));
-    facts.appendChild(field("timeframe", profile.timeframe));
-    facts.appendChild(field("strategy", profile.strategy));
-    facts.appendChild(field("equity", formatMoney(profile.equity)));
-    facts.appendChild(field("cash", formatMoney(profile.cash)));
-    facts.appendChild(field("position value", formatMoney(profile.position_value)));
-    facts.appendChild(field("return", formatNumber(profile.total_return * 100, 2) + " %"));
-    facts.appendChild(field("trades", profile.n_trades));
-    facts.appendChild(field("positions", profile.open_positions));
-    var health = profile.health || {};
-    facts.appendChild(field("last candle", formatTimestamp(health.last_candle_at)));
-    facts.appendChild(field("lag", formatLag(health.lag_seconds)));
-    facts.appendChild(field("reconnects", health.reconnect_count));
+    Object.keys(fields).forEach(function (key) {
+      facts.appendChild(fields[key].node);
+    });
     card.appendChild(facts);
 
-    if (health.last_error) {
-      var error = el("p", "error", "last error: " + health.last_error);
-      card.appendChild(error);
-    }
+    /* the error line is part of the card from the start: it is shown or hidden,
+       never inserted, so a profile that recovers does not shift the layout */
+    var errorLine = el("p", "error hidden", "");
+    card.appendChild(errorLine);
 
-    var counters = health.counters || {};
-    var line = el("p", "muted", null);
-    line.textContent =
-      "candles " +
-      (counters.candles_processed || 0) +
-      " - orders " +
-      (counters.orders_submitted || 0) +
-      " - filled " +
-      (counters.orders_filled || 0) +
-      " - rejected " +
-      (counters.orders_rejected || 0) +
-      " - risk " +
-      (counters.risk_rejections || 0);
-    card.appendChild(line);
+    var countersLine = el("p", "muted", "");
+    card.appendChild(countersLine);
 
     var canvas = el("canvas", "equity");
     canvas.setAttribute("role", "img");
@@ -362,7 +398,114 @@
     detail.appendChild(el("p", "muted", "loading detail..."));
     card.appendChild(detail);
 
-    return { card: card, canvas: canvas, detail: detail, points: [] };
+    return {
+      card: card,
+      statusBadge: statusBadge,
+      modeBadge: modeBadge,
+      fields: fields,
+      errorLine: errorLine,
+      countersLine: countersLine,
+      canvas: canvas,
+      detail: detail,
+      points: [],
+      pointsSignature: null,
+      detailLoaded: false
+    };
+  }
+
+  function updateCard(handle, profile) {
+    var health = profile.health || {};
+
+    handle.statusBadge.className = "badge badge-" + statusKind(profile.status);
+    handle.statusBadge.textContent = String(profile.status);
+    handle.modeBadge.className = "badge badge-" + (profile.mode === "live" ? "bad" : "ok");
+    handle.modeBadge.textContent = String(profile.mode);
+
+    setField(handle.fields.symbol, profile.symbol);
+    setField(handle.fields.timeframe, profile.timeframe);
+    setField(handle.fields.strategy, profile.strategy);
+    setField(handle.fields.equity, formatMoney(profile.equity));
+    setField(handle.fields.cash, formatMoney(profile.cash));
+    setField(handle.fields.positionValue, formatMoney(profile.position_value));
+    setField(handle.fields.totalReturn, formatNumber(profile.total_return * 100, 2) + " %");
+    setField(handle.fields.trades, profile.n_trades);
+    setField(handle.fields.positions, profile.open_positions);
+    setField(handle.fields.lastCandle, formatTimestamp(health.last_candle_at));
+    setField(handle.fields.lag, formatLag(health.lag_seconds));
+    setField(handle.fields.reconnects, health.reconnect_count);
+
+    if (health.last_error) {
+      handle.errorLine.textContent = "last error: " + health.last_error;
+      handle.errorLine.classList.remove("hidden");
+    } else {
+      handle.errorLine.textContent = "";
+      handle.errorLine.classList.add("hidden");
+    }
+
+    var counters = health.counters || {};
+    handle.countersLine.textContent =
+      "candles " +
+      (counters.candles_processed || 0) +
+      " - orders " +
+      (counters.orders_submitted || 0) +
+      " - filled " +
+      (counters.orders_filled || 0) +
+      " - rejected " +
+      (counters.orders_rejected || 0) +
+      " - risk " +
+      (counters.risk_rejections || 0);
+  }
+
+  function renderPositions(list) {
+    var section = el("section", "block");
+    section.appendChild(el("h3", null, "Open positions"));
+    if (!list.length) {
+      section.appendChild(el("p", "muted", "no open position"));
+      return section;
+    }
+    var table = el("table", "grid");
+    var head = el("tr", null, null);
+    ["symbol", "side", "quantity", "average price", "unrealized PnL"].forEach(function (label) {
+      head.appendChild(el("th", null, label));
+    });
+    table.appendChild(head);
+    list.forEach(function (position) {
+      var row = el("tr", null, null);
+      row.appendChild(el("td", null, position.symbol));
+      row.appendChild(el("td", null, position.direction));
+      row.appendChild(el("td", null, formatNumber(position.quantity, 6)));
+      row.appendChild(el("td", null, formatMoney(position.average_price)));
+      row.appendChild(el("td", null, formatMoney(position.unrealized_pnl)));
+      table.appendChild(row);
+    });
+    section.appendChild(table);
+    return section;
+  }
+
+  function renderTrades(list) {
+    var section = el("section", "block");
+    section.appendChild(el("h3", null, "Last 10 trades"));
+    if (!list.length) {
+      section.appendChild(el("p", "muted", "no closed trade"));
+      return section;
+    }
+    var table = el("table", "grid");
+    var head = el("tr", null, null);
+    ["exit time", "side", "size", "exit price", "PnL"].forEach(function (label) {
+      head.appendChild(el("th", null, label));
+    });
+    table.appendChild(head);
+    list.slice(0, MAX_TRADES).forEach(function (trade) {
+      var row = el("tr", null, null);
+      row.appendChild(el("td", null, formatTimestamp(trade.exit_time)));
+      row.appendChild(el("td", null, trade.direction));
+      row.appendChild(el("td", null, formatNumber(trade.size, 6)));
+      row.appendChild(el("td", null, formatMoney(trade.exit_price)));
+      row.appendChild(el("td", null, formatMoney(trade.pnl)));
+      table.appendChild(row);
+    });
+    section.appendChild(table);
+    return section;
   }
 
   function renderDetail(container, positions, trades) {
@@ -371,7 +514,7 @@
     container.appendChild(renderTrades(trades));
   }
 
-  function loadDetail(entry, profileId) {
+  function loadDetail(handle, profileId) {
     var requests = [
       getJson("/api/profiles/" + encodeURIComponent(profileId) + "/equity"),
       getJson("/api/profiles/" + encodeURIComponent(profileId) + "/positions"),
@@ -382,16 +525,21 @@
         var equity = answers[0] || {};
         var positions = answers[1] || {};
         var trades = answers[2] || {};
-        entry.points = Array.isArray(equity.points) ? equity.points : [];
+        handle.points = Array.isArray(equity.points) ? equity.points : [];
+        handle.detailLoaded = true;
         renderDetail(
-          entry.detail,
+          handle.detail,
           Array.isArray(positions.positions) ? positions.positions : [],
           Array.isArray(trades.trades) ? trades.trades : []
         );
       })
       .catch(function () {
-        entry.detail.replaceChildren();
-        entry.detail.appendChild(el("p", "muted", "detail unavailable"));
+        /* Keep whatever was last displayed: blanking a card because one request
+           failed is what made the page look empty.  The banner carries the error. */
+        if (!handle.detailLoaded) {
+          handle.detail.replaceChildren();
+          handle.detail.appendChild(el("p", "muted", "detail unavailable"));
+        }
       });
   }
 
@@ -421,19 +569,50 @@
 
   function renderProfiles(payload) {
     var profiles = payload && Array.isArray(payload.profiles) ? payload.profiles : [];
-    if (!elements.profiles) {
+    var container = elements.profiles;
+    if (!container) {
       return [];
     }
-    elements.profiles.replaceChildren();
     if (!profiles.length) {
-      elements.profiles.appendChild(el("p", "muted", "no profile configured"));
+      Object.keys(cardsById).forEach(function (id) {
+        container.removeChild(cardsById[id].card);
+        delete cardsById[id];
+      });
+      if (!container.querySelector(".empty")) {
+        container.replaceChildren();
+        container.appendChild(el("p", "muted empty", "no profile configured"));
+      }
       return [];
     }
+    /* the "loading profiles..." placeholder of index.html and the empty state:
+       both are removed once real cards exist, and neither is ever re-added while
+       the list has content */
+    Array.prototype.slice
+      .call(container.querySelectorAll(".placeholder, .empty"))
+      .forEach(function (node) {
+        container.removeChild(node);
+      });
     var entries = [];
+    var seen = {};
     profiles.forEach(function (profile) {
-      var entry = profileCard(profile);
-      entries.push({ entry: entry, profileId: profile.profile_id });
-      elements.profiles.appendChild(entry.card);
+      var id = profile.profile_id;
+      seen[id] = true;
+      var handle = cardsById[id];
+      var fresh = false;
+      if (!handle) {
+        handle = createCard(profile);
+        cardsById[id] = handle;
+        container.appendChild(handle.card);
+        fresh = true;
+      }
+      updateCard(handle, profile);
+      entries.push({ entry: handle, profileId: id, fresh: fresh });
+    });
+    Object.keys(cardsById).forEach(function (id) {
+      if (!seen[id]) {
+        container.removeChild(cardsById[id].card);
+        delete cardsById[id];
+      }
     });
     return entries;
   }
@@ -444,6 +623,8 @@
 
   function refresh() {
     if (polling) {
+      /* A slow link must not pile requests up: the next tick is skipped while one
+         cycle is still in flight. */
       return Promise.resolve();
     }
     polling = true;
@@ -458,11 +639,19 @@
           })
         ).then(function () {
           entries.forEach(function (item) {
+            /* the canvas is only redrawn when the curve it shows really changed */
+            var signature = equitySignature(item.entry.points);
+            if (!item.fresh && signature === item.entry.pointsSignature) {
+              return;
+            }
+            item.entry.pointsSignature = signature;
             drawEquity(item.entry.canvas, item.entry.points);
           });
         });
       })
       .catch(function (error) {
+        /* The last rendered values stay on screen: an unreachable API is shown as
+           a banner, never as an empty page. */
         showBanner(
           "polling failed: " + (error && error.message ? error.message : "unknown error")
         );
@@ -470,6 +659,14 @@
       .then(function () {
         polling = false;
       });
+  }
+
+  function equitySignature(points) {
+    if (!points || !points.length) {
+      return "empty";
+    }
+    var last = points[points.length - 1];
+    return points.length + ":" + String(last.timestamp) + ":" + String(last.equity);
   }
 
   function bindKillSwitch() {

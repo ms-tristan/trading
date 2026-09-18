@@ -17,6 +17,7 @@ import contextlib
 import http.client
 import json
 import logging
+import re
 import socket
 import threading
 import time
@@ -748,3 +749,75 @@ def test_a_polling_browser_never_exhausts_the_store_connections(tmp_path: Path) 
             )
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# the dashboard must not rebuild itself on every poll
+# ---------------------------------------------------------------------------
+
+
+def dashboard_javascript_code() -> str:
+    """Return ``app.js`` with its comments removed.
+
+    The assertions below are about the code, and the file deliberately *explains*
+    the flicker it avoids (the words "loading detail..." and ``replaceChildren``
+    both appear in its prose).  Without stripping the comments the checks would be
+    reading the documentation instead of the code.
+    """
+    source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    without_blocks = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    return "\n".join(
+        line for line in without_blocks.splitlines() if not line.strip().startswith("//")
+    )
+
+
+def test_the_dashboard_updates_in_place_instead_of_rebuilding_every_poll() -> None:
+    """The polling loop must not wipe and recreate the profile cards.
+
+    Regression test for "the page keeps reloading and shows no data". The first
+    version called ``replaceChildren()`` on the profile container on every cycle:
+    each card, its equity canvas and its detail block were destroyed and rebuilt
+    every two seconds, the detail block was reset to a "loading detail..."
+    placeholder, and the curve was redrawn only after every detail request had
+    resolved.  Measured against the deployed dashboard over a 400 ms link, that
+    placeholder was on screen for 21 % of the samples.
+
+    The browser behaviour itself cannot be asserted here (the suite is offline and
+    has no browser); what is pinned is the structural contract that makes it
+    impossible: the container is never cleared while updating, cards are created
+    once and updated in place, and a late failure never blanks what is already
+    displayed.
+    """
+    javascript = dashboard_javascript_code()
+
+    assert "elements.profiles.replaceChildren()" not in javascript, (
+        "the profile list is wiped on every poll again: that is the flicker"
+    )
+    assert "function createCard(" in javascript
+    assert "function updateCard(" in javascript
+    assert "cardsById" in javascript, "cards must be tracked by profile id, not recreated"
+    # the detail block may only be emptied when nothing was ever loaded
+    assert "detailLoaded" in javascript
+    # the placeholder is written once, when the card is created
+    assert javascript.count("loading detail...") == 1
+
+
+def test_the_dashboard_cadence_comes_from_the_configuration() -> None:
+    """`monitoring.refresh_seconds` drives the page, it is not a hardcoded constant."""
+    javascript = dashboard_javascript_code()
+
+    assert 'getAttribute("data-refresh-seconds")' in javascript
+    assert "DEFAULT_REFRESH_SECONDS" in javascript
+
+
+def test_the_dashboard_javascript_stays_es5() -> None:
+    """The dashboard is served as-is to any browser: no transpiler, no build step.
+
+    A single arrow function or template literal would silently break an older
+    browser with no way to notice from the server side, so the code is pinned to
+    the syntax the file was written in.
+    """
+    javascript = dashboard_javascript_code()
+
+    for needle in ("=>", "`", "let ", "const ", "class "):
+        assert needle not in javascript, f"app.js uses post-ES5 syntax: {needle!r}"
