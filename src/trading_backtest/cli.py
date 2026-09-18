@@ -21,15 +21,23 @@ Every command supports ``--json``, which prints exactly one
 with the keys ``command, ok, symbol, timeframe, config_path, metrics, run,
 reports, data_quality``.
 
-The optional buy & hold benchmark (:data:`_BENCHMARK_HELP`) never adds a payload
-key: the gate travels *inside* ``run`` (under ``run["benchmark"]``) and as a
-dedicated ``Benchmark`` section of the written report, exactly like the other
-validation payloads.
+The optional benchmark (:data:`_BENCHMARK_HELP`) never adds a payload key: the
+gate travels *inside* ``run`` (under ``run["benchmark"]``) and as a dedicated
+``Benchmark`` section of the written report, exactly like the other validation
+payloads.  ``--benchmark-variant`` (:data:`_BENCHMARK_VARIANT_HELP`) selects
+between ``buy_and_hold``, ``cash``, ``risk_free`` and ``random_entry`` -- exactly
+one benchmark per run -- and ``--risk-free-rate`` (:data:`_RISK_FREE_HELP`) sets
+the annual rate subtracted from the annualised mean return by
+``sharpe_ratio``/``sortino_ratio`` (and compounded by the ``risk_free`` curve).
+The random-entry skill test travels the very same way, but *inside*
+``run["random_entry"]`` plus a ``random_entry`` report section: it is a
+distribution, not a curve, so it has its own gate.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
@@ -63,7 +71,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     import pandas as pd
 
     from trading_backtest.metrics import MetricSet
-    from trading_backtest.validation import BenchmarkGateResult
+    from trading_backtest.validation import (
+        BenchmarkGateResult,
+        RandomEntryGateResult,
+    )
 
 __all__ = ["app", "config_app", "data_app", "main"]
 
@@ -479,23 +490,68 @@ def _make_runner(cfg: AppConfig, *, symbol: str) -> RunnerFn:
     return make_runner(cfg, symbol=symbol)
 
 
-def _compute_metrics(result: BacktestResult, *, timeframe: str) -> MetricSet:
-    """Compute the metric set of ``result`` (imports :mod:`trading_backtest.metrics`)."""
+def _compute_metrics(
+    result: BacktestResult, *, timeframe: str, risk_free_rate: float = 0.0
+) -> MetricSet:
+    """Compute the metric set of ``result`` (imports :mod:`trading_backtest.metrics`).
+
+    ``risk_free_rate`` is the **annual** rate forwarded to
+    :func:`trading_backtest.metrics.compute_metrics`; it only moves
+    ``sharpe_ratio``/``sortino_ratio`` (``0.0`` keeps the historical values).
+    """
     from trading_backtest.metrics import compute_metrics
 
-    return compute_metrics(result, timeframe=timeframe)
+    return compute_metrics(result, timeframe=timeframe, risk_free_rate=risk_free_rate)
 
 
-def _resolve_benchmark_variant(cfg: AppConfig, *, enabled: bool | None) -> str:
+def _resolve_risk_free_rate(cfg: AppConfig, *, override: float | None) -> float:
+    """Return the annual risk-free rate of this run: ``--risk-free-rate``, else the config.
+
+    ``None`` follows ``benchmark.risk_free_rate`` (``0.0`` in the shipped
+    configuration, which preserves the historical Sharpe/Sortino values).  An
+    explicit override must be a finite fraction ``>= 0``: a negative or
+    ``nan``/``inf`` rate is a typo, not a study, and is rejected with a
+    :class:`~trading_backtest.core.errors.ConfigError` (exit code ``1``, no
+    traceback).
+    """
+    if override is None:
+        return float(cfg.benchmark.risk_free_rate)
+    if override < 0.0 or not math.isfinite(override):
+        raise ConfigError(f"--risk-free-rate must be a finite fraction >= 0, got {override!r}")
+    return float(override)
+
+
+def _resolve_benchmark_variant(
+    cfg: AppConfig, *, enabled: bool | None, variant_override: str | None = None
+) -> str:
     """Return the effective benchmark variant; ``'none'`` means: do not compute any benchmark.
 
     ``enabled`` is the tri-state ``--benchmark/--no-benchmark`` flag: ``None``
     follows ``benchmark.enabled``, ``True``/``False`` force the benchmark on/off.
     ``variant='none'`` in the configuration always wins over ``--benchmark``, and
     ``--no-benchmark`` disables the benchmark whatever the configured variant.
+
+    ``--benchmark-variant`` wins over ``benchmark.variant`` **when the benchmark
+    is active** (it can never resurrect a disabled benchmark) and is validated
+    here, by hand, against the real
+    :data:`trading_backtest.metrics.BENCHMARK_VARIANTS` tuple -- ``typer``'s
+    ``StrEnum`` idiom does not cover that set without new plumbing.  Exactly one
+    benchmark is ever computed per run.
     """
     active = cfg.benchmark.enabled if enabled is None else bool(enabled)
-    return str(cfg.benchmark.variant) if active else "none"
+    if not active:
+        return "none"
+    if variant_override is None:
+        return str(cfg.benchmark.variant)
+
+    from trading_backtest.metrics import BENCHMARK_VARIANTS
+
+    if variant_override not in BENCHMARK_VARIANTS:
+        raise ConfigError(
+            f"unknown benchmark variant: {variant_override!r}; available variants: "
+            f"{', '.join(BENCHMARK_VARIANTS)}"
+        )
+    return str(variant_override)
 
 
 def _benchmark_gate(
@@ -504,13 +560,21 @@ def _benchmark_gate(
     *,
     variant: str,
     cfg: AppConfig,
+    risk_free_rate: float = 0.0,
 ) -> BenchmarkGateResult | None:
     """Gate ``result`` against its ``variant`` benchmark (lazy validation import).
 
-    Returns ``None`` when no benchmark is requested (``variant == 'none'``), so a
-    disabled benchmark costs nothing -- not even an import.
+    Returns ``None`` when no *curve* benchmark is requested: ``variant == 'none'``
+    (nothing to compare against) and ``variant == 'random_entry'`` (a distribution
+    comparison, handled by :func:`_random_entry_gate`).  Both short-circuits keep
+    the "no import for a disabled benchmark" contract intact.
+
+    ``risk_free_rate`` is forwarded to
+    :func:`trading_backtest.validation.validate_benchmark`, so the
+    ``sharpe_ratio``/``sortino_ratio`` of the strategy row and of the benchmark row
+    use the very same annual rate.
     """
-    if variant == "none":
+    if variant in {"none", "random_entry"}:
         return None
 
     from trading_backtest.validation import validate_benchmark
@@ -519,6 +583,41 @@ def _benchmark_gate(
         result,
         frame,
         variant=variant,
+        fee_rate=cfg.exchange.fee_rate,
+        slippage=cfg.exchange.slippage,
+        risk_free_rate=risk_free_rate,
+    )
+
+
+def _random_entry_gate(
+    result: BacktestResult,
+    frame: pd.DataFrame,
+    *,
+    variant: str,
+    cfg: AppConfig,
+) -> RandomEntryGateResult | None:
+    """Gate ``result`` against random entries (the skill test); ``None`` when not selected.
+
+    Only ``variant == 'random_entry'`` runs the simulation: nothing is ever
+    computed for a disabled benchmark, and the other variants are curve
+    comparisons handled by :func:`_benchmark_gate`.
+
+    ``n_simulations``/``random_seed`` come from the configuration
+    (``benchmark.n_random_simulations`` / ``benchmark.random_entry_seed``), so a
+    run is reproducible from its configuration alone; the seed is always explicit.
+    ``risk_free_rate`` is deliberately **not** passed: the ranking is done on
+    ``total_return``, which is risk-free-rate free by construction.
+    """
+    if variant != "random_entry":
+        return None
+
+    from trading_backtest.validation import validate_random_entry
+
+    return validate_random_entry(
+        result,
+        frame,
+        n_simulations=cfg.benchmark.n_random_simulations,
+        random_seed=cfg.benchmark.random_entry_seed,
         fee_rate=cfg.exchange.fee_rate,
         slippage=cfg.exchange.slippage,
     )
@@ -594,19 +693,29 @@ def _write_and_emit(
     formats: str | None,
     json_output: bool,
     benchmark: BenchmarkGateResult | None = None,
+    random_entry: RandomEntryGateResult | None = None,
 ) -> None:
     """Build the report, write it through ``write_report`` and emit the payload.
 
-    ``benchmark`` is the optional buy & hold gate: its three side-by-side rows
-    become the ``Benchmark`` report section and its scalars travel inside the
-    ``run`` payload (never as a new top-level payload key).
+    ``benchmark`` is the optional curve gate (buy & hold, cash or risk free): its
+    three side-by-side rows become the ``Benchmark`` report section and its
+    scalars travel inside the ``run`` payload (never as a new top-level payload
+    key).
+
+    ``random_entry`` is the optional skill gate: its payload becomes the
+    ``random_entry`` report section *and* ``run["random_entry"]``.  Both channels
+    are handled here, once, so the report section and the run payload can never
+    disagree and no command duplicates the logic.
     """
     from trading_backtest.reporting import build_report, write_report
 
+    payloads: dict[str, Mapping[str, Any]] = dict(extras)
+    if random_entry is not None:
+        payloads["random_entry"] = random_entry.to_dict()
     report = build_report(
         result=result,
         metrics=metrics,
-        extras=extras,
+        extras=payloads,
         title=cfg.reporting.title,
         config_echo=cfg.model_dump(mode="json"),
         include_trades=cfg.reporting.include_trades,
@@ -623,6 +732,8 @@ def _write_and_emit(
     run_payload = dict(run)
     if benchmark is not None:
         run_payload["benchmark"] = benchmark.to_dict()
+    if random_entry is not None:
+        run_payload["random_entry"] = random_entry.to_dict()
     _emit(
         _payload(
             command=command,
@@ -671,6 +782,13 @@ _OUTPUT_DIR_HELP = "Report directory (defaults to reporting.output_dir)."
 _FORMATS_HELP = "Comma separated report formats (markdown,json). Default: reporting.formats."
 _NO_NETWORK_HELP = "Never download: a cache miss is a hard error."
 _BENCHMARK_HELP = "Compare the strategy to a buy & hold benchmark. Default: benchmark.enabled."
+_RISK_FREE_HELP = (
+    "Annualised risk-free rate as a fraction (0.05 = 5 %/yr); default: benchmark.risk_free_rate."
+)
+_BENCHMARK_VARIANT_HELP = (
+    "Benchmark variant: buy_and_hold, cash, risk_free, random_entry or none; "
+    "default: benchmark.variant."
+)
 _JSON_HELP = "Print one JSON object on stdout instead of the human summary."
 
 
@@ -706,6 +824,10 @@ def backtest(
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
     benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
+    risk_free_rate: float | None = typer.Option(None, "--risk-free-rate", help=_RISK_FREE_HELP),
+    benchmark_variant: str | None = typer.Option(
+        None, "--benchmark-variant", help=_BENCHMARK_VARIANT_HELP
+    ),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Backtest the configured strategy over one data window."""
@@ -713,6 +835,10 @@ def backtest(
         cfg = load_config(config)
         resolved_symbol = _resolve_symbol(symbol, data_file)
         resolved_timeframe = _resolve_timeframe(timeframe, cfg)
+        resolved_risk_free_rate = _resolve_risk_free_rate(cfg, override=risk_free_rate)
+        variant = _resolve_benchmark_variant(
+            cfg, enabled=benchmark, variant_override=benchmark_variant
+        )
         frame = _acquire_data(
             cfg,
             symbol=resolved_symbol,
@@ -724,10 +850,17 @@ def backtest(
         )
         quality = _quality(frame, cfg, timeframe=resolved_timeframe)
         result = _make_runner(cfg, symbol=resolved_symbol)(frame, None)
-        metrics = _compute_metrics(result, timeframe=resolved_timeframe)
-        gate = _benchmark_gate(
-            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        metrics = _compute_metrics(
+            result, timeframe=resolved_timeframe, risk_free_rate=resolved_risk_free_rate
         )
+        gate = _benchmark_gate(
+            result,
+            frame,
+            variant=variant,
+            cfg=cfg,
+            risk_free_rate=resolved_risk_free_rate,
+        )
+        random_gate = _random_entry_gate(result, frame, variant=variant, cfg=cfg)
         _write_and_emit(
             "backtest",
             cfg=cfg,
@@ -743,6 +876,7 @@ def backtest(
             formats=formats,
             json_output=json_output,
             benchmark=gate,
+            random_entry=random_gate,
         )
 
 
@@ -764,6 +898,10 @@ def walk_forward_command(
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
     benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
+    risk_free_rate: float | None = typer.Option(None, "--risk-free-rate", help=_RISK_FREE_HELP),
+    benchmark_variant: str | None = typer.Option(
+        None, "--benchmark-variant", help=_BENCHMARK_VARIANT_HELP
+    ),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Walk-forward analysis: in-sample / out-of-sample stability over time."""
@@ -773,6 +911,10 @@ def walk_forward_command(
         cfg = load_config(config)
         resolved_symbol = _resolve_symbol(symbol, data_file)
         resolved_timeframe = _resolve_timeframe(timeframe, cfg)
+        resolved_risk_free_rate = _resolve_risk_free_rate(cfg, override=risk_free_rate)
+        variant = _resolve_benchmark_variant(
+            cfg, enabled=benchmark, variant_override=benchmark_variant
+        )
         frame = _acquire_data(
             cfg,
             symbol=resolved_symbol,
@@ -785,10 +927,17 @@ def walk_forward_command(
         quality = _quality(frame, cfg, timeframe=resolved_timeframe)
         runner = _make_runner(cfg, symbol=resolved_symbol)
         result = runner(frame, None)
-        metrics = _compute_metrics(result, timeframe=resolved_timeframe)
-        gate = _benchmark_gate(
-            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        metrics = _compute_metrics(
+            result, timeframe=resolved_timeframe, risk_free_rate=resolved_risk_free_rate
         )
+        gate = _benchmark_gate(
+            result,
+            frame,
+            variant=variant,
+            cfg=cfg,
+            risk_free_rate=resolved_risk_free_rate,
+        )
+        random_gate = _random_entry_gate(result, frame, variant=variant, cfg=cfg)
         analysis = walk_forward(
             runner,
             frame,
@@ -815,6 +964,7 @@ def walk_forward_command(
             formats=formats,
             json_output=json_output,
             benchmark=gate,
+            random_entry=random_gate,
         )
 
 
@@ -832,6 +982,10 @@ def robustness(
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
     benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
+    risk_free_rate: float | None = typer.Option(None, "--risk-free-rate", help=_RISK_FREE_HELP),
+    benchmark_variant: str | None = typer.Option(
+        None, "--benchmark-variant", help=_BENCHMARK_VARIANT_HELP
+    ),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Parametric robustness: sweep a grid and summarise its stability."""
@@ -841,6 +995,10 @@ def robustness(
         cfg = load_config(config)
         resolved_symbol = _resolve_symbol(symbol, data_file)
         resolved_timeframe = _resolve_timeframe(timeframe, cfg)
+        resolved_risk_free_rate = _resolve_risk_free_rate(cfg, override=risk_free_rate)
+        variant = _resolve_benchmark_variant(
+            cfg, enabled=benchmark, variant_override=benchmark_variant
+        )
         limit = (
             max_combinations
             if max_combinations is not None
@@ -859,10 +1017,17 @@ def robustness(
         quality = _quality(frame, cfg, timeframe=resolved_timeframe)
         runner = _make_runner(cfg, symbol=resolved_symbol)
         result = runner(frame, None)
-        metrics = _compute_metrics(result, timeframe=resolved_timeframe)
-        gate = _benchmark_gate(
-            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        metrics = _compute_metrics(
+            result, timeframe=resolved_timeframe, risk_free_rate=resolved_risk_free_rate
         )
+        gate = _benchmark_gate(
+            result,
+            frame,
+            variant=variant,
+            cfg=cfg,
+            risk_free_rate=resolved_risk_free_rate,
+        )
+        random_gate = _random_entry_gate(result, frame, variant=variant, cfg=cfg)
         sweep = parameter_sweep(
             runner,
             frame,
@@ -888,6 +1053,7 @@ def robustness(
             formats=formats,
             json_output=json_output,
             benchmark=gate,
+            random_entry=random_gate,
         )
 
 
@@ -907,6 +1073,10 @@ def monte_carlo_command(
     output_dir: Path | None = typer.Option(None, "--output-dir", help=_OUTPUT_DIR_HELP),
     formats: str | None = typer.Option(None, "--formats", help=_FORMATS_HELP),
     benchmark: bool | None = typer.Option(None, "--benchmark/--no-benchmark", help=_BENCHMARK_HELP),
+    risk_free_rate: float | None = typer.Option(None, "--risk-free-rate", help=_RISK_FREE_HELP),
+    benchmark_variant: str | None = typer.Option(
+        None, "--benchmark-variant", help=_BENCHMARK_VARIANT_HELP
+    ),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Monte Carlo simulation of the trades produced by one backtest."""
@@ -916,6 +1086,10 @@ def monte_carlo_command(
         cfg = load_config(config)
         resolved_symbol = _resolve_symbol(symbol, data_file)
         resolved_timeframe = _resolve_timeframe(timeframe, cfg)
+        resolved_risk_free_rate = _resolve_risk_free_rate(cfg, override=risk_free_rate)
+        variant = _resolve_benchmark_variant(
+            cfg, enabled=benchmark, variant_override=benchmark_variant
+        )
         frame = _acquire_data(
             cfg,
             symbol=resolved_symbol,
@@ -927,10 +1101,17 @@ def monte_carlo_command(
         )
         quality = _quality(frame, cfg, timeframe=resolved_timeframe)
         result = _make_runner(cfg, symbol=resolved_symbol)(frame, None)
-        metrics = _compute_metrics(result, timeframe=resolved_timeframe)
-        gate = _benchmark_gate(
-            result, frame, variant=_resolve_benchmark_variant(cfg, enabled=benchmark), cfg=cfg
+        metrics = _compute_metrics(
+            result, timeframe=resolved_timeframe, risk_free_rate=resolved_risk_free_rate
         )
+        gate = _benchmark_gate(
+            result,
+            frame,
+            variant=variant,
+            cfg=cfg,
+            risk_free_rate=resolved_risk_free_rate,
+        )
+        random_gate = _random_entry_gate(result, frame, variant=variant, cfg=cfg)
         simulation = monte_carlo(
             result,
             n_simulations=(
@@ -959,6 +1140,7 @@ def monte_carlo_command(
             formats=formats,
             json_output=json_output,
             benchmark=gate,
+            random_entry=random_gate,
         )
 
 

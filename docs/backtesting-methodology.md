@@ -438,7 +438,7 @@ histoire fausse.
 
 ---
 
-## 11. Le benchmark buy & hold
+## 11. Les benchmarks : battre l'inaction, le hasard et le taux sans risque
 
 ### 11.1 La question à laquelle aucune stratégie n'échappe
 
@@ -535,18 +535,73 @@ n'invalide pas l'alpha. Le rapport est aussi exposé côte à côte (stratégie,
 benchmark, écart) dans le rapport markdown et sous `run.benchmark` en JSON — voir
 [`docs/usage.md`](usage.md).
 
-### 11.4 Les trois variantes (`benchmark.variant`)
+### 11.4 Les cinq variantes (`benchmark.variant`)
 
-| Variante | Ce qu'elle représente | Quand l'utiliser |
-| --- | --- | --- |
-| `buy_and_hold` | achat au premier close, conservation jusqu'au dernier close, frais et slippage du moteur | **défaut** : la référence à battre sur un actif directionnel |
-| `cash` | capital laissé en cash : rendement `0.0`, aucune exposition, aucune volatilité | la référence « ne rien faire du tout », utile pour juger une stratégie peu exposée ou un marché baissier |
-| `none` | aucune référence : le benchmark n'est ni calculé ni rapporté | runs techniques, tests, ou comparaison volontairement hors sujet |
+| Variante | Ce qu'elle représente | La question à laquelle elle répond | Quand l'utiliser |
+| --- | --- | --- | --- |
+| `buy_and_hold` | achat au premier close, conservation jusqu'au dernier close, frais et slippage du moteur | « est-ce que je bats le fait de ne rien faire ? » | **défaut** : la référence à battre sur un actif directionnel |
+| `cash` | capital laissé en cash : rendement `0.0`, aucune exposition, aucune volatilité | « est-ce que je fais mieux que ne rien faire du tout ? » | le plancher absolu, utile pour juger une stratégie peu exposée ou un marché baissier |
+| `risk_free` | même courbe, mais **rémunérée** : le capital est placé au taux sans risque annuel configuré, composé sur la même fenêtre | « est-ce que je bats un placement sans risque ? » | le vrai plancher économique : ce que le capital rapportait sans prendre aucun risque de marché |
+| `random_entry` | une **distribution**, pas une courbe : N stratégies à entrées aléatoires (§11.8) | « est-ce que je bats le hasard ? » — test de compétence | distinguer la compétence de la chance, dès que la stratégie compte quelques dizaines de trades |
+| `none` | aucune référence : le benchmark n'est ni calculé ni rapporté | — | runs techniques, tests, ou comparaison volontairement hors sujet |
+
+**`cash` et `risk_free` ne sont pas la même chose.** `cash` **ignore** le taux
+sans risque : le capital ne bouge pas, la courbe est plate, `total_return = 0.0`.
+`risk_free` est ce même cash, mais **qui rapporte** le taux configuré : c'est le
+rendement d'un placement sans risque (bon du Trésor, taux directeur) sur la
+fenêtre. Les deux chargent **aucun frais et aucun slippage**, parce qu'aucune
+transaction n'a lieu : il n'y a ni entrée ni sortie à exécuter — c'est aussi ce
+qui les distingue du `buy_and_hold`, qui paie les deux jambes. La différence
+pratique : battre `cash` est facile dès que l'actif monte un peu ; battre
+`risk_free` demande de battre ce que le capital rapportait *sans risque*, ce qui
+est la comparaison honnête — et c'est cette variante qui devient la référence
+quand `risk_free_rate > 0.0`.
+
+La courbe de `risk_free` est purement déterministe, sans lien avec les prix : à
+partir du capital initial, chaque bougie de la fenêtre crédite la fraction de
+taux correspondant à son timeframe,
+
+```
+equity[i] = balance × (1 + risk_free_rate / periods_per_year(timeframe)) ** i
+```
+
+avec `i` l'indice de la bougie dans la fenêtre (`i = 0 … n − 1` pour `n`
+bougies) et `periods_per_year` repris des mêmes conventions que les métriques
+(8760 pour `1h`, 365 pour `1d`, …). À `risk_free_rate = 0.0`, cette formule se
+réduit à `equity[i] = balance` : **la variante `risk_free` est alors
+bit-identique à `cash`** — même courbe plate, mêmes métriques, même ligne de
+rapport. C'est la garantie de non-régression : le défaut `0.0` ne change rien
+pour qui n'a pas configuré de taux.
+
+**Conséquence de la variance nulle** : une courbe à taux constant n'a aucun
+rendement variable. Sa `volatility`, son `sharpe_ratio`, son `sortino_ratio` et
+son `max_drawdown` valent donc **exactement `0.0`** (pas « non calculable » :
+zéro est la bonne réponse), et son `beta` comme sa `correlation` sont `null`
+(§11.3 : variance du benchmark nulle). Les seules sorties informatives d'un
+benchmark `cash` ou `risk_free` sont `total_return`, `cagr` et `final_balance` —
+c'est-à-dire précisément ce que le gate compare via `alpha`.
+
+**Exemple mesuré (BTC/USDT `1h`, 2023-01-01 → 2025-01-01, 17543 bougies,
+`risk_free_rate = 0.05`)** : composé heure par heure, un nominal de 5 %/an donne
+
+| Sortie | Valeur |
+| --- | --- |
+| `final_balance` | `11053.09` (depuis 10000) |
+| `total_return` | `+0.1053` ↔ **+10.53 %** |
+| `cagr` | **+5.13 %** (le composé horaire d'un nominal de 5 % rapporte 5.127 %, pas 5 %) |
+| `alpha` de la stratégie **contre `risk_free`** | `-0.3418` (soit `-0.2365 - 0.1053`) |
+| `alpha` de la stratégie contre `buy_and_hold` | `-4.9304` (soit `-0.2365 - 4.6939`) |
+
+La lecture change du tout au tout selon la référence : la stratégie livrée
+« perd 23 points » face au buy & hold, mais elle perd aussi **34 points** face à
+un simple placement sans risque — l'inaction rémunérée suffisait à la battre.
 
 `benchmark.enabled` (défaut `true`) active le calcul et l'exposition du benchmark ;
-`variant: "none"` le désactive **même quand** `enabled` vaut `true`. Les deux clés
-se surchargent par l'environnement (`TB_BENCHMARK__ENABLED`,
-`TB_BENCHMARK__VARIANT`) ou par le drapeau CLI `--benchmark` / `--no-benchmark`
+`variant: "none"` le désactive **même quand** `enabled` vaut `true`. Les clés se
+surchargent par l'environnement (`TB_BENCHMARK__ENABLED`,
+`TB_BENCHMARK__VARIANT`, et le même schéma pour les autres champs du bloc
+`benchmark`) ou, pour un run ponctuel, par les drapeaux CLI `--benchmark` /
+`--no-benchmark`, `--benchmark-variant` et `--risk-free-rate`
 ([`docs/usage.md`](usage.md)).
 
 ### 11.5 Le gate `strategy_beats_benchmark`
@@ -570,7 +625,10 @@ strategy_beats_benchmark  =  alpha > MIN_ALPHA        avec  MIN_ALPHA = 0.0
   moins de performance) ; les deux lectures se complètent, elles ne se remplacent
   pas ;
 - le gate juge la **variante active** : en `cash`, il demande de faire mieux que
-  zéro ; en `buy_and_hold`, de battre l'actif.
+  zéro ; en `risk_free`, de battre le taux sans risque ; en `buy_and_hold`, de
+  battre l'actif ; en `random_entry`, l'alpha seul ne suffit plus — le verdict
+  de compétence est `strategy_beats_random` (§11.8), qui compare la stratégie à
+  une distribution et non à une courbe.
 
 ### 11.6 Le piège du biais haussier
 
@@ -592,7 +650,173 @@ Trois manifestations du même piège :
 
 Conclusion pratique :
 
-> Les deux seuls benchmarks qui comptent sont le **buy & hold** (battre l'actif)
-> et le **cash** (battre l'inaction). Un backtest présenté sans l'un des deux
-> n'est pas une preuve, c'est une opinion — et sur un actif haussier, une opinion
-> flatteuse.
+> Les trois benchmarks qui comptent sont le **buy & hold** (battre l'actif),
+> le **cash** ou le **risk_free** (battre l'inaction, rémunérée ou non) et le
+> **random_entry** (battre le hasard, §11.8). Un backtest présenté sans l'un des
+> trois n'est pas une preuve, c'est une opinion — et sur un actif haussier, une
+> opinion flatteuse.
+
+### 11.7 Le taux sans risque
+
+**Le biais optimiste du Sharpe à `risk_free_rate = 0.0`.** Jusqu'à ce travail,
+`risk_free_rate` existait bien dans le calcul (`metrics/performance.py`,
+`metrics/benchmark.py`) mais **n'était exposé nulle part** : ni dans
+`config/models.py`, ni dans la CLI. Tous les Sharpe et Sortino rapportés
+utilisaient donc implicitement `0.0`, comme si le capital pouvait rester oisif
+sans rien rapporter. Sur 2023-2025, un T-bill US rapportait environ **5 %/an** :
+ne pas le soustraire **flatte** le ratio — la performance d'un placement sans
+risque est créditée à la stratégie.
+
+Ce que le travail a changé :
+
+1. **`benchmark.risk_free_rate`** — le taux annuel, en fraction (`0.05` = 5 %),
+   contraint à `>= 0` (`ge=0.0`). Défaut **`0.0`**, choisi pour la
+   **compatibilité ascendante** : aucun Sharpe, Sortino ou alpha déjà asserté ne
+   bouge, puisque `0.0` reproduit exactement le comportement historique. La
+   valeur **recommandée pour un run 2023-2025 est `0.05`** (niveau des T-bills
+   US de la période) : c'est celle qu'il faut écrire dans la configuration d'un
+   run réel, sinon le Sharpe reste optimiste.
+2. **Threading complet** — le taux est propagé à **chaque** calcul de
+   `sharpe_ratio` et `sortino_ratio` : ceux de la stratégie **et** ceux de
+   **chaque** benchmark (`buy_and_hold`, `cash`, `risk_free`). Sans cela, la
+   comparaison stratégie/benchmark serait incohérente : deux ratios calculés
+   avec deux taux différents ne sont pas comparables.
+3. **`--risk-free-rate`** — le drapeau CLI qui surcharge le taux pour un run
+   ponctuel, sans toucher au fichier de configuration (§4 de
+   [`docs/usage.md`](usage.md)).
+
+**Effet mesuré (BTC/USDT `1h`, 2023-2025)** — passer de `0.0` à `0.05` :
+
+| Série | Sharpe à `0.0` | Sharpe à `0.05` | Écart |
+| --- | --- | --- | --- |
+| `buy_and_hold` | 2.0573 | **1.9528** | -0.1045 |
+| stratégie | -0.2359 | **-0.3853** | -0.1494 |
+| Sortino stratégie | -0.3455 | **-0.5646** | -0.2191 |
+
+**Pourquoi la baisse n'est que d'environ 0.10 pour le buy & hold, et non de
+« 0.7 comme on pourrait le croire » ?** Parce qu'un Sharpe n'est pas un
+rendement : c'est un rendement **excédentaire par unité de risque**. Retirer `r`
+du numérateur fait baisser le ratio de
+
+```
+Δsharpe = risk_free_rate / annualised_volatility
+```
+
+Le taux est donc **divisé par la volatilité de la série**. Pour le buy & hold,
+la volatilité annualisée de BTC sur la fenêtre vaut environ **48 %**, d'où
+`0.05 / 0.478 ≈ 0.105` — exactement l'écart observé (2.0573 → 1.9528). Une
+estimation qui soustrairait « 5 % de rendement » sans tenir compte de la
+volatilité de l'actif se tromperait d'un facteur ~7. Deux conséquences directes :
+
+- la baisse dépend de la **série**, et pas seulement de l'actif : elle est
+  d'autant plus forte que la volatilité est faible. C'est pourquoi la stratégie
+  (moins volatile) perd `0.1494` là où le buy & hold perd `0.1045` :
+  `0.05 / 0.1494 ≈ 33 %` de volatilité annualisée contre `0.05 / 0.1045 ≈ 48 %`.
+  Les deux baisses sont donc exactement cohérentes avec la formule ;
+- le **signe** du Sharpe ne change pas avec le taux : une stratégie à Sharpe
+  négatif le reste, et le devient simplement plus franchement. Un Sharpe négatif
+  signifie déjà « moins bien qu'un placement sans risque » ; le taux ne fait que
+  mesurer de combien.
+
+L'alpha, lui, reste un écart de **rendement total** : il change de valeur avec la
+variante (`-4.9304` contre `buy_and_hold`, `-0.3418` contre `risk_free`), pas
+avec le mode de calcul du Sharpe.
+
+### 11.8 Le benchmark `random_entry` : compétence ou chance ?
+
+**La question.** Battre l'actif ou battre l'inaction ne prouve pas qu'une
+stratégie **sait** quelque chose : sur un actif haussier, être exposé suffit
+(§11.6). Le test de compétence est ailleurs :
+
+> **Une stratégie à signaux vaut-elle mieux qu'une stratégie qui entre au
+> hasard, avec le même nombre de trades et la même exposition ?**
+
+Si la réponse est non, la stratégie n'a aucun pouvoir prédictif : elle a
+simplement pris du risque de marché, en payant des frais pour le privilège.
+`random_entry` est le seul benchmark qui **ne peut pas** être battu par chance
+seule, puisqu'il *est* la chance, mesurée.
+
+**Protocole de simulation** — `N` simulations (`benchmark.n_random_simulations`,
+défaut **1000**, maximum 10000), chacune rejouée sur la **même fenêtre OHLCV** et
+le **même modèle de frais** que le run :
+
+1. le nombre de trades est **imposé** : c'est celui de la stratégie réelle
+   (`n_trades`) — la simulation n'a pas le droit de trader plus ou moins ;
+2. la durée de détention est dérivée de l'**exposition réalisée** de la
+   stratégie : `holding = max(1, round(exposure × n_periods / n_trades))`
+   bougies, où `exposure` est la part du temps passé en position et `n_periods`
+   le nombre de bougies de la fenêtre. Une simulation passe donc approximativement
+   le même temps investi que la stratégie — sinon le test comparerait deux
+   niveaux de risque différents ; l'exposition effectivement simulée,
+   `n_trades × holding / n_periods`, est rapportée à côté du résultat ;
+3. les points d'entrée sont tirés **uniformément au hasard** parmi les
+   emplacements disponibles de la fenêtre, et les tirages sont **disjoints**
+   (les positions d'une même simulation ne se chevauchent pas) ;
+4. la taille est **tout-en-un** (`all-in`) : le capital entier entre à chaque
+   trade, comme le fait le `buy_and_hold` du §11.2 ;
+5. **frais et slippage sont appliqués sur les deux jambes** (entrée et sortie) :
+   la simulation paie le même coût d'exécution que la stratégie réelle.
+
+**Hypothèse explicite à connaître** : la simulation remplit les ordres
+**close-to-close** (entrée à la clôture de la bougie tirée, sortie à la clôture
+de la bougie de sortie), alors que le moteur, lui, remplit à l'**open** de la
+bougie suivante (§7). C'est une simplification assumée : elle rend la simulation
+reproductible sans rejouer la machinerie de signaux, et elle est neutre en
+espérance — elle n'avantage ni la stratégie ni le hasard. Elle doit être citée
+dans toute conclusion tirée de ce benchmark.
+
+**Déterminisme total** : la graine est explicite
+(`benchmark.random_entry_seed`, défaut **42**). Même graine, mêmes données,
+même configuration ⇒ **même distribution** et même percentile, à l'identique —
+comme le Monte Carlo de trades (§6, `validation.random_seed`) et `var`/CVaR qui
+en dérivent.
+
+**Comment lire les sorties.** Chaque simulation produit un `total_return` ; la
+distribution est résumée par sa **moyenne**, sa **médiane**, son **écart-type**
+et ses **percentiles**, et exposée dans le rapport et dans le JSON sous
+`run.benchmark`, à côté de la position de la stratégie réelle :
+
+| Sortie | Sens | Lecture |
+| --- | --- | --- |
+| `percentile` | part, **en pourcentage** (`0 … 100`), des simulations qui ont fait **strictement moins bien** que la stratégie | **50** ≈ aucun skill (pile au milieu du hasard) ; **95** = signal réel ; en dessous de 50, la stratégie est *derrière* le hasard |
+| `p_value` | **p-value empirique** : part, **en fraction** (`0 … 1`), des simulations qui ont fait **aussi bien ou mieux** que la stratégie (les ex æquo comptent **contre** la stratégie) | plus c'est petit, plus la performance est difficile à expliquer par la chance |
+| `strategy_beats_random` | verdict booléen du gate | `p_value < MIN_P_VALUE` avec **`MIN_P_VALUE = 0.05`** |
+
+`MIN_P_VALUE = 0.05` est défini dans la couche `validation`, aux côtés de
+`MIN_ALPHA`. Le verdict `strategy_beats_random` **ne remplace pas** les autres
+gates : il se lit **à côté** d'`is_robust` (§5), d'`is_consistent` (§4.4) et de
+`strategy_beats_benchmark` (§11.5). Une stratégie complète coche les quatre :
+elle survit à un balayage de paramètres, elle tient hors échantillon, elle bat
+l'inaction, et elle bat le hasard. Une stratégie qui n'en coche qu'un ou deux
+est une hypothèse, pas une preuve.
+
+Trois précautions d'interprétation :
+
+- **Peu de trades ⇒ test sans pouvoir.** Avec 10 trades, la distribution du
+  hasard est si large qu'aucune stratégie ne s'en détache : un percentile élevé
+  sur 10 trades ne prouve rien. Le test devient informatif à partir d'une
+  trentaine de trades ;
+- **`random_entry` ne teste pas la qualité de la sortie.** Le protocole impose
+  la durée de détention ; une stratégie dont l'edge est *quand sortir* n'est pas
+  mesurée par ce benchmark. Le Monte Carlo de trades (§6) et le walk-forward
+  (§4) couvrent partiellement ce cas ;
+- **une stratégie sans trade ne peut jamais battre le hasard** : `n_trades = 0`
+  donne `p_value = 1.0` et `percentile = 0.0`, donc
+  `strategy_beats_random = false` — ne rien faire n'est pas une compétence, et le
+  test le dit au lieu de retourner une division par zéro. Le même raisonnement
+  vaut pour toute stratégie dont le rendement n'est pas battu par au moins 95 %
+  des simulations.
+
+Le percentile exact dépend du run (il dépend du nombre de trades, de
+l'exposition et de la graine) : il est **écrit** dans le rapport, jamais estimé
+de mémoire. Sur la fenêtre BTC 2023-2025 déjà citée (17543 bougies `1h`,
+configuration `config/backtest_btc_benchmark_e2e.json`), la stratégie livrée
+affiche `total_return = -0.2365` : c'est ce rendement que la distribution
+d'entrées aléatoires situe. Rejouer la comparaison est une commande, pas une
+opinion :
+
+```bash
+python -m trading_backtest.cli backtest \
+    --config config/backtest_btc_benchmark_e2e.json \
+    --benchmark-variant random_entry --risk-free-rate 0.05
+```

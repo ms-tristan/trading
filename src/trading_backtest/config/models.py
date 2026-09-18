@@ -115,12 +115,44 @@ class BacktestConfig(BaseModel):
 
 
 class BenchmarkConfig(BaseModel):
-    """Buy and hold benchmark settings."""
+    """Passive benchmark settings (buy & hold, cash, risk-free placement, random entry).
+
+    ``risk_free_rate`` defaults to ``0.0`` on purpose: that value preserves the
+    historical behaviour byte-for-byte, so no previously asserted Sharpe or
+    Sortino ratio moves. ``0.05`` is the recommended realistic value for
+    2023-2025 US T-bill runs and is set explicitly where such a run is
+    configured. The ``10_000`` bound on ``n_random_simulations`` is a literal
+    duplicated from the metrics layer on purpose (config and metrics are
+    sibling layers, so the config layer never imports the metrics layer).
+    """
 
     model_config = {"extra": "forbid"}
 
     enabled: bool = True
-    variant: Literal["buy_and_hold", "cash", "none"] = "buy_and_hold"
+    variant: Literal["buy_and_hold", "cash", "risk_free", "random_entry", "none"] = "buy_and_hold"
+    risk_free_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Annualised risk-free rate as a fraction (0.05 = 5 %/yr), subtracted "
+            "from the annualised mean return in sharpe_ratio/sortino_ratio and "
+            "compounded by the risk_free benchmark variant. 0.0 preserves the "
+            "historical behaviour; 0.05 is the realistic 2023-2025 US T-bill level."
+        ),
+    )
+    n_random_simulations: int = Field(
+        default=1000,
+        ge=1,
+        le=10_000,
+        description=(
+            "Number of random-entry simulations behind the random_entry benchmark distribution."
+        ),
+    )
+    random_entry_seed: int = Field(
+        default=42,
+        ge=0,
+        description=("Seed of the random_entry simulations (same seed = same distribution)."),
+    )
 
 
 class ValidationConfig(BaseModel):

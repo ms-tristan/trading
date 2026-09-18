@@ -26,6 +26,36 @@ Design rules:
 * the layer rule is unchanged -- this module imports ``core`` and its sibling
   metric modules only, never ``config``/``data``/``strategy``/``validation``/
   ``reporting``.
+
+The five variants
+-----------------
+
+``buy_and_hold``
+    Buys the asset on the first candle and marks it to market until the last
+    one: "what if I had done nothing but hold?".
+``cash``
+    A flat curve at ``initial_balance``: capital left *idle*, earning exactly
+    **0 %** (no interest at all), which is the yardstick for "not trading".
+``risk_free``
+    A curve growing at the **risk-free rate** compounded on every candle.  It is
+    deliberately distinct from ``cash``: ``cash`` earns nothing while
+    ``risk_free`` earns the return of a riskless placement (a T-bill, ~5 %/year
+    over 2023-2025), so the two curves differ by exactly that carry.  Both share
+    the same *shape* consequence -- a constant-rate curve has zero variance, so
+    its own ``volatility``/``sharpe_ratio``/``sortino_ratio``/``max_drawdown``
+    are all exactly ``0.0`` and ``beta``/``correlation`` against it are ``None``;
+    its informative outputs are ``total_return``, ``cagr`` and ``final_balance``.
+``random_entry``
+    Not a curve at all: a *distribution* of random-entry simulations, owned by
+    :mod:`trading_backtest.metrics.random_entry` (see
+    :func:`~trading_backtest.metrics.random_entry.random_entry_benchmark`).  It is
+    a legal variant of the configuration/CLI/gate, but asking this module for its
+    equity curve raises :class:`MetricsError` and points at the distribution API.
+``none``
+    No benchmark; every entry point returns ``None``.
+
+:data:`CURVE_VARIANTS` is the ordered subset of :data:`BENCHMARK_VARIANTS` whose
+members own a deterministic passive curve computable from ``data`` alone.
 """
 
 from __future__ import annotations
@@ -46,11 +76,16 @@ from trading_backtest.core.constants import (
 )
 from trading_backtest.core.errors import MetricsError
 from trading_backtest.core.models import BacktestResult
-from trading_backtest.metrics.performance import MetricSet, compute_metrics
+from trading_backtest.metrics.performance import (
+    MetricSet,
+    compute_metrics,
+    risk_free_rate_to_period,
+)
 
 __all__ = [
     "BENCHMARK_METRIC_NAMES",
     "BENCHMARK_VARIANTS",
+    "CURVE_VARIANTS",
     "DEFAULT_BENCHMARK_VARIANT",
     "MIN_RETURNS_FOR_BETA",
     "BenchmarkComparison",
@@ -63,10 +98,21 @@ __all__ = [
 ]
 
 #: Supported benchmark variants, in the order they are rendered in error messages.
-BENCHMARK_VARIANTS: tuple[str, ...] = ("buy_and_hold", "cash", "none")
+BENCHMARK_VARIANTS: tuple[str, ...] = (
+    "buy_and_hold",
+    "cash",
+    "risk_free",
+    "random_entry",
+    "none",
+)
+
+#: Subset of :data:`BENCHMARK_VARIANTS` owning a deterministic passive curve built
+#: from ``data`` alone (``random_entry`` is a distribution and ``none`` means "no
+#: benchmark"; neither has an equity curve of its own).
+CURVE_VARIANTS: tuple[str, ...] = ("buy_and_hold", "cash", "risk_free")
 
 #: Benchmark variant name.
-BenchmarkVariant = Literal["buy_and_hold", "cash", "none"]
+BenchmarkVariant = Literal["buy_and_hold", "cash", "risk_free", "random_entry", "none"]
 
 #: Variant used when the caller does not choose one.
 DEFAULT_BENCHMARK_VARIANT: BenchmarkVariant = "buy_and_hold"
@@ -102,6 +148,25 @@ def _curve_variant_error(variant: str) -> MetricsError:
     return MetricsError(
         f"benchmark variant {variant!r} has no equity curve: it means 'no benchmark'; "
         f"available curve variants: {listing}"
+    )
+
+
+def _distribution_variant_error(variant: str) -> MetricsError:
+    """Error raised when a *distribution* variant is asked for an equity curve.
+
+    ``random_entry`` is not a passive curve: it is a distribution of random-entry
+    simulations (and therefore reaches the validation layer through a gate of its
+    own).  Listing :data:`CURVE_VARIANTS` -- not every
+    :data:`BENCHMARK_VARIANTS` -- keeps the caller pointed at what really is
+    available here.
+    """
+    listing = ", ".join(CURVE_VARIANTS)
+    return MetricsError(
+        f"benchmark variant {variant!r} has no deterministic equity curve: it is a "
+        "distribution of random-entry simulations, computed by "
+        "trading_backtest.metrics.random_entry.random_entry_benchmark "
+        "(gate: trading_backtest.validation.validate_random_entry); "
+        f"curve variants: {listing}"
     )
 
 
@@ -156,6 +221,8 @@ def buy_and_hold_equity(
     fee_rate: float = 0.0,
     slippage: float = 0.0,
     variant: BenchmarkVariant = DEFAULT_BENCHMARK_VARIANT,
+    timeframe: str = DEFAULT_TIMEFRAME,
+    risk_free_rate: float = 0.0,
 ) -> pd.Series:
     """Return the equity curve of a passive ``variant`` portfolio.
 
@@ -167,9 +234,27 @@ def buy_and_hold_equity(
     strategy that liquidates at the end of the backtest.  A single-candle frame is
     therefore also a "last candle" and gets the exit adjustment.
 
-    ``cash`` returns a flat curve equal to ``initial_balance`` (a risk-free
-    alternative that ignores fees and slippage); it is the natural yardstick for
-    "not trading at all".
+    ``cash`` returns a flat curve equal to ``initial_balance`` (no interest, and
+    no fee/slippage either); it is the natural yardstick for "not trading at
+    all".
+
+    ``risk_free`` compounds the ``risk_free_rate`` on every candle:
+    ``equity[i] = initial_balance * (1 + period_rate) ** i`` with
+    ``period_rate = risk_free_rate / periods_per_year(timeframe)``.  Unlike
+    ``cash`` it therefore *earns* the riskless carry -- the two differ by exactly
+    ``(1 + period_rate) ** n_periods - 1`` -- and, exactly like ``cash``, it takes
+    no position, so ``fee_rate``/``slippage`` are ignored (there is no
+    transaction to charge).  At ``risk_free_rate == 0.0`` this curve is
+    bit-identical to ``cash``.
+
+    The curve is accumulated candle by candle from a single constant growth
+    factor instead of being evaluated as ``initial_balance * (1 + r) ** i`` for
+    each ``i`` independently.  The two agree to ~1e-16 relative, but independent
+    rounding of the power leaves a ~1e-14 "annualised volatility" on a curve that
+    is mathematically *flat*; that artefact would turn the risk-free Sharpe into
+    noise (about ``-27`` on a one-year frame) instead of the documented exact
+    ``0.0``.  Accumulating guarantees every candle-to-candle return is
+    bit-identical, hence a genuinely zero-variance curve.
 
     Parameters
     ----------
@@ -182,7 +267,13 @@ def buy_and_hold_equity(
     slippage:
         Relative slippage, always working against the position.
     variant:
-        ``"buy_and_hold"`` or ``"cash"``.
+        ``"buy_and_hold"``, ``"cash"`` or ``"risk_free"``.
+    timeframe:
+        Timeframe used to convert the annual ``risk_free_rate`` into a per-candle
+        rate (``risk_free`` only).
+    risk_free_rate:
+        Annual risk-free rate as a fraction (``0.05`` = 5 %/year); must be finite
+        and ``>= 0`` (``risk_free`` only).
 
     Returns
     -------
@@ -193,16 +284,31 @@ def buy_and_hold_equity(
     Raises
     ------
     MetricsError
-        If ``variant`` is ``"none"``/unknown, or if ``data`` has no usable close.
+        If ``variant`` is ``"none"``, ``"random_entry"`` or unknown, if
+        ``risk_free_rate`` is not a finite rate ``>= 0``, or if ``data`` has no
+        usable close.
+    ConfigError
+        Propagated untouched for an unsupported ``timeframe``.
     """
     if variant == "none":
         raise _curve_variant_error(variant)
-    if variant not in BENCHMARK_VARIANTS:
+    if variant == "random_entry":
+        raise _distribution_variant_error(variant)
+    if variant not in CURVE_VARIANTS:
         raise _unknown_variant(variant)
     prices = _benchmark_prices(data)
     balance = float(initial_balance)
     if variant == "cash":
         values = np.full(len(prices), balance, dtype="float64")
+        return pd.Series(values, index=prices.index, name="equity", dtype="float64")
+    if variant == "risk_free":
+        rate = float(risk_free_rate)
+        if not math.isfinite(rate) or rate < 0.0:
+            raise MetricsError(f"risk_free_rate must be a finite rate >= 0, got {risk_free_rate!r}")
+        period_rate = risk_free_rate_to_period(rate, timeframe)
+        growth = np.full(len(prices), 1.0 + period_rate, dtype="float64")
+        growth[0] = balance
+        values = np.multiply.accumulate(growth)
         return pd.Series(values, index=prices.index, name="equity", dtype="float64")
     fee = float(fee_rate)
     slip = float(slippage)
@@ -346,6 +452,8 @@ def _benchmark_result(
         fee_rate=fee_rate,
         slippage=slippage,
         variant=variant,
+        timeframe=timeframe,
+        risk_free_rate=risk_free_rate,
     )
     final_balance = float(equity.iloc[-1])
     synthetic = BacktestResult(
@@ -391,16 +499,20 @@ def compute_benchmark(
     data:
         OHLCV frame the strategy was backtested on (same window, same capital).
     variant:
-        ``"buy_and_hold"``, ``"cash"`` or ``"none"``.
+        ``"buy_and_hold"``, ``"cash"``, ``"risk_free"``, ``"random_entry"`` or
+        ``"none"``.
     initial_balance:
         Initial capital, identical to the backtest's.
     fee_rate, slippage:
         Costs applied exactly like the engine does.
     timeframe:
-        Timeframe used to annualise ``cagr``/``volatility``/``sharpe_ratio``.
+        Timeframe used to annualise ``cagr``/``volatility``/``sharpe_ratio`` and
+        to convert ``risk_free_rate`` into a per-candle rate.
     risk_free_rate:
-        Annualised risk-free rate forwarded to
-        :func:`~trading_backtest.metrics.performance.compute_metrics`.
+        Annual risk-free rate as a fraction (``0.05`` = 5 %/year).  It is
+        subtracted from the annualised mean return in
+        ``sharpe_ratio``/``sortino_ratio`` and, for ``variant="risk_free"``, it is
+        the rate the benchmark curve itself compounds.
     symbol:
         Free-form symbol carried by the synthetic result.
 
@@ -412,14 +524,18 @@ def compute_benchmark(
     Raises
     ------
     MetricsError
-        If ``variant`` is neither a known variant nor ``"none"``, or if ``data``
-        has no usable close.
+        If ``variant`` is neither a known variant nor ``"none"`` (``random_entry``
+        has no curve: use
+        :func:`~trading_backtest.metrics.random_entry.random_entry_benchmark`), or
+        if ``data`` has no usable close.
     ConfigError
         Propagated untouched from :func:`compute_metrics` for an unsupported
         ``timeframe``.
     """
     if variant == "none":
         return None
+    if variant == "random_entry":
+        raise _distribution_variant_error(variant)
     if variant not in BENCHMARK_VARIANTS:
         raise _unknown_variant(variant)
     return _benchmark_result(
@@ -573,13 +689,16 @@ def compare_benchmark(
     data:
         OHLCV frame the run was produced from.
     variant:
-        ``"buy_and_hold"``, ``"cash"`` or ``"none"``.
+        ``"buy_and_hold"``, ``"cash"``, ``"risk_free"``, ``"random_entry"`` or
+        ``"none"``.
     initial_balance:
         Capital both sides start with; ``None`` means "the strategy's own".
     fee_rate, slippage:
         Costs applied to the benchmark side.
     risk_free_rate:
-        Annualised risk-free rate used for ``sharpe_ratio``/``sortino_ratio``.
+        Annual risk-free rate as a fraction (``0.05`` = 5 %/year), subtracted from
+        the annualised mean return in ``sharpe_ratio``/``sortino_ratio`` on both
+        sides and compounded by the ``risk_free`` benchmark curve.
     strategy_metrics:
         Pre-computed strategy metrics (avoids recomputing them); ``None`` means
         "compute them here".
@@ -592,12 +711,16 @@ def compare_benchmark(
     Raises
     ------
     MetricsError
-        If ``variant`` is neither a known variant nor ``"none"``.
+        If ``variant`` is neither a known variant nor ``"none"`` (``random_entry``
+        has no curve: use
+        :func:`~trading_backtest.metrics.random_entry.random_entry_benchmark`).
     ConfigError
         Propagated untouched for an unsupported timeframe.
     """
     if variant == "none":
         return None
+    if variant == "random_entry":
+        raise _distribution_variant_error(variant)
     if variant not in BENCHMARK_VARIANTS:
         raise _unknown_variant(variant)
     balance = float(strategy.initial_balance) if initial_balance is None else float(initial_balance)
