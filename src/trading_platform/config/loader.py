@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -333,6 +334,18 @@ def save_profiles(path: str | Path, profiles: Sequence[ProfileConfig]) -> Path:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        # ``os.replace`` swaps the inode, so the temporary file's mode would
+        # silently become the target's. ``mkstemp`` creates it 0o600, which would
+        # turn a formerly world-readable config into an owner-only one -- enough
+        # to break a container whose bind mount maps the owner to another uid.
+        # Carry the existing mode over, defaulting to the usual 0o644 when it
+        # cannot be read.
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except OSError:
+            mode = 0o644
+        with contextlib.suppress(OSError):
+            temporary.chmod(mode)
         # ``Path.replace`` *is* ``os.replace``: an atomic rename on every supported
         # platform, which is what makes the rewrite all-or-nothing for a reader.
         temporary.replace(target)

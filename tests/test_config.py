@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -426,6 +427,28 @@ def test_save_profiles_preserves_every_other_root_key_verbatim(tmp_path: Path) -
     assert text.startswith("{\n")
     assert text.endswith("\n")
     assert list(after) == sorted(after)  # pretty, sorted keys, like dump_config
+
+
+def test_save_profiles_preserves_the_file_mode(tmp_path: Path) -> None:
+    """``os.replace`` swaps the inode, so the mode has to be carried over.
+
+    ``mkstemp`` creates the temporary file 0o600; without an explicit chmod the
+    rewritten document would silently become owner-only. In the deployed
+    container the bind mount maps the owner to another uid, so an owner-only
+    file is unreadable by the very process that wrote it -- the create route
+    worked once and every later read failed.
+    """
+    path = profiles_document(tmp_path, ["aaa-paper"])
+    path.chmod(0o644)
+
+    save_profiles(path, [ProfileConfig(id="bbb-paper", symbol="ETH/USDT")])
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+    # A deliberately private document stays private.
+    path.chmod(0o600)
+    save_profiles(path, [ProfileConfig(id="ccc-paper", symbol="SOL/USDT")])
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_save_profiles_adds_then_removes_a_profile(tmp_path: Path) -> None:
