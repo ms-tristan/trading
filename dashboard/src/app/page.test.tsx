@@ -96,7 +96,13 @@ describe('OverviewPage', () => {
   it('server-renders every profile field together with the platform summary', async () => {
     render(await OverviewPage());
 
-    expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument();
+    // The heading stays in the accessibility tree but is no longer painted: the
+    // app shell already names the surface, and the visible "Overview" title plus
+    // its subtitle were removed as pure duplication.
+    expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toHaveClass('sr-only');
+    expect(
+      screen.queryByText('Every trading profile at a glance, refreshed by HTTP polling.'),
+    ).not.toBeInTheDocument();
 
     // Profile identity and its link to the detail route.
     expect(screen.getByRole('link', { name: 'alpha' })).toHaveAttribute('href', '/profiles/alpha');
