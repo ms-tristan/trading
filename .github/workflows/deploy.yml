@@ -1,0 +1,108 @@
+name: Deploy
+
+# Deploy runs only on a real push/merge to `main` -- a pull request never
+# touches the live containers. Branch protection is what guarantees that a
+# commit reaching `main` was CI-green first (see ci.yml, which runs on every
+# pull request); this workflow deliberately does NOT repeat lint/test/build,
+# so a merge deploys exactly the revision CI already validated.
+#
+# `workflow_dispatch` is the manual escape hatch: re-running the deploy after
+# an operator fixes an environmental problem (a missing .env entry, a stopped
+# Docker daemon) without pushing an empty commit.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: the job only reads the repository and talks to the local
+# Docker daemon, so it never needs a write scope.
+permissions:
+  contents: read
+
+concurrency:
+  # A deploy is a stateful operation on the host (it rebuilds and restarts the
+  # containers), so two of them must never overlap. `cancel-in-progress` stays
+  # FALSE on purpose: interrupting a half-finished `up -d --build` could leave
+  # the stack mid-rebuild, which is worse than waiting for the running deploy.
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Rebuild and restart the stack (self-hosted)
+    # Self-hosted on this Mac: the deployment is a `docker compose` stack bound
+    # to 127.0.0.1 and fronted by the host nginx, so the job must run on the
+    # host itself. Labels mirror the runner registered by
+    # .github/runner/register-runner.sh.
+    runs-on: [self-hosted, macOS, ARM64]
+    # The "production" environment (Settings -> Environments -> protection
+    # rules) can gate this job behind a manual approval later without touching
+    # this file.
+    environment: production
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The compose file interpolates no secret itself, but the `trading-realtime`
+      # service declares `env_file: .env` -- and a fresh runner checkout has no
+      # .env (it is git-ignored, mode 600, and holds TB_OPERATOR_TOKEN). Compose
+      # is therefore pointed at the host's real deploy/.env, exactly like the
+      # Culia pipeline does. Without this the realtime container would start
+      # with no operator token and every mutating API call would be refused.
+      - name: Verify the host deployment secrets are readable
+        run: |
+          ENV_FILE=/Users/mac/Projects/Trading/deploy/.env
+          if [[ ! -r "$ENV_FILE" ]]; then
+            echo "missing or unreadable: $ENV_FILE" >&2
+            echo "the realtime container needs TB_OPERATOR_TOKEN from it" >&2
+            exit 1
+          fi
+          echo "deploy secrets present"
+
+      # Both containers are rebuilt together on purpose: the reconciliation fix
+      # lives in the Python engine image and the operator-token fix lives in the
+      # Next.js image, so deploying only one would ship half a change and leave
+      # the dashboard and the API disagreeing.
+      #
+      # Persistent state is untouched: the named volumes deploy_trading-state
+      # (SQLite state, kill-switch file, logs) and deploy_trading-cache (OHLCV)
+      # survive a rebuild, and `--wait` blocks until both healthchecks pass --
+      # the images already probe GET /api/health (realtime) and GET / (dashboard).
+      - name: Rebuild and restart the trading stack
+        run: |
+          docker compose --env-file /Users/mac/Projects/Trading/deploy/.env \
+            -f deploy/docker-compose.yml \
+            up -d --build --wait
+          docker image prune -f
+
+      # `--wait` proves the containers are healthy; this proves the stack is
+      # actually serving the contract on the host ports nginx fronts. The
+      # realtime API must report a booted engine with its profiles running, and
+      # the dashboard must answer on 3031 and still proxy /api/* to the API.
+      - name: Smoke test the public surfaces
+        run: |
+          set -euo pipefail
+
+          for _ in $(seq 1 12); do
+            if curl -fsS --max-time 5 http://127.0.0.1:3030/api/health >/dev/null 2>&1; then
+              echo "realtime API health OK"
+              break
+            fi
+            sleep 5
+          done
+
+          curl -fsS --max-time 10 http://127.0.0.1:3030/api/health \
+            | python3 -c 'import json,sys; h=json.load(sys.stdin); assert h["status"]=="ok", h; assert h["profiles_running"]>0, h; print("engine running with", h["profiles_running"], "profile(s)")'
+
+          # The dashboard serves the UI on 3031 and proxies /api/* to the engine;
+          # both must answer through the same origin the browser uses.
+          curl -fsS --max-time 10 -o /dev/null http://127.0.0.1:3031/
+          echo "dashboard UI OK"
+          curl -fsS --max-time 10 -o /dev/null http://127.0.0.1:3031/api/health
+          echo "dashboard /api proxy OK"
+
+      - name: Report the running containers
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml ps

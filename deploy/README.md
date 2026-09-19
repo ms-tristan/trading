@@ -255,6 +255,60 @@ The dev server needs a reachable monitoring API: either the realtime container
 
 ---
 
+## 4bis. Automatic deploys (GitHub Actions)
+
+Every push/merge to `main` rebuilds and restarts the whole stack automatically.
+The `deploy` job of `.github/workflows/deploy.yml` runs on a self-hosted
+GitHub Actions runner installed on this Mac — the deployment is a
+`docker compose` stack bound to `127.0.0.1` behind the host nginx, so the job
+must run on the host itself:
+
+1. checks out the exact merged commit;
+2. verifies `deploy/.env` is readable (a fresh runner checkout has none: it is
+   git-ignored and mode 600, and the realtime container needs
+   `TB_OPERATOR_TOKEN` from it) and points compose at the host's copy with
+   `--env-file`;
+3. runs `docker compose --env-file /Users/mac/Projects/Trading/deploy/.env -f
+   deploy/docker-compose.yml up -d --build --wait` — **both** containers are
+   rebuilt together, because the Python engine and the Next.js dashboard ship
+   from separate images and deploying only one would leave the pair
+   disagreeing. The named volumes `deploy_trading-state` and
+   `deploy_trading-cache` persist across the rebuild, and `--wait` blocks until
+   both images' healthchecks pass;
+4. prunes dangling images, then smoke-tests the host surfaces: `GET
+   /api/health` on `127.0.0.1:3030` must report `status: ok` with at least one
+   running profile, and the dashboard must answer on `127.0.0.1:3031` both on
+   `/` and through its `/api/*` proxy.
+
+Pull requests never touch the runner: the job is gated on
+`github.event_name == 'push'`. `ci.yml` already runs the full Python and
+dashboard gates on every pull request, so the deploy job deliberately does not
+repeat them — branch protection is what guarantees a commit reaching `main`
+was green first. `cancel-in-progress` is **disabled**: interrupting a
+half-finished `up -d --build` could leave the stack mid-rebuild, which is worse
+than waiting.
+
+Operational notes:
+
+- **Register the runner once** (repo admin): generate a token at
+  <https://github.com/ms-tristan/trading/settings/actions/runners> → "New
+  self-hosted runner" → macOS / ARM64, then run
+  `~/actions-runner-trading/register.sh` (it takes the token interactively or
+  through `ACTIONS_RUNNER_TOKEN`). Start it with `./svc.sh install && ./svc.sh
+  start`, which loads the launchd agent so it survives reboots.
+- The job labels are `[self-hosted, macOS, ARM64]`. The runner's own name and
+  labels are set by `.github/runner/register-runner.sh` — if the runner is ever
+  re-created with other labels, keep both in sync.
+- Rollback = `git revert` on `main`: the revert push triggers a fresh deploy of
+  the previous code.
+- To require a manual go/no-go before each deploy, add a protection rule to the
+  `production` environment (Settings → Environments) — the job already declares
+  `environment: production`.
+- A deploy restarts the profiles, so it is also what clears a stale
+  `last_error` left in `state.db` by an earlier engine version.
+
+---
+
 ## 5. What this deployment is not
 
 - **no per-user authentication**: a single shared Basic auth pair, plus an
