@@ -263,22 +263,45 @@ GitHub Actions runner installed on this Mac — the deployment is a
 `docker compose` stack bound to `127.0.0.1` behind the host nginx, so the job
 must run on the host itself:
 
-1. checks out the exact merged commit;
-2. verifies `deploy/.env` is readable (a fresh runner checkout has none: it is
-   git-ignored and mode 600, and the realtime container needs
-   `TB_OPERATOR_TOKEN` from it) and points compose at the host's copy with
-   `--env-file`;
-3. runs `docker compose --env-file /Users/mac/Projects/Trading/deploy/.env -f
-   deploy/docker-compose.yml up -d --build --wait` — **both** containers are
-   rebuilt together, because the Python engine and the Next.js dashboard ship
-   from separate images and deploying only one would leave the pair
-   disagreeing. The named volumes `deploy_trading-state` and
+1. fast-forwards the **host repository** (`/Users/mac/Projects/Trading`) to the
+   exact merged commit with `git merge --ff-only`, so the build context is the
+   revision being deployed. It deploys from the host copy rather than from the
+   runner's own checkout, and that is a requirement, not a shortcut: the images
+   build with `context: ..` (the parent of `deploy/`, i.e. whichever repository
+   sits beside it), and `trading-realtime` declares `env_file: - .env`, which
+   compose resolves **relative to the compose file** — a runner checkout has no
+   `deploy/.env`, and a `--env-file <host path>` does *not* satisfy a
+   service-level `env_file`. A dirty or diverged host tree therefore fails the
+   deploy instead of being forced through;
+2. verifies `deploy/.env` is readable — it is git-ignored and mode 600, and the
+   realtime container needs `TB_OPERATOR_TOKEN` from it;
+3. runs `docker compose -f deploy/docker-compose.yml up -d --build --wait` —
+   **both** containers are rebuilt together, because the Python engine and the
+   Next.js dashboard ship from separate images and deploying only one would
+   leave the pair disagreeing. The named volumes `deploy_trading-state` and
    `deploy_trading-cache` persist across the rebuild, and `--wait` blocks until
    both images' healthchecks pass;
 4. prunes dangling images, then smoke-tests the host surfaces: `GET
    /api/health` on `127.0.0.1:3030` must report `status: ok` with at least one
    running profile, and the dashboard must answer on `127.0.0.1:3031` both on
    `/` and through its `/api/*` proxy.
+
+### Profiles created through the UI are not versioned
+
+`deploy/profiles.json` is the source of truth the engine reads **and** the file
+the monitoring API rewrites when a profile is created or deleted from the
+dashboard. Those edits happen on disk only: they are never committed, so they
+are not part of the deployment revision.
+
+A deploy rebuilds from the merged commit, which means the **committed**
+`profiles.json` wins: a profile that exists only because it was created through
+the UI disappears from the running engine (its rows stay in `state.db`, but
+nothing loads it). The `test1` scratch profile behaved exactly this way — it was
+never in git, so the first deploy dropped it.
+
+To make a UI-created profile survive deploys, commit it to
+`deploy/profiles.json`. To keep a scratch profile out of a deploy, delete it
+before merging.
 
 Pull requests never touch the runner: the job is gated on
 `github.event_name == 'push'`. `ci.yml` already runs the full Python and
