@@ -139,6 +139,32 @@ describe('ProfileCard', () => {
     expect(link).toHaveAttribute('href', '/profiles/alpha%20beta');
   });
 
+  it('stretches the profile link over the whole card', async () => {
+    await renderCard(makeProfile());
+
+    // The heading link carries the overlay that makes the entire card a target,
+    // and the card is the positioning context it stretches over. Without both,
+    // only the few characters of the profile id were clickable and the rest of
+    // the card looked interactive but did nothing.
+    const link = screen.getByRole('link', { name: 'alpha' });
+    expect(link.className).toContain('after:absolute');
+    expect(link.className).toContain('after:inset-0');
+
+    const card = link.closest('article');
+    expect(card?.className).toContain('relative');
+  });
+
+  it('keeps the lifecycle controls above the stretched link', async () => {
+    await renderCard(makeProfile());
+
+    // The buttons are lifted above the overlay, so clicking them still controls
+    // the profile instead of navigating away.
+    const pause = screen.getByRole('button', { name: 'Pause' });
+    const footer = pause.closest('footer');
+    expect(footer?.className).toContain('z-10');
+    expect(footer?.className).toContain('relative');
+  });
+
   it('renders the mode and the status as text labels, never colour alone', async () => {
     const { unmount } = await renderCard(makeProfile({ mode: 'live' }));
 

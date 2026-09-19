@@ -115,13 +115,16 @@ function Field({ label, value, children }: FieldProps) {
  * One profile of the live overview.
  *
  * The card is labelled by its heading, whose link goes to the per-profile detail
- * route; the heading stays free of nested interactive content, so a keyboard user
- * never lands on a link wrapping a button. The footer renders the shared
- * lifecycle island (pause, resume, delete) of the profile, exactly like the
- * detail header, so both entry points offer the same controls. Every value
- * carries an explicit label, every state pairs its tone with a text label and an
- * icon, and every absent value renders the em dash placeholder — never `NaN`,
- * `undefined` or an empty cell.
+ * route. That link is **stretched** over the whole card, so a click anywhere on
+ * it opens the profile — clicking only the heading text was too small a target
+ * and left the rest of the card inert. The heading itself stays free of nested
+ * interactive content: the lifecycle island lives in the footer, which is lifted
+ * above the stretched overlay so its buttons stay clickable, because a link may
+ * never wrap a button. The footer renders the shared lifecycle island (pause,
+ * resume, delete) of the profile, exactly like the detail header, so both entry
+ * points offer the same controls. Every value carries an explicit label, every
+ * state pairs its tone with a text label and an icon, and every absent value
+ * renders the em dash placeholder — never `NaN`, `undefined` or an empty cell.
  */
 export function ProfileCard({ profile, className }: ProfileCardProps) {
   const mode = MODE_BADGES[profile.mode] ?? {
@@ -142,7 +145,9 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
     <article
       aria-labelledby={headingId(profile.profile_id)}
       className={cn(
-        'flex flex-col rounded-card border border-border bg-card p-xl text-card-foreground shadow-md',
+        'group relative flex flex-col rounded-card border border-border bg-card p-xl text-card-foreground shadow-md',
+        'hover:border-accent/50 focus-within:border-accent/50',
+        'motion-safe:transition-colors motion-safe:duration-200',
         className,
       )}
     >
@@ -154,7 +159,17 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
           >
             <Link
               href={`/profiles/${encodeURIComponent(profile.profile_id)}`}
-              className="rounded-button underline-offset-4 hover:text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-safe:transition-colors motion-safe:duration-200"
+              className={cn(
+                'rounded-button underline decoration-border underline-offset-4',
+                'hover:text-accent hover:decoration-accent',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+                'motion-safe:transition-colors motion-safe:duration-200',
+                // Stretched link: the pseudo-element covers the whole card, so a
+                // click anywhere on it opens the profile instead of only the
+                // heading text. The card's own controls are lifted above it (see
+                // the footer), because a link may never wrap a button.
+                'after:absolute after:inset-0 after:content-[""]',
+              )}
             >
               {textOrPlaceholder(profile.profile_id)}
             </Link>
@@ -207,7 +222,7 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
         </p>
       ) : null}
 
-      <footer className="mt-lg border-t border-border/60">
+      <footer className="relative z-10 mt-lg border-t border-border/60">
         <ProfileActions profileId={profile.profile_id} className="mt-lg" />
       </footer>
     </article>
