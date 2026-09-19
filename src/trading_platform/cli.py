@@ -37,6 +37,25 @@ monitoring ``url``.  They travel through :func:`_emit_realtime` instead of
 per invocation, and the startup URL is announced on **stderr** when ``--json``
 is used.
 
+The forecasting layer (``trading_platform.forecast``) is reached through three
+flat commands added in the very same spirit, and it is imported **inside the
+command bodies** as well, so ``forecast-build`` stays runnable without ``torch``:
+
+* ``forecast-build`` — pre-computes the versioned parquet forecast artifact of
+  one candle file (csv or parquet) and writes its JSON sidecar next to it;
+* ``forecast-skill`` — measures that artifact against the random-walk baseline
+  (RMSE/MAE/MASE skill scores, quantile coverage, directional accuracy): a
+  positive backtest PnL is not evidence of an edge, this report is;
+* ``forecast-info`` — prints the artifact metadata verbatim, like
+  ``config show`` prints the effective configuration.
+
+They keep the house payload shape; ``forecast-build`` publishes the artifact
+scalars in ``metrics`` and the metadata in ``run``, ``forecast-skill`` publishes
+the skill metrics in ``metrics`` and the full report in ``run``, and
+``forecast-info`` publishes ``run`` only.  Every artifact path is an explicit
+``--out``/``--artifact`` argument: the CLI never guesses where a run stores its
+forecasts.
+
 Exit codes: ``0`` success, ``1`` domain error (any
 :class:`~trading_platform.core.errors.TradingBacktestError`), ``2`` usage error
 (unknown command, missing argument, invalid choice...).
@@ -65,6 +84,7 @@ import asyncio
 import json
 import math
 import os
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
@@ -91,6 +111,7 @@ from trading_platform.config import (
 from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
 from trading_platform.core.errors import (
     ConfigError,
+    ForecastError,
     FreqtradeConfigError,
     InsufficientDataError,
     MarketStreamError,
@@ -180,6 +201,9 @@ _FREQTRADE_MARKERS = frozenset(
     {"max_open_trades", "stake_currency", "dry_run", "tradable_balance_ratio"}
 )
 
+#: Suffixes :func:`_read_data_file` reads as a parquet candle frame.
+_PARQUET_SUFFIXES = frozenset({".parquet", ".pq"})
+
 
 # ---------------------------------------------------------------------------
 # payload / output helpers
@@ -263,20 +287,39 @@ HIGHLIGHT_KEYS: dict[str, tuple[str, ...]] = {
         "cvar_95",
     ),
     "data_download": ("rows", "cache_path"),
+    "forecast_build": ("backend", "n_origins", "horizon", "stride"),
+    "forecast_skill": (
+        "n_pairs",
+        "rmse",
+        "mae",
+        "mase",
+        "rmse_skill_score",
+        "directional_accuracy_horizon",
+        "coverage_error_mean",
+    ),
 }
 
-#: Commands whose human output is the raw payload (configuration inspection).
-_RAW_PAYLOAD_COMMANDS = frozenset({"config_show", "config_validate"})
+#: Commands whose human output is the raw payload (configuration and artifact inspection).
+_RAW_PAYLOAD_COMMANDS = frozenset({"config_show", "config_validate", "forecast_info"})
 
 
 def _print_human(payload: Mapping[str, Any]) -> None:
-    """Print the rich summary of a successful run (metrics table + report paths)."""
+    """Print the rich summary of a successful run (metrics table + report paths).
+
+    A highlight key is looked up in ``run`` first, then in the ``metrics``
+    sub-mapping of ``run`` when that sub-mapping is a mapping: ``forecast-skill``
+    publishes the skill report of :mod:`trading_platform.forecast.skill` that way
+    (the report nests its scalars under ``metrics``), and a key that is absent
+    from both is simply not printed.
+    """
     command = str(payload.get("command") or "")
     run = payload.get("run")
     run_mapping: Mapping[str, Any] = run if isinstance(run, Mapping) else {}
+    nested = run_mapping.get("metrics")
+    nested_mapping: Mapping[str, Any] = nested if isinstance(nested, Mapping) else {}
 
     if command in _RAW_PAYLOAD_COMMANDS:
-        # configuration inspection: the effective configuration *is* the output
+        # configuration and artifact inspection: the effective payload *is* the output
         typer.echo(json.dumps(dict(run_mapping), indent=2, sort_keys=True, default=str))
         return
 
@@ -296,6 +339,8 @@ def _print_human(payload: Mapping[str, Any]) -> None:
     for key in HIGHLIGHT_KEYS.get(command, ()):
         if key in run_mapping:
             console.print(f"  {key}: {_format_value(run_mapping[key])}", highlight=False)
+        elif key in nested_mapping:
+            console.print(f"  {key}: {_format_value(nested_mapping[key])}", highlight=False)
 
     benchmark = run_mapping.get("benchmark")
     if isinstance(benchmark, Mapping):
@@ -453,6 +498,56 @@ def _read_local_csv(path: Path) -> pd.DataFrame:
     if frame.empty:
         raise InsufficientDataError(f"no candle in {path}")
     return ensure_ohlcv(frame, name=str(path))
+
+
+def _read_local_parquet(path: Path) -> pd.DataFrame:
+    """Read a local OHLCV parquet (never the network) and enforce the OHLCV contract."""
+    import pandas as pd  # local import: keeps the CLI startup lean
+
+    if not path.is_file():
+        raise InsufficientDataError(f"data file not found: {path}")
+    try:
+        frame = pd.read_parquet(path)
+    except Exception as exc:  # pyarrow raises several unrelated types
+        raise InsufficientDataError(f"cannot read OHLCV parquet {path}: {exc}") from exc
+    if frame.empty:
+        raise InsufficientDataError(f"no candle in {path}")
+    return ensure_ohlcv(frame, name=str(path))
+
+
+def _read_data_file(path: Path) -> pd.DataFrame:
+    """Read ``path`` as an OHLCV frame: a local csv or parquet file, never the network.
+
+    Parameters
+    ----------
+    path:
+        Candle file to read.  ``.csv`` goes through :func:`_read_local_csv` (the
+        reader the backtest commands use), ``.parquet``/``.pq`` through
+        :func:`_read_local_parquet`; every other suffix is rejected.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The frame, normalised by
+        :func:`trading_platform.data.ensure_ohlcv` (UTC index, ``float64``
+        columns, ascending, de-duplicated).
+
+    Raises
+    ------
+    InsufficientDataError
+        If the file is missing, if it cannot be read or if its suffix is not a
+        supported candle format.  The message always names the path.
+    """
+    target = Path(path)
+    suffix = target.suffix.lower()
+    if suffix == ".csv":
+        return _read_local_csv(target)
+    if suffix in _PARQUET_SUFFIXES:
+        return _read_local_parquet(target)
+    raise InsufficientDataError(
+        f"unsupported data file format {suffix or target.name!r}: "
+        f"expected .csv, .parquet or .pq ({target})"
+    )
 
 
 def _build_loader(cfg: AppConfig, *, no_network: bool) -> OHLCVLoader:
@@ -1279,6 +1374,237 @@ def config_validate(
                 ok=True,
                 config_path=str(path),
                 run={"valid": True, "kind": kind, "issues": issues},
+            ),
+            json_output=json_output,
+        )
+
+
+# ---------------------------------------------------------------------------
+# forecast sub-commands (the offline forecasting layer is imported in the bodies)
+# ---------------------------------------------------------------------------
+
+_OUT_HELP = "Destination parquet of the forecast artifact (sidecar: out.meta.json)."
+_BACKEND_HELP = "Forecast backend: naive, seasonal or timesfm (default: naive)."
+_CONTEXT_HELP = "Candles handed to the backend at every origin (default: 512)."
+_HORIZON_HELP = "Forecast steps stored per origin (default: 24)."
+_REFORECAST_EVERY_HELP = "Candles between two forecast origins (default: 24)."
+_SEASONAL_PERIOD_HELP = "Phases of the seasonal cycle removed from the target (default: 24)."
+_SEASONAL_WINDOW_HELP = (
+    "Trailing window of the seasonal estimate (default: 168); 1 or 0 disables it."
+)
+_MODEL_ID_HELP = "Checkpoint of a model-backed backend, e.g. google/timesfm-2.5-200m-pytorch."
+_ARTIFACT_HELP = "Forecast artifact parquet written by 'trading forecast-build'."
+
+
+def _backend_extra_hint(name: str) -> str:
+    """Return the install hint published by a backend module, ``""`` when it has none.
+
+    The registry imports ``trading_platform.forecast.backends.<name>`` before this
+    helper runs, so the module is in :data:`sys.modules` and can be asked for its
+    ``*_EXTRA_HINT`` constant (the TimesFM backend publishes
+    ``TIMESFM_EXTRA_HINT``).  Reading it there instead of duplicating the string
+    keeps the CLI and the published extras (``[timesfm]``, ``[timesfm-xreg]``) in
+    sync.
+    """
+    module = sys.modules.get(f"trading_platform.forecast.backends.{name}")
+    if module is None:
+        return ""
+    hint = getattr(module, "EXTRA_HINT", None) or getattr(
+        module, f"{name.upper()}_EXTRA_HINT", None
+    )
+    return hint if isinstance(hint, str) else ""
+
+
+def _backend_license_note(backend: object) -> str:
+    """Return the licence note of ``backend`` (``""`` when it publishes none).
+
+    A model-backed backend owns the licence of its weights and exposes it as
+    ``license_note()``; the pure offline backends inherit no licence obligation
+    and record an empty note, which is what
+    :class:`~trading_platform.forecast.artifact.ForecastBuildConfig` expects.
+    """
+    note = getattr(backend, "license_note", None)
+    return str(note()) if callable(note) else ""
+
+
+def _resolve_forecast_backend(
+    name: str, *, timeframe: str, model_id: str | None
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve ``--backend`` once: registry name, options and availability.
+
+    The backend is built through :func:`trading_platform.forecast.get_backend`,
+    which imports a heavy backend module on demand (never at CLI import time).
+    A backend that does not support ``--model-id`` is rejected instead of being
+    silently ignored: recording a checkpoint in the metadata while loading
+    another one would make the artifact lie about its own weights.
+
+    Parameters
+    ----------
+    name:
+        Registry name of the backend, as given on the command line.
+    timeframe:
+        Candle duration forwarded to the backend factory.
+    model_id:
+        Optional checkpoint identifier of a model-backed backend.
+
+    Returns
+    -------
+    tuple[Any, dict[str, Any]]
+        The resolved backend and the ``backend_options`` the artifact builder
+        must forward to its own factory call (empty for a pure backend).
+
+    Raises
+    ------
+    ForecastError
+        If the backend is unknown, if it is known but not installed (the message
+        names the missing extra when the backend publishes one), or if
+        ``model_id`` is given for a backend that has no checkpoint.
+    """
+    from trading_platform.forecast import get_backend
+
+    options: dict[str, Any] = {"timeframe": timeframe}
+    backend = get_backend(name, **options)
+    if model_id is not None:
+        if not hasattr(backend, "model_id"):
+            raise ForecastError(
+                f"--model-id is not supported by the {name!r} backend: "
+                "only a model-backed backend loads a checkpoint"
+            )
+        options["model_id"] = model_id
+        backend = get_backend(name, **options)
+    if not backend.is_available():
+        hint = _backend_extra_hint(name)
+        detail = f": install it with {hint}" if hint else ""
+        raise ForecastError(f"forecast backend {name!r} is not available{detail}")
+    return backend, {key: value for key, value in options.items() if key != "timeframe"}
+
+
+@app.command("forecast-build")
+def forecast_build(
+    config: Path = typer.Option(..., "--config", "-c", help=_CONFIG_HELP),
+    data_file: Path = typer.Option(..., "--data-file", help=_DATA_FILE_HELP),
+    out: Path = typer.Option(..., "--out", help=_OUT_HELP),
+    backend: str = typer.Option("naive", "--backend", help=_BACKEND_HELP),
+    context: int = typer.Option(512, "--context", help=_CONTEXT_HELP),
+    horizon: int = typer.Option(24, "--horizon", help=_HORIZON_HELP),
+    reforecast_every: int = typer.Option(24, "--reforecast-every", help=_REFORECAST_EVERY_HELP),
+    seasonal_period: int = typer.Option(24, "--seasonal-period", help=_SEASONAL_PERIOD_HELP),
+    seasonal_window: int = typer.Option(168, "--seasonal-window", help=_SEASONAL_WINDOW_HELP),
+    model_id: str | None = typer.Option(None, "--model-id", help=_MODEL_ID_HELP),
+    symbol: str | None = typer.Option(None, "--symbol", help=_SYMBOL_HELP),
+    timeframe: str | None = typer.Option(None, "--timeframe", help=_TIMEFRAME_HELP),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Pre-compute the forecast artifact of one candle file (offline).
+
+    Every origin uses only the candles up to and including itself, so the
+    artifact is a deterministic, look-ahead-free input for the ``timesfm``
+    strategy.  The command never touches the network.
+    """
+    with _error_surface("forecast_build", json_output=json_output):
+        from trading_platform.forecast.artifact import (
+            ForecastBuildConfig,
+            build_forecast_artifact,
+        )
+
+        cfg = load_config(config)
+        resolved_symbol = _resolve_symbol(symbol, data_file)
+        resolved_timeframe = _resolve_timeframe(timeframe, cfg)
+        resolved_backend, backend_options = _resolve_forecast_backend(
+            backend, timeframe=resolved_timeframe, model_id=model_id
+        )
+        frame = _read_data_file(Path(data_file))
+        quality = _quality(frame, cfg, timeframe=resolved_timeframe)
+        build_config = ForecastBuildConfig(
+            symbol=resolved_symbol,
+            timeframe=resolved_timeframe,
+            backend=str(resolved_backend.name),
+            context_length=context,
+            horizon=horizon,
+            reforecast_every=reforecast_every,
+            seasonal_period=seasonal_period,
+            seasonal_window=seasonal_window,
+            model_id=model_id,
+            backend_options=backend_options,
+            license=_backend_license_note(resolved_backend),
+        )
+        artifact, metadata = build_forecast_artifact(frame, build_config, Path(out))
+        _emit(
+            _payload(
+                command="forecast_build",
+                ok=True,
+                symbol=resolved_symbol,
+                timeframe=resolved_timeframe,
+                config_path=str(config),
+                metrics={
+                    "n_origins": float(metadata.n_origins),
+                    "horizon": float(metadata.horizon),
+                    "stride": float(metadata.stride),
+                    "context_length": float(metadata.context_length),
+                    "n_quantiles": float(len(metadata.quantile_levels)),
+                },
+                run=metadata.to_dict(),
+                reports=[str(artifact)],
+                data_quality=quality.to_dict(),
+            ),
+            json_output=json_output,
+        )
+
+
+@app.command("forecast-skill")
+def forecast_skill(
+    artifact: Path = typer.Option(..., "--artifact", help=_ARTIFACT_HELP),
+    data_file: Path = typer.Option(..., "--data-file", help=_DATA_FILE_HELP),
+    symbol: str | None = typer.Option(None, "--symbol", help=_SYMBOL_HELP),
+    timeframe: str | None = typer.Option(None, "--timeframe", help=_TIMEFRAME_HELP),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Measure an artifact against the random-walk baseline (offline).
+
+    A positive backtest PnL is not evidence of an edge; this command is.  It
+    reports the RMSE/MAE/MASE skill scores, the empirical quantile coverage and
+    the directional accuracy of the stored paths, and it never needs the model
+    that produced them.
+    """
+    with _error_surface("forecast_skill", json_output=json_output):
+        from trading_platform.forecast.artifact import ForecastStore
+        from trading_platform.forecast.skill import forecast_skill_report
+
+        store = ForecastStore.load(Path(artifact))
+        frame = _read_data_file(Path(data_file))
+        report = forecast_skill_report(store, frame)
+        run = report.to_dict()
+        _emit(
+            _payload(
+                command="forecast_skill",
+                ok=True,
+                symbol=symbol or store.metadata.symbol or _resolve_symbol(None, data_file),
+                timeframe=timeframe or store.timeframe,
+                metrics=run["metrics"],
+                run=run,
+            ),
+            json_output=json_output,
+        )
+
+
+@app.command("forecast-info")
+def forecast_info(
+    artifact: Path = typer.Option(..., "--artifact", help=_ARTIFACT_HELP),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Print the metadata of a forecast artifact (no candle file needed)."""
+    with _error_surface("forecast_info", json_output=json_output):
+        from trading_platform.forecast.artifact import ForecastStore
+
+        store = ForecastStore.load(Path(artifact))
+        metadata = store.metadata
+        _emit(
+            _payload(
+                command="forecast_info",
+                ok=True,
+                symbol=metadata.symbol,
+                timeframe=metadata.timeframe,
+                run=metadata.to_dict(),
             ),
             json_output=json_output,
         )

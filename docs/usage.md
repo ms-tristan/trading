@@ -44,6 +44,8 @@ local et rapport. Aucun accès réseau n'est nécessaire.
 | `dev` | `pytest`, `pytest-cov`, `coverage`, `ruff`, `mypy`, `pandas-stubs`, `types-requests` | développement et CI | outillage qualité |
 | `exchange` | `ccxt`, `requests` | uniquement pour télécharger des données réelles (`data download`) | ajoute un client exchange |
 | `freqtrade` | `freqtrade` | uniquement pour l'exécution live/dry-run du bot | dépendance lourde (ccxt, TA-Lib) |
+| `timesfm` | `timesfm`, `torch` | only to build a forecast artifact with the real model (`forecast-build --backend timesfm`) | very heavy; **never** required by the test suite nor by the `naive`/`seasonal` backends |
+| `timesfm-xreg` | `timesfm`, `torch`, `jax`, `scikit-learn` | only for the calendar-only XReg covariate mode, an explicit opt-in | the heaviest one; never the default |
 | `all` | `freqtrade` + `exchange` + `dev` | poste de travail complet | tout installer |
 
 ```bash
@@ -52,11 +54,22 @@ local et rapport. Aucun accès réseau n'est nécessaire.
 
 # bot Freqtrade (live / dry-run)
 .venv/bin/python -m pip install -e ".[freqtrade]"
+
+# TimesFM 2.5 — the Apache-2.0 checkpoint, the default forecast backend
+.venv/bin/python -m pip install -e ".[timesfm]"
+
+# optional XReg covariate mode (jax + scikit-learn), never the default
+.venv/bin/python -m pip install -e ".[timesfm-xreg]"
 ```
 
 > **Le moteur de backtest n'a besoin ni de `freqtrade` ni de `ccxt`.** La suite
 > de tests doit rester verte avec le seul extra `dev` :
 > voir [`docs/testing-policy.md`](testing-policy.md).
+>
+> The forecasting layer follows the same rule: the `naive` and `seasonal`
+> backends are pure numpy/pandas, so `forecast-build`, `forecast-skill`, the
+> tests and the offline backtest all run **without** `torch`
+> (see [`docs/forecasting.md`](forecasting.md)).
 
 ---
 
@@ -321,6 +334,29 @@ pour un run ponctuel, par les drapeaux `--benchmark/--no-benchmark`,
 complète, lecture de l'alpha, taux sans risque et biais haussier :
 [`docs/backtesting-methodology.md`](backtesting-methodology.md).
 
+### 3.10 `forecast` — the pre-computed forecast artifact
+
+The `forecast` section wires the offline prediction layer into the strategy. It
+is **optional**: with no `forecast.artifact`, the `timesfm` strategy produces no
+signal at all (it never guesses and never raises), and the `basic` strategy is
+unaffected.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `artifact` | `null` | path of the parquet artifact produced by `trading forecast-build` (plus its `<artifact>.meta.json` sidecar). `null` = no forecast data available |
+
+```json
+{
+  "strategy": {"name": "timesfm"},
+  "forecast": {"artifact": "data/forecast/forecast.parquet"}
+}
+```
+
+Every other forecast setting lives in the strategy parameters
+(`strategy.params`, §4.7). The artifact itself, its schema, the backends, the
+licence table and the measured library traps are documented in
+[`docs/forecasting.md`](forecasting.md).
+
 ---
 
 ## 4. Exemples CLI
@@ -570,6 +606,51 @@ inconnues, les types, les timeframes supportés et la cohérence
 Freqtrade et rend `{"kind": "freqtrade", "valid": true, "issues": []}` (un
 `AppConfig` rend `{"kind": "appconfig", ...}`).
 
+### 4.7 `forecast-build` / `forecast-skill` / `forecast-info`
+
+These three commands build, measure and inspect the **offline** forecast
+artifact consumed by the `timesfm` strategy. None of them runs inside
+`prepare()`/`signals()`: prediction is pre-computed here, once, and the strategy
+reads the result as a deterministic external input
+([`docs/forecasting.md`](forecasting.md)).
+
+```bash
+# build the artifact offline: random-walk baseline, no ML dependency, no network
+python -m trading_platform.cli forecast-build \
+    --config config/backtest_default.json \
+    --data-file data/BTC_USDT-1h.csv \
+    --out data/forecast/forecast.parquet \
+    --backend naive
+
+# same command with the real model (needs the timesfm extra)
+python -m trading_platform.cli forecast-build \
+    --config config/backtest_default.json --data-file data/BTC_USDT-1h.csv \
+    --out data/forecast/forecast_timesfm.parquet --backend timesfm \
+    --context 1024 --horizon 24 --reforecast-every 8
+
+# measure the artifact's forecast skill against the random walk
+python -m trading_platform.cli forecast-skill \
+    --artifact data/forecast/forecast.parquet --data-file data/BTC_USDT-1h.csv
+
+# inspect the metadata (backend, model, span, schema version, licence note)
+python -m trading_platform.cli forecast-info \
+    --artifact data/forecast/forecast.parquet --json
+```
+
+| Command | Options | Output |
+| --- | --- | --- |
+| `trading forecast-build` | `--config/-c` (required), `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context N`, `--horizon H`, `--reforecast-every S` | writes the parquet artifact and its `<artifact>.meta.json` sidecar; prints the path, the number of origins and the covered window |
+| `trading forecast-skill` | `--artifact`, `--data-file` | RMSE / MAE / MASE against the random-walk baseline, decile coverage and directional accuracy at the horizon |
+| `trading forecast-info` | `--artifact` | metadata of the artifact (no candle file needed) |
+
+Each origin uses **only candles `<= origin`**, `--context` is the number of
+candles fed to the backend, `--horizon` the number of stored steps and
+`--reforecast-every` the stride between two stored origins. All three commands
+accept `--json`. **Do not read a positive PnL as an edge**: read
+`forecast-skill` first — `rmse_skill_score <= 0`, `mase >= 1` or a directional
+accuracy near `0.5` mean the artifact carries no usable skill
+([`docs/forecasting.md`](forecasting.md) §9).
+
 ---
 
 ## 5. Lire un rapport
@@ -707,6 +788,7 @@ exactement les mêmes commandes que `make check` en local.
 | `make robustness` | `python -m trading_platform robustness --config $(CONFIG)` | balayage paramétrique |
 | `make monte-carlo` | `python -m trading_platform monte-carlo --config $(CONFIG)` | Monte Carlo |
 | `make data-download` | `python -m trading_platform data download …` | remplissage du cache (seule cible qui utilise le réseau) |
+| `make forecast-build` | `python -m trading_platform forecast-build --config $(CONFIG) --data-file $(DATA_FILE) --out $(FORECAST_ARTIFACT) --backend $(FORECAST_BACKEND)` | build the offline forecast artifact (`DATA_FILE`, `FORECAST_ARTIFACT`, `FORECAST_BACKEND` override the defaults) |
 | `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + API JSON (§11) ; dashboard : `make dashboard-dev` (§11.6) |
 | `make docker-build` | `docker build` | construction de l'image |
 | `make docker-test` | `docker build --target test` puis `docker run … pytest tests --cov-fail-under=85` | suite complète dans le conteneur |
@@ -722,6 +804,16 @@ Les cibles de pipeline (`backtest`, `walk-forward`, `robustness`, `monte-carlo`,
 `data-download`) n'ajoutent aucune option : elles appellent la CLI avec
 `--config $(CONFIG)` (`config/backtest_default.json` par défaut). Pour un run
 hors ligne, appelez directement la CLI avec `--data-file … --no-network` (§4).
+
+`make forecast-build` is the only pipeline target with extra variables: it calls
+`forecast-build` with `DATA_FILE` (`data/BTC_USDT-1h.csv`), `FORECAST_ARTIFACT`
+(`data/forecast/forecast.parquet`) and `FORECAST_BACKEND` (`naive`), all
+overridable on the command line:
+
+```bash
+make forecast-build
+FORECAST_BACKEND=timesfm FORECAST_ARTIFACT=data/forecast/tfm.parquet make forecast-build
+```
 
 ---
 
@@ -1232,3 +1324,104 @@ création valide le corps contre le catalogue (`400` sur une stratégie ou un
 timeframe inconnus, `409` sur un identifiant déjà pris). Ces quatre routes
 exigent `X-Operator-Token` et répondent `403` sur un serveur `realtime serve`,
 qui ne mute jamais l'état.
+
+---
+
+## 12. Forecast layer — offline TimesFM artifacts
+
+`trading_platform.forecast` (layer 2.5) pre-computes probabilistic price paths
+**offline** and the `timesfm` strategy consumes them as a deterministic external
+input. The strategy never runs the model inside `prepare()`/`signals()`: the
+whole prediction step happens in `trading forecast-build` (§4.7), which writes a
+versioned parquet artifact plus a `<artifact>.meta.json` sidecar. The complete
+reference — artifact schema, backend contract, licence table (TimesFM 2.5
+Apache-2.0 is the default; TimesFM 3.0 weights are
+non-commercial and opt-in only), measured hardware numbers, library traps and
+the honesty section — is [`docs/forecasting.md`](forecasting.md).
+
+### 12.1 Install
+
+```bash
+.venv/bin/python -m pip install -e ".[dev]"           # suite + naive/seasonal backends
+.venv/bin/python -m pip install -e ".[timesfm]"       # TimesFM 2.5 (Apache-2.0 weights)
+.venv/bin/python -m pip install -e ".[timesfm-xreg]"  # optional calendar-only XReg mode
+```
+
+The heavy extras are never installed by CI and never required by the test suite:
+the three commands of §4.7, the offline backends and every test run with the
+`dev` extra alone.
+
+### 12.2 End-to-end offline backtest
+
+No ML dependency, no network, no cache — the recipe uses only the synthetic
+generator, the `naive` backend and the engine:
+
+```python
+from pathlib import Path
+
+from trading_platform.config import load_config
+from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.forecast import ForecastBuildConfig, build_forecast_artifact
+from trading_platform.strategy.engine import run_backtest_on_config
+
+frame = make_ohlcv(2000, start="2022-01-01T00:00:00Z", timeframe="1h", seed=42)
+
+build_forecast_artifact(
+    frame,
+    Path("data/forecast/forecast.parquet"),
+    ForecastBuildConfig(backend="naive", context_length=256, horizon=24, reforecast_every=8),
+)
+
+Path("forecast_config.json").write_text(
+    '{"strategy": {"name": "timesfm"}, "forecast": {"artifact": "data/forecast/forecast.parquet"}}',
+    encoding="utf-8",
+)
+result = run_backtest_on_config(load_config("forecast_config.json"), frame)
+print(result.n_trades, result.final_balance)
+```
+
+`run_backtest_on_config` resolves `forecast.artifact` through the
+feature-injection seam (`trading_platform.strategy.features`) and injects the
+loaded `ForecastStore` into the strategy, so `backtest`, `walk-forward`,
+`robustness` and `monte-carlo` all run unchanged on `timesfm`:
+
+```bash
+make forecast-build
+python -m trading_platform.cli backtest \
+    --config forecast_config.json --data-file btc.csv --no-network
+python -m trading_platform.cli walk-forward \
+    --config forecast_config.json --data-file btc.csv --no-network
+```
+
+### 12.3 Strategy parameters and diagnostics
+
+`strategy.name` selects `timesfm` (registry name) and `strategy.params`
+overrides `TimesFMForecastParams`: artifact wiring, `context_length`, `horizon`,
+`reforecast_every`, `min_lead`, the forecast-age bound, the entry gates
+(predicted edge, edge vs ATR, reliability, decile agreement, path efficiency,
+volatility regime, ATR-percentile window, optional RSI context filter, cooldown),
+the exit thresholds (`exit_alpha`, `exit_confirm`, `target_capture`,
+`min_progress`, `exit_vol_ratio`), the ATR stop (`atr_period`,
+`atr_stop_multiplier`), `max_hold` and `allow_short`. `PARAM_SPACE` exposes the
+same fields to the robustness sweep.
+
+`prepare()` adds the house indicators (`rsi`, `atr`, `ema`) **and** the
+`forecast_*` diagnostic columns (`forecast_alpha_<k>`, `forecast_slope`,
+`forecast_mfe`, `forecast_mae`, `forecast_path_eff`, `forecast_iqr_term`,
+`forecast_iqr_per_bar`, `forecast_reliability`, `forecast_agreement`,
+`vol_ratio`, `forecast_age`, `atr_pct`), plus `exit_code` — the integer reason
+of the exit that fired (1 `FORECAST_FLIP`, 2 `EDGE_DECAY`, 3 `TARGET_REACHED`,
+4 `PATH_DEGRADED`, 5 `TIME_STOP`, 6 `VOL_REGIME`, 7 `STALE_FORECAST`,
+8 `ATR_STOP`). Every column, its NaN rule and the priority order of the exits
+are tabulated in [`docs/forecasting.md`](forecasting.md) §10.
+
+### 12.4 Honesty
+
+The artifact can be measured, and it must be measured: run
+`trading forecast-skill` before believing any backtest. The 2025-26 literature
+on foundation models for financial series finds **no reliable directional edge**
+on returns, and a positive backtest PnL is **not evidence of an edge**. The
+exact numbers, the arXiv references and how to read the skill metrics are in
+[`docs/forecasting.md`](forecasting.md) §9. Tests and the coverage gate follow
+[`docs/testing-policy.md`](testing-policy.md) — this document never duplicates
+it.

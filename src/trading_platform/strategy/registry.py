@@ -13,6 +13,7 @@ from typing import Any
 from trading_platform.core.errors import StrategyError
 from trading_platform.strategy.base import Strategy
 from trading_platform.strategy.basic import BasicStrategy
+from trading_platform.strategy.timesfm_forecast import TimesFMForecastStrategy
 
 __all__ = [
     "STRATEGIES",
@@ -23,7 +24,10 @@ __all__ = [
 ]
 
 #: Every strategy known to the package, keyed by :attr:`Strategy.name`.
-STRATEGIES: dict[str, type[Strategy]] = {"basic": BasicStrategy}
+STRATEGIES: dict[str, type[Strategy]] = {
+    "basic": BasicStrategy,
+    "timesfm": TimesFMForecastStrategy,
+}
 
 
 def strategy_names() -> list[str]:

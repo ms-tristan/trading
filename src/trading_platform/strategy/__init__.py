@@ -4,8 +4,12 @@ Public API::
 
     from trading_platform.strategy import (
         BasicStrategy,        # the reference EMA/RSI/ATR strategy
+        TimesFMForecastStrategy,  # the forecast-artifact driven strategy ('timesfm')
         Strategy,             # the abstract base class
         StrategyParams,       # the pydantic parameter base model
+        FeatureBundle,        # the external features a strategy may consume
+        resolve_features,     # configuration -> FeatureBundle (loads the artifact)
+        attach_features,      # FeatureBundle -> strategy instance
         get_strategy,         # registry lookup by name
         register_strategy,    # register a new strategy
         run_backtest,         # the deterministic backtest engine
@@ -52,6 +56,11 @@ from trading_platform.strategy.engine import (
     run_backtest,
     run_backtest_on_config,
 )
+from trading_platform.strategy.features import (
+    FeatureBundle,
+    attach_features,
+    resolve_features,
+)
 from trading_platform.strategy.freqtrade_adapter import (
     FREQTRADE_INTERFACE_VERSION,
     FREQTRADE_ORDER_COLUMNS,
@@ -68,6 +77,10 @@ from trading_platform.strategy.registry import (
     strategy_names,
     strategy_param_space,
 )
+from trading_platform.strategy.timesfm_forecast import (
+    TimesFMForecastParams,
+    TimesFMForecastStrategy,
+)
 
 __all__ = [
     "BOOL_SIGNAL_COLUMNS",
@@ -78,9 +91,13 @@ __all__ = [
     "STRATEGIES",
     "BasicStrategy",
     "BasicStrategyParams",
+    "FeatureBundle",
     "Strategy",
     "StrategyParams",
+    "TimesFMForecastParams",
+    "TimesFMForecastStrategy",
     "atr",
+    "attach_features",
     "ema",
     "ensure_signal_frame",
     "freqtrade_adapter",
@@ -91,6 +108,7 @@ __all__ = [
     "make_runner",
     "register_strategy",
     "require_ohlcv_frame",
+    "resolve_features",
     "rsi",
     "run_backtest",
     "run_backtest_on_config",

@@ -67,6 +67,7 @@ asset**: `trading_platform.web` is a pure JSON API, so `GET /`,
 - [`docs/architecture.md`](docs/architecture.md) — architecture du projet, couches et interfaces
 - [`docs/backtesting-methodology.md`](docs/backtesting-methodology.md) — méthodes de validation et seuils de décision
 - [`docs/usage.md`](docs/usage.md) — installation, configuration, CLI, rapports, Docker
+- [`docs/forecasting.md`](docs/forecasting.md) — offline TimesFM-backed forecasting: artifact schema, backend contract, licences, measured library traps and the honesty section (a positive backtest PnL is not evidence of an edge)
 - [`docs/realtime.md`](docs/realtime.md) — temps réel multi-profils : moteur, paper/live, persistance, dashboard
 - [`docs/testing-policy.md`](docs/testing-policy.md) — politique de tests et de couverture
 - [`deploy/README.md`](deploy/README.md) — déploiement local du tableau de bord temps réel (Docker, nginx, TLS, fail2ban)

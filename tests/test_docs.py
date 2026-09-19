@@ -17,6 +17,7 @@ DOCS_DIR = REPO_ROOT / "docs"
 
 ARCHITECTURE = DOCS_DIR / "architecture.md"
 METHODOLOGY = DOCS_DIR / "backtesting-methodology.md"
+FORECASTING = DOCS_DIR / "forecasting.md"
 USAGE = DOCS_DIR / "usage.md"
 TESTING_POLICY = DOCS_DIR / "testing-policy.md"
 README = REPO_ROOT / "README.md"
@@ -30,6 +31,7 @@ FULL_PYTEST_COMMAND = (
 DOCUMENTED_PAGES = {
     "architecture": ARCHITECTURE,
     "backtesting-methodology": METHODOLOGY,
+    "forecasting": FORECASTING,
     "usage": USAGE,
     "testing-policy": TESTING_POLICY,
 }
@@ -37,6 +39,7 @@ DOCUMENTED_PAGES = {
 FROZEN_MODULES = (
     "trading_platform.config",
     "trading_platform.data",
+    "trading_platform.forecast",
     "trading_platform.strategy",
     "trading_platform.validation",
     "trading_platform.metrics",
@@ -44,7 +47,15 @@ FROZEN_MODULES = (
     "trading_platform.cli",
 )
 
-CLI_COMMANDS = ("backtest", "walk-forward", "robustness", "monte-carlo")
+CLI_COMMANDS = (
+    "backtest",
+    "walk-forward",
+    "robustness",
+    "monte-carlo",
+    "forecast-build",
+    "forecast-skill",
+    "forecast-info",
+)
 
 _MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
 
@@ -72,7 +83,7 @@ def markdown_link_targets(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 1. The four documentation pages exist and are substantial
+# 1. The documentation pages exist and are substantial
 # ---------------------------------------------------------------------------
 
 
@@ -595,3 +606,43 @@ def test_usage_documents_the_freqtrade_exposure_section() -> None:
     assert "freqtrade trade" in text
     assert "freqtrade_dryrun.json" in text
     assert "freqtrade_config.json" in text
+
+
+# ---------------------------------------------------------------------------
+# 8. The forecasting page stays complete, honest and reproducible
+# ---------------------------------------------------------------------------
+
+
+def test_forecasting_page_pins_licences_honesty_traps_and_reproduction() -> None:
+    """The forecast layer page must document the licence, the honesty and the traps.
+
+    The tokens below are the ones a reader needs in order to trust (or reject)
+    the artifact: which weights are usable commercially, what a positive PnL
+    does *not* prove (with the two primary arXiv references), the library traps
+    measured on this machine, and the offline reproduction path.
+    """
+    text = read(FORECASTING)
+
+    # --- licences: 2.5 (the default) is Apache-2.0, 3.0 is non-commercial
+    assert "Apache-2.0" in text, "docs/forecasting.md does not document the Apache-2.0 weights"
+    assert "TimesFM Non-Commercial License v1.0" in text, (
+        "docs/forecasting.md does not name the TimesFM 3.0 weight licence"
+    )
+    assert "google/timesfm-2.5-200m-pytorch" in text, (
+        "docs/forecasting.md does not name the default checkpoint"
+    )
+
+    # --- honesty: PnL is not an edge, and the 2025-26 evidence is cited
+    assert "not evidence of an edge" in text, (
+        "docs/forecasting.md must state that a positive backtest PnL is not evidence of an edge"
+    )
+    for arxiv_id in ("2606.27100", "2607.05291"):
+        assert arxiv_id in text, f"docs/forecasting.md does not cite arXiv:{arxiv_id}"
+
+    # --- measured library traps
+    assert "mutates" in text, "docs/forecasting.md does not document the input-list mutation trap"
+    assert "MPS" in text, "docs/forecasting.md does not document the unsupported MPS path"
+
+    # --- the documented, copy-pasteable, offline reproduction path
+    for token in ("forecast-build", "forecast-skill", "run_backtest_on_config"):
+        assert token in text, f"docs/forecasting.md does not document {token!r}"

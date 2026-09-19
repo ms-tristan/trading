@@ -2041,7 +2041,7 @@ def test_the_static_catalog_answers_without_a_provider(router: Router) -> None:
     body = payload_of(response)
     assert sorted(body) == CATALOG_KEYS
     assert body == default_catalog_body()
-    assert body["strategies"] == ["basic"]
+    assert body["strategies"] == ["basic", "timesfm"]
     assert body["modes"] == ["paper", "live"]
     assert body["timeframes"], "the picker needs at least one timeframe"
     assert body["symbols"], "the picker needs at least one symbol"

@@ -20,12 +20,15 @@ NPM ?= npm
 NPM_CACHE ?= $(CURDIR)/.npm-cache
 
 CONFIG ?= config/backtest_default.json
+DATA_FILE ?= data/BTC_USDT-1h.csv
+FORECAST_ARTIFACT ?= data/forecast/forecast.parquet
+FORECAST_BACKEND ?= naive
 DOCKER_IMAGE ?= trading-platform:latest
 DOCKER_TEST_IMAGE ?= trading-platform:test
 
 .DEFAULT_GOAL := help
 .PHONY: help venv install install-dev lint format type-check test test-cov cov check \
-	backtest walk-forward robustness monte-carlo data-download realtime docker-build docker-test clean \
+	backtest walk-forward robustness monte-carlo forecast-build data-download realtime docker-build docker-test clean \
 	dashboard-install dashboard-dev dashboard-lint dashboard-typecheck dashboard-test \
 	dashboard-test-coverage dashboard-build dashboard-check check-all
 
@@ -51,6 +54,7 @@ help: ## Show this help (every target below is runnable)
 	@echo "  make walk-forward   walk-forward analysis on $(CONFIG)"
 	@echo "  make robustness     parameter sweep on $(CONFIG)"
 	@echo "  make monte-carlo    Monte Carlo simulation on $(CONFIG)"
+	@echo "  make forecast-build build the offline forecast artifact ($(FORECAST_BACKEND) backend)"
 	@echo "  make data-download  fill the OHLCV cache (needs the exchange extra)"
 	@echo "  make realtime       run the realtime engine + monitoring JSON API (PROFILES=...)"
 	@echo "  make docker-build   build the image $(DOCKER_IMAGE)"
@@ -120,6 +124,9 @@ robustness: ## Run the parametric robustness sweep
 
 monte-carlo: ## Run the Monte Carlo simulation
 	$(PYTHON) -m trading_platform monte-carlo --config $(CONFIG)
+
+forecast-build: ## Build the offline forecast artifact (DATA_FILE/FORECAST_BACKEND to override)
+	$(PYTHON) -m trading_platform forecast-build --config $(CONFIG) --data-file $(DATA_FILE) --out $(FORECAST_ARTIFACT) --backend $(FORECAST_BACKEND)
 
 data-download: ## Fill the on-disk OHLCV cache (only network-using target)
 	$(PYTHON) -m trading_platform data download --config $(CONFIG) \

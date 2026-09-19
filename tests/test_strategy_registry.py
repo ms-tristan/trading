@@ -92,11 +92,11 @@ def test_get_strategy_rejects_an_unknown_name() -> None:
     with pytest.raises(StrategyError) as error:
         registry.get_strategy("nope")
 
-    assert str(error.value) == "unknown strategy: 'nope' (available: basic)"
+    assert str(error.value) == "unknown strategy: 'nope' (available: basic, timesfm)"
 
 
 def test_strategy_names_is_sorted_and_contains_basic() -> None:
-    assert registry.strategy_names() == ["basic"]
+    assert registry.strategy_names() == ["basic", "timesfm"]
 
 
 def test_strategy_param_space_returns_the_grid_of_the_strategy() -> None:
@@ -130,7 +130,7 @@ def test_register_strategy_adds_a_new_strategy(
 
     assert returned is RegistrableStrategy
     assert isolated_registry["registrable"] is RegistrableStrategy
-    assert registry.strategy_names() == ["basic", "registrable"]
+    assert registry.strategy_names() == ["basic", "registrable", "timesfm"]
     assert isinstance(registry.get_strategy("registrable"), RegistrableStrategy)
 
 
@@ -188,4 +188,4 @@ def test_registration_does_not_leak_into_the_global_registry(
     assert "registrable" in isolated_registry
     assert registry.STRATEGIES is isolated_registry
     assert "registrable" not in _GLOBAL_REGISTRY
-    assert set(_GLOBAL_REGISTRY) == {"basic"}
+    assert set(_GLOBAL_REGISTRY) == {"basic", "timesfm"}
