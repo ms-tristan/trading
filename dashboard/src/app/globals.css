@@ -89,6 +89,44 @@
   --spacing-2xl: 24px;
   --spacing-3xl: 32px;
 
+  /*
+   * -- width scale (collision-proof bridge) --------------------------------
+   *
+   * A *named* `--spacing-*` token shadows the `--container-*` namespace. In
+   * Tailwind v4 the lookup chain of `max-w-<name>` / `min-w-<name>` is
+   * [`--max-width` | `--min-width`, `--spacing`, `--container`], so the density
+   * tokens above won that race: the built stylesheet carried
+   * `.max-w-2xl{max-width:var(--spacing-2xl)}` (24px) and
+   * `.max-w-md{max-width:var(--spacing-md)}` (8px), which collapsed the profile
+   * creation form to a 24px column and both confirmation dialogs to a 50px
+   * sliver.
+   *
+   * The spacing scale stays exactly as it is - every `gap-*`, `p-*` and `px-*`
+   * utility of the dashboard reads it - so the intended widths are pinned in the
+   * higher-priority namespace instead: one alias per spacing name, carrying the
+   * container value a named width utility means. `max-w-md` is 28rem again and
+   * `max-w-2xl` is 42rem again, and a name added later cannot silently collapse:
+   * `src/app/globals.test.ts` compiles this file and fails on any named width
+   * that resolves to a spacing token.
+   *
+   * `prose` is deliberately absent: it is not a spacing name, it never collided,
+   * and it must keep resolving to the default `65ch` (pinned by that test).
+   */
+  --max-width-xs: 20rem;
+  --max-width-sm: 24rem;
+  --max-width-md: 28rem;
+  --max-width-lg: 32rem;
+  --max-width-xl: 36rem;
+  --max-width-2xl: 42rem;
+  --max-width-3xl: 48rem;
+  --min-width-xs: 20rem;
+  --min-width-sm: 24rem;
+  --min-width-md: 28rem;
+  --min-width-lg: 32rem;
+  --min-width-xl: 36rem;
+  --min-width-2xl: 42rem;
+  --min-width-3xl: 48rem;
+
   /* -- shadows ------------------------------------------------------------ */
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05);
   --shadow-md: 0 4px 6px rgb(0 0 0 / 0.1);

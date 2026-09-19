@@ -86,6 +86,73 @@ describe('LiveToolbar', () => {
     expect(screen.getByRole('button', { name: 'Refresh now' })).toHaveFocus();
   });
 
+  it('renders the injected actions after the refresh control', () => {
+    render(
+      <LiveToolbar
+        checkedAt={null}
+        isPaused={false}
+        onToggle={vi.fn()}
+        onRefresh={vi.fn()}
+        // A stub node on purpose: the toolbar only forwards whatever the calling
+        // section injects, so the injected action stays a plain anchor here.
+        // eslint-disable-next-line @next/next/no-html-link-for-pages
+        actions={<a href="/profiles/new">New profile</a>}
+      />,
+    );
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh now' });
+    const action = screen.getByRole('link', { name: 'New profile' });
+    const cluster = refreshButton.parentElement;
+
+    expect(cluster).toContainElement(action);
+    // Last child of the live control cluster: the injected action shares the
+    // cluster of Pause / Refresh, it does not sit in a cluster of its own.
+    expect(cluster?.lastElementChild).toBe(action);
+    expect(
+      refreshButton.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('renders no extra control when no action is injected', () => {
+    render(<LiveToolbar checkedAt={null} isPaused={false} onToggle={vi.fn()} onRefresh={vi.fn()} />);
+
+    const refreshButton = screen.getByRole('button', { name: 'Refresh now' });
+    const cluster = refreshButton.parentElement as HTMLElement;
+
+    // Exactly the two live controls, and nothing else.
+    expect(cluster.children).toHaveLength(2);
+    expect(cluster.querySelectorAll('button')).toHaveLength(2);
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+  });
+
+  it('reaches the injected action after the two live controls', async () => {
+    const user = userEvent.setup();
+    const onToggle = vi.fn();
+    render(
+      <LiveToolbar
+        checkedAt={null}
+        isPaused={false}
+        onToggle={onToggle}
+        onRefresh={vi.fn()}
+        // A stub node on purpose: the toolbar only forwards whatever the calling
+        // section injects, so the injected action stays a plain anchor here.
+        // eslint-disable-next-line @next/next/no-html-link-for-pages
+        actions={<a href="/profiles/new">New profile</a>}
+      />,
+    );
+
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Pause live updates' })).toHaveFocus();
+    await user.keyboard('{Enter}');
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toHaveFocus();
+    // The injected action is the last tab stop of the cluster: it follows the
+    // two live controls and needs no extra tab stop of its own.
+    await user.tab();
+    expect(screen.getByRole('link', { name: 'New profile' })).toHaveFocus();
+  });
+
   it('shows a non-blocking error banner and hides it when the error clears', () => {
     const { rerender } = render(
       <LiveToolbar

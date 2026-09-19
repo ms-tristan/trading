@@ -1,5 +1,7 @@
 'use client';
 
+import type { ReactNode } from 'react';
+
 import { Pause, Play, RefreshCw } from 'lucide-react';
 
 import { cn } from '@/lib/cn';
@@ -23,6 +25,8 @@ export interface LiveToolbarProps {
   errorDetail?: string | null;
   /** Name of the live region ('Live updates' by default). */
   liveLabel?: string;
+  /** Extra controls appended to the live control cluster, after "Refresh now". The Profiles section injects its creation action here so the action sits with the list it acts on. */
+  actions?: ReactNode;
   className?: string;
 }
 
@@ -42,6 +46,7 @@ export function LiveToolbar({
   error = null,
   errorDetail = null,
   liveLabel = 'Live updates',
+  actions,
   className,
 }: LiveToolbarProps) {
   return (
@@ -85,6 +90,7 @@ export function LiveToolbar({
           >
             Refresh now
           </Button>
+          {actions}
         </div>
       </div>
       <ErrorBanner message={error} detail={errorDetail} />

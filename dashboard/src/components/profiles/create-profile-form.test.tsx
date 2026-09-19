@@ -419,3 +419,19 @@ describe('CreateProfileForm failures', () => {
     expect(screen.getByLabelText('Profile id')).toHaveValue('btc-paper');
   });
 });
+
+describe('CreateProfileForm layout width', () => {
+  it('keeps the form on the named 2xl container step so the fields are readable', () => {
+    const seam = installFetch(jsonResponse(CREATED));
+    // `max-w-2xl` compiles to 42rem = 672px through the width-scale bridge of
+    // globals.css. Before that bridge existed the density token won the race and
+    // this form rendered 24px wide, wrapping every label and shrinking every
+    // input to about 20px. This pin keeps the surface on the named container
+    // step, so the width can never silently collapse again.
+    const { container } = render(
+      <CreateProfileForm catalog={CATALOG} operatorToken={TOKEN} fetchImpl={seam.impl} />,
+    );
+
+    expect(container.querySelector('form')).toHaveClass('max-w-2xl');
+  });
+});

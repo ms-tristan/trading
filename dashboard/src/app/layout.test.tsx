@@ -59,26 +59,13 @@ describe('RootLayout', () => {
     );
   });
 
-  it('links to the profile creation route next to the brand link', () => {
+  it('renders no profile creation action: it lives with the list it creates into', () => {
     const html = renderLayout();
-    expect(html).toContain('href="/profiles/new"');
-    expect(html).toContain('New profile');
-    expect(html).toContain('aria-label="Profiles"');
-  });
 
-  it('acknowledges a press on the New profile action without moving it', () => {
-    const classes = classTokens(renderLayout(), 'a[href="/profiles/new"]');
-
-    expect(classes).toContain('active:border-accent');
-    expect(classes).toContain('active:bg-muted-pressed');
-    expect(classes).toContain('active:text-accent');
-    // The pressed state is a colour change only: the action stays clickable,
-    // keyboard reachable and hover-styled exactly as before.
-    expect(classes).toContain('cursor-pointer');
-    expect(classes).toContain('hover:text-accent');
-    expect(classes).toContain('focus-visible:ring-2');
-    expect(classes).toContain('motion-safe:transition-colors');
-    expect(classes).toContain('motion-safe:duration-200');
+    // The action moved into the Profiles live toolbar, next to the list it acts
+    // on, so the header must not offer a second, orphaned link to that route.
+    expect(html).not.toContain('href="/profiles/new"');
+    expect(html).not.toContain('New profile');
   });
 
   it('acknowledges a press on the brand link', () => {

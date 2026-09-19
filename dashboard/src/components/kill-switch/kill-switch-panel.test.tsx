@@ -249,6 +249,19 @@ describe('KillSwitchPanel confirmation flow', () => {
       expect(screen.getByText('Released')).toBeInTheDocument();
     });
   });
+
+  it('keeps the confirmation modal on the named md container step (28rem, 448px)', async () => {
+    const user = userEvent.setup();
+    render(<KillSwitchPanel initialState={released} />);
+
+    await user.click(screen.getByRole('button', { name: 'Engage kill switch' }));
+
+    // `max-w-md` compiles to 28rem = 448px through the width-scale bridge of
+    // globals.css. Measured live before that bridge existed: this modal was a
+    // 50 x 660 px sliver, because the name resolved to the 8px `--spacing-md`
+    // density token instead of the container step.
+    expect(screen.getByRole('dialog')).toHaveClass('max-w-md');
+  });
 });
 
 describe('KillSwitchPanel failures', () => {
