@@ -1,9 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
-import type { FormEvent, KeyboardEvent } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import type { KeyboardEvent } from 'react';
 
-import { KeyRound, OctagonAlert, ShieldCheck, Trash2 } from 'lucide-react';
+import { OctagonAlert, ShieldCheck } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { ErrorBanner } from '@/components/ui/error-banner';
@@ -11,13 +11,10 @@ import { postKillSwitch } from '@/lib/api';
 import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { EMPTY_PLACEHOLDER, formatTimestamp } from '@/lib/format';
-import {
-  clearOperatorToken,
-  hasOperatorToken,
-  readOperatorToken,
-  saveOperatorToken,
-} from '@/lib/operator-token';
+import { readOperatorToken } from '@/lib/operator-token';
 import type { KillSwitchPayload } from '@/lib/types';
+
+import { OperatorTokenForm } from './operator-token-form';
 
 /** Props of {@link KillSwitchPanel}. */
 export interface KillSwitchPanelProps {
@@ -30,43 +27,15 @@ export interface KillSwitchPanelProps {
 
 type DialogAction = 'engage' | 'release';
 
-/*
- * `sessionStorage` is a browser-only external store: it is read through
- * `useSyncExternalStore`, whose server snapshot is always `false`. That keeps
- * the indicator free of a hydration mismatch and free of a `setState` inside an
- * effect.
- */
-const tokenListeners = new Set<() => void>();
-
-function subscribeTokenSaved(listener: () => void): () => void {
-  tokenListeners.add(listener);
-  return () => {
-    tokenListeners.delete(listener);
-  };
-}
-
-function readTokenSavedSnapshot(): boolean {
-  return hasOperatorToken();
-}
-
-function readTokenSavedServerSnapshot(): boolean {
-  return false;
-}
-
-function notifyTokenSaved(): void {
-  for (const listener of tokenListeners) {
-    listener();
-  }
-}
-
 /**
  * Kill-switch control: state, operator token and the engage / release commands.
  *
  * Security and accessibility rules that this panel implements:
  *
- * * the operator token lives in `sessionStorage` only, is written on submit,
- *   cleared from the DOM immediately and **never** rendered back — the panel
- *   only shows whether a token is stored;
+ * * the operator token lives in `sessionStorage` only and is owned by
+ *   {@link OperatorTokenForm}, which the panel renders like the profile creation
+ *   form does — saved, inspected and cleared from either surface. The panel only
+ *   shows *whether* a token is stored, never its value;
  * * engaging the emergency stop is destructive, so it always goes through an
  *   explicit confirmation dialog that requires a reason; releasing confirms too;
  * * a failure never throws and never clears the state on screen: it shows a
@@ -82,45 +51,17 @@ export function KillSwitchPanel({ initialState, state = null, className }: KillS
   const [dialogAction, setDialogAction] = useState<DialogAction | null>(null);
   const [reason, setReason] = useState<string>('');
 
-  const tokenInputRef = useRef<HTMLInputElement | null>(null);
   const reasonInputRef = useRef<HTMLInputElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   const headingId = useId();
-  const tokenId = useId();
   const dialogTitleId = useId();
   const dialogDescriptionId = useId();
   const reasonId = useId();
 
   const effective = state ?? localState;
   const isEngaged = effective.kill_switch;
-  const tokenSaved = useSyncExternalStore(
-    subscribeTokenSaved,
-    readTokenSavedSnapshot,
-    readTokenSavedServerSnapshot,
-  );
-
-  const handleSaveToken = useCallback((event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const input = tokenInputRef.current;
-    const value = input === null ? '' : input.value;
-    saveOperatorToken(value);
-    if (input !== null) {
-      input.value = '';
-    }
-    notifyTokenSaved();
-    setFailure(null);
-  }, []);
-
-  const handleClearToken = useCallback(() => {
-    clearOperatorToken();
-    const input = tokenInputRef.current;
-    if (input !== null) {
-      input.value = '';
-    }
-    notifyTokenSaved();
-  }, []);
 
   const submit = useCallback(async (engage: boolean, submittedReason: string): Promise<void> => {
     setPending(true);
@@ -250,49 +191,7 @@ export function KillSwitchPanel({ initialState, state = null, className }: KillS
         </dl>
       ) : null}
 
-      <form onSubmit={handleSaveToken} className="mt-lg">
-        <label
-          htmlFor={tokenId}
-          className="block text-xs font-medium uppercase tracking-wide text-muted-foreground"
-        >
-          Operator token
-        </label>
-        <div className="mt-xs flex flex-wrap items-center gap-sm">
-          <input
-            id={tokenId}
-            ref={tokenInputRef}
-            type="password"
-            name="operatorToken"
-            autoComplete="off"
-            spellCheck={false}
-            placeholder="Paste the token, then save"
-            className={cn(
-              'min-w-0 flex-1 rounded-button border border-border bg-muted px-md py-sm font-mono text-sm text-foreground',
-              'placeholder:text-muted-foreground',
-              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
-            )}
-          />
-          <Button type="submit" size="sm" variant="secondary" icon={<KeyRound className="size-3.5" />}>
-            Save token
-          </Button>
-          {tokenSaved ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={handleClearToken}
-              icon={<Trash2 className="size-3.5" />}
-            >
-              Clear token
-            </Button>
-          ) : null}
-        </div>
-        <p role="status" aria-live="polite" className="mt-xs text-xs text-muted-foreground">
-          {tokenSaved
-            ? 'Token saved for this tab (session storage only). It is never shown again.'
-            : 'No token saved in this tab.'}
-        </p>
-      </form>
+      <OperatorTokenForm className="mt-lg" />
 
       <div className="mt-lg flex flex-wrap items-center gap-sm">
         <Button

@@ -22,7 +22,13 @@
  *   back to the overview on success (which polls, so the new profile appears
  *   without a manual reload);
  * * the operator token is read from `sessionStorage` when the caller has none,
- *   is sent as the `X-Operator-Token` header, and is never rendered nor logged.
+ *   is sent as the `X-Operator-Token` header, and is never rendered nor logged;
+ * * the token can be saved from this very page through the shared
+ *   {@link OperatorTokenForm} (the kill-switch panel renders the same component),
+ *   so reaching the surface that stores the token never depends on another page;
+ * * a creation refused with a 403 is not explained by the raw refusal alone: the
+ *   banner keeps the mapped headline and the server text verbatim, and the form
+ *   adds what the operator must do about it.
  */
 
 import { useCallback, useMemo, useRef, useState } from 'react';
@@ -30,9 +36,10 @@ import type { FormEvent, JSX } from 'react';
 
 import { useRouter } from 'next/navigation';
 
+import { OperatorTokenForm } from '@/components/kill-switch/operator-token-form';
 import { Button } from '@/components/ui/button';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { createProfile } from '@/lib/api';
+import { ApiError, createProfile } from '@/lib/api';
 import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { readOperatorToken } from '@/lib/operator-token';
@@ -76,7 +83,23 @@ export const CREATE_PROFILE_MESSAGES = {
   strategyRequired: 'Strategy is required.',
   timeframeRequired: 'Timeframe is required.',
   balanceInvalid: 'Initial balance must be greater than 0.',
+  /**
+   * Guidance added to the mapped banner when the server refuses the creation
+   * with a 403 because no valid operator token was sent. It tells the operator
+   * what to do instead of leaving them with the raw refusal.
+   */
+  tokenRefused:
+    'The server refused the request: no valid operator token was sent. Save the operator token in the field above, or from the kill switch on the overview page, then submit again.',
 } as const;
+
+/** Operator-facing hint rendered under the token form of this page. */
+export const CREATE_PROFILE_TOKEN_HINT =
+  'Needed to create a profile: this page and the kill switch on the overview page save the same token.';
+
+/** Whether `failure` is the documented 403 refusal of the operator token. */
+function isOperatorTokenRefusal(failure: unknown): boolean {
+  return failure instanceof ApiError && failure.status === 403;
+}
 
 /** Field names of the form. */
 export type CreateProfileField =
@@ -311,6 +334,10 @@ export function CreateProfileForm({
    */
   const report = failure === null ? null : failureReport(failure);
 
+  // A 403 means the request carried no valid operator token: the form says so
+  // and points at the two surfaces that store one.
+  const refusedToken = isOperatorTokenRefusal(failure);
+
   return (
     <form
       ref={formRef}
@@ -322,6 +349,21 @@ export function CreateProfileForm({
     >
       {report === null ? null : <ErrorBanner message={report.headline} detail={report.detail} />}
 
+      {/*
+        The refusal is never replaced by the guidance: the banner above keeps the
+        mapped headline and the server text verbatim, and this line only adds
+        what the operator can do about a missing or invalid token.
+      */}
+      {refusedToken ? (
+        <p
+          role="status"
+          aria-live="polite"
+          className="rounded-card border border-loss/40 bg-loss/10 px-lg py-md text-sm text-foreground"
+        >
+          {CREATE_PROFILE_MESSAGES.tokenRefused}
+        </p>
+      ) : null}
+
       {notice === null ? null : (
         <p
           role="status"
@@ -331,6 +373,15 @@ export function CreateProfileForm({
           {notice}
         </p>
       )}
+
+      {/*
+        The token is saved before the fields are filled, on the very page the
+        operator arrived on, through the component the kill switch renders too.
+      */}
+      <OperatorTokenForm
+        hint={CREATE_PROFILE_TOKEN_HINT}
+        className="rounded-card border border-border bg-card p-lg"
+      />
 
       <div className="flex flex-col gap-sm">
         <label htmlFor={FIELD_IDS.profileId} className="text-xs font-medium text-muted-foreground">

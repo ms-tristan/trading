@@ -266,16 +266,40 @@ guard and prints the same message (§6).
   execution venue (`Broker.reconcile()`) and marks the profile `degraded` in case
   of a discrepancy. Fills are reconciled at a bounded interval
   (`realtime.reconcile_interval_seconds`).
+- Reconciliation **compares like with like**. The two sides do not describe the
+  same window: `ExecutionGateway.reconcile` hands `Broker.reconcile` the profile's
+  **complete durable history** (`store.list_orders(profile_id, limit=RECONCILE_ORDER_LIMIT)`,
+  terminal orders included), while a venue only ever reports the orders it
+  currently works. So an order is compared only when the venue could legitimately
+  still know it: an order whose state is still **working** (`PENDING`,
+  `SUBMITTED`, `PARTIALLY_FILLED`) is always compared, a **terminal** order
+  (filled, cancelled, rejected) is compared only when the venue's view also knows
+  its `client_order_id`, and a **terminal order the venue no longer holds is
+  dropped from the comparison entirely — it is not a divergence** and is never
+  reported as `only_locally`. The three-way classification is otherwise unchanged:
+  `only_at_venue` (the venue holds an order the local state ignores),
+  `only_locally` (the local state believes in a *working* order the venue ignores)
+  and `mismatched` (both sides know the identifier but disagree on its state — a
+  terminal local state against a venue that still holds the order lands here,
+  never in `only_locally`). The rule lives in the single shared comparison helper
+  `_reconcile_orders`, so `PaperBroker` and `CcxtBroker` behave identically. A
+  difference of `filled_quantity` with an identical state stays in `details`
+  (`quantity_mismatches`) and does not degrade anything. The gateway still
+  **reports and never repairs**: `ok=False` is forwarded to the orchestrator,
+  which alone marks the profile `degraded`.
+- A reconciliation discrepancy on an **in-memory** venue is therefore no longer
+  produced by the profile's own history: a paper venue that restarted with an
+  empty book while the store still holds filled orders reconciles **healthy**
+  (`ok=True`, `matched=0`). A genuine divergence — a *working* order only the
+  venue holds, a *working* order only the local state knows, or a state
+  disagreement between two known orders — still degrades the profile, and nothing
+  is resubmitted in any case. This is the documented behaviour of D7, not a data
+  loss.
 - The store is **single-writer**: a second orchestrator on the same file fails
   with `StateStoreError` (a `flock` lock taken on `<base>.lock`). This lock is
   **advisory**: it protects two `SqliteStateStore` instances, not a third-party
   process that would write into the file while bypassing the store. A newer
   schema version also raises `StateStoreError` instead of writing blindly.
-- A reconciliation discrepancy on an **in-memory** venue is expected after a
-  restart: the paper broker does not know the orders it has not seen, so the
-  profile starts again as `degraded` — the local state itself is intact and
-  nothing is resubmitted. This is the documented behaviour of D7, not a data
-  loss.
 - **One** shared wallet holds the USDT cash, and it is the only thing that can
   fund an order (§9). It is a single row of the `wallet` table — schema version
   **3**, `wallet_id = 1` enforced by a `CHECK` — written through
