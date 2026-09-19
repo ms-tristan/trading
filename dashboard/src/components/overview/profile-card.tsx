@@ -20,12 +20,8 @@ import { StatusBadge, profileStatusTone, type StatusTone } from '@/components/ui
 import { cn } from '@/lib/cn';
 import {
   EMPTY_PLACEHOLDER,
-  formatDuration,
-  formatInteger,
   formatMoney,
   formatRatioAsPercent,
-  formatSignedMoney,
-  formatTimestamp,
   isFiniteNumber,
   trendLabel,
   trendOf,
@@ -90,24 +86,25 @@ function headingId(profileId: string): string {
   return `profile-${profileId.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
 }
 
-interface FieldProps {
+interface KeyValueProps {
   /** Visible label of the value (never optional: every value is labelled). */
   label: string;
-  /** Already formatted value; blank or absent renders an em dash. */
-  value?: string;
-  /** Rich value (a trend indicator, a link, ...); wins over `value`. */
-  children?: ReactNode;
+  /** Already formatted value; blank or absent renders an em dash upstream. */
+  children: ReactNode;
 }
 
-/** One labelled value of the card's definition grid. */
-function Field({ label, value, children }: FieldProps) {
-  const text = value ?? EMPTY_PLACEHOLDER;
+/**
+ * One labelled value of the card's compact key-value row.
+ *
+ * The row carries no boxed tile and no card-like background: the overview card
+ * is a summary, so its figures read as a single line of key values and never as
+ * a second, denser definition grid.
+ */
+function KeyValue({ label, children }: KeyValueProps) {
   return (
-    <div className="rounded-button border border-border/60 bg-muted/30 px-lg py-md">
+    <div data-testid="profile-card-key-value" className="min-w-0">
       <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</dt>
-      <dd className="mt-xs break-words font-mono text-sm tabular-nums text-foreground">
-        {children ?? (text.trim() === '' ? EMPTY_PLACEHOLDER : text)}
-      </dd>
+      <dd className="mt-xs font-mono text-base tabular-nums text-foreground">{children}</dd>
     </div>
   );
 }
@@ -151,14 +148,22 @@ function TrendValue({ text, value }: TrendValueProps) {
  * resume, delete) of the profile, exactly like the detail header, so both entry
  * points offer the same controls.
  *
+ * The overview card is deliberately **essential only**: the profile id heading,
+ * the symbol and the timeframe, the mode and status badges, the attributed
+ * equity and the total return with its trend. The annex data of a profile — the
+ * attributed breakdown (cash, allocation, deployed capital, position value,
+ * initial balance), the realized and unrealized P&L, the strategy, the per-
+ * profile counters and timestamps, and the reason of the last refused order —
+ * lives on the `/profiles/[id]` detail route, where the profile header renders
+ * it in full. Only the last-error row is kept here: it is an alert, not annex
+ * data.
+ *
  * Money is **attributed**: every profile funds its orders from the one shared
- * platform wallet, so `equity` and `cash` are labelled "Attributed ..." — they
- * are this profile's share of the shared ledger, never a pot of its own. The
- * attributed breakdown (allocation, deployed capital, realized and unrealized
- * P&L) and the reason of the last refused order are rendered beside them.
- * Every value carries an explicit label, every state pairs its tone with a text
- * label and an icon, and every absent value renders the em dash placeholder —
- * never `NaN`, `undefined` or an empty cell.
+ * platform wallet, so `equity` is labelled "Attributed equity" — it is this
+ * profile's share of the shared ledger, never a pot of its own. Every retained
+ * value carries an explicit label, every state pairs its tone with a text label
+ * and an icon, and every absent value renders the em dash placeholder — never
+ * `NaN`, `undefined` or an empty cell.
  */
 export function ProfileCard({ profile, className }: ProfileCardProps) {
   const mode = MODE_BADGES[profile.mode] ?? {
@@ -172,10 +177,7 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
     icon: <CircleX className={BADGE_ICON_CLASSES} />,
   };
   const hasReturn = isFiniteNumber(profile.total_return);
-  const hasRealized = isFiniteNumber(profile.realized_pnl);
-  const hasUnrealized = isFiniteNumber(profile.unrealized_pnl);
   const lastError = profile.health.last_error;
-  const lastBlockReason = profile.last_block_reason;
 
   return (
     <article
@@ -215,6 +217,14 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
               {textOrPlaceholder(profile.profile_id)}
             </Link>
           </h3>
+          <p
+            data-testid="profile-card-symbol"
+            className="mt-xs break-words font-mono text-xs text-muted-foreground"
+          >
+            {textOrPlaceholder(profile.symbol)}
+            {' · '}
+            {textOrPlaceholder(profile.timeframe)}
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-sm">
           <StatusBadge label={mode.label} tone={mode.tone} icon={mode.icon} />
@@ -222,48 +232,21 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
         </div>
       </header>
 
-      <dl className="mt-lg grid gap-md sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        <Field label="Profile id" value={textOrPlaceholder(profile.profile_id)} />
-        <Field label="Symbol" value={textOrPlaceholder(profile.symbol)} />
-        <Field label="Timeframe" value={textOrPlaceholder(profile.timeframe)} />
-        <Field label="Strategy" value={textOrPlaceholder(profile.strategy)} />
-        <Field label="Attributed equity" value={formatMoney(profile.equity)} />
-        <Field label="Attributed cash" value={formatMoney(profile.cash)} />
-        <Field label="Allocation" value={formatMoney(profile.allocation)} />
-        <Field label="Deployed" value={formatMoney(profile.deployed)} />
-        <Field label="Position value" value={formatMoney(profile.position_value)} />
-        <Field label="Initial balance" value={formatMoney(profile.initial_balance)} />
-        <Field label="Total return" value={formatRatioAsPercent(profile.total_return, { signed: true })}>
+      <dl
+        data-testid="profile-card-key-values"
+        className="mt-lg flex flex-wrap items-baseline gap-x-xl gap-y-md border-t border-border/60 pt-lg"
+      >
+        <KeyValue label="Attributed equity">{formatMoney(profile.equity)}</KeyValue>
+        <KeyValue label="Total return">
           {hasReturn ? (
             <TrendValue
               text={formatRatioAsPercent(profile.total_return, { signed: true })}
               value={profile.total_return}
             />
-          ) : undefined}
-        </Field>
-        <Field label="Realized P&L" value={formatSignedMoney(profile.realized_pnl)}>
-          {hasRealized ? (
-            <TrendValue
-              text={formatSignedMoney(profile.realized_pnl)}
-              value={profile.realized_pnl}
-            />
-          ) : undefined}
-        </Field>
-        <Field label="Unrealized P&L" value={formatSignedMoney(profile.unrealized_pnl)}>
-          {hasUnrealized ? (
-            <TrendValue
-              text={formatSignedMoney(profile.unrealized_pnl)}
-              value={profile.unrealized_pnl}
-            />
-          ) : undefined}
-        </Field>
-        <Field label="Last blocked order" value={textOrPlaceholder(lastBlockReason)} />
-        <Field label="Trades" value={formatInteger(profile.n_trades)} />
-        <Field label="Open positions" value={formatInteger(profile.open_positions)} />
-        <Field label="Last candle" value={formatTimestamp(profile.health.last_candle_at)} />
-        <Field label="Candle lag" value={formatDuration(profile.health.lag_seconds)} />
-        <Field label="Started at" value={formatTimestamp(profile.started_at)} />
-        <Field label="Updated at" value={formatTimestamp(profile.updated_at)} />
+          ) : (
+            EMPTY_PLACEHOLDER
+          )}
+        </KeyValue>
       </dl>
 
       {lastError !== null ? (
