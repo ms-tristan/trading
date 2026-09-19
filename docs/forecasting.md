@@ -46,6 +46,14 @@ so TimesFM never runs inside them. Instead:
 3. the strategy consumes that artifact as a **deterministic external input**:
    same artifact in, same signals out — no model, no network, no clock.
 
+The artifact reaches the strategy through **one** seam,
+`trading_platform.strategy.features` (`resolve_features` / `attach_features`),
+and that seam is used by **every** execution path: `run_backtest_on_config` /
+`make_runner` for the backtest and the validation layers, and
+`trading_platform.realtime.strategies.resolve_strategy` for the realtime engine.
+The realtime layer adds a profile-shaped adapter and a mandatory startup guard
+(`trading_platform.realtime.features`), never a second loading mechanism.
+
 Two prediction targets are stored and consumed:
 
 | Target | Column family | Used for |
@@ -204,6 +212,13 @@ trading forecast-skill --artifact data/forecast/forecast.parquet \
 # 3. inspect the artifact metadata (schema, backend, span, licence note)
 trading forecast-info --artifact data/forecast/forecast.parquet
 
+# 4. ... and ask whether it is STILL USABLE right now, against the profile it feeds
+trading forecast-info --artifact data/forecast/forecast.parquet \
+    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+
+# 5. or build the artifact a profile declares, offline, from its own candle file
+trading forecast-bootstrap --profiles config/profiles.timesfm.example.json --backend seasonal
+
 # the same build through make (DATA_FILE / FORECAST_ARTIFACT / FORECAST_BACKEND override)
 make forecast-build
 ```
@@ -212,11 +227,12 @@ Exact options:
 
 | Command | Options |
 | --- | --- |
-| `trading forecast-build` | `--config/-c` (required), `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context N`, `--horizon H`, `--reforecast-every S` |
+| `trading forecast-build` | `--config/-c` (required), `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context N`, `--horizon H`, `--reforecast-every S`, `--seasonal-period N` (default: derived from `--timeframe`), `--seasonal-window N`, `--model-id`, `--symbol`, `--timeframe` |
 | `trading forecast-skill` | `--artifact`, `--data-file` |
-| `trading forecast-info` | `--artifact` |
+| `trading forecast-info` | `--artifact`, `--now ISO-8601`, `--profiles`, `--profile`, `--timeframe`, `--horizon` |
+| `trading forecast-bootstrap` | `--profiles` (required), `--profile`, `--config/-c`, `--backend naive\|seasonal` |
 
-All three accept `--json` (a single JSON object on stdout, like every other
+All four accept `--json` (a single JSON object on stdout, like every other
 command). `--context` is the number of candles fed to the backend per origin,
 `--horizon` the number of stored forecast steps, `--reforecast-every` the stride
 between two stored origins. Each origin uses **only candles `<= origin`**.
@@ -246,6 +262,28 @@ A minimal configuration for the strategy is therefore:
   "forecast": {"artifact": "data/forecast/forecast.parquet"}
 }
 ```
+
+A **realtime profile** declares the same artifact through its own `forecast` key
+(the last field of `ProfileConfig`, `null` by default), and it is *required* by a
+`timesfm` profile: `null` there is a loud startup failure, not a silent no-signal
+profile.
+
+```json
+{
+  "id": "btc-timesfm-paper",
+  "symbol": "BTC/USDT",
+  "timeframe": "1h",
+  "strategy": "timesfm",
+  "forecast": "data/forecast/btc-timesfm-paper-1h-seasonal.parquet"
+}
+```
+
+The two surfaces are the same artifact and the same loader; only the declaration
+site differs — an `AppConfig` run (backtest, walk-forward, robustness,
+monte-carlo) reads `forecast.artifact`, a realtime profile reads its `forecast`
+path and the covered window of `resolve_features` decides. `config/profiles.example.json`
+keeps `"forecast": null` on both of its `basic` profiles; the shipped forecast
+profile is `config/profiles.timesfm.example.json`.
 
 ### Strategy parameters
 
@@ -329,7 +367,8 @@ print(result.n_trades, result.final_balance)
 feature-injection seam (`trading_platform.strategy.features`) and injects the
 loaded `ForecastStore` into the strategy instance — so `backtest`,
 `walk-forward`, `robustness` and `monte-carlo` all work unchanged on the new
-strategy:
+strategy, and so does the **realtime engine**, through the very same seam (see
+the next three subsections):
 
 ```bash
 make forecast-build                       # naive backend by default (no trade: see the note above)
@@ -338,15 +377,150 @@ trading backtest  --config forecast_config.json --data-file btc.csv --no-network
 trading walk-forward --config forecast_config.json --data-file btc.csv --no-network
 ```
 
-> **Scope limit — the realtime engine does not inject features yet.** The
-> artifact seam is wired into the backtest and validation paths only
-> (`strategy.engine.run_backtest_on_config` / `make_runner`). Because `timesfm`
-> is a normal registry entry, it appears in the realtime catalog
-> (`GET /api/catalog`) and a realtime profile may name it; such a profile then
-> instantiates the strategy **without** a bundle, so every forecast diagnostic
-> stays `NaN` and the profile emits **no signal at all** — it never raises and it
-> never guesses. Feed a realtime or Freqtrade deployment with `basic` until the
-> realtime engine grows its own feature resolution.
+### The realtime engine injects the very same bundle
+
+The artifact seam is **not** backtest-only any more. `trading_platform.realtime`
+resolves and attaches the profile's bundle through the **same** seam the engine
+uses — `trading_platform.strategy.features.resolve_features` /
+`attach_features` — so a realtime profile and a backtest profile of the same
+declaration receive byte-identical features. There is no second mechanism and no
+duplicated artifact-loading logic: the realtime layer adds a profile-shaped
+adapter and a startup guard, nothing more.
+
+| Symbol | Module | Role |
+| --- | --- | --- |
+| `ProfileConfig.forecast` | `trading_platform.config.models` | the artifact path a profile declares; `null` (the default) means *no forecast*, exactly the historical behaviour |
+| `ProfileConfig.forecast_artifact` | `trading_platform.config.models` | the resolved path, or `None` |
+| `ProfileConfig.strategy_params()` | `trading_platform.config.models` | the profile's `params` plus the `artifact` key a forecast-driven strategy reads; the profile's own mapping is never mutated |
+| `resolve_profile_features(profile, *, required)` | `trading_platform.realtime.features` | the one construction path of a profile's `FeatureBundle`; a thin configuration adapter over `strategy.features.resolve_features` |
+| `check_profile_forecast(profile, store, *, now=None)` | `trading_platform.realtime.features` | the mandatory startup guard; returns a `ForecastCoverage` or raises |
+| `ForecastCoverage` | `trading_platform.realtime.features` | the frozen answer to *"is this artifact still usable right now?"* (`path`, `symbol`, `timeframe`, `seasonal_period`, `horizon`, `stride`, `first_origin`, `last_origin`) |
+| `strategy_needs_forecast(profile)` | `trading_platform.realtime.features` | whether the profile's strategy declares an `artifact` parameter at all — `basic` does not |
+
+`resolve_strategy` (`trading_platform.realtime.strategies`) is the single
+construction path of a realtime strategy, and it now calls
+`attach_features(strategy, resolve_profile_features(profile, required=True))`.
+Every caller goes through `ProfileRunner._prepare` — `start`, `run` and
+`run_once`, hence `realtime run`, `realtime run --once` and the orchestrator —
+so **the artifact is loaded once per profile, at startup, never per candle**.
+
+A profile that declares **no** `forecast` keeps working exactly as before: its
+bundle is empty, and a `basic` profile that merely carries `"forecast": null` is
+unaffected down to the parameter validation (the `artifact` key is filtered on
+the strategy's own declared contract, so a strategy with `extra="forbid"`
+parameters never sees a key it does not declare).
+
+### The mandatory startup guard
+
+A profile that starts and then never trades is the exact failure this integration
+removes, so a profile is now **refused at startup** rather than allowed to run
+inert. `check_profile_forecast` runs four checks in order and raises
+`ForecastArtifactError` — a `TradingBacktestError`, so the existing CLI error
+surface already renders it — with an actionable message at each one:
+
+1. **a bundle without a forecast** behind a declared path is a caller bug and
+   still surfaces loudly;
+2. **symbol mismatch** — the artifact was built for another instrument;
+3. **timeframe mismatch** — the artifact was built on another candle duration;
+4. **staleness** — the artifact's coverage can no longer reach the profile's
+   decision horizon. This is the mandatory guard.
+
+A `timesfm` profile that declares **no** path at all fails just as loudly:
+
+```
+profile 'btc-timesfm-paper' uses strategy 'timesfm', which needs a forecast artifact,
+but declares no 'forecast' path; build one with 'trading forecast-build' and add
+'"forecast": "<artifact>.parquet"' to the profile
+```
+
+The staleness refusal, verbatim (one sentence, wrapped here for readability):
+
+```
+the forecast artifact data/forecast/forecast.parquet is stale for profile 'btc-timesfm-paper':
+its last origin is 2026-09-01T00:00:00+00:00 and the profile decision horizon only stays covered
+until 2026-09-02T00:00:00+00:00 (now is 2026-09-03T00:00:00+00:00); coverage must reach the 1h
+decision horizon, so rebuild it with 'trading forecast-build --symbol BTC/USDT --timeframe 1h'
+and point the profile at the new file
+```
+
+The bound is **derived from the strategy's own parameters**, not from a constant:
+the guard reads `min_lead` and `forecast_age` from the profile's merged strategy
+parameters and `horizon` / `stride` from the artifact metadata, and a decision is
+only taken where the active path still has room. Concretely
+`age_bound = min(forecast_age, horizon − 1 − min_lead)` and the artifact stays
+usable until `last_origin + (age_bound − 1) × stride × candle_delta(timeframe)`.
+The comparison is `now > usable_until`, so the boundary instant itself **passes**.
+`now` defaults to the wall clock read by the guard (a startup check, not a
+per-candle decision, so it has no clock seam); a caller that supplies `now` makes
+it deterministic, which is how the tests pin the boundary.
+
+### De-seasonalisation follows the timeframe
+
+The de-seasonalised target of §1 folds the clock into `period` phases, so the
+period only describes a **daily** cycle when it equals the number of candles of
+that timeframe in a day. `24` was the historical default and is correct for
+hourly candles and for nothing else — every other timeframe was de-seasonalised
+on a cycle that did not exist. `seasonal_period` now defaults to `None`, which
+means *derive it from the timeframe*:
+
+| Symbol | Role |
+| --- | --- |
+| `candles_per_day(timeframe)` | `max(1, 86_400 // TIMEFRAME_SECONDS[timeframe])`; raises `ForecastError` on an unsupported timeframe |
+| `resolve_seasonal_period(timeframe, override=None)` | the period actually used: the explicit `override` when given (validated as an integer `>= 1`), otherwise `candles_per_day(timeframe)` |
+| `SECONDS_PER_DAY` | `86_400`, the reference cycle |
+
+| `--timeframe` | `1m` | `5m` | `15m` | `30m` | `1h` | `4h` | `1d` | `3d`, `1w` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `candles_per_day` | **1440** | **288** | **96** | **48** | **24** | **6** | **1** | **1** (floored) |
+
+`--seasonal-period N` remains the explicit override for an instrument whose cycle
+is not a day, and it wins over the derivation. A period of `1` disables the
+seasonal fold instead of inventing one, which is what a timeframe longer than a
+day collapses to. The resolved value is recorded in the artifact metadata, and
+`forecast-info` reports the period **in force for the artifact's own timeframe** —
+so an artifact built before this change still reports the period that actually
+applies to it.
+
+### Any symbol, any timeframe
+
+`trading forecast-build` is generic in both: any `--symbol` and any supported
+`--timeframe` (`1m` through `1d`) can be built, and both are recorded in the
+sidecar. A pairing that does not match what the artifact feeds is therefore
+**detected and refused**, never silently misused:
+
+- `check_profile_forecast` refuses an artifact built for another symbol or
+  another timeframe before the first candle (checks 2 and 3 above);
+- `resolve_profile_features`/`bootstrap_profile_forecast` cross-check a profile's
+  declarations against the candle file name they imply, so an artifact is never
+  stamped with a symbol or a timeframe its numbers do not describe.
+
+### Is this artifact still usable right now?
+
+`trading forecast-info` answers that question directly. Alongside the verbatim
+metadata it publishes `run['coverage']`:
+`first_origin`, `last_origin`, `usable_until`, `usable`, `seasonal_period` and
+`checked_at`. Without `--profiles` the command only **reports** — it never fails
+on staleness. Pointed at a real profile it becomes a pre-flight of that profile:
+`--profiles <file> [--profile <id>]` reuses `check_profile_forecast` verbatim, so
+a symbol, timeframe or coverage failure raises the **same** message the realtime
+startup guard raises, and `coverage` gains `profile_id`, `symbol_ok` and
+`timeframe_ok`. `--now ISO-8601` makes the answer deterministic, and `--timeframe`
+/ `--horizon` override what the coverage is measured on. The guard is therefore
+**operable**, not merely an error message:
+
+```bash
+trading forecast-info --artifact data/forecast/forecast.parquet
+trading forecast-info --artifact data/forecast/forecast.parquet \
+    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+```
+
+`trading forecast-bootstrap --profiles <file> [--profile <id>] [--backend naive|seasonal]`
+closes the loop from the other side: it reads the profile, locates the candle file
+its `symbol`/`timeframe` imply, builds the artifact under `data/forecast/` with an
+**offline** backend only (no `torch`, no checkpoint download, no clock) and prints
+the same `coverage` block, so what was just built can be checked immediately.
+The three-command operational flow built on these two commands is documented in
+[`realtime.md`](realtime.md) §6.
 
 ---
 
@@ -415,8 +589,14 @@ read directly from the library source, not repeated from a vendor claim:
 **causality** (an artifact built from a truncated candle frame is byte-identical
 on the shared origins — no look-ahead); the artifact schema (parquet round-trip);
 the wiring (`backtest`, `walk-forward`, `robustness`, `monte-carlo` run on the
-new strategy); and the **auditability** of every entry gate and every exit rule
-(each rule is individually tested, and `exit_code` records which one fired).
+new strategy); the **realtime integration** (a `timesfm` profile receives its
+bundle through the same seam, at startup, and really produces entries through the
+live runner path); the startup guard (a missing, corrupt, mismatched or stale
+artifact refuses to start with an actionable message instead of running inert);
+the **symbol/timeframe genericity** (any supported pairing builds, and a mismatch
+is refused); the seasonal period **per timeframe**; and the **auditability** of
+every entry gate and every exit rule (each rule is individually tested, and
+`exit_code` records which one fired).
 
 **What the suite does NOT prove.** It does **not** prove that TimesFM has any
 forecast skill on 1h crypto: zero-shot skill on this asset class is
@@ -424,6 +604,17 @@ forecast skill on 1h crypto: zero-shot skill on this asset class is
 backtest over one window can be luck, regime, or a base-rate artifact. The
 strategy may well be **no better than the baselines**, and the honest default is
 to assume it until `trading forecast-skill` says otherwise.
+
+**Making the strategy usable changes nothing about that.** The realtime
+integration documented above is an *engineering* delivery: it makes an existing,
+already-researched strategy selectable, wired, generic and safely operable. It
+does not add a directional edge, it does not improve accuracy, and no threshold
+was tuned against data to produce it. Every conclusion measured below stands
+unchanged — the point forecast is statistically a random walk, the real-price
+directional accuracy is `0.519`, and the informative part of the model is the
+**dispersion**, not the direction. A `timesfm` profile that now starts and trades
+is therefore *observable*, not *validated*: it is exactly as unprofitable as this
+section says until the skill report says otherwise.
 
 The 2025-26 empirical literature on foundation models for financial series —
 which is why this layer measures its own skill instead of claiming one:

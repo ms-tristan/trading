@@ -47,6 +47,7 @@ which rejects any unknown key (`extra="forbid"`):
 | `poll_interval_seconds` | polling cadence specific to the profile |
 | `risk` | `RiskLimitsConfig` block (§3) |
 | `entry_lookback_candles` | live-only catch-up window: the entry decision may act on a crossover that occurred within the last N candles (0, the default, keeps the historical behaviour: only the last row decides); ignored by the backtest, which already reads every row; 0 <= N <= 200 |
+| `forecast` | path of the **offline forecast artifact** the profile consumes (built by `trading forecast-build`, see [`forecasting.md`](forecasting.md)); `null` by default. It is **required** by a `timesfm` profile and refused loudly at startup when it is missing, corrupt, stale or built for another symbol/timeframe; a `basic` profile never reads it, and `"forecast": null` is exactly the historical behaviour |
 
 The complete document carries three root keys: `profiles`, `realtime`
 (`RealtimeConfig`: state base, directories, CSV or cache provider, `start_at`
@@ -131,7 +132,11 @@ The real-time engine **implements no formula**. It assembles:
 - the Freqtrade bridge (`strategy.freqtrade_adapter.make_freqtrade_strategy`),
   exposed by `realtime.strategies.freqtrade_strategy_for(profile)` (lazy import,
   returns `None` when the extra is absent): **the same profile definition can be
-  handed to Freqtrade unchanged**.
+  handed to Freqtrade unchanged**;
+- the **feature-injection seam** (`strategy.features.resolve_features` /
+  `attach_features`), reached through `realtime.features.resolve_profile_features`:
+  a profile that declares a `forecast` artifact receives it exactly as it would in
+  a backtest (§3.1).
 
 ## 3. The safety model
 
@@ -187,6 +192,63 @@ The real-time engine **implements no formula**. It assembles:
 6. **Unforgeable paper/live separation.** A paper profile can **never** be routed
    to a real broker: the mode is part of the identity of the profile and of every
    persisted order, and the broker checks its own mode.
+
+### 3.1 The forecast startup guard
+
+A forecast-driven profile is **refused at startup**, never started to run inert.
+`realtime.features.resolve_profile_features(profile, required=True)` loads the
+declared artifact **once**, through the project's single loader
+(`strategy.features.resolve_features`), attaches it to the strategy in
+`resolve_strategy` through the shared `attach_features` seam, and then runs
+`realtime.features.check_profile_forecast`. Four checks run in order, and each
+raises `ForecastArtifactError` with an actionable message:
+
+1. a feature bundle with no forecast behind a declared path is a caller bug, and
+   still surfaces loudly;
+2. **symbol mismatch** — the artifact was built for another instrument;
+3. **timeframe mismatch** — the artifact was built on another candle duration;
+4. **staleness** — the artifact's coverage can no longer reach the profile's
+   decision horizon. This is the reason the guard exists.
+
+A `timesfm` profile that declares **no** `forecast` path at all fails just as
+loudly, because a profile that starts and then never trades, silently and
+forever, is the exact failure this contract removes:
+
+```
+profile 'btc-timesfm-paper' uses strategy 'timesfm', which needs a forecast artifact,
+but declares no 'forecast' path; build one with 'trading forecast-build' and add
+'"forecast": "<artifact>.parquet"' to the profile
+```
+
+The staleness refusal, verbatim (one sentence, wrapped here for readability):
+
+```
+the forecast artifact data/forecast/forecast.parquet is stale for profile 'btc-timesfm-paper':
+its last origin is 2026-09-01T00:00:00+00:00 and the profile decision horizon only stays covered
+until 2026-09-02T00:00:00+00:00 (now is 2026-09-03T00:00:00+00:00); coverage must reach the 1h
+decision horizon, so rebuild it with 'trading forecast-build --symbol BTC/USDT --timeframe 1h'
+and point the profile at the new file
+```
+
+The bound is derived from the profile's **own** declarations rather than from a
+constant: the guard reads `min_lead` and `forecast_age` from the merged strategy
+parameters and `horizon` / `stride` / `timeframe` from the artifact metadata, so
+`age_bound = min(forecast_age, horizon − 1 − min_lead)` and the artifact stays
+usable until `last_origin + (age_bound − 1) × stride × candle_delta(timeframe)`.
+The comparison is `now > usable_until`: the boundary instant itself **passes**.
+
+Because the guard runs inside `resolve_strategy`, and every entry point of a
+profile — `ProfileRunner.start`, `ProfileRunner.run` / `run_once`,
+`realtime run`, `realtime run --once`, `realtime check` and the orchestrator —
+goes through it, the refusal happens **before the first candle**. The error is a
+`TradingBacktestError`, so the CLI error surface already renders it; it is never
+wrapped and never swallowed. A profile that declares no forecast (every `basic`
+profile of the platform, including the two shipped examples) keeps the exact
+previous behaviour: its bundle is empty, nothing is loaded, nothing is checked.
+
+Ask the same question **before** starting the engine with
+`trading forecast-info --profiles <file> [--profile <id>]`, which reuses this very
+guard and prints the same message (§6).
 
 ## 4. Persistence, restart and reconciliation
 
@@ -394,6 +456,86 @@ only through `Clock.sleep`, so a non-cooperative manual clock would starve the
 loop, its timers (`asyncio.wait_for`) would no longer fire and `SIGINT` would
 never be delivered. Accepted trade-off: an **anchored** `run` replays history as
 fast as the CPU allows (it is backfill), it is not a live follow-up of real time.
+
+### 6.1 Operating a forecast profile: the three-command flow
+
+A `timesfm` profile is inert without an artifact, and the startup guard refuses
+it rather than letting it run silently (§3.1). The operational path is therefore
+**download → build → declare → start → confirm**, and the first two steps are
+automatable:
+
+```bash
+# 1. download the candles of the symbol/timeframe the profile declares
+#    (the ONLY network-using step; any symbol, any supported timeframe)
+make data-download SYMBOL=BTC/USDT TIMEFRAME=1h
+
+# 2. build the artifact the profile declares, offline and deterministically
+#    (the seasonal/naive backends only: no torch, no checkpoint download)
+make forecast-profile TIMESFM_PROFILE=config/profiles.timesfm.example.json BACKEND=seasonal
+#    ... or the equivalent CLI call, which is what the target runs
+trading forecast-bootstrap --profiles config/profiles.timesfm.example.json --backend seasonal
+
+# 2b. ask the guard itself whether what was just built is usable right now
+make forecast-info PROFILE=config/profiles.timesfm.example.json
+trading forecast-info --artifact data/forecast/btc-timesfm-paper-1h-seasonal.parquet \
+    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+
+# 3. start the engine; the profile now really trades
+make realtime-forecast          # == trading realtime run --profiles config/profiles.timesfm.example.json
+```
+
+The whole chain is also wired end to end as `make forecast-flow`, which runs
+`data-download` → `forecast-bootstrap` → `forecast-info` → `realtime-forecast` in
+that order. The artifact path is the profile's `forecast` key; keep the default
+`data/forecast/<profile-id>-<timeframe>-<backend>.parquet` naming that
+`forecast-bootstrap` writes, or point the key at wherever your artifact lives.
+
+**Declare the profile.** The forecast profile is a normal `ProfileConfig` (§1),
+so the only thing that distinguishes it is the `strategy` name, its `params` and
+the `forecast` key:
+
+```json
+{
+  "id": "btc-timesfm-paper",
+  "symbol": "BTC/USDT",
+  "timeframe": "1h",
+  "strategy": "timesfm",
+  "mode": "paper",
+  "forecast": "data/forecast/btc-timesfm-paper-1h-seasonal.parquet"
+}
+```
+
+The shipped example is `config/profiles.timesfm.example.json`. The `symbol`, the
+`timeframe` and the `forecast` path must agree with the artifact's own metadata:
+the guard refuses a mismatch at startup rather than trading another instrument's
+forecast.
+
+**Confirm it is trading.** "Started" is not "trading", and this is the whole
+point of the delivery, so check the observable surface rather than the log line:
+
+```bash
+# a single deterministic tick, then exit 0 (no server)
+trading realtime run --profiles config/profiles.timesfm.example.json --once --json
+
+# or, against the running engine, the per-profile snapshot of the JSON API
+curl -s http://127.0.0.1:8080/api/profiles | python -m json.tool
+```
+
+A trading profile shows up in three additive places of the snapshot payload
+(§5): `n_trades` grows above `0`, `open_positions` reports the position it holds,
+and `last_block_reason` stays `null` while the risk layer is not refusing orders.
+A profile whose `n_trades` stays at `0` while its `status` is `running` is *not*
+trading: read the strategy's `exit_code` / `forecast_*` diagnostics (they are
+`NaN` only when no trajectory covers the bar) and remember that the entry gates
+are deliberately strict — an artifact that is *wired* is not an artifact that is
+*informative*. Read [`forecasting.md`](forecasting.md) §9 before drawing any
+conclusion from a profitable one.
+
+**When the guard refuses.** The message is the operational instruction: it names
+the profile, the artifact, the covered window and the exact
+`trading forecast-build --symbol … --timeframe …` rebuild command. Run
+`trading forecast-info --profiles …` to reproduce it without touching the engine,
+and `make forecast-info` for the same answer through the profiles file.
 
 ## 7. What is NOT proven
 

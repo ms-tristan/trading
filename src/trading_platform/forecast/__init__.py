@@ -8,8 +8,9 @@ deliberately cheap to import and completely offline:
   :mod:`trading_platform.core.errors`;
 * heavy optional dependencies (``torch``, ``timesfm``, ``jax``) are imported
   lazily by the backend module that needs them, behind the ``[timesfm]`` extra,
-  and never appear here — ``forecast.backends.timesfm``, ``forecast.artifact``
-  and ``forecast.skill`` are imported on demand, never by this ``__init__``;
+  and never appear here — ``forecast.backends.timesfm``, ``forecast.artifact``,
+  ``forecast.skill`` and ``forecast.bootstrap`` are imported on demand, never by
+  this ``__init__``;
 * nothing here touches the configuration, the strategy, the validation layer,
   the reporting layer or the CLI: the dependency direction is
   ``core`` → ``forecast`` → (builder, strategy, CLI).
@@ -47,9 +48,12 @@ from trading_platform.forecast.registry import (
 )
 from trading_platform.forecast.series import (
     EPOCH,
+    SECONDS_PER_DAY,
     TIMEFRAME_SECONDS,
     candle_phase,
+    candles_per_day,
     deseasonalize_log_price,
+    resolve_seasonal_period,
     timeframe_delta,
 )
 from trading_platform.forecast.types import (
@@ -65,6 +69,7 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "EPOCH",
     "MEDIAN_LEVEL",
+    "SECONDS_PER_DAY",
     "TIMEFRAME_SECONDS",
     "ForecastArtifactError",
     "ForecastBackend",
@@ -78,9 +83,11 @@ __all__ = [
     "build_naive_backend",
     "build_seasonal_backend",
     "candle_phase",
+    "candles_per_day",
     "deseasonalize_log_price",
     "get_backend",
     "installed_backends",
     "register_backend",
+    "resolve_seasonal_period",
     "timeframe_delta",
 ]

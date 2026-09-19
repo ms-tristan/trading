@@ -37,24 +37,31 @@ monitoring ``url``.  They travel through :func:`_emit_realtime` instead of
 per invocation, and the startup URL is announced on **stderr** when ``--json``
 is used.
 
-The forecasting layer (``trading_platform.forecast``) is reached through three
+The forecasting layer (``trading_platform.forecast``) is reached through four
 flat commands added in the very same spirit, and it is imported **inside the
 command bodies** as well, so ``forecast-build`` stays runnable without ``torch``:
 
 * ``forecast-build`` — pre-computes the versioned parquet forecast artifact of
-  one candle file (csv or parquet) and writes its JSON sidecar next to it;
+  one candle file (csv or parquet) and writes its JSON sidecar next to it; it is
+  generic in the symbol and in the timeframe, and its seasonal period defaults
+  to the number of candles of one day at that timeframe;
+* ``forecast-bootstrap`` — builds the artifact a *profile* declares, from the
+  candle file the profile's own declarations imply, using one of the two offline
+  backends only: the repeatable, network-free bootstrap of the operational flow;
 * ``forecast-skill`` — measures that artifact against the random-walk baseline
   (RMSE/MAE/MASE skill scores, quantile coverage, directional accuracy): a
   positive backtest PnL is not evidence of an edge, this report is;
 * ``forecast-info`` — prints the artifact metadata verbatim, like
-  ``config show`` prints the effective configuration.
+  ``config show`` prints the effective configuration, and answers *"is this
+  artifact still usable right now?"* through ``run['coverage']``; pointed at a
+  real profile it reuses the very same startup guard the realtime engine runs.
 
-They keep the house payload shape; ``forecast-build`` publishes the artifact
-scalars in ``metrics`` and the metadata in ``run``, ``forecast-skill`` publishes
-the skill metrics in ``metrics`` and the full report in ``run``, and
-``forecast-info`` publishes ``run`` only.  Every artifact path is an explicit
-``--out``/``--artifact`` argument: the CLI never guesses where a run stores its
-forecasts.
+They keep the house payload shape; ``forecast-build`` and ``forecast-bootstrap``
+publish the artifact scalars in ``metrics`` and the metadata in ``run``,
+``forecast-skill`` publishes the skill metrics in ``metrics`` and the full
+report in ``run``, and ``forecast-info`` publishes ``run`` only.  Every artifact
+path is an explicit ``--out``/``--artifact`` argument: the CLI never guesses
+where a run stores its forecasts.
 
 Exit codes: ``0`` success, ``1`` domain error (any
 :class:`~trading_platform.core.errors.TradingBacktestError`), ``2`` usage error
@@ -108,7 +115,7 @@ from trading_platform.config import (
     load_profiles,
     load_realtime_config,
 )
-from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
+from trading_platform.core.constants import OHLCV_INDEX_NAME, SUPPORTED_TIMEFRAMES, UTC
 from trading_platform.core.errors import (
     ConfigError,
     ForecastError,
@@ -288,6 +295,7 @@ HIGHLIGHT_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "data_download": ("rows", "cache_path"),
     "forecast_build": ("backend", "n_origins", "horizon", "stride"),
+    "forecast_bootstrap": ("backend", "n_origins", "horizon", "stride"),
     "forecast_skill": (
         "n_pairs",
         "rmse",
@@ -457,24 +465,72 @@ def _appconfig_issues(cfg: AppConfig) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _symbol_from_filename(path: Path) -> str | None:
-    """Infer ``BTC/USDT`` from a ``BTC_USDT-1h.csv`` style fixture name."""
+def parse_data_file_stem(path: str | Path) -> tuple[str | None, str | None]:
+    """Parse the conventional candle filename ``SYMBOL-TIMEFRAME.ext``.
+
+    The on-disk candle cache names every file ``<symbol>-<timeframe><suffix>``
+    with the pair's ``/`` written as ``_`` (``data/BTC_USDT-1h.csv``).  This
+    helper is the single parser of that convention: the forecast commands use it
+    to infer the symbol and the timeframe of a run from the file they were
+    handed, and ``trading forecast-bootstrap`` uses it to read the two
+    declarations of a profile back from the candle file it actually found.
+
+    The split happens on the **first** ``-`` only, so a timeframe is the last
+    dash-separated segment and a symbol may hold none.  The timeframe half is
+    validated against :data:`~trading_platform.core.constants.SUPPORTED_TIMEFRAMES`;
+    an unsupported one is reported as "absent" rather than guessed, so a
+    mismatched pairing can never be silently misused.
+
+    Parameters
+    ----------
+    path:
+        Candle file name or path, for example ``BTC_USDT-1h.csv``.
+
+    Returns
+    -------
+    tuple[str | None, str | None]
+        ``(symbol, timeframe)``, for example ``("BTC/USDT", "1h")``.  Both
+        halves are ``None`` when either one is missing or when the timeframe is
+        not supported -- the caller then falls back to its own default.
+
+    Examples
+    --------
+    >>> parse_data_file_stem("data/BTC_USDT-1h.csv")
+    ('BTC/USDT', '1h')
+    >>> parse_data_file_stem("ETH_USDT-4h.parquet")
+    ('ETH/USDT', '4h')
+    >>> parse_data_file_stem("candles.csv")
+    (None, None)
+    """
     stem = Path(path).name
-    for suffix in (".csv", ".parquet"):
+    for suffix in (".csv", ".parquet", ".pq"):
         if stem.lower().endswith(suffix):
             stem = stem[: -len(suffix)]
             break
-    base = stem.rsplit("-", 1)[0] if "-" in stem else stem
-    inferred = base.strip().replace("_", "/").upper()
-    return inferred or None
+    if "-" not in stem:
+        return None, None
+    raw_symbol, _, raw_timeframe = stem.partition("-")
+    timeframe = raw_timeframe.strip().lower()
+    if timeframe not in SUPPORTED_TIMEFRAMES:
+        return None, None
+    symbol = raw_symbol.strip().replace("_", "/").upper()
+    if not symbol:
+        return None, None
+    return symbol, timeframe
 
 
 def _resolve_symbol(symbol: str | None, data_file: Path | None) -> str:
-    """Resolve the trading pair: ``--symbol``, the file name, then a generic default."""
+    """Resolve the trading pair: ``--symbol``, the file name, then a generic default.
+
+    The file name is read through :func:`parse_data_file_stem`, so the inference
+    is the documented ``SYMBOL-TIMEFRAME.ext`` convention and nothing else; a
+    name that does not carry a supported timeframe falls back to
+    :data:`DEFAULT_SYMBOL` exactly as before.
+    """
     if symbol:
         return symbol
     if data_file is not None:
-        inferred = _symbol_from_filename(Path(data_file))
+        inferred, _ = parse_data_file_stem(Path(data_file))
         if inferred:
             return inferred
     return DEFAULT_SYMBOL
@@ -1388,12 +1444,16 @@ _BACKEND_HELP = "Forecast backend: naive, seasonal or timesfm (default: naive)."
 _CONTEXT_HELP = "Candles handed to the backend at every origin (default: 512)."
 _HORIZON_HELP = "Forecast steps stored per origin (default: 24)."
 _REFORECAST_EVERY_HELP = "Candles between two forecast origins (default: 24)."
-_SEASONAL_PERIOD_HELP = "Phases of the seasonal cycle removed from the target (default: 24)."
+_SEASONAL_PERIOD_HELP = (
+    "Phases of the seasonal cycle removed from the target "
+    "(default: derived from --timeframe as the number of candles in one day)."
+)
 _SEASONAL_WINDOW_HELP = (
     "Trailing window of the seasonal estimate (default: 168); 1 or 0 disables it."
 )
 _MODEL_ID_HELP = "Checkpoint of a model-backed backend, e.g. google/timesfm-2.5-200m-pytorch."
 _ARTIFACT_HELP = "Forecast artifact parquet written by 'trading forecast-build'."
+_PROFILES_PATH_HELP = "Path to the JSON profiles file (profiles + realtime + monitoring)."
 
 
 def _backend_extra_hint(name: str) -> str:
@@ -1488,7 +1548,9 @@ def forecast_build(
     context: int = typer.Option(512, "--context", help=_CONTEXT_HELP),
     horizon: int = typer.Option(24, "--horizon", help=_HORIZON_HELP),
     reforecast_every: int = typer.Option(24, "--reforecast-every", help=_REFORECAST_EVERY_HELP),
-    seasonal_period: int = typer.Option(24, "--seasonal-period", help=_SEASONAL_PERIOD_HELP),
+    seasonal_period: int | None = typer.Option(
+        None, "--seasonal-period", help=_SEASONAL_PERIOD_HELP
+    ),
     seasonal_window: int = typer.Option(168, "--seasonal-window", help=_SEASONAL_WINDOW_HELP),
     model_id: str | None = typer.Option(None, "--model-id", help=_MODEL_ID_HELP),
     symbol: str | None = typer.Option(None, "--symbol", help=_SYMBOL_HELP),
@@ -1499,17 +1561,33 @@ def forecast_build(
 
     Every origin uses only the candles up to and including itself, so the
     artifact is a deterministic, look-ahead-free input for the ``timesfm``
-    strategy.  The command never touches the network.
+    strategy.  The command never touches the network, and it is generic in the
+    symbol and in the timeframe: any pair and any supported candle duration
+    (``1m`` through ``1d``) can be built, and both are recorded in the artifact
+    metadata so a mismatched pairing is detected rather than silently misused.
+
+    ``--seasonal-period`` defaults to the number of candles of one day at
+    ``--timeframe`` (``1440`` on ``1m``, ``24`` on ``1h``, ``6`` on ``4h``,
+    ``1`` on ``1d``), which is what makes the de-seasonalisation fold on a real
+    daily cycle instead of assuming hourly candles.
     """
     with _error_surface("forecast_build", json_output=json_output):
         from trading_platform.forecast.artifact import (
             ForecastBuildConfig,
             build_forecast_artifact,
         )
+        from trading_platform.forecast.bootstrap import ensure_forecast_backends
+        from trading_platform.forecast.series import resolve_seasonal_period
+
+        # Before anything is read or written: an installation defect must be
+        # reported as such, not as a ModuleNotFoundError from deep inside the
+        # registry.
+        ensure_forecast_backends()
 
         cfg = load_config(config)
         resolved_symbol = _resolve_symbol(symbol, data_file)
         resolved_timeframe = _resolve_timeframe(timeframe, cfg)
+        period = resolve_seasonal_period(resolved_timeframe, seasonal_period)
         resolved_backend, backend_options = _resolve_forecast_backend(
             backend, timeframe=resolved_timeframe, model_id=model_id
         )
@@ -1522,7 +1600,7 @@ def forecast_build(
             context_length=context,
             horizon=horizon,
             reforecast_every=reforecast_every,
-            seasonal_period=seasonal_period,
+            seasonal_period=period,
             seasonal_window=seasonal_window,
             model_id=model_id,
             backend_options=backend_options,
@@ -1546,6 +1624,87 @@ def forecast_build(
                 run=metadata.to_dict(),
                 reports=[str(artifact)],
                 data_quality=quality.to_dict(),
+            ),
+            json_output=json_output,
+        )
+
+
+@app.command("forecast-bootstrap")
+def forecast_bootstrap(
+    profiles: Path = typer.Option(..., "--profiles", help=_PROFILES_PATH_HELP),
+    profile: str | None = typer.Option(
+        None, "--profile", help="Profile id to bootstrap (default: the first declared profile)."
+    ),
+    config: Path = typer.Option(
+        "config/backtest_default.json", "--config", "-c", help=_CONFIG_HELP
+    ),
+    backend: str = typer.Option(
+        "seasonal",
+        "--backend",
+        help="Offline forecast backend: naive or seasonal (default: seasonal).",
+    ),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Build the artifact a profile declares, from its own candle file (offline).
+
+    The repeatable bootstrap of the operational flow: it reads the profile,
+    locates the candle file its ``symbol``/``timeframe`` imply, builds the
+    artifact with one of the two **offline** backends and writes it under
+    ``data/forecast/``.  It never downloads, never imports ``torch`` and reads
+    no clock, so the same inputs always produce the same artifact.
+
+    The printed ``coverage`` block is the one ``trading forecast-info`` reports,
+    so the operator can immediately check that what was just built is usable.
+    """
+    with _error_surface("forecast_bootstrap", json_output=json_output):
+        import pandas as pd  # local import: keeps the CLI startup lean
+
+        from trading_platform.forecast.artifact import ForecastStore
+        from trading_platform.forecast.bootstrap import ensure_forecast_backends
+        from trading_platform.forecast.bootstrap_profile import bootstrap_profile_forecast
+        from trading_platform.forecast.series import resolve_seasonal_period, timeframe_delta
+
+        ensure_forecast_backends()
+        cfg = load_config(config)
+        artifact, metadata = bootstrap_profile_forecast(
+            Path(profiles), profile, config=cfg, backend=backend
+        )
+        store = ForecastStore.load(artifact)
+        origins = store.origins()
+        cadence = store.stride if store.stride >= 1 else 1
+        checked_at = pd.Timestamp.now(tz=UTC)
+        usable_until = pd.Timestamp(origins[-1]) + cadence * max(0, store.horizon - 2) * (
+            timeframe_delta(str(metadata.timeframe))
+        )
+        coverage = {
+            "first_origin": origins[0].isoformat(),
+            "last_origin": origins[-1].isoformat(),
+            "usable_until": usable_until.isoformat(),
+            "usable": bool(int(metadata.n_origins) >= 1 and checked_at <= usable_until),
+            "seasonal_period": int(
+                resolve_seasonal_period(str(metadata.timeframe), int(metadata.seasonal_period))
+            ),
+            "checked_at": checked_at.isoformat(),
+        }
+        run = dict(metadata.to_dict())
+        run["coverage"] = coverage
+        _emit(
+            _payload(
+                command="forecast_bootstrap",
+                ok=True,
+                symbol=metadata.symbol,
+                timeframe=metadata.timeframe,
+                config_path=str(config),
+                metrics={
+                    "backend": str(metadata.backend),
+                    "n_origins": float(metadata.n_origins),
+                    "horizon": float(metadata.horizon),
+                    "stride": float(metadata.stride),
+                    "context_length": float(metadata.context_length),
+                    "n_quantiles": float(len(metadata.quantile_levels)),
+                },
+                run=run,
+                reports=[str(artifact)],
             ),
             json_output=json_output,
         )
@@ -1590,21 +1749,128 @@ def forecast_skill(
 @app.command("forecast-info")
 def forecast_info(
     artifact: Path = typer.Option(..., "--artifact", help=_ARTIFACT_HELP),
+    now: str | None = typer.Option(
+        None,
+        "--now",
+        help=(
+            "Instant the coverage is measured against, ISO-8601 (default: now, UTC); "
+            "makes the answer deterministic."
+        ),
+    ),
+    profiles: Path | None = typer.Option(
+        None,
+        "--profiles",
+        help="Profiles file the artifact must feed (enables the per-profile guard).",
+    ),
+    profile: str | None = typer.Option(
+        None, "--profile", help="Profile id inside --profiles (default: the first one)."
+    ),
+    timeframe: str | None = typer.Option(
+        None, "--timeframe", help="Override the timeframe the coverage is measured on."
+    ),
+    horizon: int | None = typer.Option(
+        None, "--horizon", help="Override the decision horizon, in candles."
+    ),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
-    """Print the metadata of a forecast artifact (no candle file needed)."""
+    """Answer "is this artifact still usable right now?" -- metadata plus coverage.
+
+    The metadata is still printed verbatim in ``run``, and ``run['coverage']``
+    adds the operational verdict: the covered window (``first_origin``,
+    ``last_origin``, ``usable_until``), the seasonal period actually in force and
+    the ``usable`` flag.  Without ``--profiles`` the command only *reports*, it
+    never fails on staleness; pointing it at a real profile turns it into a
+    pre-flight of that profile, and a symbol/timeframe/coverage failure then
+    raises the very same refusal message the realtime startup guard raises, so
+    the operator reads identical wording before and during startup.
+    """
     with _error_surface("forecast_info", json_output=json_output):
+        import pandas as pd  # local import: keeps the CLI startup lean
+
         from trading_platform.forecast.artifact import ForecastStore
+        from trading_platform.forecast.series import (
+            resolve_seasonal_period,
+            timeframe_delta,
+        )
 
         store = ForecastStore.load(Path(artifact))
         metadata = store.metadata
+        seasonal_period = resolve_seasonal_period(
+            str(metadata.timeframe), int(metadata.seasonal_period)
+        )
+        origins = store.origins()
+        first_origin = origins[0]
+        last_origin = origins[-1]
+        cadence = store.stride if store.stride >= 1 else 1
+        checked_at = _parse_moment(now, field="--now")
+        if checked_at is None:
+            checked_at = pd.Timestamp.now(tz=UTC)
+
+        resolved_profile: ProfileConfig | None = None
+        if profiles is not None or profile is not None:
+            if profiles is None:
+                raise ConfigError("--profile requires --profiles")
+            declared = load_profiles(Path(profiles))
+            if profile is None:
+                resolved_profile = declared[0]
+            else:
+                matches = [entry for entry in declared if entry.id == profile]
+                if not matches:
+                    known = ", ".join(sorted(entry.id for entry in declared))
+                    raise ConfigError(
+                        f"profile {profile!r} is not declared by {profiles} (known ids: {known})"
+                    )
+                resolved_profile = matches[0]
+
+        if resolved_profile is not None:
+            # Reuse the startup guard verbatim: pre-flight and startup must refuse
+            # with the same words, so the message is never re-implemented here.
+            from trading_platform.realtime.features import check_profile_forecast
+
+            check_profile_forecast(resolved_profile, store, now=checked_at)
+
+        resolved_horizon = int(horizon) if horizon is not None else store.horizon
+        measured_timeframe = timeframe or str(metadata.timeframe)
+
+        usable_until = pd.Timestamp(last_origin) + cadence * max(
+            0, int(resolved_horizon) - 2
+        ) * timeframe_delta(measured_timeframe)
+        coverage: dict[str, Any] = {
+            "first_origin": first_origin.isoformat(),
+            "last_origin": last_origin.isoformat(),
+            "usable_until": usable_until.isoformat(),
+            "usable": bool(int(metadata.n_origins) >= 1 and checked_at <= usable_until),
+            "seasonal_period": int(seasonal_period),
+            "checked_at": checked_at.isoformat(),
+        }
+        if resolved_profile is not None:
+            coverage.update(
+                {
+                    "symbol_ok": str(metadata.symbol) == str(resolved_profile.symbol),
+                    "timeframe_ok": str(metadata.timeframe) == str(resolved_profile.timeframe),
+                    "profile_id": resolved_profile.id,
+                }
+            )
+
+        run = dict(metadata.to_dict())
+        run["coverage"] = coverage
+        if resolved_profile is not None:
+            run["profile"] = resolved_profile.id
+        metrics = {
+            "n_origins": float(metadata.n_origins),
+            "horizon": float(resolved_horizon),
+            "stride": float(metadata.stride),
+            "context_length": float(metadata.context_length),
+            "n_quantiles": float(len(metadata.quantile_levels)),
+        }
         _emit(
             _payload(
                 command="forecast_info",
                 ok=True,
                 symbol=metadata.symbol,
-                timeframe=metadata.timeframe,
-                run=metadata.to_dict(),
+                timeframe=measured_timeframe,
+                run=run,
+                metrics=metrics,
             ),
             json_output=json_output,
         )

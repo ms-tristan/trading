@@ -75,7 +75,11 @@ from trading_platform import __version__
 from trading_platform.core.constants import UTC
 from trading_platform.core.errors import ForecastArtifactError, ForecastError
 from trading_platform.forecast.registry import ForecastBackend, get_backend
-from trading_platform.forecast.series import deseasonalize_log_price, timeframe_delta
+from trading_platform.forecast.series import (
+    deseasonalize_log_price,
+    resolve_seasonal_period,
+    timeframe_delta,
+)
 from trading_platform.forecast.types import (
     DEFAULT_QUANTILE_LEVELS,
     MEDIAN_LEVEL,
@@ -334,7 +338,12 @@ class ForecastBuildConfig:
     quantile_levels:
         Levels to store, ascending, inside ``(0, 1)``, median included.
     seasonal_period:
-        Number of phases of the daily/seasonal cycle, for example ``24``.
+        Number of phases of the daily/seasonal cycle.  ``None`` means "derive it
+        from the timeframe with
+        :func:`trading_platform.forecast.series.resolve_seasonal_period`" -- the
+        daily cycle holds ``1440`` phases on ``1m`` candles, ``24`` on ``1h`` and
+        ``1`` on ``1d`` and longer, so a hard-coded ``24`` is only right for
+        hourly candles.  An explicit integer overrides the derivation.
     seasonal_window:
         Trailing window of the seasonal estimate; ``<= 1`` disables the
         de-seasonalisation (``0`` and ``1`` behave the same, ``0`` marks it
@@ -363,7 +372,7 @@ class ForecastBuildConfig:
     horizon: int = 24
     reforecast_every: int = 24
     quantile_levels: tuple[float, ...] = DEFAULT_QUANTILE_LEVELS
-    seasonal_period: int = 24
+    seasonal_period: int | None = None
     seasonal_window: int = 168
     min_context: int = 32
     model_id: str | None = None
@@ -427,10 +436,14 @@ def build_forecast_frame(
     """
     _validate_build_config(config)
     close = _validated_close(candles)
+    # ``seasonal_period=None`` means "derive it from the timeframe": the daily
+    # cycle is 1440 phases on 1m candles and 24 on 1h, so a hard-coded 24 is only
+    # right for hourly candles.  Resolved once, here, before anything is built.
+    seasonal_period = resolve_seasonal_period(config.timeframe, config.seasonal_period)
     target = deseasonalize_log_price(
         close,
         timeframe=config.timeframe,
-        period=config.seasonal_period,
+        period=seasonal_period,
         window=config.seasonal_window,
     )
     values = target.to_numpy(dtype="float64")
@@ -506,7 +519,7 @@ def build_forecast_frame(
         n_origins=len(origins),
         license=str(config.license),
         deseasonalized=bool(int(config.seasonal_window) > 1),
-        seasonal_period=int(config.seasonal_period),
+        seasonal_period=int(seasonal_period),
         seasonal_window=int(config.seasonal_window),
     )
     return frame, metadata
@@ -1119,8 +1132,13 @@ def _validate_build_config(config: ForecastBuildConfig) -> None:
         "reforecast_every": _config_int(
             config.reforecast_every, name="reforecast_every", issues=issues
         ),
-        "seasonal_period": _config_int(
-            config.seasonal_period, name="seasonal_period", issues=issues
+        # ``None`` is a legal value: it means "derive the period from the
+        # timeframe" (see ``resolve_seasonal_period``), so it is validated only
+        # when an explicit value was given.
+        "seasonal_period": (
+            None
+            if config.seasonal_period is None
+            else _config_int(config.seasonal_period, name="seasonal_period", issues=issues)
         ),
         "seasonal_window": _config_int(
             config.seasonal_window, name="seasonal_window", issues=issues

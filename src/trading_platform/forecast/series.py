@@ -33,9 +33,12 @@ from trading_platform.core.errors import ForecastError
 
 __all__ = [
     "EPOCH",
+    "SECONDS_PER_DAY",
     "TIMEFRAME_SECONDS",
     "candle_phase",
+    "candles_per_day",
     "deseasonalize_log_price",
+    "resolve_seasonal_period",
     "timeframe_delta",
 ]
 
@@ -214,3 +217,80 @@ def deseasonalize_log_price(
     )
     de_seasonalized = log_price - seasonal.to_numpy(dtype="float64")
     return pd.Series(de_seasonalized, index=index, name=DESEASONALIZED_NAME, dtype="float64")
+
+
+#: Length of one UTC day, in seconds; the reference cycle of the seasonal period.
+SECONDS_PER_DAY: int = 86_400
+
+
+def candles_per_day(timeframe: str) -> int:
+    """Return how many ``timeframe`` candles a single UTC day contains.
+
+    This is the *natural* seasonal period of a daily cycle: the de-seasonalised
+    target of :func:`deseasonalize_log_price` folds the clock into ``period``
+    phases, so the period only describes a day when it equals the number of
+    candles of that timeframe in a day.  ``24`` -- the historical default -- is
+    therefore correct for hourly candles and for nothing else.
+
+    The result is floored at ``1``: a timeframe longer than a day (``3d``,
+    ``1w``) cannot resolve a daily cycle, so its period collapses to a single
+    phase, which disables the seasonal fold instead of inventing one.
+
+    Parameters
+    ----------
+    timeframe:
+        Candle duration, a key of :data:`TIMEFRAME_SECONDS`.
+
+    Returns
+    -------
+    int
+        ``max(1, 86_400 // TIMEFRAME_SECONDS[timeframe])`` -- for example
+        ``1440`` for ``1m``, ``24`` for ``1h``, ``1`` for ``1d`` and beyond.
+
+    Raises
+    ------
+    ForecastError
+        If ``timeframe`` is not one of :data:`TIMEFRAME_SECONDS`; the message
+        lists the supported values.
+    """
+    supported = ", ".join(sorted(TIMEFRAME_SECONDS))
+    try:
+        seconds = TIMEFRAME_SECONDS[timeframe]
+    except (KeyError, TypeError):
+        raise ForecastError(
+            f"unsupported timeframe: {timeframe!r} (supported: {supported})"
+        ) from None
+    return max(1, SECONDS_PER_DAY // int(seconds))
+
+
+def resolve_seasonal_period(timeframe: str, override: int | None = None) -> int:
+    """Return the seasonal period to use for ``timeframe``.
+
+    ``override`` wins when it is given (an operator may know that the cycle of
+    the instrument is not a day), and is validated as an integer greater than or
+    equal to one.  Without an override the period is the timeframe's own
+    :func:`candles_per_day`, so the de-seasonalisation always folds on a real
+    daily cycle instead of assuming hourly candles.
+
+    Parameters
+    ----------
+    timeframe:
+        Candle duration, a key of :data:`TIMEFRAME_SECONDS`.
+    override:
+        Explicit number of phases of the cycle, or ``None`` to derive it from
+        ``timeframe``.
+
+    Returns
+    -------
+    int
+        The period to hand to :func:`deseasonalize_log_price` (``>= 1``).
+
+    Raises
+    ------
+    ForecastError
+        If ``override`` is not an integer greater than or equal to one, or if
+        ``timeframe`` is unsupported.
+    """
+    if override is not None:
+        return _positive_int(override, name="seasonal_period")
+    return candles_per_day(timeframe)

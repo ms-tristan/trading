@@ -6,11 +6,15 @@ Pure file-content assertions -- no network, no exchange, no market data:
   script and the coverage gate;
 * ``requirements*.txt`` mirror the dependency floors declared there;
 * ``Makefile`` / ``Dockerfile`` / ``.dockerignore`` expose the documented tasks;
+* the bootstrap assets of the forecast flow (``config/profiles.example.json``,
+  the two committed Freqtrade documents and the ``forecast-bootstrap*`` targets
+  that build their artifacts) ship with the checkout;
 * ``docs/testing-policy.md`` pins the full coverage command and the 85 % gate.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -238,6 +242,41 @@ def test_makefile_pipeline_targets_use_the_cli() -> None:
 
     for command in ("backtest", "walk-forward", "robustness", "monte-carlo"):
         assert f"$(PYTHON) -m trading_platform {command} --config $(CONFIG)" in text
+
+
+#: The bootstrap assets the wheel and the documented flow depend on: the shipped
+#: profile documents (read by ``make realtime`` and by the config tests) and the
+#: offline prediction artifact a forecast profile consumes.
+BOOTSTRAP_CONFIG_ASSETS = (
+    "config/profiles.example.json",
+    "config/freqtrade_config.json",
+    "config/freqtrade_dryrun.json",
+)
+
+
+def test_the_shipped_configuration_assets_are_present_and_parsable() -> None:
+    """Every bootstrap asset ships in the checkout and parses as JSON."""
+    for relative in BOOTSTRAP_CONFIG_ASSETS:
+        path = REPO_ROOT / relative
+
+        assert path.is_file(), f"{relative} is missing from the checkout"
+        assert json.loads(read(path)), f"{relative} is empty"
+
+
+def test_the_makefile_bootstraps_a_forecast_profile() -> None:
+    """The three-command flow: download, build the artifact, build for a profile."""
+    text = makefile_text()
+
+    for target in ("data-download", "forecast-bootstrap", "forecast-bootstrap-seasonal"):
+        assert re.search(rf"^{re.escape(target)}:", text, flags=re.MULTILINE), target
+        assert f"make {target}" in text, f"`make help` does not mention {target!r}"
+
+    for variable in ("SYMBOL ?=", "TIMEFRAME ?=", "FORECAST_DIR ?="):
+        assert variable in text, f"the Makefile does not declare {variable!r}"
+
+    # the bootstrap targets are offline predictions: the offline backends only
+    assert "--backend naive" in text
+    assert "--backend seasonal" in text
 
 
 # ---------------------------------------------------------------------------

@@ -646,3 +646,53 @@ def test_forecasting_page_pins_licences_honesty_traps_and_reproduction() -> None
     # --- the documented, copy-pasteable, offline reproduction path
     for token in ("forecast-build", "forecast-skill", "run_backtest_on_config"):
         assert token in text, f"docs/forecasting.md does not document {token!r}"
+
+
+def test_forecasting_page_documents_the_realtime_injection_and_the_startup_guard() -> None:
+    """The page must document that the realtime engine now injects the bundle.
+
+    The forecast layer used to carry a **scope limit**: the artifact was consumed
+    by the backtest and the validation layers, while the realtime engine resolved
+    a profile's strategy and nothing else, so a ``timesfm`` profile started, kept
+    every diagnostic at ``NaN`` and never emitted a signal.  That limit is gone,
+    and documentation that still announces it is worse than no documentation at
+    all: it tells an operator not to look for the behaviour that now exists.
+
+    What replaces it is the delivered surface, pinned here token by token: the
+    module that owns the injection, the two public functions, the coverage object
+    the operator reads, the profile key that declares the artifact, the offline
+    bootstrap command, and the **mandatory** startup guard with the exact command
+    that rebuilds a refused artifact.
+    """
+    text = read(FORECASTING)
+
+    # --- the reversed scope limit: the stale sentence is gone, not qualified
+    assert "does not inject features yet" not in text, (
+        "docs/forecasting.md still announces the retired scope limit "
+        "('does not inject features yet'): the realtime engine does inject the bundle now"
+    )
+
+    # --- the shipped surface of the realtime injection
+    for token in (
+        "realtime.features",
+        "resolve_profile_features",
+        "check_profile_forecast",
+        "ForecastCoverage",
+        "ProfileConfig.forecast",
+        "forecast-bootstrap",
+    ):
+        assert token in text, f"docs/forecasting.md does not document {token!r}"
+
+    # --- the guard is mandatory, and its refusal is actionable
+    assert "mandatory" in text, "docs/forecasting.md must state that the startup guard is mandatory"
+    assert "trading forecast-build" in text, (
+        "docs/forecasting.md must quote the rebuild command of a refused artifact"
+    )
+    # the artifact is loaded once, at startup -- never per candle -- which is the
+    # property an operator relies on when a profile starts at all.
+    assert "loaded once per profile, at startup, never per candle" in text, (
+        "docs/forecasting.md must state that the artifact is loaded once, at startup"
+    )
+    assert "resolve_strategy" in text, (
+        "docs/forecasting.md must name the single construction path that runs the guard"
+    )
