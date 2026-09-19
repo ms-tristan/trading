@@ -186,6 +186,134 @@ def license_note(model_id: str) -> str:
     return LICENSE_NON_COMMERCIAL if model_id in NON_COMMERCIAL_MODEL_IDS else LICENSE_APACHE
 
 
+#: Checkpoints served by the ``timesfm3`` API instead of the legacy wrapper.
+#: Their weights ship under the non-commercial licence, so they are opt-in.
+_TIMESFM3_MODEL_IDS: tuple[str, ...] = ("google/timesfm-3.0-pytorch",)
+
+#: Deciles exposed by the TimesFM 3.0 head (9 levels: 0.1 ... 0.9).
+_TIMESFM3_QUANTILES: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+#: Extra modules of the TimesFM 3.0 path: it lives in its own distribution module.
+_TIMESFM3_EXTRA_MODULES: tuple[str, ...] = ("torch", "timesfm3")
+
+
+def _is_timesfm3(model_id: str) -> bool:
+    """Return whether ``model_id`` is served by the ``timesfm3`` API.
+
+    The legacy ``timesfm`` package ships a 2.5 implementation whose class cannot
+    load the 3.0 weights (they fail ``load_state_dict``), so the two families need
+    genuinely different code paths.  Any checkpoint the ``timesfm3`` API documents
+    is routed here; everything else keeps the historical 2.5 wrapper.
+
+    Examples
+    --------
+    >>> _is_timesfm3("google/timesfm-3.0-pytorch")
+    True
+    >>> _is_timesfm3("google/timesfm-2.5-200m-pytorch")
+    False
+    """
+    return str(model_id) in _TIMESFM3_MODEL_IDS
+
+
+class _TimesFM3Runtime:
+    """Thin adapter mapping the ``timesfm3`` evaluator onto the backend's needs.
+
+    The 3.0 API is not a drop-in replacement for the 2.5 wrapper:
+
+    * it is constructed from a :class:`~timesfm3.ModelConfig` rather than a
+      ``ForecastConfig``;
+    * ``predict_batch`` yields :class:`~timesfm3.evaluator.ForecastOutput` objects
+      carrying ``.forecast`` (median) and ``.quantiles`` of shape
+      ``(horizon, n_levels)`` -- the transpose of the 2.5 layout;
+    * it returns the **level** of the series, so the origin level must be
+      subtracted exactly like the 2.5 path does;
+    * ``univariate=True`` **silently ignores covariates**, so it is never used:
+      the multivariate path is the only one where covariates have any effect;
+    * a ``past_future`` covariate window is what decides the horizon
+      (``horizon = window_width - padded_context``), so the window is always
+      padded to ``padded_context + horizon`` -- a short window silently returns a
+      *shorter* forecast instead of failing.
+
+    This class exists so those traps are handled in one place rather than at every
+    call site.
+    """
+
+    def __init__(
+        self, model_id: str, *, device: str | int | None = None, per_core_batch_size: int = 16
+    ) -> None:
+        from timesfm3 import ModelConfig, TimesFM3Evaluator
+
+        self._model_id = str(model_id)
+        self._config = ModelConfig(
+            checkpoint_path=self._model_id,
+            per_core_batch_size=int(per_core_batch_size),
+            device=device,
+        )
+        self._evaluator = TimesFM3Evaluator(self._config)
+
+    @property
+    def median_row(self) -> int:
+        """Row of the decile block carrying the median (index 4 in 3.0)."""
+        return int(getattr(self._config, "median_quantile_index", 4))
+
+    def forecast(
+        self,
+        inputs: list[np.ndarray],
+        *,
+        horizon: int,
+        past_only: list[np.ndarray | None] | None = None,
+        past_future: list[np.ndarray | None] | None = None,
+    ) -> list[np.ndarray]:
+        """Return one ``(9, horizon)`` decile block per input, origin-relative.
+
+        The returned blocks are **deltas** from the last context value, matching
+        the artifact contract.
+        """
+        padded = int(np.ceil(int(inputs[0].size) / 32.0) * 32)
+        if past_future is not None:
+            wanted = padded + int(horizon)
+            fixed: list[np.ndarray | None] = []
+            for window in past_future:
+                if window is None:
+                    fixed.append(None)
+                    continue
+                window = np.asarray(window, dtype="float32")
+                if window.shape[-1] < wanted:
+                    pad = wanted - int(window.shape[-1])
+                    window = np.concatenate(
+                        [window, np.repeat(window[:, -1:], pad, axis=1)], axis=1
+                    )
+                fixed.append(window)
+            past_future = fixed
+
+        kwargs: dict[str, Any] = {
+            "return_quantiles": True,
+            "use_symmetric_averaging": False,
+            "make_positive": False,
+            "univariate": False,
+        }
+        if past_only is not None:
+            kwargs["past_only_covariates"] = past_only
+        if past_future is not None:
+            kwargs["past_future_covariates"] = past_future
+
+        blocks: list[np.ndarray] = []
+        for context, output in zip(
+            inputs,
+            self._evaluator.predict_batch(inputs, horizon=int(horizon), **kwargs),
+            strict=True,
+        ):
+            quantiles = np.asarray(output.quantiles, dtype="float64").T  # (9, horizon)
+            if quantiles.shape[1] != int(horizon):
+                raise ForecastError(
+                    f"the timesfm 3.0 backend returned {quantiles.shape[1]} step(s) for a "
+                    f"horizon of {horizon}: a past-future covariate window shorter than "
+                    "padded_context + horizon makes the library infer a shorter horizon"
+                )
+            blocks.append((quantiles - float(context[-1])).astype("float32"))
+        return blocks
+
+
 def build_backend(**options: Any) -> TimesFMBackend:
     """Build a :class:`TimesFMBackend` from keyword ``options`` (registry factory).
 
@@ -254,6 +382,124 @@ def _decile_index(level: float) -> int | None:
         if math.isclose(level, decile, rel_tol=0.0, abs_tol=1e-9):
             return index
     return None
+
+
+def _chunks(indices: range, size: int) -> list[range]:
+    """Split ``indices`` into consecutive slices of at most ``size`` elements."""
+    return [indices[start : start + size] for start in range(0, len(indices), size)]
+
+
+def _decile_rows(block: np.ndarray, levels: Sequence[float]) -> np.ndarray:
+    """Select the requested levels from a ``(9, horizon)`` decile block.
+
+    TimesFM 3.0 always returns the nine deciles ``0.1 ... 0.9``; a caller may ask
+    for a subset.  An unknown level is reported rather than silently dropped.
+
+    Raises
+    ------
+    ForecastError
+        If a requested level is not one of the nine deciles the head provides.
+    """
+    rows = []
+    for level in levels:
+        index = _decile_index(float(level))
+        if index is None:
+            raise ForecastError(
+                "the timesfm 3.0 head exposes the nine deciles (0.1 ... 0.9) only, "
+                f"got {level!r}: interpolate another level yourself"
+            )
+        rows.append(index)
+    return np.asarray(block[rows, :], dtype="float32")
+
+
+class _CovariateProvider:
+    """Build the TimesFM 3.0 covariates from the data the backend may legally see.
+
+    Two families, and the distinction is the whole point:
+
+    * **past-only** channels are read from the context itself (RSI, realised
+      volatility, volume z-score, MACD, momentum).  They look backwards, so they
+      need nothing known in advance.
+    * **past+future** channels must be known across the horizon.  Only a
+      deterministic calendar qualifies (hour, day of week, day of month, as
+      sine/cosine pairs so that 23h and 0h are neighbours).  Injecting a *realised*
+      future indicator would leak the target and is refused by design.
+
+    The provider is deliberately conservative: it never fabricates a value that
+    depends on the future.
+    """
+
+    def __init__(self, timeframe: str, *, period: int = 24) -> None:
+        self._timeframe = timeframe
+        self._period = int(period)
+
+    def past_only(self, contexts: list[np.ndarray]) -> list[np.ndarray | None]:
+        """Return the past-only channels of every context (shape ``(n, len)``)."""
+        return [self._past_channels(context) for context in contexts]
+
+    def past_future(
+        self,
+        contexts: list[np.ndarray],
+        *,
+        origins: Sequence[pd.Timestamp],
+        horizon: int,
+    ) -> list[np.ndarray | None]:
+        """Return the calendar channels spanning context + horizon.
+
+        The window is sized ``len(context) + horizon``: TimesFM 3.0 infers the
+        horizon from the covariate width, so a short window silently yields a
+        shorter forecast.
+        """
+        windows: list[np.ndarray | None] = []
+        for context, origin in zip(contexts, origins, strict=True):
+            length = int(context.size) + int(horizon)
+            phases = _calendar_phase(origin, self._timeframe, length)
+            values = np.asarray(phases, dtype="float64")
+            span = float(self._period)
+            channels = np.stack(
+                [
+                    np.sin(2.0 * np.pi * values / span),
+                    np.cos(2.0 * np.pi * values / span),
+                ]
+            )
+            windows.append(channels.astype("float32"))
+        return windows
+
+    @staticmethod
+    def _past_channels(context: np.ndarray) -> np.ndarray | None:
+        """Return momentum/volatility channels for one context, shaped ``(n, len)``.
+
+        Every channel is computed **inside** the context window only, so an origin
+        never sees a value that was not available at its close.  The output is
+        channel-major and spans the whole context, which is what TimesFM 3.0
+        expects for ``past_only_covariates``.
+        """
+        values = np.asarray(context, dtype="float64").reshape(-1)
+        if values.size < 3:
+            return None
+        steps = np.diff(values, prepend=values[0])
+        window = min(14, max(1, values.size - 1))
+
+        # Rolling RSI over the window, computed causally at every step.
+        gains = np.where(steps > 0.0, steps, 0.0)
+        losses = np.where(steps < 0.0, -steps, 0.0)
+        gain_avg = pd.Series(gains).rolling(window, min_periods=1).mean().to_numpy(dtype="float64")
+        loss_avg = pd.Series(losses).rolling(window, min_periods=1).mean().to_numpy(dtype="float64")
+        denominator = gain_avg + loss_avg
+        rsi = np.where(
+            denominator > 0.0, gain_avg / np.where(denominator > 0.0, denominator, 1.0), 0.5
+        )
+
+        # Rolling realised volatility of the log increments.
+        volatility = (
+            pd.Series(steps).rolling(window, min_periods=1).std().fillna(0.0).to_numpy("float64")
+        )
+
+        # Trailing momentum over at most 24 steps.
+        span = min(24, values.size - 1)
+        momentum = values - np.concatenate([np.repeat(values[:1], span), values[:-span]])
+
+        return np.stack([rsi, volatility, momentum]).astype("float32")
 
 
 def _validate_levels(levels: Sequence[float]) -> tuple[tuple[float, ...], tuple[int, ...]]:
@@ -529,6 +775,7 @@ class TimesFMBackend:
         force_flip_invariance: bool = False,
         return_backcast: bool = False,
         use_xreg: bool = False,
+        use_covariates: bool = False,
         xreg_mode: str = "xreg + timesfm",
         timeframe: str = "1h",
         quantile_levels: Sequence[float] = DEFAULT_QUANTILE_LEVELS,
@@ -558,6 +805,10 @@ class TimesFMBackend:
         except TypeError:
             raise ForecastError("quantile_levels must be a sequence of numbers") from None
         self._model: Any = None
+        self._model3: Any = None
+        self._covariates: _CovariateProvider | None = (
+            _CovariateProvider(timeframe) if use_covariates else None
+        )
         self._resolved_device: str | None = None
 
         if license_note(self._model_id) == LICENSE_NON_COMMERCIAL:
@@ -678,6 +929,9 @@ class TimesFMBackend:
         levels, level_rows = _validate_levels(self._quantile_levels)
         contexts = [_context_values(request) for request in requests]
 
+        if _is_timesfm3(self._model_id):
+            return self._predict_timesfm3(requests, contexts, steps=steps, levels=levels)
+
         torch_module, timesfm_module = self._import_runtime()
         torch_module.set_float32_matmul_precision(_MATMUL_PRECISION)
         self._resolved_device = self._resolve_device()
@@ -712,6 +966,80 @@ class TimesFMBackend:
         return [trajectories[index] for index in range(len(requests))]
 
     # -- internals ---------------------------------------------------------
+
+    def _predict_timesfm3(
+        self,
+        requests: Sequence[ForecastRequest],
+        contexts: list[np.ndarray],
+        *,
+        steps: int,
+        levels: tuple[float, ...],
+    ) -> list[ForecastTrajectory]:
+        """Run the TimesFM 3.0 path and return origin-relative trajectories.
+
+        Separate from the 2.5 path on purpose: the two checkpoint families expose
+        different APIs, and the legacy class cannot load the 3.0 weights at all
+        (``load_state_dict`` fails on every ``tokenizer.*`` / ``stacked_xf.*`` key).
+
+        The returned paths are **deltas** from the origin close, like everywhere
+        else in this layer, so the strategy and the skill scorer are unchanged.
+
+        Raises
+        ------
+        ForecastError
+            If the ``timesfm3`` runtime is missing while a 3.0 checkpoint was
+            requested, or if the model returns an unexpected shape.
+        """
+        try:
+            import timesfm3  # noqa: F401
+        except ImportError as exc:
+            raise ForecastError(
+                f"the checkpoint {self._model_id!r} needs the 'timesfm3' module: "
+                f"{TIMESFM_EXTRA_HINT}"
+            ) from exc
+
+        if self._covariates is None:
+            past_only = past_future = None
+        else:
+            past_only = self._covariates.past_only(contexts)
+            past_future = self._covariates.past_future(
+                contexts, origins=[request.origin for request in requests], horizon=steps
+            )
+
+        blocks: list[np.ndarray] = []
+        for entries in _chunks(range(len(contexts)), self._per_core_batch_size):
+            runtime = self._ensure_timesfm3()
+            inputs = [np.array(contexts[i], dtype="float32", copy=True) for i in entries]
+            produced = runtime.forecast(
+                inputs,
+                horizon=steps,
+                past_only=None if past_only is None else [past_only[i] for i in entries],
+                past_future=None if past_future is None else [past_future[i] for i in entries],
+            )
+            blocks.extend(produced)
+
+        quantile_levels = tuple(float(level) for level in levels)
+        rows = [_decile_rows(block, levels) for block in blocks]
+        return [
+            ForecastTrajectory(
+                origin=request.origin,
+                timeframe=self._timeframe,
+                horizon=steps,
+                quantile_levels=quantile_levels,
+                quantiles=row,
+            )
+            for request, row in zip(requests, rows, strict=True)
+        ]
+
+    def _ensure_timesfm3(self) -> _TimesFM3Runtime:
+        """Build the TimesFM 3.0 runtime once, then reuse it."""
+        if self._model3 is None:
+            self._model3 = _TimesFM3Runtime(
+                self._model_id,
+                device=None if self._device is None else self._device,
+                per_core_batch_size=self._per_core_batch_size,
+            )
+        return cast("_TimesFM3Runtime", self._model3)
 
     def _import_runtime(self) -> tuple[Any, Any]:
         """Import ``torch`` and ``timesfm`` lazily.

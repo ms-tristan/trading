@@ -44,6 +44,10 @@ from trading_platform.forecast.backends.timesfm import (
     TIMESFM_XREG_EXTRA_HINT,
     TimesFMBackend,
     _calendar_phase,
+    _chunks,
+    _CovariateProvider,
+    _decile_rows,
+    _is_timesfm3,
     build_backend,
     license_note,
 )
@@ -841,3 +845,156 @@ def test_calendar_phase_of_daily_candles_is_the_day_of_the_week() -> None:
     # Every weekly candle starts on the same weekday, so that phase is constant:
     # documented degeneracy of the calendar covariate, not a silent surprise.
     assert _calendar_phase(ORIGIN, "1w", 2) == [0, 0]
+
+
+# ---------------------------------------------------------------------------
+# TimesFM 3.0: checkpoint dispatch, the timesfm3 adapter and the covariates
+# ---------------------------------------------------------------------------
+
+
+class FakeForecastOutput:
+    """Minimal stand-in for ``timesfm3.evaluator.ForecastOutput``."""
+
+    def __init__(self, horizon: int, channels: int = 9) -> None:
+        # The real 3.0 output is (horizon, channels), i.e. the TRANSPOSE of 2.5.
+        self.forecast = np.arange(1, horizon + 1, dtype="float32").reshape(horizon, 1)
+        self.quantiles = np.repeat(
+            np.arange(1, horizon + 1, dtype="float32").reshape(horizon, 1), channels, axis=1
+        )
+        self.ts_id = None
+
+
+class FakeTimesFM3:
+    """Fake ``timesfm3`` module exposing the pieces the backend imports."""
+
+    def __init__(self, *, horizon_override: int | None = None) -> None:
+        self.override = horizon_override
+        self.calls: list[dict[str, Any]] = []
+
+    def ModelConfig(self, **kwargs: Any) -> Any:  # noqa: N802 - mirrors the library name
+        return types.SimpleNamespace(**kwargs, median_quantile_index=4)
+
+    def TimesFM3Evaluator(self, config: Any) -> Any:  # noqa: N802 - mirrors the library
+        return FakeTimesFM3Evaluator(self, config)
+
+
+class FakeTimesFM3Evaluator:
+    """Fake evaluator: records the call and yields one output per context."""
+
+    def __init__(self, module: FakeTimesFM3, config: Any) -> None:
+        self._module = module
+        self.config = config
+
+    def predict_batch(self, contexts: list[np.ndarray], horizon: int, **kwargs: Any):
+        self._module.calls.append({"contexts": contexts, "horizon": horizon, **kwargs})
+        produced = horizon if self._module.override is None else self._module.override
+        for _ in contexts:
+            yield FakeForecastOutput(produced)
+
+
+def install_timesfm3(monkeypatch: pytest.MonkeyPatch, **options: Any) -> FakeTimesFM3:
+    """Inject a fake ``timesfm3`` module (and a torch stub) and return it."""
+    module = FakeTimesFM3(**options)
+    monkeypatch.setitem(sys.modules, "timesfm3", module)
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    return module
+
+
+def test_timesfm3_checkpoints_are_dispatched_to_the_3_0_path() -> None:
+    assert _is_timesfm3("google/timesfm-3.0-pytorch") is True
+    assert _is_timesfm3("google/timesfm-2.5-200m-pytorch") is False
+    assert _is_timesfm3("anything/else") is False
+
+
+def test_3_0_path_returns_origin_relative_deltas(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = install_timesfm3(monkeypatch)
+    backend = TimesFMBackend(model_id="google/timesfm-3.0-pytorch")
+    trajectories = backend.predict(make_requests(1, length=32), horizon=4)
+
+    # The fake head returns 1..horizon as the LEVEL; the backend must subtract the
+    # last context value, exactly like the 2.5 path does.
+    context_last = 1.0 + 31.0
+    assert trajectories[0].quantiles.shape == (9, 4)
+    assert np.allclose(trajectories[0].median, np.arange(1, 5) - context_last)
+    assert module.calls[0]["univariate"] is False
+    assert module.calls[0]["make_positive"] is False
+
+
+def test_3_0_path_rejects_a_truncated_horizon(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A past-future window shorter than padded_context + horizon makes the library
+    # silently decode fewer steps; the backend must refuse rather than store a
+    # short path.
+    install_timesfm3(monkeypatch, horizon_override=3)
+    backend = TimesFMBackend(model_id="google/timesfm-3.0-pytorch")
+    with pytest.raises(ForecastError) as excinfo:
+        backend.predict(make_requests(1, length=32), horizon=4)
+    assert "past-future covariate window" in str(excinfo.value)
+
+
+def test_3_0_path_without_the_timesfm3_module_names_the_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(sys.modules, "timesfm3", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [MissingModuleBlocker(("timesfm3",)), *sys.meta_path])
+    backend = TimesFMBackend(model_id="google/timesfm-3.0-pytorch")
+    with pytest.raises(ForecastError) as excinfo:
+        backend.predict(make_requests(1, length=32), horizon=2)
+    assert "timesfm3" in str(excinfo.value)
+
+
+def test_3_0_covariates_are_passed_with_the_right_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = install_timesfm3(monkeypatch)
+    backend = TimesFMBackend(model_id="google/timesfm-3.0-pytorch", use_covariates=True)
+    backend.predict(make_requests(2, length=64), horizon=4)
+
+    call = module.calls[0]
+    past_only = call["past_only_covariates"]
+    past_future = call["past_future_covariates"]
+    # Channel-major and spanning the whole context, which is what 3.0 expects.
+    assert len(past_only) == 2
+    assert past_only[0].shape == (3, 64)
+    # The window must cover context + horizon, or the library infers a shorter one.
+    assert len(past_future) == 2
+    assert past_future[0].shape == (2, 64 + 4)
+
+
+def test_covariate_provider_never_looks_past_the_context() -> None:
+    provider = _CovariateProvider("1h")
+    context = np.arange(50, dtype="float64")
+    channels = provider.past_only([context])[0]
+    assert channels is not None
+    # Appending future values must not change any channel of the same prefix.
+    extended = provider.past_only([np.arange(70, dtype="float64")])[0]
+    assert np.allclose(channels, extended[:, :50])
+
+
+def test_covariate_provider_needs_at_least_three_points() -> None:
+    provider = _CovariateProvider("1h")
+    assert provider.past_only([np.asarray([1.0, 2.0])]) == [None]
+
+
+def test_covariate_provider_rsi_of_a_flat_context_is_neutral() -> None:
+    provider = _CovariateProvider("1h")
+    channels = provider.past_only([np.full(40, 5.0)])[0]
+    assert channels is not None
+    assert np.allclose(channels[0], 0.5)
+
+
+def test_decile_rows_selects_the_requested_levels() -> None:
+    block = np.arange(9 * 4, dtype="float32").reshape(9, 4)
+    rows = _decile_rows(block, (0.5, 0.9))
+    assert np.array_equal(rows, block[[4, 8], :])
+
+
+def test_decile_rows_rejects_a_level_the_head_does_not_provide() -> None:
+    block = np.zeros((9, 4), dtype="float32")
+    with pytest.raises(ForecastError) as excinfo:
+        _decile_rows(block, (0.25,))
+    assert "nine deciles" in str(excinfo.value)
+
+
+def test_chunks_splits_a_range_into_consecutive_slices() -> None:
+    assert [list(part) for part in _chunks(range(5), 2)] == [[0, 1], [2, 3], [4]]
+    assert _chunks(range(0), 3) == []
