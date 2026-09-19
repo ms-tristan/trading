@@ -13,12 +13,14 @@ from trading_platform.core.errors import (
     InsufficientDataError,
     MetricsError,
     MonteCarloError,
+    RealtimeError,
     ReportingError,
     RobustnessError,
     StrategyError,
     TradingBacktestError,
     ValidationLayerError,
     WalkForwardError,
+    WalletError,
 )
 
 ALL_ERRORS = [
@@ -35,6 +37,7 @@ ALL_ERRORS = [
     MetricsError,
     ReportingError,
     FreqtradeConfigError,
+    WalletError,
 ]
 
 
@@ -61,6 +64,8 @@ def test_every_error_derives_from_the_base_class(error_class: type[Exception]) -
         (MonteCarloError, ValidationLayerError),
         (ConfigError, TradingBacktestError),
         (FreqtradeConfigError, ConfigError),
+        (RealtimeError, TradingBacktestError),
+        (WalletError, RealtimeError),
     ],
 )
 def test_hierarchy_chains(error_class: type[Exception], parent: type[Exception]) -> None:
@@ -109,3 +114,7 @@ def test_errors_are_raisable_and_catchable_as_base() -> None:
         raise FreqtradeConfigError("bad config.json")
     with pytest.raises(ValidationLayerError):
         raise WalkForwardError("no window")
+    # The shared wallet is part of the realtime surface: one `except RealtimeError`
+    # catches a refused debit like it catches every other live-trading failure.
+    with pytest.raises(RealtimeError):
+        raise WalletError("platform wallet cannot debit 1.00 USDT: available 0.00 USDT")

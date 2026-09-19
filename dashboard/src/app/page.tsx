@@ -73,6 +73,12 @@ function ApiUnreachable({ failure, baseUrl }: { failure: unknown; baseUrl: strin
  * control (seeded with the server-rendered state) and the single live region of
  * the page, whose polling cadence is resolved here — on the server — from
  * `NEXT_PUBLIC_POLL_INTERVAL_MS`, the mirror of `monitoring.refresh_seconds`.
+ *
+ * The shared platform wallet is part of that live region: it is rendered by
+ * {@link OverviewLive} from the `wallet` of the `profiles` payload this Server
+ * Component already fetched, so the first paint carries the wallet values and
+ * the same polling bundle refreshes them. Exactly one wallet panel is rendered
+ * — a second, page-level copy would show the same ledger twice.
  */
 export default async function OverviewPage() {
   const baseUrl = serverApiBaseUrl();

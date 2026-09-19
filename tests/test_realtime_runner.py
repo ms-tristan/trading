@@ -30,6 +30,7 @@ from trading_platform.core.errors import (
     KillSwitchActiveError,
     OrderRejectedError,
     RiskLimitExceededError,
+    WalletError,
 )
 from trading_platform.core.models import Direction, ExitReason, TradeRecord
 from trading_platform.realtime import runner as runner_module
@@ -297,7 +298,16 @@ class FakeStore:
 
 
 class FakeGateway:
-    """In-memory :class:`ExecutionGateway` with venue-side idempotency."""
+    """In-memory :class:`ExecutionGateway` with venue-side idempotency.
+
+    It publishes the same *attributed* read model as the real gateway -- the
+    profile's share of the shared platform wallet -- together with the optional
+    ``publish_platform_state`` seam.  ``cash`` keeps the meaning every historical
+    test gives it (the cash attributed to this profile) and ``allocation`` is
+    derived from it unless a test states one explicitly, so the payload stays
+    self-consistent: ``equity == cash + position_value`` and ``cash == allocation -
+    deployed + realized_pnl``.
+    """
 
     def __init__(
         self,
@@ -306,16 +316,21 @@ class FakeGateway:
         cash: float = 1000.0,
         closed_trade: TradeRecord | None = None,
         error: BaseException | None = None,
+        allocation: float | None = None,
+        realized_pnl: float = 0.0,
     ) -> None:
         self.position_value = position
         self.cash = float(cash)
         self.closed = closed_trade
         self.error = error
+        self.allocation = None if allocation is None else float(allocation)
+        self.realized_pnl = float(realized_pnl)
         self.orders: dict[str, Order] = {}
         self.submissions: list[tuple[OrderRequest, float, dict[str, Any]]] = []
         self.venue_submissions = 0
         self.polls = 0
         self.closed_calls = 0
+        self.published: list[dict[str, float]] = []
 
     def submit(
         self,
@@ -383,6 +398,48 @@ class FakeGateway:
         return self.position_value
 
     def snapshot_fields(self) -> dict[str, Any]:
+        """Return the attributed read model of this profile (never the wallet)."""
+        position = self.position_value
+        quantity = 0.0 if position is None else float(position.quantity)
+        average = 0.0 if position is None else float(position.average_price)
+        position_value = quantity * average if position else 0.0
+        deployed = abs(quantity * average) if position else 0.0
+        # The allocation is the inverse of the attributed cash formula unless the
+        # test states it: the payload therefore stays consistent with the ``cash``
+        # knob every historical test already uses.
+        allocation = self.allocation
+        if allocation is None:
+            allocation = self.cash + deployed - self.realized_pnl
+        return {
+            "equity": self.cash + position_value,
+            "cash": self.cash,
+            "position_value": position_value,
+            "open_positions": 0 if position is None else 1,
+            "allocation": float(allocation),
+            "deployed": deployed,
+            "realized_pnl": self.realized_pnl,
+            "unrealized_pnl": position_value - deployed,
+        }
+
+    def publish_platform_state(self, *, exposure: float, daily_pnl: float) -> None:
+        """Record the platform aggregates the runner published."""
+        self.published.append({"exposure": float(exposure), "daily_pnl": float(daily_pnl)})
+
+
+class LegacyGateway(FakeGateway):
+    """A gateway written before the shared wallet: four fields, no platform seam.
+
+    It exists to prove the *backward-compatible* half of the runner contract: an
+    injected gateway that publishes none of the attributed fields must keep
+    working, and one that has no ``publish_platform_state`` at all must simply not
+    be published to.
+    """
+
+    #: ``getattr`` sees the attribute and finds ``None``: no publishing happens.
+    publish_platform_state = None  # type: ignore[assignment]
+
+    def snapshot_fields(self) -> dict[str, Any]:
+        """Return the historical four-key payload, without any attributed field."""
         position = self.position_value
         quantity = 0.0 if position is None else float(position.quantity)
         position_value = quantity * float(position.average_price) if position else 0.0
@@ -728,19 +785,38 @@ def test_a_blocked_order_returns_a_blocked_decision(install: Any, logs: Any, err
     async def scenario() -> Any:
         await runner.start()
         blocked = await runner.run_once()
+        blocked_reason = runner.last_block_reason
+        blocked_snapshot_reason = runner.snapshot().last_block_reason
         marked_after_block = list(store.marked)
         equity_after_block = list(store.equity)
         gateway.error = None
         gateway.position_value = None
         resumed = await runner.run_once()
-        return blocked, resumed, marked_after_block, equity_after_block
+        return (
+            blocked,
+            resumed,
+            blocked_reason,
+            blocked_snapshot_reason,
+            marked_after_block,
+            equity_after_block,
+        )
 
-    blocked, resumed, marked_after_block, equity_after_block = run(scenario())
+    (
+        blocked,
+        resumed,
+        blocked_reason,
+        blocked_snapshot_reason,
+        marked_after_block,
+        equity_after_block,
+    ) = run(scenario())
     assert blocked is not None
     assert blocked.blocked is True
     assert blocked.block_reason == str(error)
     assert blocked.action is SignalAction.ENTER_LONG
     assert blocked.client_order_id.endswith("-0000")
+    # the refusal is readable without the log stream, and it reaches the snapshot
+    assert blocked_reason == str(error)
+    assert blocked_snapshot_reason == str(error)
     blocked_events = [event for event in events(logs) if event == "order_blocked"]
     assert blocked_events == ["order_blocked"]
     assert marked_after_block == []
@@ -748,6 +824,90 @@ def test_a_blocked_order_returns_a_blocked_decision(install: Any, logs: Any, err
 
     assert resumed is not None
     assert resumed.blocked is False
+    assert len(store.marked) == 1
+    # an accepted order clears the reason: the profile is trading again
+    assert runner.last_block_reason == ""
+    assert runner.snapshot().last_block_reason is None
+
+
+def test_the_shared_wallet_refusal_is_the_last_block_reason(install: Any) -> None:
+    """A refusal the *shared wallet* caused names it, exactly like a per-profile one."""
+    install(mode="entry_long")
+    error = RiskLimitExceededError(
+        "platform wallet cannot fund order: requires 1010.00 USDT, available 400.00 USDT",
+        ["platform_wallet"],
+    )
+    gateway = FakeGateway(error=error, cash=400.0)
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway, store=store)
+
+    async def scenario() -> Any:
+        await runner.start()
+        decision = await runner.run_once()
+        return decision, runner.last_block_reason, runner.snapshot()
+
+    decision, reason, snapshot = run(scenario())
+    assert decision is not None and decision.blocked is True
+    assert "platform_wallet" in decision.block_reason
+    assert reason == str(error)
+    assert snapshot.last_block_reason == str(error)
+    assert snapshot.to_dict()["last_block_reason"] == str(error)
+    # nothing was submitted and nothing was persisted: the tick stopped before it
+    assert gateway.submissions == []
+    assert store.marked == []
+    assert store.equity == []
+
+
+def test_a_daily_loss_block_sets_and_clears_the_last_block_reason(install: Any) -> None:
+    """The per-profile limit path is covered too, on the very same seam."""
+    install(mode="entry_long")
+    gateway = FakeGateway()
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway, store=store)
+    # the runner delegates the decision to the gateway: the seam is what is pinned
+    gateway.error = RiskLimitExceededError("max_daily_loss exceeded", ["max_daily_loss"])
+
+    async def scenario() -> Any:
+        await runner.start()
+        blocked = await runner.run_once()
+        gateway.error = None
+        accepted = await runner.run_once()
+        return blocked, accepted
+
+    blocked, accepted = run(scenario())
+    assert blocked is not None and blocked.blocked is True
+    assert accepted is not None and accepted.blocked is False
+    assert runner.last_block_reason == ""
+
+
+def test_a_venue_wallet_refusal_blocks_instead_of_crashing(install: Any) -> None:
+    """A fill the shared ledger could not fund is a refusal, not a crashed tick.
+
+    The venue raises when the ledger cannot fund the movement (the fee of a full
+    allocation, say); the runner turns it into the same blocked decision every
+    other refusal produces, keeps its reason, and stays alive.
+    """
+    install(mode="entry_long")
+    error = WalletError("platform wallet cannot debit 1001.00 USDT: available 1000.00 USDT")
+    gateway = FakeGateway(error=error, cash=1000.0)
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway, store=store)
+
+    async def scenario() -> Any:
+        await runner.start()
+        blocked = await runner.run_once()
+        gateway.error = None
+        gateway.position_value = None
+        accepted = await runner.run_once()
+        return blocked, accepted
+
+    blocked, accepted = run(scenario())
+    assert blocked is not None
+    assert blocked.blocked is True
+    assert blocked.block_reason == str(error)
+    assert runner.last_block_reason == ""  # cleared by the accepted order
+    assert accepted is not None and accepted.blocked is False
+    assert len(store.list_positions("btc-paper")) == 0  # nothing was half-applied
     assert len(store.marked) == 1
 
 
@@ -960,6 +1120,30 @@ def test_a_stake_amount_drives_the_entry_size(install: Any) -> None:
     decision = run(scenario())
     assert decision is not None
     assert decision.quantity == pytest.approx(250.0 / decision.reference_price)
+
+
+def test_an_entry_without_a_stake_is_sized_on_the_attributed_cash(install: Any) -> None:
+    """Without a stake the order spends the profile's *attributed* cash.
+
+    The sizing measures the share of the shared wallet the profile owns -- the
+    cash the gateway attributes to it -- never the platform's whole balance: a
+    profile whose attributed cash is 400.00 buys 400.00 worth of the asset.
+    """
+    install(mode="entry_long")
+    gateway = FakeGateway(cash=400.0)
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway)
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.reference_price == pytest.approx(101.0)
+    assert decision.quantity == pytest.approx(400.0 / 101.0)
+    request, reference, _context = gateway.submissions[0]
+    assert reference == pytest.approx(101.0)
+    assert request.quantity == pytest.approx(400.0 / 101.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1414,9 +1598,131 @@ def test_health_and_snapshot_expose_the_documented_fields(install: Any) -> None:
     assert snapshot.total_return == pytest.approx(0.0)
     assert snapshot.open_positions == 0
     assert snapshot.started_at is not None
+    # every attributed field is published, even for a flat profile
+    assert snapshot.allocation == pytest.approx(1000.0)
+    assert snapshot.deployed == pytest.approx(0.0)
+    assert snapshot.realized_pnl == pytest.approx(0.0)
+    assert snapshot.unrealized_pnl == pytest.approx(0.0)
+    assert snapshot.last_block_reason is None
     payload = snapshot.to_dict()
     assert payload["health"]["counters"]["candles_processed"] == 1
     assert isinstance(payload["started_at"], str)
+    assert payload["allocation"] == pytest.approx(1000.0)
+    assert payload["deployed"] == pytest.approx(0.0)
+    assert payload["realized_pnl"] == pytest.approx(0.0)
+    assert payload["unrealized_pnl"] == pytest.approx(0.0)
+    assert payload["last_block_reason"] is None
+
+
+def test_the_snapshot_reports_the_attributed_platform_figures(install: Any) -> None:
+    """The profile's cash view is its share of the shared wallet, never the wallet."""
+    install(mode="hold")
+    gateway = FakeGateway(
+        position=make_position(quantity=0.5, average_price=100.0, stop_price=50.0),
+        cash=975.0,
+        allocation=1000.0,
+        realized_pnl=25.0,
+    )
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway)
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    run(scenario())
+    snapshot = runner.snapshot()
+    assert snapshot.allocation == pytest.approx(1000.0), "the profile's share of the wallet"
+    assert snapshot.deployed == pytest.approx(50.0)
+    assert snapshot.realized_pnl == pytest.approx(25.0)
+    assert snapshot.unrealized_pnl == pytest.approx(0.0)
+    assert snapshot.cash == pytest.approx(975.0)
+    assert snapshot.equity == pytest.approx(1025.0)
+    # the attributed identities the dashboard relies on
+    assert snapshot.cash == pytest.approx(
+        snapshot.allocation - snapshot.deployed + snapshot.realized_pnl
+    )
+    assert snapshot.equity == pytest.approx(
+        snapshot.allocation + snapshot.realized_pnl + snapshot.unrealized_pnl
+    )
+    assert snapshot.equity == pytest.approx(snapshot.cash + snapshot.position_value)
+    assert snapshot.total_return == pytest.approx(0.025)
+
+
+def test_the_runner_publishes_the_platform_aggregates(install: Any) -> None:
+    """Every equity read feeds the injected platform aggregation, exposure included."""
+    install(mode="hold")
+    gateway = FakeGateway(
+        position=make_position(quantity=0.5, average_price=100.0, stop_price=50.0),
+        cash=975.0,
+        allocation=1000.0,
+        realized_pnl=25.0,
+    )
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway)
+
+    async def scenario() -> Any:
+        await runner.start()
+        await runner.run_once()
+        return list(gateway.published)
+
+    published = run(scenario())
+    assert published, "the runner must feed the platform caps on every tick"
+    # the runner marks the open position at the tick price (the close of the candle)
+    assert published[-1]["exposure"] == pytest.approx(0.5 * 101.0)
+    # the daily P&L is measured against the day baseline: the allocation when the
+    # profile has no persisted curve yet (1000.0), so 25.0 realized + 0.5 * 1.0
+    assert published[-1]["daily_pnl"] == pytest.approx(25.5)
+    assert all(entry["exposure"] >= 0.0 for entry in published)
+
+
+def test_a_gateway_without_the_attributed_fields_keeps_its_historical_figures(
+    install: Any,
+) -> None:
+    """The reads fall back per field: a gateway written before the wallet still works."""
+    install(mode="hold")
+    gateway = LegacyGateway(
+        position=make_position(quantity=0.5, average_price=100.0, stop_price=50.0), cash=1000.0
+    )
+    runner, _stream, _gateway, _store, _clock = build(gateway=gateway)
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    run(scenario())
+    snapshot = runner.snapshot()
+    assert snapshot.cash == pytest.approx(1000.0), "the historical cash, untouched"
+    assert snapshot.equity == pytest.approx(1050.0)
+    assert snapshot.allocation == pytest.approx(1000.0), "the profile's effective allocation"
+    assert snapshot.deployed == pytest.approx(50.0), "rebuilt from the open position"
+    assert snapshot.realized_pnl == pytest.approx(0.0)
+    assert snapshot.unrealized_pnl == pytest.approx(0.0)
+    assert snapshot.position_value == pytest.approx(50.0)
+    assert gateway.published == [], "no platform seam, no publishing"
+
+
+def test_an_explicit_allocation_drives_the_profile_figures(install: Any) -> None:
+    """``allocation`` is what the per-profile risk limits and the reporting measure."""
+    install(mode="entry_long")
+    gateway = FakeGateway(allocation=250.0, cash=250.0)
+    runner, _stream, _gateway, _store, _clock = build(
+        gateway=gateway, profile_config=profile(initial_balance=1000.0, allocation=250.0)
+    )
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    # the order spends the allocation, not the profile's historical initial balance
+    assert decision.quantity == pytest.approx(250.0 / decision.reference_price)
+    _request, _reference, context = gateway.submissions[0]
+    assert context["equity"] == pytest.approx(250.0)
+    assert context["peak_equity"] == pytest.approx(250.0), "the drawdown denominator"
+    snapshot = runner.snapshot()
+    assert snapshot.initial_balance == pytest.approx(1000.0), "the field keeps its meaning"
+    assert snapshot.allocation == pytest.approx(250.0), "the share of the shared wallet"
+    assert snapshot.total_return == pytest.approx(0.0)
 
 
 def test_mark_degraded_survives_the_next_tick(install: Any) -> None:

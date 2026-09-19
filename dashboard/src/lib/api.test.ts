@@ -19,6 +19,7 @@ import {
   fetchProfile,
   fetchProfiles,
   fetchTrades,
+  isWalletSnapshot,
   pauseProfile,
   postKillSwitch,
   requestJson,
@@ -42,6 +43,7 @@ import type {
   ProfilesPayload,
   ProfileSnapshot,
   TradesPayload,
+  WalletSnapshot,
 } from './types';
 
 // ---------------------------------------------------------------------------
@@ -93,12 +95,59 @@ const health: HealthPayload = {
   profiles_running: 1,
   kill_switch: false,
   checked_at: '2024-01-01T00:00:00+00:00',
+  wallet: null,
+};
+
+/**
+ * The one shared USDT wallet of the platform, as `GET /api/profiles` and
+ * `GET /api/health` emit it (`source` is `'local'` for the paper ledger and
+ * `'venue'` for the exchange account of live mode).
+ */
+const wallet: WalletSnapshot = {
+  name: 'usdt',
+  mode: 'paper',
+  initial_balance: 25000,
+  cash: 20964.75,
+  equity: 25380.5,
+  deployed: 4450.5,
+  realized_pnl: 415.25,
+  unrealized_pnl: -34.75,
+  total_exposure: 4450.5,
+  profiles: 2,
+  source: 'local',
+  updated_at: '2024-01-01T00:00:00+00:00',
 };
 
 const profiles: ProfilesPayload = {
   profiles: [profile],
   generated_at: '2024-01-01T00:00:00+00:00',
+  wallet,
 };
+
+/** The keys a server that predates the attributed breakdown does not emit. */
+const ATTRIBUTED_KEYS = [
+  'allocation',
+  'deployed',
+  'realized_pnl',
+  'unrealized_pnl',
+  'last_block_reason',
+] as const;
+
+/** A profile of an older server: every attributed key removed. */
+function legacyProfile(entry: ProfileSnapshot): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...entry };
+  for (const key of ATTRIBUTED_KEYS) {
+    delete copy[key];
+  }
+  return copy;
+}
+
+/** A payload of an older server: the shared-wallet key removed. */
+function withoutWalletKey<T extends { wallet?: unknown }>(payload: T): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...payload };
+  delete copy.wallet;
+  return copy;
+}
 
 const equity: EquityPayload = {
   points: [{ timestamp: '2024-01-01T00:00:00+00:00', equity: 10000, cash: 10000, position_value: 0 }],
@@ -399,6 +448,108 @@ describe('malformed responses', () => {
     const { impl } = recordingFetch(jsonResponse({ profiles: [{ profile_id: 'alpha' }] }));
 
     await expect(fetchProfiles({ fetchImpl: impl })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the shared platform wallet (additive part of the contract)
+// ---------------------------------------------------------------------------
+
+describe('the shared platform wallet', () => {
+  it('accepts a wallet snapshot and refuses a half-known one', () => {
+    expect(isWalletSnapshot(wallet)).toBe(true);
+
+    // A snapshot missing a documented key, or carrying an undocumented source
+    // or mode, is not a wallet: it is refused instead of half-rendered.
+    expect(isWalletSnapshot({ ...wallet, cash: undefined })).toBe(false);
+    expect(isWalletSnapshot({ ...wallet, source: 'exchange' })).toBe(false);
+    expect(isWalletSnapshot({ ...wallet, mode: 'backtest' })).toBe(false);
+    expect(isWalletSnapshot({ ...wallet, profiles: '2' })).toBe(false);
+    expect(isWalletSnapshot({ ...wallet, updated_at: 0 })).toBe(false);
+    expect(isWalletSnapshot(null)).toBe(false);
+    expect(isWalletSnapshot([])).toBe(false);
+    expect(isWalletSnapshot('usdt')).toBe(false);
+  });
+
+  it('returns the shared wallet of the profiles payload verbatim', async () => {
+    const { impl } = recordingFetch(jsonResponse(profiles));
+
+    const result = await fetchProfiles({ fetchImpl: impl });
+
+    expect(result.wallet).toEqual(wallet);
+    expect(result).toEqual(profiles);
+  });
+
+  it('defaults the wallet to null for a payload of an older server', async () => {
+    const { impl } = recordingFetch(jsonResponse(withoutWalletKey(profiles)));
+
+    const result = await fetchProfiles({ fetchImpl: impl });
+
+    // Absent is not `undefined` for a consumer: the read route makes the
+    // documented "no wallet" state explicit.
+    expect(result.wallet).toBeNull();
+    expect(result.generated_at).toBe(profiles.generated_at);
+    expect(result.profiles).toHaveLength(1);
+
+    const healthImpl = recordingFetch(jsonResponse(withoutWalletKey(health))).impl;
+    const healthResult = await fetchHealth({ fetchImpl: healthImpl });
+
+    expect(healthResult.wallet).toBeNull();
+    expect(healthResult.version).toBe(health.version);
+  });
+
+  it('accepts an explicit null wallet', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...profiles, wallet: null }));
+
+    await expect(fetchProfiles({ fetchImpl: impl })).resolves.toMatchObject({ wallet: null });
+  });
+
+  it('still accepts a profile that predates the attributed breakdown', async () => {
+    const legacy = {
+      profiles: [legacyProfile(profile)],
+      generated_at: '2024-01-01T00:00:00+00:00',
+    };
+    const { impl } = recordingFetch(jsonResponse(legacy));
+
+    const result = await fetchProfiles({ fetchImpl: impl });
+
+    expect(result.profiles).toHaveLength(1);
+    expect(result.profiles[0]?.profile_id).toBe('alpha');
+    expect(result.profiles[0]?.equity).toBe(profile.equity);
+    expect(result.profiles[0]?.allocation).toBeUndefined();
+    expect(result.profiles[0]?.last_block_reason).toBeUndefined();
+    expect(result.wallet).toBeNull();
+  });
+
+  it('refuses an invalid attributed value instead of rendering it', async () => {
+    const broken = {
+      profiles: [{ ...profile, allocation: 'ten thousand' }],
+      generated_at: null,
+    };
+    const { impl } = recordingFetch(jsonResponse(broken));
+
+    await expect(fetchProfiles({ fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/profiles',
+    });
+  });
+
+  it('refuses a wallet value that is not a wallet snapshot', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...profiles, wallet: { name: 'usdt' } }));
+
+    await expect(fetchProfiles({ fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/profiles',
+    });
+
+    const healthImpl = recordingFetch(
+      jsonResponse({ ...health, wallet: { ...wallet, cash: 'lots' } }),
+    ).impl;
+
+    await expect(fetchHealth({ fetchImpl: healthImpl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/health',
+    });
   });
 });
 

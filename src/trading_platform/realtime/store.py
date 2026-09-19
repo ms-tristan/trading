@@ -37,6 +37,17 @@ Candles are the one exception to that JSON rule: they are stored as plain numeri
 columns (one row per profile and timestamp, see :class:`CandleRow`) and the store
 keeps only the most recent :data:`CANDLE_WINDOW` rows of each profile, so the chart
 surface has real price history without ever letting the database grow without bound.
+
+The shared platform wallet is the second exception.  It is a **single** row of the
+``wallet`` table (``wallet_id = 1``, enforced by a ``CHECK``), holding the USDT cash
+every profile funds its orders from, together with the initial balance the wallet was
+started with.  It is written through :meth:`SqliteStateStore.save_wallet` -- an
+``INSERT ... ON CONFLICT(wallet_id) DO UPDATE``, so re-saving it can never create a
+second row -- and read back through :meth:`SqliteStateStore.load_wallet`, which
+answers ``None`` for a database that never stored one.  Schema version ``3`` adds
+that table; the migration is additive, so a database deployed at version ``1`` or
+``2`` simply gains the empty ``wallet`` table and the wallet is initialised from the
+configuration at the next boot.
 """
 
 from __future__ import annotations
@@ -71,15 +82,24 @@ from trading_platform.realtime.models import (
     status_error,
 )
 
-__all__ = ["CANDLE_WINDOW", "SCHEMA_VERSION", "CandleRow", "SqliteStateStore", "StateStore"]
+__all__ = [
+    "CANDLE_WINDOW",
+    "SCHEMA_VERSION",
+    "CandleRow",
+    "SqliteStateStore",
+    "StateStore",
+    "WalletRow",
+]
 
 logger = logging.getLogger(__name__)
 
 #: Schema version written into the ``schema_version`` table by this build.
 #:
 #: History: ``1`` was the first shipped schema (profiles, orders, fills, positions,
-#: equity, trades, status, meta); ``2`` adds the bounded ``candles`` table.
-SCHEMA_VERSION: int = 2
+#: equity, trades, status, meta); ``2`` adds the bounded ``candles`` table; ``3``
+#: adds the single-row ``wallet`` table (the shared platform wallet every profile
+#: funds its orders from).
+SCHEMA_VERSION: int = 3
 
 #: How many candles the store keeps **per profile** (the bounded retention window).
 #:
@@ -142,6 +162,11 @@ _DDL: tuple[str, ...] = (
         "closed INTEGER NOT NULL, PRIMARY KEY(profile_id, timestamp))"
     ),
     "CREATE INDEX IF NOT EXISTS idx_candles_profile ON candles(profile_id, timestamp)",
+    (
+        "CREATE TABLE IF NOT EXISTS wallet ("
+        "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id = 1), cash REAL NOT NULL, "
+        "initial_balance REAL NOT NULL, updated_at TEXT NOT NULL)"
+    ),
 )
 
 _T = TypeVar("_T")
@@ -176,6 +201,30 @@ class CandleRow:
             "close": float(self.close),
             "volume": float(self.volume),
             "closed": bool(self.closed),
+        }
+
+
+@dataclass(frozen=True)
+class WalletRow:
+    """The persisted state of the shared platform wallet (one row, always).
+
+    The wallet is the single source of truth for the USDT cash of the whole
+    platform: every profile funds its orders from it.  ``cash`` is what is left to
+    deploy right now, ``initial_balance`` is what the wallet started with (it is the
+    denominator of the platform-wide P&L) and ``updated_at`` is the instant of the
+    last accepted write.
+    """
+
+    cash: float
+    initial_balance: float
+    updated_at: pd.Timestamp | None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable mapping with one key per field."""
+        return {
+            "cash": float(self.cash),
+            "initial_balance": float(self.initial_balance),
+            "updated_at": _iso_or_none(self.updated_at),
         }
 
 
@@ -307,6 +356,14 @@ class StateStore(Protocol):
 
     def load_profiles(self) -> list[ProfileConfig]:
         """Return every persisted profile, ordered by ``profile_id``."""
+        ...
+
+    def save_wallet(self, *, cash: float, initial_balance: float) -> None:
+        """Persist the shared platform wallet (one row, upserted in place)."""
+        ...
+
+    def load_wallet(self) -> WalletRow | None:
+        """Return the persisted shared wallet, or ``None`` when never written."""
         ...
 
     def upsert_order(self, order: Order) -> None:
@@ -489,11 +546,12 @@ class SqliteStateStore:
         try:
             conn = self._new_connection()
             self._apply_pragmas(conn)
-            # v1 -> v2 forward migration, additive only: ``_create_schema`` runs
+            # v1/v2 -> v3 forward migration, additive only: ``_create_schema`` runs
             # first and every statement is ``CREATE TABLE/INDEX IF NOT EXISTS``, so a
-            # database deployed at version 1 simply gains the empty ``candles`` table
-            # (and its index) here, while every existing table, column and row is left
-            # untouched; ``_check_schema_version`` then bumps the stored version to 2.
+            # database deployed at version 1 or 2 simply gains the empty ``candles``
+            # and/or ``wallet`` table (and its index) here, while every existing table,
+            # column and row is left untouched; ``_check_schema_version`` then bumps
+            # the stored version to 3.
             self._create_schema(conn)
             self._check_schema_version(conn)
         except BaseException:
@@ -715,6 +773,52 @@ class SqliteStateStore:
                     f"{profile_id}: {exc}"
                 ) from exc
         return profiles
+
+    # -- shared platform wallet ---------------------------------------------
+
+    def save_wallet(self, *, cash: float, initial_balance: float) -> None:
+        """Persist the shared platform wallet, upserting the single ``wallet_id = 1`` row.
+
+        The ``ON CONFLICT(wallet_id) DO UPDATE`` clause is what makes the wallet a
+        *single* row for ever: the very first save inserts it, every later save
+        overwrites the cash and the initial balance of that same row, inside one
+        ``BEGIN IMMEDIATE ... COMMIT``.  A failed save (a ``NaN`` cash, which SQLite
+        stores as ``NULL``, violates ``cash REAL NOT NULL``) rolls back and leaves the
+        previous wallet exactly as it was, reported as :class:`StateStoreError`.
+        """
+        now = self._now_iso()
+        with self._write("save_wallet") as conn:
+            conn.execute(
+                "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
+                "VALUES (1, ?, ?, ?) ON CONFLICT(wallet_id) DO UPDATE SET "
+                "cash = excluded.cash, initial_balance = excluded.initial_balance, "
+                "updated_at = excluded.updated_at",
+                (float(cash), float(initial_balance), now),
+            )
+
+    def load_wallet(self) -> WalletRow | None:
+        """Return the persisted shared wallet, or ``None`` when never written.
+
+        ``None`` is the signal the engine uses to initialise the wallet from the
+        configuration (the configured platform initial balance, or the sum of the
+        profile allocations) -- it is never confused with a wallet of ``0.0``.
+
+        Raises
+        ------
+        StateStoreError
+            If the stored ``updated_at`` is not a valid timestamp.
+        """
+        row = self._fetchone(
+            "load_wallet",
+            "SELECT cash, initial_balance, updated_at FROM wallet WHERE wallet_id = 1",
+        )
+        if row is None:
+            return None
+        return WalletRow(
+            cash=float(row["cash"]),
+            initial_balance=float(row["initial_balance"]),
+            updated_at=_parse_timestamp(row["updated_at"], operation="load_wallet", key="wallet"),
+        )
 
     # -- orders -------------------------------------------------------------
 

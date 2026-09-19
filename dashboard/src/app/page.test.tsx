@@ -14,7 +14,14 @@ vi.mock('@/lib/api', async (importOriginal) => {
 });
 
 import { ApiError, fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
-import type { HealthPayload, KillSwitchPayload, ProfilesPayload, ProfileSnapshot } from '@/lib/types';
+import { EMPTY_PLACEHOLDER } from '@/lib/format';
+import type {
+  HealthPayload,
+  KillSwitchPayload,
+  ProfilesPayload,
+  ProfileSnapshot,
+  WalletSnapshot,
+} from '@/lib/types';
 
 import OverviewPage from './page';
 
@@ -70,6 +77,20 @@ const profile: ProfileSnapshot = {
 const profiles: ProfilesPayload = {
   profiles: [profile],
   generated_at: '2024-01-01T00:00:00+00:00',
+  wallet: {
+    name: 'usdt',
+    mode: 'paper',
+    initial_balance: 25000,
+    cash: 21500,
+    equity: 25750,
+    deployed: 4500,
+    realized_pnl: 1000,
+    unrealized_pnl: -250,
+    total_exposure: 4700,
+    profiles: 1,
+    source: 'local',
+    updated_at: '2024-01-01T00:00:00+00:00',
+  } satisfies WalletSnapshot,
 };
 
 beforeEach(() => {
@@ -112,7 +133,10 @@ describe('OverviewPage', () => {
     // Numbers, signed return and counters.
     expect(screen.getByText('$10,450.50')).toBeInTheDocument();
     expect(screen.getByText('+4.50%')).toBeInTheDocument();
-    expect(screen.getByText('Up')).toBeInTheDocument();
+    // Every direction on the page carries the same explicit text label: the
+    // profile return and the wallet P&L of the shared ledger both read "Up".
+    expect(screen.getAllByText('Up').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('Down')).toBeInTheDocument();
     expect(screen.getByText('12')).toBeInTheDocument();
 
     // Mode and status are rendered as text, never as colour alone.
@@ -127,6 +151,53 @@ describe('OverviewPage', () => {
 
     // The live region starts on the server-rendered stamp.
     expect(screen.getByText(/checked at/i)).toHaveTextContent('2024-01-01 00:00:00 UTC');
+  });
+
+  it('server-renders the shared platform wallet of the profiles payload', async () => {
+    render(await OverviewPage());
+
+    // Exactly one panel: the shared ledger is rendered once, from the wallet of
+    // the server-rendered payload — the browser issues no request for it.
+    const panels = screen.getAllByRole('region', { name: 'Platform wallet' });
+    expect(panels).toHaveLength(1);
+
+    const tiles = screen.getByTestId('wallet-tiles');
+    expect(within(tiles).getByText('$21,500.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('$25,750.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('+$1,000.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('-$250.00')).toBeInTheDocument();
+
+    // The panel says what the wallet is, and where the cash lives.
+    expect(
+      screen.getByText(/one shared usdt wallet funds every order of every profile/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Local ledger')).toBeInTheDocument();
+    expect(screen.getByText('Paper mode')).toBeInTheDocument();
+
+    // The profile figures stay on screen: they are the attributed share.
+    expect(screen.getByText('$10,450.50')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
+    expect(fetchHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders the em dash state when the payload carries no wallet key', async () => {
+    // An older monitoring server: `profiles.wallet` is absent, not null.
+    vi.mocked(fetchProfiles).mockResolvedValue({
+      profiles: [profile],
+      generated_at: '2024-01-01T00:00:00+00:00',
+    });
+
+    render(await OverviewPage());
+
+    // The panel is not blank and the page does not crash: it shows the em dash
+    // state of every wallet value, with a note saying why.
+    expect(screen.getByRole('region', { name: 'Platform wallet' })).toBeInTheDocument();
+    expect(screen.getByText('No shared wallet reported')).toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getAllByText(EMPTY_PLACEHOLDER)).toHaveLength(
+      8,
+    );
+    expect(screen.getByText('$10,450.50')).toBeInTheDocument();
+    expect(screen.queryByText('NaN')).not.toBeInTheDocument();
   });
 
   it('fetches the first paint from API_ORIGIN only once, before any browser request', async () => {
@@ -174,10 +245,12 @@ describe('OverviewPage', () => {
     expect(screen.getByText(/API_ORIGIN/)).toBeInTheDocument();
     expect(screen.getByText(new RegExp(API_ORIGIN))).toBeInTheDocument();
 
-    // No live region, no toolbar: nothing polls an API that is down.
+    // No live region, no toolbar: nothing polls an API that is down. The shared
+    // wallet panel is absent too — there is no payload to render it from.
     expect(screen.queryByText(/checked at/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /live updates/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { level: 2, name: 'Profiles' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Platform wallet' })).not.toBeInTheDocument();
 
     expect(fetchHealth).toHaveBeenCalledTimes(1);
     expect(fetchProfiles).toHaveBeenCalledTimes(1);

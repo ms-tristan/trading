@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -40,6 +41,7 @@ __all__ = [
     "RiskLimitsConfig",
     "StrategyConfig",
     "ValidationConfig",
+    "resolve_platform_initial_balance",
 ]
 
 #: Types accepted in a strategy parameter grid.
@@ -219,6 +221,13 @@ class ProfileConfig(BaseModel):
     into a loud :class:`~trading_platform.core.errors.ConfigError` instead of a
     silently ignored key.  Secrets are resolved from the environment only (see
     ``trading_platform.realtime.credentials``).
+
+    ``allocation`` is the profile's share of the one shared platform wallet: the
+    figure its per-profile risk limits are measured against and the figure its
+    reporting is attributed to.  It is *optional and additive*: when it is absent
+    (``None``) the profile's own ``initial_balance`` **is** its allocation, so
+    every configuration written before the shared wallet existed keeps its exact
+    previous behaviour.
     """
 
     model_config = {"extra": "forbid"}
@@ -230,12 +239,23 @@ class ProfileConfig(BaseModel):
     params: dict[str, ParamValue] = Field(default_factory=dict)
     mode: Literal["paper", "live"] = "paper"
     initial_balance: float = Field(default=DEFAULT_INITIAL_BALANCE, gt=0)
+    allocation: float | None = Field(default=None, gt=0)
     stake_amount: float | None = Field(default=None, gt=0)
     exchange: str = "binance"
     enabled: bool = True
     warmup_candles: int = Field(default=200, ge=1)
     poll_interval_seconds: float = Field(default=5.0, gt=0)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
+
+    @property
+    def effective_allocation(self) -> float:
+        """Return this profile's share of the shared wallet.
+
+        ``allocation`` when it is configured, otherwise ``initial_balance``: the
+        fallback is what keeps a configuration written before the shared wallet
+        existed strictly equivalent to the new model.
+        """
+        return float(self.initial_balance if self.allocation is None else self.allocation)
 
     @field_validator("id")
     @classmethod
@@ -264,7 +284,17 @@ class ProfileConfig(BaseModel):
 
 
 class RealtimeConfig(BaseModel):
-    """Engine settings shared by every profile of a realtime run."""
+    """Engine settings shared by every profile of a realtime run.
+
+    The three ``platform_*`` fields are the platform-wide wallet and risk caps:
+    ``platform_initial_balance`` seeds the one shared USDT wallet when the store
+    remembers nothing, while ``platform_max_total_notional`` and
+    ``platform_max_daily_loss`` cap the exposure and the daily loss aggregated
+    over *every* profile.  All three are optional and additive -- an absent cap
+    means "not enforced", and an absent initial balance means the wallet starts
+    at the sum of the profiles' effective allocations (see
+    :func:`resolve_platform_initial_balance`).
+    """
 
     model_config = {"extra": "forbid"}
 
@@ -287,6 +317,38 @@ class RealtimeConfig(BaseModel):
         "buy_and_hold"
     )
     kill_switch_file: Path | None = None
+    platform_initial_balance: float | None = Field(default=None, gt=0)
+    platform_max_total_notional: float | None = Field(default=None, gt=0)
+    platform_max_daily_loss: float | None = Field(default=None, gt=0)
+
+
+def resolve_platform_initial_balance(
+    realtime: RealtimeConfig, profiles: Sequence[ProfileConfig]
+) -> float:
+    """Return the cash the one shared platform wallet starts with.
+
+    ``realtime.platform_initial_balance`` when it is configured, otherwise the sum
+    of the profiles' :attr:`ProfileConfig.effective_allocation` -- which is the
+    documented backward-compatible fallback: a configuration that predates the
+    shared wallet funds it with exactly the balances the profiles declared, so the
+    platform's total cash is unchanged.  An empty ``profiles`` sequence therefore
+    resolves to ``0.0``.
+
+    Parameters
+    ----------
+    realtime:
+        The realtime section of the configuration document.
+    profiles:
+        Every profile of the run (an empty sequence is accepted).
+
+    Returns
+    -------
+    float
+        The starting cash of the shared wallet, in USDT.
+    """
+    if realtime.platform_initial_balance is not None:
+        return float(realtime.platform_initial_balance)
+    return float(sum(profile.effective_allocation for profile in profiles))
 
 
 class MonitoringConfig(BaseModel):

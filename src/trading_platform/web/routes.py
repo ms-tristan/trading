@@ -36,6 +36,15 @@ The orchestrator class is deliberately **never** imported here: the CLI can
 therefore serve the persisted state (``realtime serve``) without an engine, and
 a test can serve a local fake.
 
+Shared wallet (additive)
+------------------------
+``GET /api/health`` and ``GET /api/profiles`` carry one extra key, ``wallet``:
+the platform-wide view of the **one** shared USDT wallet every profile funds its
+orders from (``null`` when the provider reports none).  Nothing else changes:
+every pre-existing key keeps its name and its type, and the per-profile payloads
+gain the *attributed* figures (``allocation``, ``deployed``, ``realized_pnl``,
+``unrealized_pnl`` and ``last_block_reason``) beside the ones they already had.
+
 Profile lifecycle
 -----------------
 The four lifecycle routes require the operator token and are refused with the
@@ -657,11 +666,17 @@ class Router:
             return _json_response(200, self._health_payload())
         if route == "profiles":
             snapshot = self._provider.snapshot()
+            # The shared wallet view is **additive**: a snapshot carrying no wallet
+            # (a provider whose store holds no wallet row yet) -- or a provider
+            # whose snapshot predates the wallet and carries no ``wallet`` attribute
+            # at all -- is rendered as an explicit ``null`` instead of a missing key.
+            wallet = getattr(snapshot, "wallet", None)
             return _json_response(
                 200,
                 {
                     "profiles": [profile.to_dict() for profile in snapshot.profiles],
                     "generated_at": _iso(snapshot.generated_at),
+                    "wallet": None if wallet is None else _snapshot_payload(wallet),
                 },
             )
         if route == "profile":
@@ -965,6 +980,13 @@ class Router:
         counts, uptime), and ``version``/``checked_at`` come from the router
         configuration and the clock seam.  ``status`` is exactly ``'ok'`` or
         ``'degraded'`` -- degraded as soon as the kill switch is engaged.
+
+        ``wallet`` is the shared platform wallet the reporting layer published
+        (the very same object the orchestrator's ``health()`` body carries, and the
+        persisted ledger for the read-only surface of ``realtime serve``).  A
+        provider that reports no wallet answers ``null``: the key is always
+        present, so a consumer never has to guess whether the wallet is missing
+        or simply empty.
         """
         raw = self._provider.health()
         reported: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
@@ -992,6 +1014,7 @@ class Router:
             "profiles_running": int(profiles_running),
             "kill_switch": kill_switch,
             "checked_at": _iso(self._clock.now()),
+            "wallet": _snapshot_payload(reported.get("wallet")),
         }
 
     # -- kill switch --------------------------------------------------------

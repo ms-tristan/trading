@@ -31,6 +31,7 @@ from trading_platform.config.models import (
     ProfileConfig,
     RealtimeConfig,
     RiskLimitsConfig,
+    resolve_platform_initial_balance,
 )
 from trading_platform.core.errors import ConfigError, MarketStreamError, ProfileError
 from trading_platform.core.models import Direction
@@ -58,6 +59,7 @@ from trading_platform.realtime.orchestrator import (
     make_risk_manager,
 )
 from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.realtime.wallet import PlatformWallet
 from trading_platform.strategy.base import Strategy, StrategyParams, ensure_signal_frame
 
 TIMEOUT = 30.0
@@ -90,7 +92,7 @@ START = pd.Timestamp("2024-01-01T00:00:00Z")
 SYMBOL_BTC = "BTC/USDT"
 SYMBOL_ETH = "ETH/USDT"
 
-#: The exact key set of the ``/api/health`` body.
+#: The exact key set of the ``/api/health`` body (the shared wallet view included).
 HEALTH_KEYS = frozenset(
     {
         "status",
@@ -100,6 +102,7 @@ HEALTH_KEYS = frozenset(
         "profiles_running",
         "kill_switch",
         "checked_at",
+        "wallet",
     }
 )
 
@@ -276,14 +279,33 @@ def build_orchestrator(
     realtime: RealtimeConfig | None = None,
     environ: dict[str, str] | None = None,
     version: str = "0.1.0-test",
+    wallet: PlatformWallet | None = None,
 ) -> tuple[RealtimeOrchestrator, SqliteStateStore, ManualClock, list[FakeStream]]:
-    """Build an orchestrator wired with fake streams and paper venues."""
+    """Build an orchestrator wired with fake streams and paper venues.
+
+    The venues share **one** :class:`PlatformWallet` built exactly like the
+    orchestrator builds its own -- the platform initial balance, or the sum of the
+    profiles' allocations -- because that is what the production wiring does: every
+    simulated profile spends the same USDT ledger.  An explicit ``wallet`` is used
+    as-is, which is how a test pins one identity across the whole platform.
+    """
     resolved_clock = (
         ParkingClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)) if clock is None else clock
     )
     resolved_store = (
         SqliteStateStore(tmp_path / "state.db", clock=resolved_clock) if store is None else store
     )
+    resolved_realtime = realtime_config(tmp_path) if realtime is None else realtime
+    shared = wallet
+    if shared is None:
+        live = any(str(item.mode) == RunMode.LIVE.value for item in profiles if item.enabled)
+        shared = PlatformWallet(
+            initial_balance=resolve_platform_initial_balance(resolved_realtime, profiles),
+            mode=RunMode.LIVE if live else RunMode.PAPER,
+            store=resolved_store,
+            clock=resolved_clock,
+            name="platform",
+        )
     streams: list[FakeStream] = []
 
     def factory(target: ProfileConfig) -> FakeStream:
@@ -293,19 +315,23 @@ def build_orchestrator(
 
     def venues(target: ProfileConfig) -> PaperBroker:
         return PaperBroker(
-            clock=resolved_clock, initial_balance=float(target.initial_balance), seed=7
+            clock=resolved_clock,
+            initial_balance=float(target.initial_balance),
+            seed=7,
+            wallet=shared if shared.is_authoritative else None,
         )
 
     orchestrator = RealtimeOrchestrator(
         profiles=profiles,
         store=resolved_store,
         clock=resolved_clock,
-        realtime=realtime_config(tmp_path) if realtime is None else realtime,
+        realtime=resolved_realtime,
         monitoring=MonitoringConfig(port=0),
         stream_factory=factory if stream_factory is None else stream_factory,
         broker_factory=venues if broker_factory is None else broker_factory,
         environ={} if environ is None else environ,
         version=version,
+        wallet=shared,
     )
     return orchestrator, resolved_store, resolved_clock, streams
 
@@ -686,6 +712,356 @@ def test_a_read_model_that_cannot_read_reports_a_stopped_profile(tmp_path: Path)
 
 
 # ---------------------------------------------------------------------------
+# 12b. the one shared platform wallet
+# ---------------------------------------------------------------------------
+
+
+class CountingWallet(PlatformWallet):
+    """A shared wallet that counts how many times the boot restored it."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.restores: list[float | None] = []
+
+    def restore(self) -> float | None:
+        """Restore as usual, remembering what the durable state answered."""
+        result = super().restore()
+        self.restores.append(result)
+        return result
+
+
+class LiveVenueBroker:
+    """Offline stand-in for a live venue: it reports a balance and nothing else.
+
+    It exists so the live half of the wallet wiring is exercised without a network
+    call, a credential or a fixed port: no order is ever accepted here.
+    """
+
+    def __init__(
+        self, *, balance: float | None = 640.0, error: BaseException | None = None
+    ) -> None:
+        self.balance_value = balance
+        self.error = error
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        return "fake-live"
+
+    @property
+    def mode(self) -> RunMode:
+        return RunMode.LIVE
+
+    def fetch_balance(self) -> float | None:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.balance_value
+
+    def submit(self, request: Any, *, reference_price: float) -> Any:
+        raise AssertionError("no order may reach the venue in these tests")
+
+    def cancel(self, client_order_id: str) -> bool:
+        return False
+
+    def poll(self) -> list[Any]:
+        return []
+
+    def open_orders(self) -> list[Any]:
+        return []
+
+    def reconcile(self, expected: Any = ()) -> ReconciliationReport:
+        return ReconciliationReport(
+            profile_id="", ok=True, checked_at=START, matched=len(list(expected))
+        )
+
+
+def test_every_profile_funds_its_orders_from_the_one_wallet(tmp_path: Path) -> None:
+    """The production venue factory hands *the same* wallet to every paper profile."""
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    clock = ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC))
+    streams: list[FakeStream] = []
+
+    def factory(target: ProfileConfig) -> FakeStream:
+        stream = FakeStream(str(target.symbol))
+        streams.append(stream)
+        return stream
+
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    orchestrator = RealtimeOrchestrator(
+        profiles=profiles,
+        store=store,
+        clock=clock,
+        realtime=realtime_config(tmp_path),
+        monitoring=MonitoringConfig(port=0),
+        stream_factory=factory,
+        version="wallet-test",
+    )
+    wallet = orchestrator.wallet
+    assert orchestrator.wallet is wallet, "the wallet is built once per orchestrator"
+    assert wallet.name == "platform"
+    assert wallet.mode is RunMode.PAPER
+    assert wallet.initial_balance == pytest.approx(2000.0), "the sum of the allocations"
+
+    run(orchestrator.run_once())
+    first = orchestrator.runner("btc-paper").gateway.broker  # type: ignore[union-attr]
+    second = orchestrator.runner("eth-paper").gateway.broker  # type: ignore[union-attr]
+    assert first is not second, "one venue per profile"
+    assert first.wallet is wallet
+    assert second.wallet is wallet
+    store.close()
+
+
+def test_the_shared_wallet_is_restored_once_from_the_durable_state(
+    tmp_path: Path, logs: Any
+) -> None:
+    """A restart adopts the persisted ledger; the boot restores it exactly once."""
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    clock = ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC))
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    store.initialize()
+    store.save_wallet(cash=777.5, initial_balance=2000.0)
+    wallet = CountingWallet(store=store, clock=clock, initial_balance=2000.0, name="platform")
+    orchestrator, _store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, clock=clock, store=store, wallet=wallet
+    )
+
+    async def scenario() -> PlatformWallet:
+        await orchestrator.run_once()
+        await orchestrator.run_once()
+        return orchestrator.wallet
+
+    assert run(scenario()) is wallet
+    assert wallet.restores == [777.5], "the persisted cash, adopted exactly once"
+    assert wallet.initial_balance == pytest.approx(2000.0)
+    restored_events = [
+        record
+        for record in logs
+        if getattr(record, "event", "") == "platform_wallet_restored"
+        and record.context.get("restored") is True
+    ]
+    assert len(restored_events) == 1
+    assert restored_events[0].context["cash"] == pytest.approx(777.5)
+    assert restored_events[0].context["mode"] == "paper"
+    store.close()
+
+
+def test_a_platform_without_a_persisted_wallet_starts_from_the_configuration(
+    tmp_path: Path, logs: Any
+) -> None:
+    """No persisted row: the wallet starts at the sum of the allocations and says so."""
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    clock = ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC))
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    wallet = CountingWallet(store=store, clock=clock, initial_balance=2000.0, name="platform")
+    orchestrator, _store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, clock=clock, store=store, wallet=wallet
+    )
+
+    run(orchestrator.run_once())
+
+    assert wallet.restores == [None]
+    assert store.load_wallet() is not None, "the first row is written for the next boot"
+    assert store.load_wallet().cash == pytest.approx(wallet.cash)  # type: ignore[union-attr]
+    restored_events = [
+        record
+        for record in logs
+        if getattr(record, "event", "") == "platform_wallet_restored"
+        and record.context.get("restored") is False
+    ]
+    assert len(restored_events) == 1
+    store.close()
+
+
+def test_the_orchestrator_builds_its_wallet_from_the_platform_configuration(
+    tmp_path: Path,
+) -> None:
+    """``realtime.platform_initial_balance`` wins over the sum of the allocations."""
+    profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        realtime=realtime_config(tmp_path, platform_initial_balance=2500.0),
+    )
+    assert orchestrator.wallet.initial_balance == pytest.approx(2500.0)
+    assert orchestrator.wallet.cash == pytest.approx(2500.0)
+    store.close()
+
+
+def test_the_snapshot_and_health_expose_the_shared_wallet_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The platform payload carries the wallet, aggregated from the profile figures."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [
+        profile("btc-paper", SYMBOL_BTC, stake_amount=250.0),
+        profile("eth-paper", SYMBOL_ETH, stake_amount=250.0),
+    ]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+
+    async def scenario() -> PlatformSnapshot:
+        await orchestrator.run_once()
+        return orchestrator.snapshot()
+
+    snapshot = run(scenario())
+    wallet = snapshot.wallet
+    assert wallet is not None
+    assert wallet.name == "platform"
+    assert wallet.source == "local"
+    assert wallet.profiles == 2
+    assert wallet.initial_balance == pytest.approx(2000.0)
+    assert [item.open_positions for item in snapshot.profiles] == [1, 1]
+    assert wallet.deployed == pytest.approx(sum(item.deployed for item in snapshot.profiles))
+    assert wallet.realized_pnl == pytest.approx(
+        sum(item.realized_pnl for item in snapshot.profiles)
+    )
+    assert wallet.unrealized_pnl == pytest.approx(
+        sum(item.unrealized_pnl for item in snapshot.profiles)
+    )
+    assert wallet.total_exposure == pytest.approx(
+        sum(abs(item.position_value) for item in snapshot.profiles)
+    )
+    assert wallet.equity == pytest.approx(
+        wallet.cash + sum(item.position_value for item in snapshot.profiles)
+    )
+    # the documented deviation: the entry fees of the still-open positions are not
+    # attributed to any profile yet, so the ledger holds exactly that much less
+    fees = sum(item.deployed for item in snapshot.profiles) * 0.001
+    assert wallet.cash == pytest.approx(
+        2000.0 - sum(item.deployed for item in snapshot.profiles) - fees
+    )
+    assert sum(item.cash for item in snapshot.profiles) - wallet.cash == pytest.approx(fees)
+
+    payload = snapshot.to_dict()
+    assert payload["wallet"] == wallet.to_dict()
+    assert payload["wallet"]["cash"] == pytest.approx(wallet.cash)
+    health = orchestrator.health()
+    assert set(health) == HEALTH_KEYS
+    assert health["wallet"] == payload["wallet"]
+    assert json.dumps(health, allow_nan=False)
+    store.close()
+
+
+def test_the_platform_risk_state_is_fed_by_every_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The platform cap reads what the *other* profile published, through one state."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [
+        profile("btc-paper", SYMBOL_BTC, stake_amount=250.0),
+        profile("eth-paper", SYMBOL_ETH, stake_amount=250.0),
+    ]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, realtime=realtime_config(tmp_path, platform_max_total_notional=300.0)
+    )
+
+    async def scenario() -> list[Any]:
+        return await orchestrator.run_once()
+
+    decisions = run(scenario())
+    by_profile = {decision.profile_id: decision for decision in decisions}
+    assert by_profile["btc-paper"].blocked is False
+    # eth-paper sees btc-paper's published exposure and is refused by the platform cap
+    assert by_profile["eth-paper"].blocked is True
+    assert "platform_max_total_notional" in by_profile["eth-paper"].block_reason
+    assert orchestrator.runner("eth-paper").last_block_reason == (  # type: ignore[union-attr]
+        by_profile["eth-paper"].block_reason
+    )
+    assert len(store.list_positions("eth-paper")) == 0
+    store.close()
+
+
+def test_a_deleted_profile_is_forgotten_by_the_platform_risk_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A removed profile must stop contributing to the platform-wide exposure."""
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [
+        profile("btc-paper", SYMBOL_BTC, stake_amount=250.0),
+        profile("eth-paper", SYMBOL_ETH, stake_amount=250.0),
+    ]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, realtime=realtime_config(tmp_path, platform_max_total_notional=300.0)
+    )
+    path = write_profiles(tmp_path / "profiles.json", profiles)
+
+    async def scenario() -> Any:
+        first = await orchestrator.run_once()
+        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        after = await orchestrator.run_once()
+        return first, removed, after
+
+    first, removed, after = run(scenario())
+    by_profile = {decision.profile_id: decision for decision in first}
+    assert by_profile["eth-paper"].blocked is True, "the platform cap is shared"
+    assert removed == "btc-paper"
+    # the deleted profile's exposure is gone from the aggregation: the same order
+    # that was refused a moment ago now fits under the cap
+    assert [decision.profile_id for decision in after] == ["eth-paper"]
+    assert after[0].blocked is False
+    assert len(store.list_positions("eth-paper")) == 1
+    store.close()
+
+
+def test_a_live_platform_mirrors_the_venue_balance_into_a_read_only_wallet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In live mode the wallet *is* the venue account: mirrored, never debited."""
+    flag: dict[str, Any] = {"mode": "hold"}
+    scripted(monkeypatch, flag)
+    venues = [LiveVenueBroker(balance=640.0)]
+    profiles = [profile("btc-live", SYMBOL_BTC, mode="live")]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        broker_factory=lambda target: venues[0],
+        environ={"TB_ALLOW_LIVE_TRADING": "I_UNDERSTAND_THE_RISK"},
+    )
+
+    run(orchestrator.run_once())
+
+    wallet = orchestrator.wallet
+    assert wallet.mode is RunMode.LIVE
+    assert wallet.is_authoritative is False
+    assert wallet.spendable() == pytest.approx(640.0), "the venue account is the truth"
+    assert wallet.cash == pytest.approx(1000.0), "the local ledger is never moved"
+    assert venues[0].calls == 1, "exactly one best-effort reading at boot"
+    snapshot = orchestrator.snapshot()
+    assert snapshot.wallet is not None
+    assert snapshot.wallet.source == "venue"
+    assert snapshot.wallet.cash == pytest.approx(1000.0)
+    store.close()
+
+
+def test_a_live_wallet_sync_failure_is_logged_and_never_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, logs: Any
+) -> None:
+    """An unreachable venue is reported, and the platform still starts."""
+    from trading_platform.core.errors import BrokerUnavailableError
+
+    flag: dict[str, Any] = {"mode": "hold"}
+    scripted(monkeypatch, flag)
+    venues = [LiveVenueBroker(error=BrokerUnavailableError("venue unreachable"))]
+    profiles = [profile("btc-live", SYMBOL_BTC, mode="live")]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        broker_factory=lambda target: venues[0],
+        environ={"TB_ALLOW_LIVE_TRADING": "I_UNDERSTAND_THE_RISK"},
+    )
+
+    run(orchestrator.run_once())
+
+    assert "platform_wallet_venue_sync_failed" in events(logs)
+    # the fallback is the configured initial balance, never an invented 0.0
+    assert orchestrator.wallet.spendable() == pytest.approx(1000.0)
+    store.close()
+
+
+# ---------------------------------------------------------------------------
 # 13. the constructor and the wiring refuse the impossible
 # ---------------------------------------------------------------------------
 
@@ -745,6 +1121,59 @@ def test_default_broker_factory_builds_a_paper_venue(tmp_path: Path) -> None:
     assert type(first) is type(second)
     assert first.name == second.name
     assert "PaperBroker" in repr(first)
+
+
+def test_default_broker_factory_passes_the_shared_wallet_to_a_paper_venue() -> None:
+    """A paper venue spends the injected ledger; without one it keeps its own."""
+    clock = ManualClock()
+    target = profile("btc-paper", SYMBOL_BTC)
+    wallet = PlatformWallet(initial_balance=2000.0, name="platform")
+    shared = default_broker_factory(target, clock=clock, environ={}, wallet=wallet)
+    private = default_broker_factory(target, clock=clock, environ={})
+    assert shared.wallet is wallet
+    assert private.wallet is not wallet
+    assert private.wallet.name == "paper-wallet"
+    assert private.wallet.cash == pytest.approx(1000.0), "unchanged behaviour without a wallet"
+
+
+def test_default_broker_factory_ignores_the_wallet_for_a_live_profile() -> None:
+    """A live venue reports its own account: it is never handed a simulated ledger."""
+    target = profile("btc-live", SYMBOL_BTC, mode="live")
+    environ = {"TB_LIVE_API_KEY": "key-1234", "TB_LIVE_API_SECRET": "secret-5678"}
+    broker = default_broker_factory(
+        target,
+        clock=ManualClock(),
+        environ=environ,
+        wallet=PlatformWallet(initial_balance=2000.0),
+    )
+    assert type(broker).__name__ == "CcxtBroker"
+    assert not hasattr(broker, "wallet")
+
+
+def test_make_risk_manager_carries_the_platform_limits_wallet_and_state() -> None:
+    """The three platform seams reach the manager, and stay optional."""
+    from trading_platform.realtime.risk import PlatformRiskLimits, PlatformRiskState
+
+    clock = ManualClock()
+    wallet = PlatformWallet(initial_balance=2000.0)
+    aggregated = PlatformRiskState(clock=clock)
+    limits = PlatformRiskLimits(max_total_notional=500.0, max_daily_loss=100.0)
+    manager = make_risk_manager(
+        profile("btc-paper", SYMBOL_BTC),
+        clock=clock,
+        platform=limits,
+        wallet=wallet,
+        state=aggregated,
+    )
+
+    assert manager.platform_limits is limits
+    manager.publish_platform_state("btc-paper", exposure=120.0, daily_pnl=-5.0)
+    assert aggregated.total_exposure == pytest.approx(120.0)
+    assert aggregated.total_daily_pnl == pytest.approx(-5.0)
+    # the historical construction is untouched: no platform seam, no platform check
+    bare = make_risk_manager(profile("btc-paper", SYMBOL_BTC), clock=clock)
+    assert bare.platform_limits is None
+    bare.publish_platform_state("btc-paper", exposure=1.0, daily_pnl=1.0)
 
 
 def test_default_broker_factory_refuses_a_live_profile_without_credentials() -> None:
@@ -896,7 +1325,11 @@ def test_pause_profile_closes_the_entry_gate_and_keeps_the_exits(
     flag: dict[str, Any] = {"mode": "entry_long"}
     scripted(monkeypatch, flag)
     orchestrator, store, _clock, _streams = build_orchestrator(
-        tmp_path, [profile("btc-paper", SYMBOL_BTC)]
+        # An explicit stake, like every deployed profile: under the shared-wallet
+        # model a profile funds its orders from ONE ledger, so an order that spent
+        # the whole allocation could not pay the venue fee on top of it.
+        tmp_path,
+        [profile("btc-paper", SYMBOL_BTC, stake_amount=500.0)],
     )
 
     async def scenario() -> dict[str, Any]:
@@ -950,7 +1383,7 @@ def test_a_paused_profile_still_honours_the_stop_of_its_open_position(
     flag: dict[str, Any] = {"mode": "entry_long", "stop_loss": 101.5}
     scripted(monkeypatch, flag)
     orchestrator, store, _clock, _streams = build_orchestrator(
-        tmp_path, [profile("btc-paper", SYMBOL_BTC)]
+        tmp_path, [profile("btc-paper", SYMBOL_BTC, stake_amount=500.0)]
     )
 
     async def scenario() -> Any:
@@ -1160,17 +1593,20 @@ def test_delete_profile_keeps_everything_when_the_venue_refuses_the_flatten(
     flag: dict[str, Any] = {"mode": "entry_long"}
     scripted(monkeypatch, flag)
     profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    wallets: dict[str, PlatformWallet] = {}
 
     def venues(target: ProfileConfig) -> PaperBroker:
         return RefusingFlattenBroker(
             clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
             initial_balance=float(target.initial_balance),
             seed=7,
+            wallet=wallets["platform"],
         )
 
     orchestrator, store, _clock, _streams = build_orchestrator(
         tmp_path, profiles, broker_factory=venues
     )
+    wallets["platform"] = orchestrator.wallet
     path = write_profiles(tmp_path / "profiles.json", profiles)
     run(orchestrator.run_once())
     before = path.read_bytes()
@@ -1190,17 +1626,20 @@ def test_delete_profile_keeps_everything_when_the_position_stays_open(
     flag: dict[str, Any] = {"mode": "entry_long"}
     scripted(monkeypatch, flag)
     profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
+    wallets: dict[str, PlatformWallet] = {}
 
     def venues(target: ProfileConfig) -> PaperBroker:
         return SilentFlattenBroker(
             clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
             initial_balance=float(target.initial_balance),
             seed=7,
+            wallet=wallets["platform"],
         )
 
     orchestrator, store, _clock, _streams = build_orchestrator(
         tmp_path, profiles, broker_factory=venues
     )
+    wallets["platform"] = orchestrator.wallet
     path = write_profiles(tmp_path / "profiles.json", profiles)
     run(orchestrator.run_once())
     before = path.read_bytes()

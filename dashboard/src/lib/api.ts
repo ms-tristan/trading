@@ -39,6 +39,7 @@ import type {
   ProfilesPayload,
   ProfileSnapshot,
   TradesPayload,
+  WalletSnapshot,
 } from './types';
 
 /** Header carrying the operator token on the single mutating route. */
@@ -261,8 +262,68 @@ function isBoolean(value: unknown): boolean {
   return typeof value === 'boolean';
 }
 
+/**
+ * An optional number-or-null key: absent is accepted (an older server does not
+ * emit it), present must match the documented type.
+ */
+function isOptionalNumberOrNull(value: unknown): boolean {
+  return value === undefined || isNumberOrNull(value);
+}
+
+/** An optional string-or-null key, tolerated exactly like the numeric one. */
+function isOptionalStringOrNull(value: unknown): boolean {
+  return value === undefined || isStringOrNull(value);
+}
+
 function isArrayOf(value: unknown, item: (entry: unknown) => boolean): boolean {
   return Array.isArray(value) && value.every((entry) => item(entry));
+}
+
+/**
+ * The shared platform wallet of `GET /api/profiles` and `GET /api/health`.
+ *
+ * `source` is one of the two documented origins and `mode` one of the two run
+ * modes: anything else is not a wallet snapshot, so the body is refused as
+ * `'malformed'` instead of being rendered as a half-known wallet.
+ */
+export function isWalletSnapshot(value: unknown): value is WalletSnapshot {
+  return (
+    isRecord(value) &&
+    isString(value.name) &&
+    isRunMode(value.mode) &&
+    isNumberOrNull(value.initial_balance) &&
+    isNumberOrNull(value.cash) &&
+    isNumberOrNull(value.equity) &&
+    isNumberOrNull(value.deployed) &&
+    isNumberOrNull(value.realized_pnl) &&
+    isNumberOrNull(value.unrealized_pnl) &&
+    isNumberOrNull(value.total_exposure) &&
+    isNumber(value.profiles) &&
+    (value.source === 'local' || value.source === 'venue') &&
+    isStringOrNull(value.updated_at)
+  );
+}
+
+/**
+ * The optional `wallet` key of a payload: absent (`undefined`) and explicit
+ * `null` both mean "no wallet reported", anything else must be a wallet.
+ */
+function isOptionalWallet(value: unknown): boolean {
+  return value === undefined || value === null || isWalletSnapshot(value);
+}
+
+/**
+ * Default the shared-wallet key to `null` when the producer did not emit it.
+ *
+ * The guard tolerates the absence so that an older monitoring server stays a
+ * valid producer; this normalisation makes the absence explicit, so a consumer
+ * never has to tell `undefined` from `null`.
+ */
+function withWallet<T extends { wallet?: WalletSnapshot | null }>(payload: T): T {
+  if (payload.wallet !== undefined) {
+    return payload;
+  }
+  return { ...payload, wallet: null };
 }
 
 function isHealthPayload(value: unknown): boolean {
@@ -274,7 +335,8 @@ function isHealthPayload(value: unknown): boolean {
     isNumber(value.profiles_total) &&
     isNumber(value.profiles_running) &&
     isBoolean(value.kill_switch) &&
-    isStringOrNull(value.checked_at)
+    isStringOrNull(value.checked_at) &&
+    isOptionalWallet(value.wallet)
   );
 }
 
@@ -322,7 +384,15 @@ function isProfileSnapshot(value: unknown): value is ProfileSnapshot {
     isNumber(value.open_positions) &&
     isProfileHealth(value.health) &&
     isStringOrNull(value.started_at) &&
-    isStringOrNull(value.updated_at)
+    isStringOrNull(value.updated_at) &&
+    // The attributed breakdown of the shared wallet: validated only when the
+    // producer emits it, so a payload of an older server still validates and is
+    // still rendered (with the em dash placeholder where a value is absent).
+    isOptionalNumberOrNull(value.allocation) &&
+    isOptionalNumberOrNull(value.deployed) &&
+    isOptionalNumberOrNull(value.realized_pnl) &&
+    isOptionalNumberOrNull(value.unrealized_pnl) &&
+    isOptionalStringOrNull(value.last_block_reason)
   );
 }
 
@@ -330,7 +400,8 @@ function isProfilesPayload(value: unknown): boolean {
   return (
     isRecord(value) &&
     isArrayOf(value.profiles, isProfileSnapshot) &&
-    isStringOrNull(value.generated_at)
+    isStringOrNull(value.generated_at) &&
+    isOptionalWallet(value.wallet)
   );
 }
 
@@ -553,18 +624,18 @@ function expectShape<T>(
 // read routes
 // ---------------------------------------------------------------------------
 
-/** `GET /api/health` — platform status, version, uptime, kill switch. */
+/** `GET /api/health` — platform status, version, uptime, kill switch, wallet. */
 export async function fetchHealth(options: RequestOptions = {}): Promise<HealthPayload> {
   const path = '/api/health';
   const payload = await requestJson<unknown>(path, options);
-  return expectShape<HealthPayload>(payload, isHealthPayload, path);
+  return withWallet(expectShape<HealthPayload>(payload, isHealthPayload, path));
 }
 
-/** `GET /api/profiles` — every configured profile with its live snapshot. */
+/** `GET /api/profiles` — the shared wallet and every configured profile. */
 export async function fetchProfiles(options: RequestOptions = {}): Promise<ProfilesPayload> {
   const path = '/api/profiles';
   const payload = await requestJson<unknown>(path, options);
-  return expectShape<ProfilesPayload>(payload, isProfilesPayload, path);
+  return withWallet(expectShape<ProfilesPayload>(payload, isProfilesPayload, path));
 }
 
 /** `GET /api/profiles/{id}` — one profile. */

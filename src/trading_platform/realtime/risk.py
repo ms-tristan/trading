@@ -25,17 +25,21 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import pandas as pd
 
-from trading_platform.config.models import ProfileConfig, RiskLimitsConfig
+from trading_platform.config.models import ProfileConfig, RealtimeConfig, RiskLimitsConfig
 from trading_platform.core.errors import KillSwitchActiveError, LiveTradingForbiddenError
 from trading_platform.realtime.clock import Clock
 from trading_platform.realtime.models import OrderRequest
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import graph acyclic
+    from trading_platform.realtime.wallet import PlatformWallet
 
 __all__ = [
     "ENV_KILL_SWITCH",
@@ -46,6 +50,8 @@ __all__ = [
     "KillSwitchState",
     "LiveTradingGate",
     "MetaStore",
+    "PlatformRiskLimits",
+    "PlatformRiskState",
     "RiskDecision",
     "RiskLimits",
     "RiskManager",
@@ -144,6 +150,36 @@ class RiskLimits:
 
 
 @dataclass(frozen=True)
+class PlatformRiskLimits:
+    """The platform-wide limits shared by every profile, all optional.
+
+    They are enforced *in addition to* the per-profile :class:`RiskLimits`:
+    ``max_total_notional`` caps the exposure aggregated over every profile and
+    ``max_daily_loss`` caps the daily loss aggregated over every profile.  ``None``
+    means "not enforced", which is what an older configuration document produces --
+    and even then the shared-wallet funding check still applies.
+    """
+
+    max_total_notional: float | None = None
+    max_daily_loss: float | None = None
+
+    @classmethod
+    def from_config(cls, cfg: RealtimeConfig) -> PlatformRiskLimits:
+        """Build the platform limits from their validated configuration model."""
+        return cls(
+            max_total_notional=cfg.platform_max_total_notional,
+            max_daily_loss=cfg.platform_max_daily_loss,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable mapping (``None`` stays ``None``)."""
+        return {
+            "max_total_notional": self.max_total_notional,
+            "max_daily_loss": self.max_daily_loss,
+        }
+
+
+@dataclass(frozen=True)
 class RiskDecision:
     """The verdict of :meth:`RiskManager.check_order`.
 
@@ -170,31 +206,129 @@ class RiskDecision:
         return cls(allowed=False, reason=str(reason), limit=str(limit))
 
 
+class PlatformRiskState:
+    """Thread-safe aggregation of the per-profile exposure and daily P&L.
+
+    The profiles run in **separate threads** and publish their figures
+    independently, so every read and every write happens under one
+    :class:`threading.RLock` of this object: a reader can never observe a
+    half-written mapping and two profiles publishing at the same time can never
+    lose an update.
+
+    The aggregation only ever *reports* what the profiles published: it holds the
+    **last** value of each profile (a repeated ``update`` is idempotent, it never
+    accumulates a stale reading) and an unknown profile simply contributes
+    nothing.  No timestamp is published here -- ``daily_pnl`` is already the
+    current UTC day of the profile that reported it; the injected ``clock`` is the
+    time seam this module shares with the rest of the realtime layer, so nothing
+    here ever reads the wall clock.
+    """
+
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._profiles: dict[str, tuple[float, float]] = {}
+
+    def update(self, profile_id: str, *, exposure: float, daily_pnl: float) -> None:
+        """Record the latest figures of ``profile_id`` (replacing the previous ones)."""
+        key = str(profile_id)
+        entry = (float(exposure), float(daily_pnl))
+        with self._lock:
+            self._profiles[key] = entry
+
+    def forget(self, profile_id: str) -> None:
+        """Drop ``profile_id`` from the aggregation (no-op when unknown)."""
+        with self._lock:
+            self._profiles.pop(str(profile_id), None)
+
+    @property
+    def total_exposure(self) -> float:
+        """Return the exposure aggregated over every known profile (``0.0`` when empty)."""
+        with self._lock:
+            return float(sum(exposure for exposure, _ in self._profiles.values()))
+
+    @property
+    def total_daily_pnl(self) -> float:
+        """Return the daily P&L aggregated over every known profile (``0.0`` when empty)."""
+        with self._lock:
+            return float(sum(pnl for _, pnl in self._profiles.values()))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable view: the totals plus one entry per profile."""
+        with self._lock:
+            profiles = {
+                profile_id: {"exposure": exposure, "daily_pnl": daily_pnl}
+                for profile_id, (exposure, daily_pnl) in self._profiles.items()
+            }
+        return {
+            "total_exposure": float(sum(entry["exposure"] for entry in profiles.values())),
+            "total_daily_pnl": float(sum(entry["daily_pnl"] for entry in profiles.values())),
+            "profiles": profiles,
+        }
+
+
 class RiskManager:
-    """Enforce the per-profile limits before any order reaches the broker.
+    """Enforce the per-profile and platform limits before any order reaches the broker.
 
     The evaluation order is frozen and the **first** failure wins, so a rejection
-    reason is reproducible: ``kill_switch``, ``max_order_notional``,
-    ``max_position_notional``, ``max_open_positions``, ``max_daily_loss``,
-    ``max_drawdown_pct``, ``max_daily_trades``.
+    reason is reproducible: ``kill_switch``, ``platform_wallet``,
+    ``platform_max_total_notional``, ``platform_max_daily_loss``,
+    ``max_order_notional``, ``max_position_notional``, ``max_open_positions``,
+    ``max_daily_loss``, ``max_drawdown_pct``, ``max_daily_trades``.
+
+    The three platform seams are **injected**, never reached through a global:
+    ``platform`` carries the platform-wide caps, ``wallet`` is the one shared USDT
+    wallet every order is funded from and ``state`` is the aggregation of the
+    figures the profiles published.  With the three of them left at ``None`` the
+    evaluation is exactly the historical per-profile one -- which is what keeps
+    every configuration written before the shared wallet existed unchanged.
 
     Exits are never blocked by a *position* cap: when ``closes_position`` is
-    ``True`` the position-notional and open-position limits are skipped, while the
-    order-notional, daily-loss, drawdown and daily-trade limits still apply (a
-    runaway exit is still an order, and a blown risk budget must stop trading).
+    ``True`` the wallet funding check, the platform notional cap, the
+    position-notional and the open-position limits are skipped, while the
+    order-notional, daily-loss (per-profile and platform), drawdown and
+    daily-trade limits still apply (a runaway exit is still an order, and a blown
+    risk budget must stop trading).
     """
 
     def __init__(
-        self, limits: RiskLimits, *, clock: Clock, kill_switch: KillSwitch | None = None
+        self,
+        limits: RiskLimits,
+        *,
+        clock: Clock,
+        kill_switch: KillSwitch | None = None,
+        platform: PlatformRiskLimits | None = None,
+        wallet: PlatformWallet | None = None,
+        state: PlatformRiskState | None = None,
     ) -> None:
         self._limits = limits
         self._clock = clock
         self._kill_switch = kill_switch
+        self._platform = platform
+        self._wallet = wallet
+        self._state = state
 
     @property
     def limits(self) -> RiskLimits:
         """Return the immutable limits this manager enforces."""
         return self._limits
+
+    @property
+    def platform_limits(self) -> PlatformRiskLimits | None:
+        """Return the injected platform-wide limits, or ``None`` when absent."""
+        return self._platform
+
+    def publish_platform_state(self, profile_id: str, *, exposure: float, daily_pnl: float) -> None:
+        """Publish this profile's figures to the injected platform aggregation.
+
+        No-op when no :class:`PlatformRiskState` was injected and when no profile
+        identifier is given: publishing is an observability side channel and must
+        never make an order fail.
+        """
+        state = self._state
+        if state is None or not str(profile_id):
+            return
+        state.update(profile_id, exposure=exposure, daily_pnl=daily_pnl)
 
     def check_order(
         self,
@@ -210,6 +344,10 @@ class RiskManager:
         closes_position: bool = False,
     ) -> RiskDecision:
         """Evaluate every limit against one order request, first failure wins.
+
+        The platform-wide limits and the shared-wallet funding check read the
+        objects injected into this manager, so the signature below stays exactly
+        the per-profile one it has always been.
 
         Parameters
         ----------
@@ -285,6 +423,39 @@ class RiskManager:
             state = kill_switch.state()
             return RiskDecision.reject("kill_switch", f"global kill switch engaged: {state.reason}")
 
+        # The platform checks read the *injected* objects, so the signature of
+        # ``check_order`` stays exactly the per-profile one: an entry is funded
+        # from the one shared wallet and counts against the platform-wide budget.
+        platform = self._platform
+        if not closes_position:
+            wallet = self._wallet
+            if wallet is not None:
+                available = float(wallet.spendable())
+                if notional > available:
+                    return RiskDecision.reject(
+                        "platform_wallet",
+                        f"platform wallet cannot fund order: requires {notional:.2f} USDT, "
+                        f"available {available:.2f} USDT",
+                    )
+
+            if platform is not None and platform.max_total_notional is not None:
+                projected = self._platform_exposure() + notional
+                if projected > platform.max_total_notional:
+                    return RiskDecision.reject(
+                        "platform_max_total_notional",
+                        f"platform exposure {projected:.2f} exceeds "
+                        f"platform_max_total_notional {platform.max_total_notional:.2f}",
+                    )
+
+        if platform is not None and platform.max_daily_loss is not None:
+            total_daily_pnl = self._platform_daily_pnl()
+            if -total_daily_pnl > platform.max_daily_loss:
+                return RiskDecision.reject(
+                    "platform_max_daily_loss",
+                    f"platform daily loss {abs(total_daily_pnl):.2f} exceeds "
+                    f"platform_max_daily_loss {platform.max_daily_loss:.2f}",
+                )
+
         if limits.max_order_notional is not None and notional > limits.max_order_notional:
             return RiskDecision.reject(
                 "max_order_notional",
@@ -336,6 +507,18 @@ class RiskManager:
             )
 
         return RiskDecision.allow()
+
+    # -- platform seams ----------------------------------------------------
+
+    def _platform_exposure(self) -> float:
+        """Return the exposure aggregated over the profiles (``0.0`` when unknown)."""
+        state = self._state
+        return 0.0 if state is None else float(state.total_exposure)
+
+    def _platform_daily_pnl(self) -> float:
+        """Return the daily P&L aggregated over the profiles (``0.0`` when unknown)."""
+        state = self._state
+        return 0.0 if state is None else float(state.total_daily_pnl)
 
 
 # ---------------------------------------------------------------------------

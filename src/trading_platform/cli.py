@@ -1983,7 +1983,15 @@ class _PersistedSnapshotProvider:
         )
 
     def profile_snapshot(self, profile_id: str) -> Any:
-        """Return the persisted snapshot of one profile, or ``None`` when unknown."""
+        """Return the persisted snapshot of one profile, or ``None`` when unknown.
+
+        The money fields carry the **attributed** semantics of the shared platform
+        wallet: ``allocation`` is the profile's share of the one ledger (its own
+        ``initial_balance`` when the optional ``allocation`` key is absent), ``cash``
+        and ``equity`` are the attributed figures the engine persisted, ``deployed``
+        is the cost basis of the open positions and the two P&L figures are
+        attributed to this profile only.
+        """
         from trading_platform.realtime.models import ProfileSnapshot, ProfileStatus, RunMode
 
         specs = {str(profile.id): profile for profile in self._store.load_profiles()}
@@ -1995,10 +2003,16 @@ class _PersistedSnapshotProvider:
         trades = self.monitor.trades(profile_id)
         health = self.monitor.health(profile_id)
         last = equity[-1] if equity else None
+        allocation = float(spec.effective_allocation)
         initial = float(spec.initial_balance)
-        cash = float(last.cash) if last is not None else initial
+        cash = float(last.cash) if last is not None else allocation
         position_value = float(last.position_value) if last is not None else 0.0
-        equity_value = float(last.equity) if last is not None else initial
+        equity_value = float(last.equity) if last is not None else allocation
+        deployed = sum(
+            abs(float(position.quantity) * float(position.average_price)) for position in positions
+        )
+        realized_pnl = sum(float(trade.pnl) for trade in trades)
+        unrealized_pnl = position_value - deployed
         state = self._store.profile_state(profile_id)
         return ProfileSnapshot(
             profile_id=str(profile_id),
@@ -2011,12 +2025,16 @@ class _PersistedSnapshotProvider:
             equity=equity_value,
             cash=cash,
             position_value=position_value,
-            total_return=(equity_value / initial - 1.0) if initial else 0.0,
+            total_return=(equity_value / allocation - 1.0) if allocation else 0.0,
             n_trades=len(trades),
             open_positions=len(positions),
             health=health,
             started_at=None,
             updated_at=state.updated_at,
+            allocation=allocation,
+            deployed=deployed,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
         )
 
     def snapshot(self) -> Any:
@@ -2025,11 +2043,10 @@ class _PersistedSnapshotProvider:
 
         from trading_platform.realtime.models import PlatformSnapshot
 
+        specs = self._store.load_profiles()
         profiles = [
             item
-            for item in (
-                self.profile_snapshot(str(profile.id)) for profile in self._store.load_profiles()
-            )
+            for item in (self.profile_snapshot(str(profile.id)) for profile in specs)
             if item is not None
         ]
         state = self.kill_switch_state()
@@ -2042,11 +2059,54 @@ class _PersistedSnapshotProvider:
             version=__version__,
             started_at=None,
             uptime_seconds=0.0,
+            wallet=self._wallet_view(specs, profiles),
+        )
+
+    def _wallet_view(self, specs: Any, profiles: list[Any]) -> Any:
+        """Return the persisted shared wallet, or ``None`` when no row was written.
+
+        ``realtime serve`` runs no engine, but the wallet **is** persisted: the
+        read-only surface therefore reports the durable ledger -- its cash, its
+        initial balance, the equity of the whole platform and the attributed P&L
+        sums -- instead of a configured guess.  A store that never saw a wallet
+        answers ``None``, which the API renders as an explicit ``null``.
+        """
+        from trading_platform.realtime.models import RunMode
+        from trading_platform.realtime.wallet import WalletSnapshot
+
+        row = self._store.load_wallet()
+        if row is None:
+            return None
+        mode = (
+            RunMode.LIVE
+            if any(RunMode(str(spec.mode)) is RunMode.LIVE for spec in specs)
+            else RunMode.PAPER
+        )
+        positions_value = sum(float(item.position_value) for item in profiles)
+        return WalletSnapshot(
+            name="platform",
+            mode=mode,
+            initial_balance=float(row.initial_balance),
+            cash=float(row.cash),
+            equity=float(row.cash) + positions_value,
+            deployed=sum(float(item.deployed) for item in profiles),
+            realized_pnl=sum(float(item.realized_pnl) for item in profiles),
+            unrealized_pnl=sum(float(item.unrealized_pnl) for item in profiles),
+            total_exposure=sum(abs(float(item.position_value)) for item in profiles),
+            profiles=len(profiles),
+            source="local" if mode is RunMode.PAPER else "venue",
+            updated_at=row.updated_at,
         )
 
     def health(self) -> dict[str, Any]:
-        """Return the ``/api/health`` body of the persisted platform (no engine)."""
+        """Return the ``/api/health`` body of the persisted platform (no engine).
+
+        ``wallet`` is the persisted shared wallet (the very same object the
+        snapshot publishes); it is ``None`` only when the store holds no wallet row
+        yet, which the API renders as an explicit ``null``.
+        """
         snapshot = self.snapshot()
+        wallet = snapshot.wallet
         return {
             "status": "degraded" if snapshot.kill_switch else "ok",
             "version": snapshot.version,
@@ -2055,6 +2115,7 @@ class _PersistedSnapshotProvider:
             "profiles_running": 0,
             "kill_switch": snapshot.kill_switch,
             "checked_at": self._clock.now().isoformat(),
+            "wallet": None if wallet is None else wallet.to_dict(),
         }
 
     def candle_series(self, profile_id: str, limit: int) -> list[CandleRow]:

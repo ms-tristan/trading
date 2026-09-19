@@ -53,6 +53,7 @@ from trading_platform.realtime.models import (
 )
 from trading_platform.realtime.monitor import Monitor
 from trading_platform.realtime.store import CandleRow
+from trading_platform.realtime.wallet import PlatformWallet, WalletSnapshot
 from trading_platform.web import routes as web_routes
 from trading_platform.web.routes import (
     CANDLE_ROUTE_DEFAULT_LIMIT,
@@ -85,6 +86,34 @@ HEALTH_KEYS = [
     "status",
     "uptime_seconds",
     "version",
+    "wallet",
+]
+
+#: Exact keys of the shared-platform-wallet object (additive, §5 of the docs).
+WALLET_KEYS = sorted(
+    [
+        "cash",
+        "deployed",
+        "equity",
+        "initial_balance",
+        "mode",
+        "name",
+        "profiles",
+        "realized_pnl",
+        "source",
+        "total_exposure",
+        "unrealized_pnl",
+        "updated_at",
+    ]
+)
+
+#: Exact keys of the five attributed figures a ``ProfileSnapshot`` gained.
+ATTRIBUTED_PROFILE_KEYS = [
+    "allocation",
+    "deployed",
+    "last_block_reason",
+    "realized_pnl",
+    "unrealized_pnl",
 ]
 
 EQUITY_POINT_KEYS = ["cash", "equity", "position_value", "timestamp"]
@@ -93,7 +122,7 @@ TRADES_KEYS = ["count", "trades"]
 ORDERS_KEYS = ["orders"]
 POSITIONS_KEYS = ["positions"]
 METRICS_KEYS = ["benchmark", "generated_at", "metrics"]
-PROFILES_KEYS = ["generated_at", "profiles"]
+PROFILES_KEYS = ["generated_at", "profiles", "wallet"]
 PROFILE_KEYS = sorted(
     [
         "cash",
@@ -112,6 +141,7 @@ PROFILE_KEYS = sorted(
         "timeframe",
         "total_return",
         "updated_at",
+        *ATTRIBUTED_PROFILE_KEYS,
     ]
 )
 KILL_SWITCH_KEYS = ["changed_at", "kill_switch", "reason"]
@@ -261,6 +291,7 @@ class FakeProvider:
     """Local implementation of :class:`SnapshotProvider` (no orchestrator)."""
 
     profiles: tuple[ProfileSnapshot, ...] = ()
+    wallet: Any = None
     kill_switch: bool = False
     kill_switch_reason: str = ""
     kill_switch_changed_at: Any = None
@@ -292,10 +323,16 @@ class FakeProvider:
             kill_switch_reason=self.kill_switch_reason,
             version=self.version,
             uptime_seconds=self.uptime_seconds,
+            wallet=self.wallet,
         )
 
     def health(self) -> dict[str, Any]:
-        return dict(self.health_body)
+        body = dict(self.health_body)
+        if self.wallet is not None:
+            body.setdefault(
+                "wallet", self.wallet.to_dict() if hasattr(self.wallet, "to_dict") else self.wallet
+            )
+        return body
 
     def profile_snapshot(self, profile_id: str) -> ProfileSnapshot | None:
         for profile in self.profiles:
@@ -336,6 +373,31 @@ class FakeProvider:
             engaged=self.kill_switch,
             reason=self.kill_switch_reason,
             changed_at=self.kill_switch_changed_at,
+        )
+
+
+@dataclass(frozen=True)
+class LegacySnapshot:
+    """Platform snapshot of a provider written **before** the shared wallet existed.
+
+    It deliberately carries no ``wallet`` attribute at all, which is the shape the
+    router must survive: the additive key is then rendered ``null`` instead of
+    crashing the route or silently disappearing from the payload.
+    """
+
+    profiles: tuple[ProfileSnapshot, ...]
+    generated_at: Any
+    uptime_seconds: float = 42.5
+
+
+class LegacyProvider(FakeProvider):
+    """Provider whose platform snapshot predates the one shared wallet."""
+
+    def snapshot(self) -> Any:
+        return LegacySnapshot(
+            profiles=self.profiles,
+            generated_at=pd.Timestamp(START + timedelta(seconds=10)),
+            uptime_seconds=self.uptime_seconds,
         )
 
 
@@ -450,6 +512,12 @@ def make_profile_snapshot(
     mode: RunMode = RunMode.PAPER,
     status: ProfileStatus = ProfileStatus.RUNNING,
     equity: float = 10150.0,
+    cash: float = 5000.0,
+    allocation: float = 0.0,
+    deployed: float = 0.0,
+    realized_pnl: float = 0.0,
+    unrealized_pnl: float = 0.0,
+    last_block_reason: str | None = None,
 ) -> ProfileSnapshot:
     """Build a deterministic profile snapshot for one profile."""
     return ProfileSnapshot(
@@ -461,7 +529,7 @@ def make_profile_snapshot(
         status=status,
         initial_balance=10000.0,
         equity=equity,
-        cash=5000.0,
+        cash=cash,
         position_value=5150.0,
         total_return=0.015,
         n_trades=3,
@@ -469,7 +537,37 @@ def make_profile_snapshot(
         health=make_health(profile_id, status=status),
         started_at=pd.Timestamp(START),
         updated_at=pd.Timestamp(START + timedelta(hours=3)),
+        allocation=allocation,
+        deployed=deployed,
+        realized_pnl=realized_pnl,
+        unrealized_pnl=unrealized_pnl,
+        last_block_reason=last_block_reason,
     )
+
+
+def make_wallet_snapshot(**overrides: Any) -> WalletSnapshot:
+    """Build a deterministic view of the one shared platform wallet.
+
+    The default figures are internally consistent for a two-profile platform:
+    ``equity`` is ``cash + positions_value`` and the attributed sums of both
+    profiles add up to them.
+    """
+    fields: dict[str, Any] = {
+        "name": "platform",
+        "mode": RunMode.PAPER,
+        "initial_balance": 10000.0,
+        "cash": 7500.0,
+        "equity": 10250.0,
+        "deployed": 2500.0,
+        "realized_pnl": 100.0,
+        "unrealized_pnl": 150.0,
+        "total_exposure": 2650.0,
+        "profiles": 2,
+        "source": "local",
+        "updated_at": pd.Timestamp(START + timedelta(hours=3)),
+    }
+    fields.update(overrides)
+    return WalletSnapshot(**fields)
 
 
 def make_trade(entry: datetime) -> TradeRecord:
@@ -749,6 +847,144 @@ def test_health_falls_back_to_the_snapshot_for_a_partial_health_body(
     assert body["uptime_seconds"] == 42.5
 
 
+# ---------------------------------------------------------------------------
+# the shared platform wallet: additive, never a missing key
+# ---------------------------------------------------------------------------
+
+
+def test_health_payload_carries_the_shared_wallet_object(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """``GET /api/health`` renders the wallet view of the provider verbatim."""
+    wallet = make_wallet_snapshot()
+    provider.wallet = wallet
+    router = build_router(provider, monitor, manual_clock)
+
+    body = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(body) == HEALTH_KEYS
+    assert sorted(body["wallet"]) == WALLET_KEYS
+    assert body["wallet"] == wallet.to_dict()
+    assert body["wallet"]["name"] == "platform"
+    assert body["wallet"]["mode"] == "paper"
+    assert body["wallet"]["source"] == "local"
+    assert body["wallet"]["profiles"] == 2
+    assert body["wallet"]["initial_balance"] == 10000.0
+    assert body["wallet"]["cash"] == 7500.0
+    assert body["wallet"]["equity"] == 10250.0
+    assert body["wallet"]["deployed"] == 2500.0
+    assert body["wallet"]["realized_pnl"] == 100.0
+    assert body["wallet"]["unrealized_pnl"] == 150.0
+    assert body["wallet"]["total_exposure"] == 2650.0
+    assert body["wallet"]["updated_at"] == pd.Timestamp(START + timedelta(hours=3)).isoformat()
+
+
+def test_profiles_payload_carries_the_shared_wallet_object(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """``GET /api/profiles`` carries the very same wallet view, beside the profiles."""
+    wallet = make_wallet_snapshot(mode=RunMode.LIVE, source="venue", cash=1200.0)
+    provider.wallet = wallet
+    router = build_router(provider, monitor, manual_clock)
+
+    body = payload_of(router.handle("GET", "/api/profiles"))
+
+    assert sorted(body) == PROFILES_KEYS
+    assert sorted(body["wallet"]) == WALLET_KEYS
+    assert body["wallet"] == wallet.to_dict()
+    assert body["wallet"]["mode"] == "live"
+    assert body["wallet"]["source"] == "venue"
+    assert [item["profile_id"] for item in body["profiles"]] == [PROFILE_A, PROFILE_B]
+
+
+def test_health_renders_a_plain_wallet_mapping_as_is(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A provider handing a plain mapping (the CLI adapter) is rendered unchanged."""
+    payload = {"name": "platform", "mode": "live", "source": "venue", "cash": None}
+    provider.health_body = {
+        "status": "ok",
+        "profiles_total": 0,
+        "profiles_running": 0,
+        "uptime_seconds": 0.0,
+        "wallet": payload,
+    }
+    router = build_router(provider, monitor, manual_clock)
+
+    assert payload_of(router.handle("GET", "/api/health"))["wallet"] == payload
+
+
+def test_the_rendered_wallet_is_the_real_platform_wallet_view(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The wallet object of the payload is the real ``PlatformWallet`` snapshot.
+
+    The wallet is built with an injected clock and **no** store: it is an
+    in-memory ledger, so this test touches no SQLite file and no network.
+    """
+    wallet = PlatformWallet(initial_balance=10_000.0, clock=manual_clock)
+    wallet.restore_cash(7_500.0)
+    provider.wallet = wallet.snapshot(
+        positions_value=2_750.0,
+        deployed=2_500.0,
+        realized_pnl=100.0,
+        unrealized_pnl=150.0,
+        total_exposure=2_650.0,
+        profiles=2,
+    )
+    router = build_router(provider, monitor, manual_clock)
+
+    body = payload_of(router.handle("GET", "/api/health"))["wallet"]
+
+    assert sorted(body) == WALLET_KEYS
+    assert body["name"] == "platform"
+    assert body["mode"] == "paper"
+    assert body["initial_balance"] == 10_000.0
+    assert body["cash"] == 7_500.0
+    assert body["equity"] == 10_250.0
+    assert body["deployed"] == 2_500.0
+    assert body["realized_pnl"] == 100.0
+    assert body["unrealized_pnl"] == 150.0
+    assert body["total_exposure"] == 2_650.0
+    assert body["profiles"] == 2
+    assert body["source"] == "local"
+    assert body["updated_at"] == manual_clock.now().isoformat()
+
+
+def test_a_provider_without_a_wallet_answers_null_never_a_missing_key(
+    router: Router,
+) -> None:
+    """The wallet key is always present: an absent wallet is an explicit ``null``."""
+    health = payload_of(router.handle("GET", "/api/health"))
+    profiles = payload_of(router.handle("GET", "/api/profiles"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert health["wallet"] is None
+    assert sorted(profiles) == PROFILES_KEYS
+    assert profiles["wallet"] is None
+
+
+def test_a_legacy_snapshot_without_the_wallet_attribute_answers_null(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A provider written before the wallet existed has no ``wallet`` on its snapshot."""
+    legacy = LegacyProvider(profiles=provider.profiles, health_body={"status": "ok"})
+    router = build_router(legacy, monitor, manual_clock)
+
+    profiles = payload_of(router.handle("GET", "/api/profiles"))
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(profiles) == PROFILES_KEYS
+    assert profiles["wallet"] is None
+    assert [item["profile_id"] for item in profiles["profiles"]] == [PROFILE_A, PROFILE_B]
+    assert sorted(health) == HEALTH_KEYS
+    assert health["wallet"] is None
+    # ... and the counters still fall back to that legacy snapshot
+    assert health["profiles_total"] == 2
+    assert health["profiles_running"] == 1
+    assert health["uptime_seconds"] == 42.5
+
+
 def test_profiles_payload_has_exactly_the_documented_keys(router: Router) -> None:
     response = router.handle("GET", "/api/profiles")
     assert response.status == 200
@@ -776,11 +1012,13 @@ def test_empty_provider_still_answers_every_platform_route(
     assert payload_of(router.handle("GET", "/api/profiles")) == {
         "profiles": [],
         "generated_at": pd.Timestamp(START + timedelta(seconds=10)).isoformat(),
+        "wallet": None,
     }
     health = payload_of(router.handle("GET", "/api/health"))
     assert sorted(health) == HEALTH_KEYS
     assert health["profiles_total"] == 0
     assert health["profiles_running"] == 0
+    assert health["wallet"] is None
     assert payload_of(router.handle("GET", "/")) == {"error": "not found: /"}
     assert router.handle("GET", "/api/profiles/" + PROFILE_A).status == 404
 
@@ -796,6 +1034,106 @@ def test_profile_detail_matches_the_snapshot_payload(router: Router) -> None:
     body = payload_of(response)
     assert sorted(body) == PROFILE_KEYS
     assert body == make_profile_snapshot(PROFILE_A, "BTC/USDT").to_dict()
+    # ... and the five attributed keys are there, additively, on both routes.
+    for key in ATTRIBUTED_PROFILE_KEYS:
+        assert key in body
+
+
+def test_a_profile_carries_its_attributed_figures(
+    monitor: Monitor, manual_clock: ManualClock
+) -> None:
+    """``allocation``/``deployed``/``realized_pnl``/``unrealized_pnl`` are published.
+
+    The figures are the *attributed* view of the one shared wallet, so the
+    documented identities hold on the payload itself: the equity is the
+    allocation plus both P&L terms, and the profile's cash view is the allocation
+    minus what is deployed plus what is realized.
+    """
+    profile = make_profile_snapshot(
+        PROFILE_A,
+        "BTC/USDT",
+        equity=2_595.25,
+        cash=1_425.50,
+        allocation=2_500.0,
+        deployed=1_200.0,
+        realized_pnl=125.5,
+        unrealized_pnl=-30.25,
+    )
+    provider = FakeProvider(profiles=(profile,), wallet=make_wallet_snapshot())
+    router = build_router(provider, monitor, manual_clock)
+
+    detail = payload_of(router.handle("GET", f"/api/profiles/{PROFILE_A}"))
+    listed = payload_of(router.handle("GET", "/api/profiles"))["profiles"][0]
+
+    assert sorted(detail) == PROFILE_KEYS
+    assert detail["allocation"] == 2_500.0
+    assert detail["deployed"] == 1_200.0
+    assert detail["realized_pnl"] == 125.5
+    assert detail["unrealized_pnl"] == -30.25
+    assert detail["last_block_reason"] is None
+    # the pre-existing keys keep their names, their types and their values
+    assert detail["initial_balance"] == 10_000.0
+    assert detail["equity"] == 2_595.25
+    assert detail["cash"] == 1_425.50
+    # the attribution identities the delivery brief documents
+    assert detail["equity"] == pytest.approx(
+        detail["allocation"] + detail["realized_pnl"] + detail["unrealized_pnl"]
+    )
+    assert detail["cash"] == pytest.approx(
+        detail["allocation"] - detail["deployed"] + detail["realized_pnl"]
+    )
+    assert listed == detail
+
+
+def test_a_blocked_profile_publishes_its_refusal_verbatim(
+    monitor: Monitor, manual_clock: ManualClock
+) -> None:
+    """The refusal of the funding check is visible, word for word, on the payload."""
+    refusal = "platform wallet cannot fund order: requires 500.00 USDT, available 120.00 USDT"
+    provider = FakeProvider(
+        profiles=(make_profile_snapshot(PROFILE_A, "BTC/USDT", last_block_reason=refusal),),
+        wallet=make_wallet_snapshot(cash=120.0),
+    )
+    router = build_router(provider, monitor, manual_clock)
+
+    detail = payload_of(router.handle("GET", f"/api/profiles/{PROFILE_A}"))
+    listed = payload_of(router.handle("GET", "/api/profiles"))["profiles"][0]
+
+    assert detail["last_block_reason"] == refusal
+    assert listed["last_block_reason"] == refusal
+    assert "requires 500.00 USDT" in detail["last_block_reason"]
+    assert "available 120.00 USDT" in detail["last_block_reason"]
+
+
+def test_non_finite_attributed_figures_are_null_and_never_nan(
+    monitor: Monitor, manual_clock: ManualClock
+) -> None:
+    """The finite-or-``None`` mapping of the models is the single source of truth."""
+    provider = FakeProvider(
+        profiles=(
+            make_profile_snapshot(
+                PROFILE_A,
+                "BTC/USDT",
+                allocation=float("nan"),
+                deployed=float("inf"),
+                realized_pnl=float("-inf"),
+                unrealized_pnl=float("nan"),
+            ),
+        )
+    )
+    router = build_router(provider, monitor, manual_clock)
+
+    for path in ("/api/profiles", f"/api/profiles/{PROFILE_A}"):
+        text = router.handle("GET", path).body.decode()
+        assert "NaN" not in text, path
+        assert "Infinity" not in text, path
+
+    detail = payload_of(router.handle("GET", f"/api/profiles/{PROFILE_A}"))
+    assert detail["allocation"] is None
+    assert detail["deployed"] is None
+    assert detail["realized_pnl"] is None
+    assert detail["unrealized_pnl"] is None
+    assert detail["last_block_reason"] is None
 
 
 def test_unknown_profile_is_a_documented_404(router: Router) -> None:
@@ -1207,9 +1545,28 @@ def test_no_payload_contains_nan_or_infinity() -> None:
         },
     )
     provider = FakeProvider(
-        profiles=(make_profile_snapshot(PROFILE_A, "BTC/USDT", equity=float("inf")),),
+        profiles=(
+            make_profile_snapshot(
+                PROFILE_A,
+                "BTC/USDT",
+                equity=float("inf"),
+                allocation=float("inf"),
+                deployed=float("-inf"),
+                realized_pnl=float("nan"),
+                unrealized_pnl=float("nan"),
+            ),
+        ),
         uptime_seconds=float("nan"),
         health_body={"status": "ok", "profiles_total": 1, "profiles_running": 1},
+        wallet=make_wallet_snapshot(
+            initial_balance=float("inf"),
+            cash=float("nan"),
+            equity=float("-inf"),
+            deployed=float("nan"),
+            realized_pnl=float("inf"),
+            unrealized_pnl=float("-inf"),
+            total_exposure=float("nan"),
+        ),
     )
     router = build_router(provider, Monitor(store, clock=clock), clock)
 
@@ -1235,7 +1592,19 @@ def test_no_payload_contains_nan_or_infinity() -> None:
     assert points[0]["equity"] is None
     assert points[0]["cash"] is None
     assert points[0]["position_value"] is None
-    assert payload_of(router.handle("GET", "/api/health"))["uptime_seconds"] is None
+    health = payload_of(router.handle("GET", "/api/health"))
+    assert health["uptime_seconds"] is None
+    # the wallet view obeys the same rule: every non-finite figure is null
+    assert health["wallet"]["cash"] is None
+    assert health["wallet"]["equity"] is None
+    assert health["wallet"]["total_exposure"] is None
+    assert health["wallet"]["profiles"] == 2  # an integer survives untouched
+
+    detail = payload_of(router.handle("GET", f"/api/profiles/{PROFILE_A}"))
+    assert detail["allocation"] is None
+    assert detail["deployed"] is None
+    assert detail["realized_pnl"] is None
+    assert detail["unrealized_pnl"] is None
 
 
 def test_every_error_body_is_valid_json(router: Router) -> None:
@@ -1274,6 +1643,57 @@ class WeirdProvider(FakeProvider):
             generated_at=pd.Timestamp(START),
             kill_switch=False,
         )
+
+
+class WeirdWallet:
+    """Wallet stand-in whose payload would break a naive ``json.dumps``."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": "platform",
+            "mode": "paper",
+            "initial_balance": float("nan"),
+            "cash": float("inf"),
+            "equity": float("-inf"),
+            "deployed": float("nan"),
+            "realized_pnl": float("inf"),
+            "unrealized_pnl": float("-inf"),
+            "total_exposure": float("nan"),
+            "profiles": 2,
+            "source": "local",
+            "updated_at": datetime(2024, 1, 1, tzinfo=UTC),
+            "unknown_object": object(),
+        }
+
+
+def test_a_json_hostile_wallet_payload_is_always_encodable(
+    monitor: Monitor, manual_clock: ManualClock
+) -> None:
+    """The wallet goes through the same wire safety net as every other object."""
+    provider = FakeProvider(
+        profiles=(make_profile_snapshot(PROFILE_A, "BTC/USDT"),),
+        wallet=cast("Any", WeirdWallet()),
+    )
+    router = build_router(provider, monitor, manual_clock)
+
+    for path in ("/api/health", "/api/profiles"):
+        response = router.handle("GET", path)
+        text = response.body.decode()
+        assert response.status == 200, path
+        assert "NaN" not in text, path
+        assert "Infinity" not in text, path
+        assert isinstance(json.loads(text), dict), path
+
+    wallet = payload_of(router.handle("GET", "/api/profiles"))["wallet"]
+    assert wallet["cash"] is None
+    assert wallet["equity"] is None
+    assert wallet["deployed"] is None
+    assert wallet["realized_pnl"] is None
+    assert wallet["unrealized_pnl"] is None
+    assert wallet["total_exposure"] is None
+    assert wallet["profiles"] == 2
+    assert wallet["updated_at"] == str(datetime(2024, 1, 1, tzinfo=UTC))
+    assert wallet["unknown_object"].startswith("<object object at")
 
 
 def test_a_json_hostile_payload_is_always_encodable(

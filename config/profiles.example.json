@@ -29,7 +29,8 @@
         "max_daily_loss": 500.0,
         "max_drawdown_pct": 0.25,
         "max_daily_trades": 10
-      }
+      },
+      "allocation": 10000.0
     },
     {
       "id": "eth-paper",
@@ -60,7 +61,8 @@
         "max_daily_loss": 250.0,
         "max_drawdown_pct": 0.2,
         "max_daily_trades": 6
-      }
+      },
+      "allocation": 5000.0
     }
   ],
   "realtime": {
@@ -80,7 +82,10 @@
     "reconcile_interval_seconds": 60.0,
     "risk_free_rate": 0.0,
     "benchmark_variant": "buy_and_hold",
-    "kill_switch_file": "data/realtime/KILL_SWITCH"
+    "kill_switch_file": "data/realtime/KILL_SWITCH",
+    "platform_initial_balance": 15000.0,
+    "platform_max_total_notional": 12000.0,
+    "platform_max_daily_loss": 1000.0
   },
   "monitoring": {
     "host": "127.0.0.1",

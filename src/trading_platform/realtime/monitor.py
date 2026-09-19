@@ -37,6 +37,18 @@ CLI, the orchestrator or a test -- hands it the OHLCV frame of the profile.  Tha
 is a documented consequence, not a bug, and it is one of the limitations listed
 in ``docs/realtime.md``.
 
+Attributed capital base
+-----------------------
+Every profile funds its orders from **one** shared platform wallet, so the
+capital a profile is measured against is its **allocation** -- its share of that
+wallet -- and never the whole ledger:
+:meth:`Monitor.initial_balance` and
+:meth:`Monitor.build_result` both use it, which is what attributes every metric
+and every report line to the profile.  A profile configured without an
+``allocation`` falls back to its own ``initial_balance``, so a configuration
+written before the shared wallet existed produces exactly the numbers it always
+did.
+
 Failure surface
 ---------------
 Every persistence failure is converted at this boundary into
@@ -404,19 +416,33 @@ class Monitor:
     # -- profile header -----------------------------------------------------
 
     def initial_balance(self, profile_id: str) -> float:
-        """Return the initial balance of a profile.
+        """Return the capital base **attributed** to a profile.
 
-        The value comes from the persisted
+        The value is the profile's *allocation* -- its share of the one shared
+        platform wallet every order is funded from -- taken from the persisted
         :class:`~trading_platform.config.models.ProfileConfig` when the profile
-        was ever saved and falls back to
+        was ever saved, and it falls back to
         :data:`~trading_platform.core.constants.DEFAULT_INITIAL_BALANCE`
-        otherwise.
+        otherwise.  A profile configured without an ``allocation`` is attributed
+        its own ``initial_balance``, so the value stays exactly the one this
+        method returned before the shared wallet existed.
         """
         with self._guard(profile_id):
             spec = self._profile(profile_id)
-        if spec is None:
-            return float(DEFAULT_INITIAL_BALANCE)
-        return float(spec.initial_balance)
+        return self._capital_base(spec)
+
+    @staticmethod
+    def _capital_base(spec: ProfileConfig | None) -> float:
+        """Return the capital the metrics and the report of ``spec`` attribute to it.
+
+        ``None`` (a profile that was never saved) reports the documented default;
+        a saved profile reports its
+        :attr:`~trading_platform.config.models.ProfileConfig.effective_allocation`
+        -- its ``allocation`` when configured, its own ``initial_balance``
+        otherwise -- because every performance figure of a profile is measured
+        against its share of the shared wallet, never against the whole platform.
+        """
+        return float(DEFAULT_INITIAL_BALANCE if spec is None else spec.effective_allocation)
 
     def _symbol(self, profile_id: str, data: _Persisted) -> str:
         """Return the symbol of a profile, falling back to its first position."""
@@ -439,7 +465,8 @@ class Monitor:
 
         The produced result is what the metrics, benchmark and validation layers
         consume, which is what makes a live profile comparable with a backtest
-        run of the same strategy: same initial capital, same trades, same equity
+        run of the same strategy: same attributed capital base -- the profile's
+        allocation, never the whole shared wallet -- same trades, same equity
         curve.  An empty profile yields an empty ``float64`` curve with a UTC
         :class:`pandas.DatetimeIndex` (never a crash) and a window dated by the
         injected clock.
@@ -456,7 +483,7 @@ class Monitor:
     def _result_from(self, profile_id: str, data: _Persisted) -> BacktestResult:
         """Build the :class:`BacktestResult` of an already-read profile."""
         spec = data.profile
-        balance = float(DEFAULT_INITIAL_BALANCE if spec is None else spec.initial_balance)
+        balance = self._capital_base(spec)
         curve = _equity_series(data.equity)
         final_balance = float(curve.iloc[-1]) if len(curve) else balance
         if not math.isfinite(final_balance):

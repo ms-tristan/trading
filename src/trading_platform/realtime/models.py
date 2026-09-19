@@ -27,12 +27,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import pandas as pd
 
 from trading_platform.core.constants import UTC
 from trading_platform.core.models import Direction
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    # Annotation only: the wallet imports this module, so the reference stays
+    # inside ``TYPE_CHECKING`` and the "models imports no sibling" rule holds.
+    from trading_platform.realtime.wallet import WalletSnapshot
 
 __all__ = [
     "BrokerAck",
@@ -746,7 +751,16 @@ class ProfileHealth:
 
 @dataclass(frozen=True)
 class ProfileSnapshot:
-    """Everything the dashboard shows for one profile at one instant."""
+    """Everything the dashboard shows for one profile at one instant.
+
+    Every cash figure of a profile is **attributed**, never the venue's: the
+    platform funds every order from one shared wallet, so ``cash`` is
+    ``allocation - deployed + realized_pnl`` -- the profile's own share of the
+    ledger -- and ``equity`` is ``allocation + realized_pnl + unrealized_pnl``.
+    The five appended fields are additive: the existing keys keep their names and
+    their types, only their meaning is refined, and a snapshot built without them
+    (as every caller did before the shared wallet existed) reports zeros.
+    """
 
     profile_id: str
     symbol: str
@@ -764,6 +778,11 @@ class ProfileSnapshot:
     health: ProfileHealth
     started_at: pd.Timestamp | None = None
     updated_at: pd.Timestamp | None = None
+    allocation: float = 0.0
+    deployed: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    last_block_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable mapping with one key per field."""
@@ -784,12 +803,25 @@ class ProfileSnapshot:
             "health": self.health.to_dict(),
             "started_at": _timestamp_or_none(self.started_at),
             "updated_at": _timestamp_or_none(self.updated_at),
+            "allocation": _finite_or_none(self.allocation),
+            "deployed": _finite_or_none(self.deployed),
+            "realized_pnl": _finite_or_none(self.realized_pnl),
+            "unrealized_pnl": _finite_or_none(self.unrealized_pnl),
+            "last_block_reason": (
+                None if self.last_block_reason is None else str(self.last_block_reason)
+            ),
         }
 
 
 @dataclass(frozen=True)
 class PlatformSnapshot:
-    """The whole platform as seen by the monitoring layer."""
+    """The whole platform as seen by the monitoring layer.
+
+    ``wallet`` is the shared USDT wallet every profile funds its orders from: the
+    platform-wide view of the cash, the equity and the exposure.  It is the last
+    field and it is optional, so every construction written before the shared
+    wallet existed keeps working and serialises ``"wallet": null``.
+    """
 
     profiles: tuple[ProfileSnapshot, ...]
     generated_at: pd.Timestamp
@@ -799,6 +831,7 @@ class PlatformSnapshot:
     version: str = ""
     started_at: pd.Timestamp | None = None
     uptime_seconds: float = 0.0
+    wallet: WalletSnapshot | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable mapping with one key per field."""
@@ -811,6 +844,7 @@ class PlatformSnapshot:
             "version": str(self.version),
             "started_at": _timestamp_or_none(self.started_at),
             "uptime_seconds": _finite_or_none(self.uptime_seconds),
+            "wallet": None if self.wallet is None else self.wallet.to_dict(),
         }
 
 
