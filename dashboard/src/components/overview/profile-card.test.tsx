@@ -1,8 +1,9 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { act, render, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { EMPTY_PLACEHOLDER } from '@/lib/format';
-import type { ProfileSnapshot, ProfileStatus } from '@/lib/types';
+import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
+import type { ControlPayload, ProfileSnapshot, ProfileStatus } from '@/lib/types';
 
 import { ProfileCard } from './profile-card';
 
@@ -54,9 +55,63 @@ function field(label: string): HTMLElement {
   return wrapper;
 }
 
+const OPERATOR_TOKEN = 'card-operator-token';
+
+/** `GET /api/control` answer of the card tests: only this profile. */
+function controlPayload(profileId = 'alpha', paused = false): ControlPayload {
+  return {
+    engine_running: true,
+    read_only: false,
+    mutable: true,
+    profiles: [{ profile_id: profileId, paused, running: true }],
+  };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: () => Promise.resolve(JSON.stringify(body)),
+  } as unknown as Response;
+}
+
+let fetchMock: ReturnType<typeof vi.fn>;
+
+/** Let the first control poll of the actions island settle. */
+async function settle(): Promise<void> {
+  await act(async () => {
+    for (let tick = 0; tick < 8; tick += 1) {
+      await Promise.resolve();
+    }
+  });
+}
+
+/** Render the card and wait for the control poll of its actions island. */
+async function renderCard(profile: ProfileSnapshot) {
+  const view = render(<ProfileCard profile={profile} />);
+  await settle();
+  return view;
+}
+
+beforeEach(() => {
+  window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, OPERATOR_TOKEN);
+  fetchMock = vi.fn(async (url: unknown): Promise<Response> => {
+    if (String(url) === '/api/control') {
+      return jsonResponse(controlPayload());
+    }
+    return jsonResponse({ error: 'not found' }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.sessionStorage.clear();
+});
+
 describe('ProfileCard', () => {
-  it('renders every labelled field of the profile', () => {
-    render(<ProfileCard profile={makeProfile()} />);
+  it('renders every labelled field of the profile', async () => {
+    await renderCard(makeProfile());
 
     expect(field('Profile id')).toHaveTextContent('alpha');
     expect(field('Symbol')).toHaveTextContent('BTC/USDT');
@@ -74,8 +129,8 @@ describe('ProfileCard', () => {
     expect(field('Updated at')).toHaveTextContent('2024-01-01 00:00:00 UTC');
   });
 
-  it('labels the card with its heading and links it to the profile detail route', () => {
-    render(<ProfileCard profile={makeProfile({ profile_id: 'alpha beta' })} />);
+  it('labels the card with its heading and links it to the profile detail route', async () => {
+    await renderCard(makeProfile({ profile_id: 'alpha beta' }));
 
     const heading = screen.getByRole('heading', { level: 3 });
     expect(heading).toHaveAttribute('id', 'profile-alpha-beta');
@@ -84,15 +139,15 @@ describe('ProfileCard', () => {
     expect(link).toHaveAttribute('href', '/profiles/alpha%20beta');
   });
 
-  it('renders the mode and the status as text labels, never colour alone', () => {
-    const { unmount } = render(<ProfileCard profile={makeProfile({ mode: 'live' })} />);
+  it('renders the mode and the status as text labels, never colour alone', async () => {
+    const { unmount } = await renderCard(makeProfile({ mode: 'live' }));
 
     const liveBadge = screen.getByText('Live').closest('span[data-tone]');
     expect(liveBadge).toHaveAttribute('data-tone', 'warn');
     expect(liveBadge?.querySelector('svg')).not.toBeNull();
     unmount();
 
-    render(<ProfileCard profile={makeProfile({ status: 'degraded', mode: 'paper' })} />);
+    await renderCard(makeProfile({ status: 'degraded', mode: 'paper' }));
 
     expect(screen.getByText('Paper').closest('span[data-tone]')).toHaveAttribute('data-tone', 'info');
     const degradedBadge = screen.getByText('Degraded').closest('span[data-tone]');
@@ -100,55 +155,53 @@ describe('ProfileCard', () => {
     expect(degradedBadge?.querySelector('svg')).not.toBeNull();
   });
 
-  it('pairs the total return with an explicit sign, a trend label and an icon', () => {
-    const { unmount } = render(<ProfileCard profile={makeProfile({ total_return: 0.045 })} />);
+  it('pairs the total return with an explicit sign, a trend label and an icon', async () => {
+    const { unmount } = await renderCard(makeProfile({ total_return: 0.045 }));
 
     expect(field('Total return')).toHaveTextContent('+4.50%');
     expect(field('Total return')).toHaveTextContent('Up');
     expect(field('Total return').querySelector('svg')).not.toBeNull();
     unmount();
 
-    render(<ProfileCard profile={makeProfile({ total_return: -0.02 })} />);
+    await renderCard(makeProfile({ total_return: -0.02 }));
 
     expect(field('Total return')).toHaveTextContent('-2.00%');
     expect(field('Total return')).toHaveTextContent('Down');
   });
 
-  it('renders the em dash for every absent value and never NaN or undefined', () => {
-    render(
-      <ProfileCard
-        profile={makeProfile({
-          symbol: '',
-          timeframe: null as unknown as string,
-          strategy: undefined as unknown as string,
-          initial_balance: null,
-          equity: null,
-          cash: null,
-          position_value: null,
-          total_return: null,
-          started_at: null,
-          updated_at: null,
-          n_trades: null as unknown as number,
-          open_positions: undefined as unknown as number,
-          health: {
-            profile_id: 'alpha',
-            status: 'running',
-            last_candle_at: null,
-            lag_seconds: null,
-            last_error: null,
-            reconnect_count: 0,
-            counters: {
-              candles_processed: 0,
-              orders_submitted: 0,
-              orders_filled: 0,
-              orders_rejected: 0,
-              stream_reconnects: 0,
-              risk_rejections: 0,
-              errors: 0,
-            },
+  it('renders the em dash for every absent value and never NaN or undefined', async () => {
+    await renderCard(
+      makeProfile({
+        symbol: '',
+        timeframe: null as unknown as string,
+        strategy: undefined as unknown as string,
+        initial_balance: null,
+        equity: null,
+        cash: null,
+        position_value: null,
+        total_return: null,
+        started_at: null,
+        updated_at: null,
+        n_trades: null as unknown as number,
+        open_positions: undefined as unknown as number,
+        health: {
+          profile_id: 'alpha',
+          status: 'running',
+          last_candle_at: null,
+          lag_seconds: null,
+          last_error: null,
+          reconnect_count: 0,
+          counters: {
+            candles_processed: 0,
+            orders_submitted: 0,
+            orders_filled: 0,
+            orders_rejected: 0,
+            stream_reconnects: 0,
+            risk_rejections: 0,
+            errors: 0,
           },
-        })}
-      />,
+        },
+      }),
     );
 
     for (const label of [
@@ -178,17 +231,15 @@ describe('ProfileCard', () => {
     expect(field('Total return')).not.toHaveTextContent('Flat');
   });
 
-  it('surfaces a non-null last error as a labelled warning row', () => {
-    const { unmount } = render(
-      <ProfileCard
-        profile={makeProfile({
-          health: {
-            ...makeProfile().health,
-            status: 'degraded',
-            last_error: 'feed disconnected',
-          },
-        })}
-      />,
+  it('surfaces a non-null last error as a labelled warning row', async () => {
+    const { unmount } = await renderCard(
+      makeProfile({
+        health: {
+          ...makeProfile().health,
+          status: 'degraded',
+          last_error: 'feed disconnected',
+        },
+      }),
     );
 
     const row = screen.getByText('Last error').closest('p');
@@ -196,14 +247,48 @@ describe('ProfileCard', () => {
     expect(row?.querySelector('svg')).not.toBeNull();
     unmount();
 
-    render(<ProfileCard profile={makeProfile()} />);
+    await renderCard(makeProfile());
     expect(screen.queryByText('Last error')).not.toBeInTheDocument();
   });
 
-  it('falls back to a neutral badge for a status outside the documented set', () => {
-    render(<ProfileCard profile={makeProfile({ status: 'unknown' as ProfileStatus })} />);
+  it('falls back to a neutral badge for a status outside the documented set', async () => {
+    await renderCard(makeProfile({ status: 'unknown' as ProfileStatus }));
 
     const badge = screen.getByText('unknown').closest('span[data-tone]');
     expect(badge).toHaveAttribute('data-tone', 'neutral');
+  });
+
+  it('renders the actions island of the profile in the card footer', async () => {
+    await renderCard(makeProfile());
+
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete profile' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Pause' }).closest('[data-paused]')).toHaveAttribute(
+      'data-paused',
+      'false',
+    );
+    expect(fetchMock).toHaveBeenCalledWith('/api/control', expect.anything());
+  });
+
+  it('shows the card as paused when /api/control reports the profile paused', async () => {
+    fetchMock.mockImplementation(async (url: unknown): Promise<Response> => {
+      if (String(url) === '/api/control') {
+        return jsonResponse(controlPayload('alpha', true));
+      }
+      return jsonResponse({ error: 'not found' }, 404);
+    });
+
+    await renderCard(makeProfile());
+
+    expect(screen.getByText('Paused').closest('span[data-tone]')).toHaveAttribute(
+      'data-tone',
+      'warn',
+    );
+    expect(
+      screen.getByText('Not opening new positions; the open position stays managed.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled();
   });
 });

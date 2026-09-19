@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
 import type { HealthPayload, KillSwitchPayload, ProfilesPayload, ProfileSnapshot } from '@/lib/types';
 
 import { OverviewLive } from './overview-live';
@@ -73,12 +74,20 @@ interface StubServer {
   killSwitch: KillSwitchPayload;
   /** When `true`, every request fails (no response ever arrives). */
   failing: boolean;
-  /** Requested paths, in call order. */
+  /** Requested paths of the page cycle, in call order. */
   calls: string[];
   fetchMock: ReturnType<typeof vi.fn>;
 }
 
-/** Install a network double: no live server is ever reached (see api.test.ts). */
+/**
+ * Install a network double: no live server is ever reached (see api.test.ts).
+ *
+ * The cards render the per-profile action island, which polls `GET /api/control`
+ * on its own cadence. That route is answered here — it must never 404 and never
+ * join the failure switch, or the pages under test would show an unrelated
+ * banner — but it is deliberately **not** recorded in `calls`, which tracks the
+ * page cycle only.
+ */
 function startServer(): StubServer {
   const server: StubServer = {
     health: { ...health },
@@ -94,6 +103,17 @@ function startServer(): StubServer {
 
   server.fetchMock.mockImplementation(async (url: unknown): Promise<Response> => {
     const target = String(url);
+    if (target.endsWith('/api/control')) {
+      return jsonResponse({
+        engine_running: true,
+        read_only: false,
+        mutable: true,
+        profiles: [
+          { profile_id: 'alpha', paused: false, running: true },
+          { profile_id: 'beta', paused: false, running: true },
+        ],
+      });
+    }
     server.calls.push(target);
     if (server.failing) {
       throw new TypeError('Failed to fetch');
@@ -143,12 +163,15 @@ async function settle(): Promise<void> {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2024-06-01T12:00:00Z'));
+  // The action islands of the cards only offer their controls to a saved token.
+  window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, 'overview-operator-token');
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  window.sessionStorage.clear();
 });
 
 describe('OverviewLive', () => {
@@ -156,19 +179,31 @@ describe('OverviewLive', () => {
     const server = startServer();
     renderLive(server);
 
-    // The Server Component already fetched: mounting must not duplicate it.
-    expect(server.fetchMock).not.toHaveBeenCalled();
+    // The Server Component already fetched: mounting must not duplicate the
+    // page cycle (the action islands poll their own read-only control route).
+    expect(server.calls).toEqual([]);
     expect(screen.getAllByRole('article')).toHaveLength(2);
     expect(screen.getByText('$10,450.50')).toBeInTheDocument();
 
     await advance(1999);
-    expect(server.fetchMock).not.toHaveBeenCalled();
+    expect(server.calls).toEqual([]);
 
     await advance(1);
     expect(server.calls).toEqual(['/api/health', '/api/profiles', '/api/kill-switch']);
 
     await advance(2000);
     expect(server.calls).toHaveLength(6);
+  });
+
+  it('renders the action island of every card, fed by the control route', async () => {
+    const server = startServer();
+    renderLive(server);
+
+    expect(screen.getAllByRole('button', { name: 'Delete profile' })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: 'Pause' })).toHaveLength(2);
+    expect(server.fetchMock).toHaveBeenCalledWith('/api/control', expect.anything());
+    // Nothing of the page cycle was duplicated by those control polls.
+    expect(server.calls).toEqual([]);
   });
 
   it('refreshes the cards in place and stamps the checked-at time', async () => {

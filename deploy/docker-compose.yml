@@ -37,8 +37,13 @@ services:
       - "127.0.0.1:3030:8080"
 
     volumes:
-      # deployment profiles are read-only inside the container
-      - ./profiles.json:/app/deploy/profiles.json:ro
+      # The deploy DIRECTORY, read-write: the monitoring API rewrites
+      # profiles.json when a profile is created or deleted, and its atomic
+      # temp-file + os.replace fails with EBUSY when the target is a
+      # bind-mounted FILE (a rename onto a mount point is not allowed). Mounting
+      # the directory keeps the rename inside one filesystem. deploy/.env keeps
+      # mode 600 and stays unreadable to the unprivileged container user.
+      - ./:/app/deploy
       # durable state (SQLite database, kill-switch file, structured logs)
       - trading-state:/app/data/realtime
       # OHLCV cache (survives restarts, avoids re-downloading the warmup window)

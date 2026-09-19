@@ -87,6 +87,28 @@ The dashboard is **stateless**: it owns no volume, no database and no durable
 file. Restarting or rebuilding it loses nothing, and its operator token lives
 only in the browser's `sessionStorage` (never on disk, never rendered back).
 
+### The profiles file is written by the API
+
+`deploy/` itself is bind-mounted **read-write** at `/app/deploy`, because
+`POST /api/profiles` and `DELETE /api/profiles/{id}` rewrite `profiles.json`
+(the on-disk source of truth). Two host-side details matter:
+
+1. **The directory must be writable by the container user** (`appuser`, uid
+   1000), which is not the uid that owns the checkout:
+
+   ```bash
+   chmod o+w deploy
+   ```
+
+   The rewrite is atomic — a temp file in the same directory, then
+   `os.replace` — and that rename fails with `EBUSY` when the target is a
+   bind-mounted **file**, which is why the whole directory is mounted rather
+   than `profiles.json` alone. The image still ships its own copy at
+   `/app/deploy/profiles.json`; the mount shadows it at runtime.
+2. **`deploy/.env` keeps mode 600**, so it stays readable by its owner only and
+   the unprivileged container user cannot read it — granting the directory
+   write access does not expose the operator token.
+
 ### Secrets
 
 `deploy/.env` carries the **operator token** of the monitoring API — the token

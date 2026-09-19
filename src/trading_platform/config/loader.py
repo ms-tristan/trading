@@ -11,13 +11,18 @@ of :class:`~trading_platform.config.models.ProfileConfig`), ``realtime`` and
 ``monitoring``.  :func:`load_profiles`, :func:`load_realtime_config` and
 :func:`load_monitoring_config` read that one file; each of them ignores the keys
 it does not own, so a run, a monitoring-only server and a pre-flight check all
-consume the same document.
+consume the same document.  :func:`save_profiles` owns the write side: it replaces
+the ``profiles`` key and preserves every other root key, atomically.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Mapping
+import os
+import secrets
+import stat
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -41,12 +46,16 @@ __all__ = [
     "load_profiles",
     "load_realtime_config",
     "override_params",
+    "save_profiles",
 ]
 
 _JSON_SUFFIXES = (".json",)
 
 #: The only keys accepted at the root of a profiles document.
 _PROFILES_ROOT_KEYS: frozenset[str] = frozenset({"profiles", "realtime", "monitoring"})
+
+#: How many names :func:`_open_temporary` tries before giving up.
+_TEMPORARY_ATTEMPTS: int = 100
 
 _SectionModel = TypeVar("_SectionModel", bound=BaseModel)
 
@@ -274,6 +283,98 @@ def load_profiles(path: str | Path) -> list[ProfileConfig]:
         seen.add(profile.id)
         profiles.append(profile)
     return profiles
+
+
+def _open_temporary(directory: Path, name: str, mode: int) -> tuple[int, str]:
+    """Create a unique temporary file next to ``name``, with ``mode``.
+
+    ``tempfile.mkstemp`` cannot be used here: it hard-codes 0o600, and the mode
+    of the file that gets renamed onto the target is the one the target ends up
+    with. ``O_EXCL`` keeps the creation atomic, so two concurrent callers can
+    never pick the same name.
+    """
+    for _ in range(_TEMPORARY_ATTEMPTS):
+        candidate = directory / f".{name}.{secrets.token_hex(6)}.tmp"
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+        except FileExistsError:
+            continue
+        return descriptor, str(candidate)
+    raise ConfigError(f"cannot create a temporary file next to {directory / name}")
+
+
+def save_profiles(path: str | Path, profiles: Sequence[ProfileConfig]) -> Path:
+    """Rewrite the ``profiles`` key of the profiles document ``path``, atomically.
+
+    The profiles file is the on-disk **source of truth** of the running platform, so
+    the create/delete routes rewrite it while the engine keeps running.  The document
+    is therefore never truncated in place: the existing payload is read first, only
+    its ``profiles`` key is replaced, and the result is written to a temporary file
+    of the same directory which is then moved onto the target with :func:`os.replace`
+    -- an atomic rename on every supported platform.  A crash between the two steps
+    leaves the original file untouched, and a reader never observes a half-written
+    document.
+
+    Every other root key (``realtime``, ``monitoring``) is preserved **verbatim**: a
+    caller that owns only the profile list must not silently drop the engine
+    settings that share the document.
+
+    Parameters
+    ----------
+    path:
+        JSON profiles file (``.json`` only, like :func:`load_profiles`).  It must
+        already exist: this function updates a document, it never invents one.
+    profiles:
+        The profiles to declare, in the order they must appear.  An empty sequence
+        is written as an empty list; whether that is a legal platform is the
+        caller's rule and :func:`load_profiles` still refuses to read it.
+
+    Returns
+    -------
+    Path
+        The written path.
+
+    Raises
+    ------
+    ConfigError
+        The document cannot be read (missing file, wrong extension, invalid JSON),
+        or it cannot be written (unwritable directory, failing rename).  The
+        original file is left untouched and the temporary file is removed.
+    """
+    target = Path(path)
+    payload = _read_payload(target)
+    payload["profiles"] = [profile.model_dump(mode="json") for profile in profiles]
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    # The mode has to be right at CREATION time. Some bind mounts -- Docker
+    # Desktop's virtiofs on macOS, for one -- refuse chmod outright with EPERM,
+    # and ``tempfile.mkstemp`` hard-codes 0o600: the rename would then hand the
+    # target a mode that makes it unreadable to the uid the mount maps the owner
+    # to, which is exactly how the container lost access to the config it had
+    # just written.
+    try:
+        mode = stat.S_IMODE(target.stat().st_mode)
+    except OSError:
+        mode = 0o644
+    temporary: Path | None = None
+    try:
+        handle, name = _open_temporary(target.parent, target.name, mode)
+        temporary = Path(name)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Best effort, for platforms where the umask stripped bits at creation.
+        with contextlib.suppress(OSError):
+            temporary.chmod(mode)
+        # ``Path.replace`` *is* ``os.replace``: an atomic rename on every supported
+        # platform, which is what makes the rewrite all-or-nothing for a reader.
+        temporary.replace(target)
+    except OSError as exc:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise ConfigError(f"cannot write profiles file {target}: {exc}") from exc
+    return target
 
 
 def _strip_section_prefix(overrides: Mapping[str, Any], key: str) -> dict[str, Any]:

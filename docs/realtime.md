@@ -189,6 +189,38 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 | `GET /api/profiles/{id}/metrics` | `{metrics: {...}, benchmark: {...} \| null, generated_at}` | 404 |
 | `GET /api/kill-switch` | `{kill_switch, reason, changed_at}` | — |
 | `POST /api/kill-switch` | body `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` | 400 malformed body, 403 missing/invalid token, 403 server in read-only mode |
+| `GET /api/profiles/{id}/candles?limit=N` | `{candles: [{profile_id, timestamp, open, high, low, close, volume, closed}…], count}` (oldest first) | 404 unknown profile, 400 malformed `limit` |
+| `GET /api/catalog` | `{symbols: [{symbol, base, quote}…], strategies: [...], timeframes: [...], modes: [...]}` | — |
+| `GET /api/control` | `{engine_running, read_only, mutable, profiles: [{profile_id, paused, running}…]}` | — |
+| `POST /api/profiles/{id}/pause` | `{profile: ProfileSnapshot, paused: true}` | 400, 403, 404, 409, 503 |
+| `POST /api/profiles/{id}/resume` | `{profile: ProfileSnapshot, paused: false}` | 400, 403, 404, 409, 503 |
+| `DELETE /api/profiles/{id}` | `{profile_id, deleted: true}` | 400, 403, 404, 409, 503 |
+| `POST /api/profiles` | body `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?}` → `201 {profile: ProfileSnapshot}` | 400 malformed body / unknown strategy / unsupported timeframe, 403, 409 duplicate |
+
+`GET /api/profiles/{id}/candles` serves the persisted history of one profile,
+**oldest first**. `limit` is optional: it defaults to **500** and is clamped to
+**1000** (the store keeps the 1000 most recent candles of every profile). An
+empty, non-numeric, zero or negative value answers
+`400 {"error": "malformed query parameter: 'limit' must be a positive integer"}`;
+any other query parameter is ignored. The route reads the same seam in both
+modes -- the live engine in `realtime run`, the persisted state in
+`realtime serve` -- so a chart keeps its history when the engine is stopped.
+
+`GET /api/catalog` is the vocabulary of the dashboard pickers: the tradable
+**spot** pairs of the exchange for the configured quote currency (fetched through
+the existing exchange/`ccxt` seam, cached server-side with a TTL and backed by a
+static table), the strategy names of
+`trading_platform.strategy.registry.strategy_names()` (never hard-coded), the
+keys of `SUPPORTED_TIMEFRAMES` ordered shortest to longest, and `["paper",
+"live"]`. It answers identically with and without an engine and **never** answers
+a `500`: any failure degrades to the static catalog.
+
+`GET /api/control` is what the dashboard reads before enabling its controls:
+`engine_running` (a lifecycle seam is attached), `read_only`, `mutable` (a
+writable server **and** a controller **and** a configured operator token) and
+`profiles`, the pause/run state of every profile. A failing controller answers
+the same status with an empty profile list; it never turns this read into a
+`500`.
 
 The dashboard is a **separate Next.js application** (`dashboard/`): it owns its
 own Node server, it renders the overview page and the per-profile page, and it
@@ -296,3 +328,62 @@ fast as the CPU allows (it is backfill), it is not a live follow-up of real time
 - `realtime check` attests the **absence** of credentials, not their validity: it
   opens no connection, so an invalid key/secret pair will only be detected at the
   first real call to the broker.
+
+## 8. Profile lifecycle and candle history
+
+The dashboard drives four mutations with the **same** single operator token
+(`X-Operator-Token`) as the kill switch. The read-only server of
+`realtime serve` refuses all four with the documented `403`
+`{"error": "mutations are disabled on this server"}`: it attaches **no**
+controller, and a lifecycle route answers `403` whenever that seam is absent --
+even on an otherwise writable server.
+
+**Pause stops opening, never managing.** A paused profile keeps its stream, its
+runner and its supervision: it stops **opening new positions**, while the static
+stop of the open position and every exit signal keep being evaluated, so a
+position is **never** left unmanaged. The flag is durable (it is written to the
+store's `meta`, so a restart resumes paused) and it is exposed through
+`GET /api/control` as `{profile_id, paused, running}` -- **not** through
+`ProfileSnapshot`, whose shape is frozen. A paused profile therefore still
+reports `status: "running"`, and its tick still publishes equity points and
+candles: pause is not stop.
+
+**Delete flattens before it removes.** `DELETE /api/profiles/{id}` closes every
+open order and flattens the open position **at market** through the existing
+execution gateway **before** anything is removed. When flattening fails, the
+delete fails with an explicit error (`409`) and the profile stays exactly where
+it was: nothing is orphaned and no profile that is still exposed is removed. The
+delete also refuses to remove the **last** profile of the platform (an engine
+with no profile cannot run). Once flat, the profile is stopped, removed from the
+running engine **and** removed from the profiles configuration file; a file that
+cannot be rewritten aborts with `400`, with the engine still consistent.
+
+**Create validates against the catalog.** `POST /api/profiles` accepts
+`{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?}`,
+refuses an unknown field, a field of the wrong type, an unknown strategy (the
+message names the available ones), an unsupported timeframe and a malformed
+identifier with `400`, and a duplicate identifier with `409`. On success the
+profile is persisted to the profiles configuration file and **started
+immediately** in the running engine, and the `201` body carries its
+`ProfileSnapshot`, so the dashboard refreshes without guessing.
+
+**The profiles configuration file is the source of truth.** Adding or removing a
+profile rewrites it **atomically** (temporary file + `os.replace`), so an
+interrupted rewrite can never leave a truncated document behind.
+
+**Candle history.** The engine persists every candle it processes in a bounded
+`candles` table (one row per profile and timestamp, the 1000 most recent rows per
+profile, pruned in the same transaction as the append). Until this delivery the
+store persisted **no** candle at all -- only the *last processed candle*
+watermark -- so §7's honesty list is corrected here: the store now keeps a
+bounded candle history per profile, which is what the chart draws. What is
+**not** corrected is the decision rule: decisions still only ever use **closed**
+candles, and a candle closed before the engine started is still **skipped**, not
+replayed (§2.1).
+
+**Error mapping of the four mutations.** `MonitoringError` (`503`: no engine, or
+a command that timed out), `ProfileError` (`409`: a duplicate, a profile that is
+not running, a refused flattening, the last profile), `ConfigError` (`400`: an
+unknown strategy, an unsupported timeframe, an unsupported value, a profiles file
+that cannot be rewritten) and -- for anything else -- the existing `500`
+boundary.

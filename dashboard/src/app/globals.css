@@ -40,6 +40,27 @@
   --color-chart-axis: #94a3b8;
   --color-chart-grid: #1e293b;
 
+  /*
+   * -- candlestick chart --------------------------------------------------
+   *
+   * A trading chart must stay readable when colour alone cannot carry the
+   * meaning: a bullish body is drawn HOLLOW (`--color-chart-bull-hollow` is the
+   * card colour, so the background shows through), a bearish body is FILLED,
+   * and the data table below the canvas repeats every value as text. The
+   * markers, the average price line and the stop line each carry their own
+   * colour *and* their own shape or line style.
+   */
+  --color-chart-bull: #22c55e;
+  --color-chart-bear: #ef4444;
+  --color-chart-bull-hollow: #0e1223;
+  --color-chart-wick-bull: #22c55e;
+  --color-chart-wick-bear: #ef4444;
+  --color-chart-crosshair: #94a3b8;
+  --color-chart-marker-entry: #38bdf8;
+  --color-chart-marker-exit: #f59e0b;
+  --color-chart-stop: #ef4444;
+  --color-chart-average: #a78bfa;
+
   /* -- typography --------------------------------------------------------- */
   --font-sans: "Fira Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Fira Code", ui-monospace, sfmono-regular, menlo, monospace;

@@ -1,9 +1,10 @@
-import { render, screen, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { act, render, screen, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { HealthPayload, KillSwitchPayload, ProfileSnapshot } from '@/lib/types';
+import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
+import type { ControlPayload, HealthPayload, KillSwitchPayload, ProfileSnapshot } from '@/lib/types';
 
-import { ProfileHeader } from './profile-header';
+import { ProfileHeader, type ProfileHeaderProps } from './profile-header';
 
 const PROFILE: ProfileSnapshot = {
   profile_id: 'btc-paper',
@@ -56,9 +57,69 @@ const KILL_SWITCH: KillSwitchPayload = {
   changed_at: null,
 };
 
+const HEADER_PROPS: ProfileHeaderProps = {
+  profile: PROFILE,
+  health: HEALTH,
+  killSwitch: KILL_SWITCH,
+};
+
+const OPERATOR_TOKEN = 'header-operator-token';
+
+/** `GET /api/control` answer of the header tests: only this profile, running. */
+function controlPayload(paused = false): ControlPayload {
+  return {
+    engine_running: true,
+    read_only: false,
+    mutable: true,
+    profiles: [{ profile_id: PROFILE.profile_id, paused, running: true }],
+  };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: () => Promise.resolve(JSON.stringify(body)),
+  } as unknown as Response;
+}
+
+let fetchMock: ReturnType<typeof vi.fn>;
+
+/** Let the first control poll of the actions island settle. */
+async function settle(): Promise<void> {
+  await act(async () => {
+    for (let tick = 0; tick < 8; tick += 1) {
+      await Promise.resolve();
+    }
+  });
+}
+
+/** Render the header and wait for the control poll of its actions island. */
+async function renderHeader(overrides: Partial<ProfileHeaderProps> = {}) {
+  const view = render(<ProfileHeader {...HEADER_PROPS} {...overrides} />);
+  await settle();
+  return view;
+}
+
+beforeEach(() => {
+  window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, OPERATOR_TOKEN);
+  fetchMock = vi.fn(async (url: unknown): Promise<Response> => {
+    if (String(url) === '/api/control') {
+      return jsonResponse(controlPayload());
+    }
+    return jsonResponse({ error: 'not found' }, 404);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.sessionStorage.clear();
+});
+
 describe('ProfileHeader', () => {
-  it('renders the identity of the profile with a status badge and a mode badge', () => {
-    render(<ProfileHeader profile={PROFILE} health={HEALTH} killSwitch={KILL_SWITCH} />);
+  it('renders the identity of the profile with a status badge and a mode badge', async () => {
+    await renderHeader();
 
     expect(screen.getByRole('heading', { level: 1, name: 'btc-paper' })).toBeInTheDocument();
     expect(screen.getByText('BTC/USDT · 1h · ema_cross')).toBeInTheDocument();
@@ -72,8 +133,8 @@ describe('ProfileHeader', () => {
     expect(screen.getByText('Kill switch released')).toBeInTheDocument();
   });
 
-  it('renders every platform and snapshot field of the profile', () => {
-    render(<ProfileHeader profile={PROFILE} health={HEALTH} killSwitch={KILL_SWITCH} />);
+  it('renders every platform and snapshot field of the profile', async () => {
+    await renderHeader();
 
     expect(screen.getByText('$10,250.00')).toBeInTheDocument();
     expect(screen.getByText('$250.00')).toBeInTheDocument();
@@ -90,8 +151,8 @@ describe('ProfileHeader', () => {
     expect(screen.getAllByText('45s')).toHaveLength(2);
   });
 
-  it('renders the engine counters for the profile', () => {
-    render(<ProfileHeader profile={PROFILE} health={HEALTH} killSwitch={KILL_SWITCH} />);
+  it('renders the engine counters for the profile', async () => {
+    await renderHeader();
 
     const counters = screen.getByRole('region', { name: 'Engine counters' });
     expect(within(counters).getByText('Candles processed')).toBeInTheDocument();
@@ -107,13 +168,13 @@ describe('ProfileHeader', () => {
     expect(within(counters).getByText('0')).toBeInTheDocument();
   });
 
-  it('shows the last error as a labelled warning row when the API reports one', () => {
+  it('shows the last error as a labelled warning row when the API reports one', async () => {
     const failing: ProfileSnapshot = {
       ...PROFILE,
       status: 'degraded',
       health: { ...PROFILE.health, last_error: 'stream closed by peer' },
     };
-    render(<ProfileHeader profile={failing} health={HEALTH} killSwitch={KILL_SWITCH} />);
+    await renderHeader({ profile: failing });
 
     expect(screen.getByText('Last error')).toBeInTheDocument();
     expect(screen.getByText('stream closed by peer')).toBeInTheDocument();
@@ -121,7 +182,7 @@ describe('ProfileHeader', () => {
     expect(screen.getAllByText('Degraded')).toHaveLength(2);
   });
 
-  it('renders an em dash for every absent value instead of NaN or undefined', () => {
+  it('renders an em dash for every absent value instead of NaN or undefined', async () => {
     const empty: ProfileSnapshot = {
       profile_id: 'eth-live',
       symbol: 'ETH/USDT',
@@ -151,13 +212,11 @@ describe('ProfileHeader', () => {
       uptime_seconds: null,
       checked_at: null,
     };
-    render(
-      <ProfileHeader
-        profile={empty}
-        health={degradedHealth}
-        killSwitch={{ kill_switch: true, reason: '', changed_at: null }}
-      />,
-    );
+    await renderHeader({
+      profile: empty,
+      health: degradedHealth,
+      killSwitch: { kill_switch: true, reason: '', changed_at: null },
+    });
 
     expect(screen.getByText('Live trading')).toBeInTheDocument();
     expect(screen.getByText('Platform degraded')).toBeInTheDocument();
@@ -165,5 +224,39 @@ describe('ProfileHeader', () => {
     expect(screen.queryByText('NaN')).toBeNull();
     expect(screen.queryByText('undefined')).toBeNull();
     expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(8);
+  });
+
+  it('renders the actions island of the profile inside the header card', async () => {
+    await renderHeader();
+
+    const header = screen.getByRole('region', { name: `Profile ${PROFILE.profile_id}` });
+    expect(within(header).getByRole('button', { name: 'Pause' })).toBeEnabled();
+    expect(within(header).getByRole('button', { name: 'Resume' })).toBeDisabled();
+    expect(within(header).getByRole('button', { name: 'Delete profile' })).toBeEnabled();
+    expect(
+      within(header).getByRole('button', { name: 'Pause' }).closest('[data-paused]'),
+    ).toHaveAttribute('data-paused', 'false');
+    expect(fetchMock).toHaveBeenCalledWith('/api/control', expect.anything());
+  });
+
+  it('shows the profile as paused when /api/control reports it paused', async () => {
+    fetchMock.mockImplementation(async (url: unknown): Promise<Response> => {
+      if (String(url) === '/api/control') {
+        return jsonResponse(controlPayload(true));
+      }
+      return jsonResponse({ error: 'not found' }, 404);
+    });
+
+    await renderHeader();
+
+    expect(screen.getByText('Paused').closest('span[data-tone]')).toHaveAttribute(
+      'data-tone',
+      'warn',
+    );
+    expect(
+      screen.getByText('Not opening new positions; the open position stays managed.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled();
   });
 });

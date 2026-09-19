@@ -11,7 +11,8 @@
  *   cheap payloads that must react immediately;
  * * the **detail loop** (`detailIntervalMs`, 5x slower) refreshes the
  *   SQLite-backed, metric-heavy payloads: equity curve, positions, trades,
- *   orders and metrics.
+ *   orders and metrics. The candle chart polls on that same cadence through
+ *   `CandlestickPanel`, so the page never runs a third rhythm.
  *
  * A single {@link LiveToolbar} drives both, a single error banner combines both
  * failures, and a failed poll never clears the screen: the last known good
@@ -20,6 +21,7 @@
 
 import { useCallback } from 'react';
 
+import { CandlestickPanel } from '@/components/charts/candlestick-panel';
 import { EquityChart } from '@/components/charts/equity-chart';
 import { KillSwitchPanel } from '@/components/kill-switch/kill-switch-panel';
 import { Card } from '@/components/ui/card';
@@ -35,7 +37,7 @@ import {
   fetchTrades,
 } from '@/lib/api';
 import { usePolling } from '@/lib/use-polling';
-import type { ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
+import type { CandlesPayload, ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
 
 import { BenchmarkPanel } from './benchmark-panel';
 import { MetricsPanel } from './metrics-panel';
@@ -52,6 +54,13 @@ export interface ProfileLiveProps {
   initialLive: ProfileLiveBundle;
   /** Detail bundle rendered by the Server Component. */
   initialDetail: ProfileDetailBundle;
+  /**
+   * Candle window rendered by the Server Component.
+   *
+   * It is the chart's first paint: without it the panel would show its empty
+   * state until the detail loop fired, ten seconds into the visit.
+   */
+  initialCandles?: CandlesPayload;
   /** ISO-8601 stamp of the server-side fetch. */
   initialCheckedAt: string;
   /** Cadence of the live loop, in milliseconds. */
@@ -77,6 +86,7 @@ export function ProfileLive({
   profileId,
   initialLive,
   initialDetail,
+  initialCandles,
   initialCheckedAt,
   pollIntervalMs,
   detailIntervalMs,
@@ -163,6 +173,14 @@ export function ProfileLive({
       >
         <EquityChart points={detail.data.equity.points} ariaLabel={`Equity curve of ${profileId}`} />
       </Card>
+
+      <CandlestickPanel
+        profileId={profileId}
+        positions={detail.data.positions}
+        trades={detail.data.trades}
+        detailIntervalMs={detailIntervalMs}
+        initialCandles={initialCandles}
+      />
 
       <Card
         title="Open positions"

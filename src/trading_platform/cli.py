@@ -70,7 +70,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import typer
 from rich.console import Console
@@ -110,6 +110,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     import pandas as pd
 
     from trading_platform.metrics import MetricSet
+    from trading_platform.realtime.store import CandleRow
     from trading_platform.validation import (
         BenchmarkGateResult,
         RandomEntryGateResult,
@@ -1539,7 +1540,9 @@ def _realtime_tick(
     return decisions_payload, profiles_payload
 
 
-async def _engine_until_stopped(orchestrator: Any, sink: list[dict[str, Any]]) -> None:
+async def _engine_until_stopped(
+    orchestrator: Any, sink: list[dict[str, Any]], controller: Any = None
+) -> None:
     """Run the supervised platform, then stop it **on the very same event loop**.
 
     ``orchestrator.stop()`` cancels the profile tasks it created, so it must run
@@ -1549,10 +1552,17 @@ async def _engine_until_stopped(orchestrator: Any, sink: list[dict[str, Any]]) -
     ``stop()`` closes the store, hence the ``sink``: a snapshot read afterwards
     would query a closed database.
 
+    ``controller`` is the runtime-control bridge of the monitoring server: it is
+    bound to the running loop **here**, because this coroutine is the only place
+    where that loop exists -- a lifecycle command arriving over HTTP is then
+    marshalled onto it instead of touching the registry from a server thread.
+
     ``SIGINT`` reaches this coroutine as an ``asyncio.CancelledError`` (CPython
     cancels the main task before re-raising ``KeyboardInterrupt``), so both the
     interrupted and the nominal path stop the platform the same way.
     """
+    if controller is not None:
+        controller.bind(asyncio.get_running_loop())
     try:
         await orchestrator.run_forever()
     except asyncio.CancelledError:
@@ -1566,6 +1576,44 @@ async def _engine_until_stopped(orchestrator: Any, sink: list[dict[str, Any]]) -
     await orchestrator.stop()
 
 
+def _realtime_catalog_venue(profiles: Sequence[ProfileConfig]) -> tuple[str, str]:
+    """Return the ``(exchange, quote)`` pair the catalog must describe.
+
+    The profiles document is the only configuration a realtime command loads, so
+    the venue is read from the profiles themselves: the exchange of the first
+    profile whose symbol carries a quote currency, and that quote.  A document
+    with no such profile falls back on the platform-wide defaults of
+    :class:`~trading_platform.config.models.ExchangeConfig`.
+    """
+    from trading_platform.config.models import ExchangeConfig
+
+    defaults = ExchangeConfig()
+    for profile in profiles:
+        symbol = str(profile.symbol)
+        if "/" in symbol:
+            return str(profile.exchange), symbol.split("/", 1)[1].upper()
+    if profiles:
+        return str(profiles[0].exchange), defaults.quote_currency
+    return defaults.name, defaults.quote_currency
+
+
+def _realtime_catalog(profiles: Sequence[ProfileConfig], realtime: RealtimeConfig) -> Any:
+    """Build the market catalog of a run (offline unless ``realtime.allow_network``).
+
+    Both ``realtime run`` and ``realtime serve`` install it, so the pickers of the
+    dashboard answer identically with and without an engine.  ``allowed_network``
+    is never forced: an offline deployment answers the static symbol table.
+    """
+    from trading_platform.realtime.catalog import MarketCatalog
+
+    exchange, quote = _realtime_catalog_venue(profiles)
+    return MarketCatalog(
+        exchange=exchange,
+        quote=quote,
+        allow_network=bool(realtime.allow_network),
+    )
+
+
 def _realtime_engine(
     profiles: Sequence[ProfileConfig],
     realtime: RealtimeConfig,
@@ -1573,6 +1621,7 @@ def _realtime_engine(
     *,
     clock: Any,
     store: Any,
+    profiles_path: Path,
     host: str | None,
     port: int | None,
     json_output: bool,
@@ -1582,10 +1631,18 @@ def _realtime_engine(
     Returns the last profile snapshots and the monitoring URL.  ``SIGINT`` is a
     clean shutdown: the server is closed and the orchestrator stopped before the
     payload is emitted, and the exit code stays ``0``.
+
+    Two seams travel to the web layer: the market catalog (the pickers) and the
+    runtime controller (pause/resume/delete/create).  The controller rewrites
+    ``profiles_path`` -- the on-disk source of truth -- and is bound to the engine
+    loop by :func:`_engine_until_stopped`.
     """
+    from trading_platform.realtime.control import RuntimeProfileController
     from trading_platform.web.server import create_server, start_in_thread
 
     orchestrator = _realtime_orchestrator(profiles, realtime, monitoring, clock=clock, store=store)
+    catalog = _realtime_catalog(profiles, realtime)
+    controller = RuntimeProfileController(orchestrator=orchestrator, profiles_path=profiles_path)
     server = create_server(
         orchestrator,
         monitor=_realtime_monitor(store, clock=clock, realtime=realtime),
@@ -1594,13 +1651,15 @@ def _realtime_engine(
         host=host,
         port=port,
         version=__version__,
+        controller=controller,
+        catalog=catalog,
     )
     thread = start_in_thread(server)
     url = f"http://{monitoring.host if host is None else host}:{server.port}/"
     _announce(url, json_output=json_output)
     snapshots: list[dict[str, Any]] = []
     try:
-        asyncio.run(_engine_until_stopped(orchestrator, snapshots))
+        asyncio.run(_engine_until_stopped(orchestrator, snapshots, controller))
     except KeyboardInterrupt:
         typer.echo("interrupted: the platform is shut down and stopped", err=True)
     finally:
@@ -1819,6 +1878,7 @@ def realtime_run(
                 monitoring,
                 clock=clock,
                 store=store,
+                profiles_path=path,
                 host=host,
                 port=port,
                 json_output=json_output,
@@ -1850,7 +1910,7 @@ def realtime_serve(
 
     with _error_surface("realtime-serve", json_output=json_output):
         path = Path(profiles)
-        load_profiles(path)
+        engine_profiles = load_profiles(path)
         realtime = load_realtime_config(path)
         monitoring = load_monitoring_config(path)
         _realtime_logging(realtime)
@@ -1869,6 +1929,7 @@ def realtime_serve(
                 host=host,
                 port=port,
                 version=__version__,
+                catalog=_realtime_catalog(engine_profiles, realtime),
             )
             url = f"http://{monitoring.host if host is None else host}:{server.port}/"
             _announce(url, json_output=json_output)
@@ -1995,6 +2056,15 @@ class _PersistedSnapshotProvider:
             "kill_switch": snapshot.kill_switch,
             "checked_at": self._clock.now().isoformat(),
         }
+
+    def candle_series(self, profile_id: str, limit: int) -> list[CandleRow]:
+        """Return the persisted candles of one profile, oldest first.
+
+        The read-only counterpart of ``RealtimeOrchestrator.candle_series``: it is
+        what makes ``GET /api/profiles/{id}/candles`` answer over persisted state
+        with **no** engine running, which is the whole point of ``realtime serve``.
+        """
+        return cast("list[CandleRow]", self._store.candle_series(profile_id, limit))
 
     def kill_switch_state(self) -> Any:
         """Return the effective kill-switch state (file, environment, store)."""

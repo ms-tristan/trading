@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '@/lib/api';
 import type {
+  CandlesPayload,
   EquityPayload,
   HealthPayload,
   KillSwitchPayload,
@@ -33,6 +34,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
     fetchTrades: vi.fn(),
     fetchOrders: vi.fn(),
     fetchMetrics: vi.fn(),
+    fetchCandles: vi.fn(),
   };
 });
 
@@ -161,6 +163,32 @@ const METRICS: MetricsPayload = {
   generated_at: '2024-01-01T05:01:00+00:00',
 };
 
+const CANDLES: CandlesPayload = {
+  candles: [
+    {
+      profile_id: 'btc-paper',
+      timestamp: '2024-01-01T00:00:00+00:00',
+      open: 20000,
+      high: 20100,
+      low: 19900,
+      close: 20050,
+      volume: 12.5,
+      closed: true,
+    },
+    {
+      profile_id: 'btc-paper',
+      timestamp: '2024-01-01T01:00:00+00:00',
+      open: 20050,
+      high: 20200,
+      low: 20000,
+      close: 20150,
+      volume: 9.75,
+      closed: true,
+    },
+  ],
+  count: 2,
+};
+
 /** Resolve every mocked read with a valid payload. */
 function mockHappyPath(): void {
   vi.mocked(api.fetchProfile).mockResolvedValue(PROFILE);
@@ -171,6 +199,7 @@ function mockHappyPath(): void {
   vi.mocked(api.fetchTrades).mockResolvedValue(TRADES);
   vi.mocked(api.fetchOrders).mockResolvedValue(ORDERS);
   vi.mocked(api.fetchMetrics).mockResolvedValue(METRICS);
+  vi.mocked(api.fetchCandles).mockResolvedValue(CANDLES);
 }
 
 /** Render the Server Component exactly as Next renders it. */
@@ -194,6 +223,12 @@ describe('ProfileDetailPage', () => {
 
     expect(api.fetchProfile).toHaveBeenCalledWith('btc-paper', { baseUrl: 'http://127.0.0.1:8080' });
     expect(api.fetchEquity).toHaveBeenCalledWith('btc-paper', { baseUrl: 'http://127.0.0.1:8080' });
+    // The candle window belongs to the first paint: without it the chart would
+    // show its empty state until the ten-second detail loop fired.
+    expect(api.fetchCandles).toHaveBeenCalledWith('btc-paper', expect.any(Number), {
+      baseUrl: 'http://127.0.0.1:8080',
+    });
+    expect(screen.queryByText(/no candle yet/i)).not.toBeInTheDocument();
     expect(api.fetchHealth).toHaveBeenCalledWith({ baseUrl: 'http://127.0.0.1:8080' });
     expect(api.fetchKillSwitch).toHaveBeenCalledWith({ baseUrl: 'http://127.0.0.1:8080' });
   });

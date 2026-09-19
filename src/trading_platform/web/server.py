@@ -48,15 +48,19 @@ from trading_platform.config.models import MonitoringConfig
 from trading_platform.realtime.monitor import Monitor
 from trading_platform.web.routes import (
     LOGGER_NAME,
+    CatalogProvider,
     HttpResponse,
+    ProfileController,
     Router,
     SnapshotProvider,
     operator_token_from_env,
 )
 
 __all__ = [
+    "CatalogProvider",
     "MonitoringHandler",
     "MonitoringServer",
+    "ProfileController",
     "SnapshotProvider",
     "create_server",
     "operator_token_from_env",
@@ -271,6 +275,8 @@ def create_server(
     host: str | None = None,
     port: int | None = None,
     version: str = "",
+    controller: ProfileController | None = None,
+    catalog: CatalogProvider | None = None,
 ) -> MonitoringServer:
     """Build (and bind) the monitoring server of a platform.
 
@@ -281,6 +287,11 @@ def create_server(
     environment through :func:`operator_token_from_env` (``TB_OPERATOR_TOKEN``);
     an empty value means "no token configured", and the mutating route then
     refuses every request -- the fail-safe direction.
+
+    ``controller`` and ``catalog`` are the two lifecycle seams of the profile
+    surface, forwarded verbatim to :class:`~trading_platform.web.routes.Router`:
+    a server built without a controller (``realtime serve``) refuses every
+    lifecycle route with the documented ``403`` and still answers the catalog.
     """
     token = operator_token_from_env() if operator_token is None else operator_token
     router = Router(
@@ -290,6 +301,8 @@ def create_server(
         read_only=read_only,
         operator_token=token,
         version=version,
+        controller=controller,
+        catalog=catalog,
     )
     address = (config.host if host is None else host, config.port if port is None else port)
     return MonitoringServer(address, MonitoringHandler, router=router)

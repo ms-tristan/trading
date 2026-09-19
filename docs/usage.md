@@ -1162,3 +1162,47 @@ make dashboard-build            # next build (standalone output)
 make dashboard-check            # lint + typecheck + test-coverage + build
 make check-all                  # make check (Python) + make dashboard-check
 ```
+
+### 11.8 Cycle de vie des profils et historique de bougies
+
+Le tableau de bord Next.js de `dashboard/` expose désormais la création, la mise
+en pause, la reprise et la suppression d'un profil, ainsi qu'un graphique en
+chandeliers japonais sur la page d'un profil (avec les entrées/sorties, le prix
+moyen de la position ouverte et son stop).
+
+```bash
+# le catalogue des sélecteurs : paires négociables, stratégies, timeframes, modes
+curl -s http://127.0.0.1:8080/api/catalog
+
+# l'état de pause de chaque profil, et ce que ce serveur accepte de muter
+curl -s http://127.0.0.1:8080/api/control
+
+# les bougies persistées d'un profil (500 par défaut, 1000 au maximum)
+curl -s "http://127.0.0.1:8080/api/profiles/btc-paper/candles?limit=100"
+
+# pause, reprise et suppression : le jeton opérateur est obligatoire
+curl -s -X POST -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
+  http://127.0.0.1:8080/api/profiles/btc-paper/pause
+curl -s -X POST -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
+  http://127.0.0.1:8080/api/profiles/btc-paper/resume
+curl -s -X DELETE -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
+  http://127.0.0.1:8080/api/profiles/btc-paper
+
+# création : le profil est écrit dans le fichier de profils, puis démarré
+curl -s -X POST -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"profile_id": "sol-paper", "symbol": "SOL/USDT", "timeframe": "15m",
+       "strategy": "basic", "mode": "paper", "initial_balance": 2500}' \
+  http://127.0.0.1:8080/api/profiles
+```
+
+Mettre un profil en pause arrête l'**ouverture** de nouvelles positions mais
+garde la position ouverte pilotée : le stop et les sorties restent évalués, donc
+un profil en pause reste `running` et continue de publier son equity et ses
+bougies. La suppression aplatit d'abord toute la position au marché, puis retire
+le profil du moteur **et** du fichier de profils (réécrit de façon atomique) :
+si l'aplatissement échoue, la suppression échoue et rien n'est modifié. La
+création valide le corps contre le catalogue (`400` sur une stratégie ou un
+timeframe inconnus, `409` sur un identifiant déjà pris). Ces quatre routes
+exigent `X-Operator-Token` et répondent `403` sur un serveur `realtime serve`,
+qui ne mute jamais l'état.
