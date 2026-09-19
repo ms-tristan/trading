@@ -114,7 +114,7 @@ afterEach(() => {
 });
 
 describe('OverviewPage', () => {
-  it('server-renders every profile field together with the platform summary', async () => {
+  it('server-renders the essential profile fields together with the platform summary', async () => {
     render(await OverviewPage());
 
     // The heading stays in the accessibility tree but is no longer painted: the
@@ -127,8 +127,13 @@ describe('OverviewPage', () => {
 
     // Profile identity and its link to the detail route.
     expect(screen.getByRole('link', { name: 'alpha' })).toHaveAttribute('href', '/profiles/alpha');
-    expect(screen.getByText('BTC/USDT')).toBeInTheDocument();
-    expect(screen.getByText('BasicStrategy')).toBeInTheDocument();
+    expect(screen.getByText('BTC/USDT · 1h')).toBeInTheDocument();
+
+    // The overview cards are essential only: the annex fields of a profile
+    // (strategy, counters, per-profile money breakdown) live on the detail route
+    // and are never rendered on the homepage anymore.
+    expect(screen.queryByText('BasicStrategy')).not.toBeInTheDocument();
+    expect(screen.queryByText('Strategy')).not.toBeInTheDocument();
 
     // Numbers, signed return and counters.
     expect(screen.getByText('$10,450.50')).toBeInTheDocument();
@@ -137,7 +142,9 @@ describe('OverviewPage', () => {
     // profile return and the wallet P&L of the shared ledger both read "Up".
     expect(screen.getAllByText('Up').length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText('Down')).toBeInTheDocument();
-    expect(screen.getByText('12')).toBeInTheDocument();
+    // The per-profile trade counter left the homepage with the annex fields: no
+    // card renders the bare "12" anymore.
+    expect(screen.queryByText('12')).not.toBeInTheDocument();
 
     // Mode and status are rendered as text, never as colour alone.
     expect(screen.getByText('Paper')).toBeInTheDocument();

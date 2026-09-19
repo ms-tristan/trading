@@ -61,15 +61,6 @@ function makeProfile(overrides: Partial<ProfileSnapshot> = {}): ProfileSnapshot 
   };
 }
 
-/** The labelled field wrapper of `label` (its `<dt>` / `<dd>` pair). */
-function field(label: string): HTMLElement {
-  const wrapper = screen.getByText(label).closest('div');
-  if (wrapper === null) {
-    throw new Error(`no field wrapper for ${label}`);
-  }
-  return wrapper;
-}
-
 const OPERATOR_TOKEN = 'card-operator-token';
 
 /** `GET /api/control` answer of the card tests: only this profile. */
@@ -108,6 +99,81 @@ async function renderCard(profile: ProfileSnapshot) {
   return view;
 }
 
+/** The heading of the card, which is also its accessible label. */
+function heading(): HTMLElement {
+  return screen.getByRole('heading', { level: 3 });
+}
+
+/** The card element itself, reached through its labelled heading. */
+function card(): HTMLElement | null {
+  return heading().closest('article');
+}
+
+/** The compact key-value row of the card (never a definition grid). */
+function keyValues(): HTMLElement {
+  return screen.getByTestId('profile-card-key-values');
+}
+
+/** The key-value pair whose `<dt>` text is exactly `label`. */
+function keyValue(label: string): HTMLElement {
+  const pairs = keyValues().querySelectorAll<HTMLElement>('[data-testid="profile-card-key-value"]');
+  for (const pair of pairs) {
+    if (pair.querySelector('dt')?.textContent === label) {
+      return pair;
+    }
+  }
+  throw new Error(`no key-value pair for ${label}`);
+}
+
+/** The `SYMBOL · TIMEFRAME` secondary line of the heading block. */
+function symbolLine(): HTMLElement {
+  return screen.getByTestId('profile-card-symbol');
+}
+
+/**
+ * The labels that moved to the `/profiles/[id]` detail route (rendered there by
+ * the profile header) and may therefore never appear on the overview card.
+ */
+const ANNEX_LABELS = [
+  'Profile id',
+  'Symbol',
+  'Timeframe',
+  'Strategy',
+  'Attributed cash',
+  'Allocation',
+  'Deployed',
+  'Position value',
+  'Initial balance',
+  'Realized P&L',
+  'Unrealized P&L',
+  'Last blocked order',
+  'Trades',
+  'Open positions',
+  'Last candle',
+  'Candle lag',
+  'Started at',
+  'Updated at',
+] as const;
+
+/**
+ * The annex values of the default fixture: the figures the trimmed card no
+ * longer renders (strategy, attributed cash, allocation, deployed, position
+ * value, initial balance, realized and unrealized P&L, trade count, candle
+ * timestamp, candle lag, start time).
+ */
+const ANNEX_VALUES = [
+  'BasicStrategy',
+  '$8,000.00',
+  '$10,000.00',
+  '$2,245.50',
+  '$2,450.50',
+  '+$245.50',
+  '+$205.00',
+  '2024-01-01 00:00:00 UTC',
+  '12s',
+  '2023-12-01 00:00:00 UTC',
+] as const;
+
 beforeEach(() => {
   window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, OPERATOR_TOKEN);
   fetchMock = vi.fn(async (url: unknown): Promise<Response> => {
@@ -125,161 +191,48 @@ afterEach(() => {
 });
 
 describe('ProfileCard', () => {
-  it('renders every labelled field of the profile', async () => {
+  it('renders only the essential values of the profile', async () => {
     await renderCard(makeProfile());
 
-    expect(field('Profile id')).toHaveTextContent('alpha');
-    expect(field('Symbol')).toHaveTextContent('BTC/USDT');
-    expect(field('Timeframe')).toHaveTextContent('1h');
-    expect(field('Strategy')).toHaveTextContent('BasicStrategy');
-    // The money fields of the profile are its attributed share of the one
-    // shared platform wallet, and they are labelled as such.
-    expect(field('Attributed equity')).toHaveTextContent('$10,450.50');
-    expect(field('Attributed cash')).toHaveTextContent('$8,000.00');
-    expect(field('Allocation')).toHaveTextContent('$10,000.00');
-    expect(field('Deployed')).toHaveTextContent('$2,245.50');
-    expect(field('Realized P&L')).toHaveTextContent('+$245.50');
-    expect(field('Unrealized P&L')).toHaveTextContent('+$205.00');
-    expect(field('Last blocked order')).toHaveTextContent(EMPTY_PLACEHOLDER);
-    expect(field('Position value')).toHaveTextContent('$2,450.50');
-    expect(field('Initial balance')).toHaveTextContent('$10,000.00');
-    expect(field('Trades')).toHaveTextContent('12');
-    expect(field('Open positions')).toHaveTextContent('1');
-    expect(field('Last candle')).toHaveTextContent('2024-01-01 00:00:00 UTC');
-    expect(field('Candle lag')).toHaveTextContent('12s');
-    expect(field('Started at')).toHaveTextContent('2023-12-01 00:00:00 UTC');
-    expect(field('Updated at')).toHaveTextContent('2024-01-01 00:00:00 UTC');
+    expect(heading()).toHaveTextContent('alpha');
+    expect(heading()).toHaveAttribute('id', 'profile-alpha');
+    expect(symbolLine()).toHaveTextContent('BTC/USDT · 1h');
+
+    expect(keyValue('Attributed equity')).toHaveTextContent('$10,450.50');
+    expect(keyValue('Total return')).toHaveTextContent('+4.50%');
+    expect(keyValue('Total return')).toHaveTextContent('Up');
   });
 
-  it('never labels a per-profile cash figure as a pot of its own', async () => {
+  it('never renders the annex fields on the overview card', async () => {
     await renderCard(makeProfile());
 
-    // The bare labels are gone: `cash` and `equity` are attributed shares of the
-    // shared wallet, and the card says so.
-    expect(screen.queryByText('Cash')).not.toBeInTheDocument();
-    expect(screen.queryByText('Equity')).not.toBeInTheDocument();
+    for (const label of ANNEX_LABELS) {
+      expect(screen.queryByText(label)).toBeNull();
+    }
+
+    for (const value of ANNEX_VALUES) {
+      expect(screen.queryByText(value)).toBeNull();
+    }
+
+    const text = document.body.textContent ?? '';
+    expect(text).not.toContain('BasicStrategy');
+    expect(text).not.toContain('+$245.50');
+    expect(text).not.toContain('+$205.00');
+
+    // The retained figures keep their exact labels: equity stays *attributed*
+    // (a share of the shared wallet) and is never renamed to a pot of its own.
+    expect(screen.getByText('Attributed equity')).toBeInTheDocument();
+    expect(screen.getByText('Total return')).toBeInTheDocument();
   });
 
-  it('pairs each attributed P&L with its sign, a trend label and an icon', async () => {
-    const { unmount } = await renderCard(
-      makeProfile({ realized_pnl: -120.5, unrealized_pnl: 0 }),
-    );
-
-    expect(field('Realized P&L')).toHaveTextContent('-$120.50');
-    expect(field('Realized P&L')).toHaveTextContent('Down');
-    expect(field('Realized P&L').querySelector('svg')).not.toBeNull();
-
-    expect(field('Unrealized P&L')).toHaveTextContent('$0.00');
-    expect(field('Unrealized P&L')).toHaveTextContent('Flat');
-    unmount();
-
-    await renderCard(makeProfile({ realized_pnl: 245.5, unrealized_pnl: 205 }));
-
-    expect(field('Realized P&L')).toHaveTextContent('+$245.50');
-    expect(field('Realized P&L')).toHaveTextContent('Up');
-    expect(field('Unrealized P&L')).toHaveTextContent('+$205.00');
-    expect(field('Unrealized P&L')).toHaveTextContent('Up');
-  });
-
-  it('shows the reason of the last blocked order verbatim', async () => {
-    const refusal =
-      'platform_wallet: the shared wallet cannot fund this order — needs 500.00 USDT, holds 120.00 USDT';
-    const { unmount } = await renderCard(makeProfile({ last_block_reason: refusal }));
-
-    expect(field('Last blocked order')).toHaveTextContent(refusal);
-    unmount();
-
-    // No refusal -> the documented em dash, never an empty cell.
-    await renderCard(makeProfile({ last_block_reason: null }));
-    expect(field('Last blocked order')).toHaveTextContent(EMPTY_PLACEHOLDER);
-  });
-
-  it('labels the card with its heading and links it to the profile detail route', async () => {
-    await renderCard(makeProfile({ profile_id: 'alpha beta' }));
-
-    const heading = screen.getByRole('heading', { level: 3 });
-    expect(heading).toHaveAttribute('id', 'profile-alpha-beta');
-
-    const link = screen.getByRole('link', { name: 'alpha beta' });
-    expect(link).toHaveAttribute('href', '/profiles/alpha%20beta');
-  });
-
-  it('stretches the profile link over the whole card', async () => {
-    await renderCard(makeProfile());
-
-    // The heading link carries the overlay that makes the entire card a target,
-    // and the card is the positioning context it stretches over. Without both,
-    // only the few characters of the profile id were clickable and the rest of
-    // the card looked interactive but did nothing.
-    const link = screen.getByRole('link', { name: 'alpha' });
-    expect(link.className).toContain('after:absolute');
-    expect(link.className).toContain('after:inset-0');
-
-    const card = link.closest('article');
-    expect(card?.className).toContain('relative');
-  });
-
-  it('keeps the lifecycle controls above the stretched link', async () => {
-    await renderCard(makeProfile());
-
-    // The buttons are lifted above the overlay, so clicking them still controls
-    // the profile instead of navigating away.
-    const pause = screen.getByRole('button', { name: 'Pause' });
-    const footer = pause.closest('footer');
-    expect(footer?.className).toContain('z-10');
-    expect(footer?.className).toContain('relative');
-  });
-
-  it('renders the mode and the status as text labels, never colour alone', async () => {
-    const { unmount } = await renderCard(makeProfile({ mode: 'live' }));
-
-    const liveBadge = screen.getByText('Live').closest('span[data-tone]');
-    expect(liveBadge).toHaveAttribute('data-tone', 'warn');
-    expect(liveBadge?.querySelector('svg')).not.toBeNull();
-    unmount();
-
-    await renderCard(makeProfile({ status: 'degraded', mode: 'paper' }));
-
-    expect(screen.getByText('Paper').closest('span[data-tone]')).toHaveAttribute('data-tone', 'info');
-    const degradedBadge = screen.getByText('Degraded').closest('span[data-tone]');
-    expect(degradedBadge).toHaveAttribute('data-tone', 'warn');
-    expect(degradedBadge?.querySelector('svg')).not.toBeNull();
-  });
-
-  it('pairs the total return with an explicit sign, a trend label and an icon', async () => {
-    const { unmount } = await renderCard(makeProfile({ total_return: 0.045 }));
-
-    expect(field('Total return')).toHaveTextContent('+4.50%');
-    expect(field('Total return')).toHaveTextContent('Up');
-    expect(field('Total return').querySelector('svg')).not.toBeNull();
-    unmount();
-
-    await renderCard(makeProfile({ total_return: -0.02 }));
-
-    expect(field('Total return')).toHaveTextContent('-2.00%');
-    expect(field('Total return')).toHaveTextContent('Down');
-  });
-
-  it('renders the em dash for every absent value and never NaN or undefined', async () => {
+  it('renders the em dash for every absent retained value and never NaN or undefined', async () => {
     await renderCard(
       makeProfile({
+        profile_id: '',
         symbol: '',
         timeframe: null as unknown as string,
-        strategy: undefined as unknown as string,
-        initial_balance: null,
         equity: null,
-        cash: null,
-        position_value: null,
         total_return: null,
-        allocation: null,
-        deployed: null,
-        realized_pnl: null,
-        unrealized_pnl: null,
-        last_block_reason: null,
-        started_at: null,
-        updated_at: null,
-        n_trades: null as unknown as number,
-        open_positions: undefined as unknown as number,
         health: {
           profile_id: 'alpha',
           status: 'running',
@@ -300,69 +253,126 @@ describe('ProfileCard', () => {
       }),
     );
 
-    for (const label of [
-      'Symbol',
-      'Timeframe',
-      'Strategy',
-      'Initial balance',
-      'Attributed equity',
-      'Attributed cash',
-      'Allocation',
-      'Deployed',
-      'Position value',
-      'Total return',
-      'Realized P&L',
-      'Unrealized P&L',
-      'Last blocked order',
-      'Trades',
-      'Open positions',
-      'Last candle',
-      'Candle lag',
-      'Started at',
-      'Updated at',
-    ]) {
-      expect(field(label)).toHaveTextContent(EMPTY_PLACEHOLDER);
-    }
+    // Both sides of the symbol line fall back to the em dash placeholder.
+    expect(symbolLine()).toHaveTextContent(EMPTY_PLACEHOLDER);
+    // The `<dd>` is the only place the figure can be: no stray text around it.
+    expect(keyValue('Attributed equity').querySelector('dd')?.textContent).toBe(EMPTY_PLACEHOLDER);
+    expect(keyValue('Total return')).toHaveTextContent(EMPTY_PLACEHOLDER);
+    // An absent total return carries no trend claim at all: no text, no icon.
+    expect(keyValue('Total return')).not.toHaveTextContent('Up');
+    expect(keyValue('Total return')).not.toHaveTextContent('Down');
+    expect(keyValue('Total return')).not.toHaveTextContent('Flat');
+    expect(keyValue('Total return').querySelector('svg')).toBeNull();
 
-    expect(screen.getAllByText(EMPTY_PLACEHOLDER).length).toBeGreaterThanOrEqual(19);
     const text = document.body.textContent ?? '';
     expect(text).not.toContain('NaN');
     expect(text).not.toContain('undefined');
-    // An absent total return or P&L carries no trend claim at all.
-    expect(field('Total return')).not.toHaveTextContent('Flat');
-    expect(field('Realized P&L')).not.toHaveTextContent('Flat');
-    expect(field('Unrealized P&L')).not.toHaveTextContent('Flat');
   });
 
-  it('renders an older payload without the attributed keys as the em dash state', async () => {
-    // A server that does not emit the attributed breakdown yet stays valid: the
-    // absent keys are not formatted into a wrong figure, they are em dashes.
-    await renderCard(
-      makeProfile({
-        allocation: undefined,
-        deployed: undefined,
-        realized_pnl: undefined,
-        unrealized_pnl: undefined,
-        last_block_reason: undefined,
-      }),
-    );
+  it('falls back to the em dash on either side of the symbol line independently', async () => {
+    const { unmount } = await renderCard(makeProfile({ symbol: '' }));
 
-    for (const label of [
-      'Allocation',
-      'Deployed',
-      'Realized P&L',
-      'Unrealized P&L',
-      'Last blocked order',
-    ]) {
-      expect(field(label)).toHaveTextContent(EMPTY_PLACEHOLDER);
-    }
+    const withoutSymbol = symbolLine().textContent ?? '';
+    expect(withoutSymbol.startsWith(EMPTY_PLACEHOLDER)).toBe(true);
+    expect(withoutSymbol.endsWith('1h')).toBe(true);
+    unmount();
 
-    // The pre-existing figures keep rendering: nothing was removed.
-    expect(field('Attributed equity')).toHaveTextContent('$10,450.50');
-    expect(field('Attributed cash')).toHaveTextContent('$8,000.00');
-    const text = document.body.textContent ?? '';
-    expect(text).not.toContain('NaN');
-    expect(text).not.toContain('undefined');
+    await renderCard(makeProfile({ timeframe: null as unknown as string }));
+
+    const withoutTimeframe = symbolLine().textContent ?? '';
+    expect(withoutTimeframe.startsWith('BTC/USDT')).toBe(true);
+    expect(withoutTimeframe.endsWith(EMPTY_PLACEHOLDER)).toBe(true);
+  });
+
+  it('pairs every state with a tone, a text label and an icon', async () => {
+    const { unmount } = await renderCard(makeProfile({ mode: 'live' }));
+
+    const liveBadge = screen.getByText('Live').closest('span[data-tone]');
+    expect(liveBadge).toHaveAttribute('data-tone', 'warn');
+    expect(liveBadge?.querySelector('svg')).not.toBeNull();
+    unmount();
+
+    const second = await renderCard(makeProfile({ mode: 'paper', status: 'degraded' }));
+
+    const paperBadge = screen.getByText('Paper').closest('span[data-tone]');
+    expect(paperBadge).toHaveAttribute('data-tone', 'info');
+    expect(paperBadge?.querySelector('svg')).not.toBeNull();
+
+    const degradedBadge = screen.getByText('Degraded').closest('span[data-tone]');
+    expect(degradedBadge).toHaveAttribute('data-tone', 'warn');
+    expect(degradedBadge?.querySelector('svg')).not.toBeNull();
+    second.unmount();
+
+    await renderCard(makeProfile({ status: 'running' }));
+
+    const runningBadge = screen.getByText('Running').closest('span[data-tone]');
+    expect(runningBadge).toHaveAttribute('data-tone', 'ok');
+    expect(runningBadge?.querySelector('svg')).not.toBeNull();
+  });
+
+  it('falls back to a neutral badge for a status outside the documented set', async () => {
+    await renderCard(makeProfile({ status: 'unknown' as ProfileStatus }));
+
+    const badge = screen.getByText('unknown').closest('span[data-tone]');
+    expect(badge).toHaveAttribute('data-tone', 'neutral');
+    expect(badge?.querySelector('svg')).not.toBeNull();
+  });
+
+  it('falls back to a neutral badge for a mode outside the documented set', async () => {
+    await renderCard(makeProfile({ mode: 'sandbox' as ProfileSnapshot['mode'] }));
+
+    const badge = screen.getByText('sandbox').closest('span[data-tone]');
+    expect(badge).toHaveAttribute('data-tone', 'neutral');
+    expect(badge?.querySelector('svg')).not.toBeNull();
+  });
+
+  it('pairs the total return with a sign, a trend label and an icon', async () => {
+    const { unmount } = await renderCard(makeProfile({ total_return: 0.045 }));
+
+    expect(keyValue('Total return')).toHaveTextContent('+4.50%');
+    expect(keyValue('Total return')).toHaveTextContent('Up');
+    expect(keyValue('Total return').querySelectorAll('svg')).toHaveLength(1);
+    unmount();
+
+    await renderCard(makeProfile({ total_return: -0.02 }));
+
+    expect(keyValue('Total return')).toHaveTextContent('-2.00%');
+    expect(keyValue('Total return')).toHaveTextContent('Down');
+    expect(keyValue('Total return').querySelectorAll('svg')).toHaveLength(1);
+  });
+
+  it('labels the card with its heading and links it to the profile detail route', async () => {
+    await renderCard(makeProfile({ profile_id: 'alpha beta' }));
+
+    expect(heading()).toHaveAttribute('id', 'profile-alpha-beta');
+
+    const link = screen.getByRole('link', { name: 'alpha beta' });
+    expect(link).toHaveAttribute('href', '/profiles/alpha%20beta');
+  });
+
+  it('stretches the profile link over the whole card', async () => {
+    await renderCard(makeProfile());
+
+    // The heading link carries the overlay that makes the entire card a target,
+    // and the card is the positioning context it stretches over. Without both,
+    // only the few characters of the profile id were clickable and the rest of
+    // the card looked interactive but did nothing.
+    const link = screen.getByRole('link', { name: 'alpha' });
+    expect(link.className).toContain('after:absolute');
+    expect(link.className).toContain('after:inset-0');
+
+    expect(link.closest('article')?.className).toContain('relative');
+  });
+
+  it('keeps the lifecycle controls above the stretched link', async () => {
+    await renderCard(makeProfile());
+
+    // The buttons are lifted above the overlay, so clicking them still controls
+    // the profile instead of navigating away.
+    const pause = screen.getByRole('button', { name: 'Pause' });
+    const footer = pause.closest('footer');
+    expect(footer?.className).toContain('z-10');
+    expect(footer?.className).toContain('relative');
   });
 
   it('surfaces a non-null last error as a labelled warning row', async () => {
@@ -382,14 +392,17 @@ describe('ProfileCard', () => {
     unmount();
 
     await renderCard(makeProfile());
-    expect(screen.queryByText('Last error')).not.toBeInTheDocument();
+    expect(screen.queryByText('Last error')).toBeNull();
   });
 
-  it('falls back to a neutral badge for a status outside the documented set', async () => {
-    await renderCard(makeProfile({ status: 'unknown' as ProfileStatus }));
+  it('renders a compact card without a definition grid', async () => {
+    await renderCard(makeProfile());
 
-    const badge = screen.getByText('unknown').closest('span[data-tone]');
-    expect(badge).toHaveAttribute('data-tone', 'neutral');
+    // The card holds exactly one `<dl>` — the compact key-value row — and it
+    // holds exactly the two retained figures: the 19-field grid is gone.
+    expect(card()?.querySelector('dl')).toBe(keyValues());
+    expect(keyValues().querySelectorAll('[data-testid="profile-card-key-value"]')).toHaveLength(2);
+    expect(screen.queryByText('Strategy')).toBeNull();
   });
 
   it('renders the actions island of the profile in the card footer', async () => {
@@ -448,18 +461,18 @@ describe('ProfileCard press feedback', () => {
     await renderCard(makeProfile());
 
     const link = screen.getByRole('link', { name: 'alpha' });
-    const card = link.closest('article') as HTMLElement;
+    const element = link.closest('article') as HTMLElement;
 
     // Scoped to `a:active`: pressing a button of the footer never puts the link
     // in the active state, so the card cannot light up for a lifecycle click.
-    expect(card).toHaveClass('has-[a:active]:border-accent');
-    expect(card).toHaveClass('has-[a:active]:ring-1');
-    expect(card).toHaveClass('has-[a:active]:ring-accent');
+    expect(element).toHaveClass('has-[a:active]:border-accent');
+    expect(element).toHaveClass('has-[a:active]:ring-1');
+    expect(element).toHaveClass('has-[a:active]:ring-accent');
     // A ring is a box-shadow: no reflow, and the existing states stay intact.
-    expect(card).toHaveClass('hover:border-accent/50');
-    expect(card).toHaveClass('focus-within:border-accent/50');
-    expect(card).toHaveClass('motion-safe:transition-colors');
-    expect(card).toHaveClass('motion-safe:duration-200');
+    expect(element).toHaveClass('hover:border-accent/50');
+    expect(element).toHaveClass('focus-within:border-accent/50');
+    expect(element).toHaveClass('motion-safe:transition-colors');
+    expect(element).toHaveClass('motion-safe:duration-200');
   });
 
   it('never lets the card press affordance swallow a lifecycle click', async () => {
