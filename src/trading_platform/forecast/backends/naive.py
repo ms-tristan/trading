@@ -15,6 +15,21 @@ and two calls with the same requests return the same trajectories.  It also
 hosts the small validation helpers shared by the offline backends (see
 :mod:`trading_platform.forecast.backends.seasonal`), so both agree bit for bit
 on what a valid request and a valid level sequence are.
+
+Because the two offline backends are the only forecasters a ``.[dev]``
+installation can run, they carry the whole *offline* proof of the forecasting
+layer: every documented recipe that needs an artifact without a model download
+(``trading forecast-build --backend naive``) is served here, which is also how
+the realtime integration of the ``timesfm`` strategy is regression-tested
+without ``torch``.
+
+Non-mutation guarantee
+----------------------
+The input list and every context it holds are **read-only** for both offline
+backends.  A model wrapper is known to pad its input list in place, so both
+implementations iterate over a snapshot and copy each context into ``float64``
+before touching it; ``tests/test_forecast_backends_offline.py`` pins that the
+caller's sequence and its context lists are byte-identical after a call.
 """
 
 from __future__ import annotations
@@ -158,11 +173,25 @@ class NaiveBackend:
         Number of trailing log differences used to estimate the per-step scale
         (``>= 1``).
 
+    Attributes
+    ----------
+    name:
+        Registry identifier of the backend, always :data:`BACKEND_NAME`.
+
     Examples
     --------
     With a context of ``(0.0, 1.0, 2.0)`` the trailing log differences are both
     ``1.0``, so the per-step scale is ``1.0``, the median path is flat and the
     level ``q`` of step ``i`` is ``sqrt(i) * z(q)``.
+
+    >>> import pandas as pd
+    >>> backend = NaiveBackend(quantile_levels=(0.1, 0.5, 0.9))
+    >>> request = ForecastRequest(
+    ...     origin=pd.Timestamp("2024-01-01T00:00:00Z"), context=(0.0, 1.0, 2.0)
+    ... )
+    >>> trajectory = backend.predict([request], horizon=2)[0]
+    >>> [round(float(value), 4) for value in trajectory.median]
+    [0.0, 0.0]
     """
 
     name: str = BACKEND_NAME
@@ -200,6 +229,15 @@ class NaiveBackend:
         """Return ``True``: this backend only needs ``numpy`` (always available)."""
         return True
 
+    def license_note(self) -> str:
+        """Return an empty licence note: this backend ships no third-party weights.
+
+        The artifact metadata records this string, so a model-backed backend
+        publishes the licence of its checkpoint while a pure-numpy baseline
+        publishes nothing.
+        """
+        return ""
+
     def predict(
         self, requests: Sequence[ForecastRequest], *, horizon: int
     ) -> list[ForecastTrajectory]:
@@ -209,9 +247,18 @@ class NaiveBackend:
         ----------
         requests:
             The requests to forecast.  They are read, never modified (the model
-            wrappers of other backends are known to mutate their input list).
-        horizon:
-            Number of steps of every trajectory (``>= 1``).
+            wrappers of other backends are known to mutate their input list), so
+            ``predict`` may be handed a caller-owned sequence directly.
+
+        Returns
+        -------
+        list[ForecastTrajectory]
+            Exactly one trajectory per request, in request order, each carrying
+            the request :attr:`~trading_platform.forecast.types.ForecastRequest.origin`,
+            the configured timeframe, the requested ``horizon`` and the
+            configured quantile levels.  The median (``0.5``) row is flat at
+            ``0.0`` and the remaining rows grow like ``sqrt(step)``; every value
+            is finite.
 
         Raises
         ------
@@ -225,8 +272,10 @@ class NaiveBackend:
         z_scores = np.array([_gaussian_z(level) for level in levels], dtype="float64")
         time_scale = np.sqrt(np.arange(1, steps + 1, dtype="float64"))
 
+        # Iterate over a snapshot: a caller-owned (possibly mutable) sequence is
+        # never traversed in place, and `_context_values` copies every series.
         trajectories: list[ForecastTrajectory] = []
-        for request in requests:
+        for request in list(requests):
             context = _context_values(request)
             window = context[-(self._dispersion_window + 1) :]
             sigma_step = float(np.mean(np.abs(np.diff(window))))
@@ -244,5 +293,22 @@ class NaiveBackend:
 
 
 def build_backend(**options: Any) -> NaiveBackend:
-    """Build a :class:`NaiveBackend` from keyword ``options`` (registry factory)."""
+    """Build a :class:`NaiveBackend` from keyword ``options`` (registry factory).
+
+    Parameters
+    ----------
+    **options:
+        Forwarded verbatim to :class:`NaiveBackend` (``timeframe``,
+        ``quantile_levels``, ``dispersion_window``).
+
+    Returns
+    -------
+    NaiveBackend
+        A fresh, deterministic backend instance.
+
+    Examples
+    --------
+    >>> build_backend(timeframe="4h").timeframe
+    '4h'
+    """
     return NaiveBackend(**options)

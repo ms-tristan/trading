@@ -3,7 +3,7 @@
 Ce document décrit l'architecture du squelette de backtesting : l'arborescence
 livrée, les couches et leurs règles d'import, l'inventaire **gelé** des
 interfaces publiques, le contrat de données OHLCV, les modèles de domaine et les
-deux « coutures » (*seams*) qui rendent le projet testable hors ligne.
+trois « coutures » (*seams*) qui rendent le projet testable hors ligne.
 
 Il complète :
 
@@ -66,6 +66,10 @@ Trading/
 │   │   ├── validation.py             # contrôles qualité OHLCV (tri, doublons, NaN, trous)
 │   │   └── synthetic.py              # générateur de données synthétiques déterministes (tests)
 │   ├── forecast/                     # layer 2.5: offline forecasting (backends, parquet artifact, skill report)
+│   │   ├── series.py                 # de-seasonalisation + seasonal period per timeframe (candles_per_day, resolve_seasonal_period)
+│   │   ├── artifact.py               # ForecastBuildConfig / build_forecast_artifact / ForecastStore + sidecar metadata
+│   │   ├── bootstrap.py              # ensure_forecast_backends: the offline backends are importable, or one loud error
+│   │   └── bootstrap_profile.py      # bootstrap_profile_forecast: build the artifact a realtime profile declares
 │   ├── strategy/
 │   │   ├── indicators.py             # EMA, RSI, ATR — calculs purs, sans dépendance externe
 │   │   ├── base.py                   # Strategy : contrat prepare / signals / run
@@ -103,6 +107,7 @@ Trading/
 │   │   ├── risk.py                   # RiskLimits / RiskManager / KillSwitch / LiveTradingGate
 │   │   ├── gateway.py                # ExecutionGateway : l'UNIQUE cycle de vie d'un ordre (paper = live)
 │   │   ├── strategies.py             # résolution de stratégie + pont IStrategy Freqtrade (paresseux)
+│   │   ├── features.py               # profile forecast bundle + startup guard (coverage, symbol, timeframe)
 │   │   ├── runner.py                 # ProfileRunner : un profil, warm-up, boucle par bougie, santé
 │   │   ├── orchestrator.py           # RealtimeOrchestrator : N profils, supervision, câblage, kill switch
 │   │   ├── monitor.py                # read model : ProfileReport, equity, métriques, benchmark, santé
@@ -112,7 +117,8 @@ Trading/
 │   │   ├── routes.py                 # routage pur requête -> réponse + couture SnapshotProvider
 │   │   └── server.py                 # ThreadingHTTPServer, create_server, serve, start_in_thread
 │   └── cli.py                        # CLI Typer (couche 8) : backtest, walk-forward, robustness,
-│                                     # monte-carlo, forecast-build / forecast-skill / forecast-info,
+│                                     # monte-carlo, forecast-build / forecast-bootstrap /
+│                                     # forecast-skill / forecast-info,
 │                                     # data, config et `realtime run|serve|check`
 ├── tests/                            # suite pytest hors ligne (voir docs/testing-policy.md)
 ├── dashboard/                        # standalone Next.js dashboard (App Router, Tailwind v4, 2 s polling)
@@ -197,7 +203,7 @@ bas de cette liste.**
 | 3 | `trading_platform.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_platform.metrics` | couches 1–2.5 (`strategy.engine` importe `config` ; `strategy.timesfm_forecast` importe `forecast` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
 | 4 | `trading_platform.reporting` | couches 1–3 (`core` et `metrics`) |
 | 5 | `trading_platform.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
-| 6 | `trading_platform.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) |
+| 6 | `trading_platform.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) ; it also imports the `strategy.features` seam to inject a profile's forecast artifact (`realtime/features.py`), and the forecast startup guard lives in the same layer |
 | 7 | `trading_platform.web` | layers 1-6, standard library only (HTTP JSON API; no HTML, no static asset - it only knows the SnapshotProvider seam) |
 | 8 | `trading_platform.cli` | couches 1–7 (plus `freqtrade` pour valider une config Freqtrade) |
 
@@ -229,7 +235,11 @@ Conséquences pratiques :
   ignore ce qu'est un walk-forward.
 - `realtime` **réutilise** les couches basses au lieu de les réimplémenter :
   stratégies du registre, `data.loader` / `data.validation`, `metrics`,
-  `validation`, `config` et le pont Freqtrade. Il n'écrit **aucune** formule.
+  `validation`, `config` et le pont Freqtrade. Il n'écrit **aucune** formule. It
+  likewise reuses the **feature-injection seam** (`strategy.features`,
+  §4.10.2): a profile's forecast artifact is loaded once, at startup, by
+  `strategy.features.resolve_features` — never by a second loader, never per
+  candle.
 - `web` n'importe **jamais** l'orchestrateur : il ne connaît de la plateforme que
   la couture `SnapshotProvider`, ce qui lui permet de servir un état persisté
   alors qu'aucun moteur ne tourne (`realtime serve`).
@@ -869,6 +879,41 @@ remplis / rejetés, bougies traitées, reconnexions, refus de risque) sont expos
 par le read model ; chaque profil porte son état explicite (`status`,
 `last_candle_at`, `lag_seconds`, `last_error`, `reconnect_count`).
 
+#### 4.10.7 Profile feature injection — `realtime/features.py`
+
+The realtime engine attaches to each profile the **same** feature bundle as the
+backtest, through the **same** seam (`trading_platform.strategy.features`:
+`resolve_features` / `attach_features`). There is therefore **no** second
+artifact-loading mechanism: the module only adapts a profile to the shape
+expected by the project's single loader, then checks the coverage.
+
+| Symbol | Key signature | Role |
+| --- | --- | --- |
+| `resolve_profile_features` | `resolve_profile_features(profile: ProfileConfig, *, required: bool) -> FeatureBundle` | the **only** construction path of a profile's bundle; loads the artifact **once** (at startup, never per candle) via `strategy.features.resolve_features`, then runs the guard when a path is declared |
+| `check_profile_forecast` | `check_profile_forecast(profile, store, *, now: pd.Timestamp \| None = None) -> ForecastCoverage` | the **mandatory** startup guard: empty bundle, symbol, timeframe, then coverage; raises `ForecastArtifactError` with an actionable message |
+| `ForecastCoverage` | `@dataclass(frozen=True)`: `path`, `symbol`, `timeframe`, `seasonal_period`, `horizon`, `stride`, `first_origin`, `last_origin` | the frozen answer to "is this artifact still usable right now?", rendered by `trading forecast-info` |
+| `strategy_needs_forecast` | `strategy_needs_forecast(profile: ProfileConfig) -> bool` | does the profile's strategy declare an `artifact` parameter? (the strategy's contract, never a hardcoded name) |
+
+`realtime/strategies.py::resolve_strategy` is the **only** construction path of a
+realtime strategy, and it is the one that calls
+`attach_features(strategy, resolve_profile_features(profile, required=True))`.
+All its callers go through `ProfileRunner._prepare` (`start`, `run`, `run_once`,
+the orchestrator, hence `realtime run`, `realtime run --once` and
+`realtime check`): an artifact that is missing, corrupt, built for another
+symbol/timeframe or too stale to cover the profile's decision horizon fails
+**before the first candle**, instead of starting and never trading.
+
+The `ProfileConfig.forecast` field (`Path | None`, `null` by default, the **last**
+field of the model so the order of the existing fields does not move) carries the
+declared path; `ProfileConfig.forecast_artifact` returns it and
+`ProfileConfig.strategy_params()` merges `params` with the `artifact` key without
+ever mutating the profile's configuration. A profile that declares nothing —
+every `basic` profile, including the two shipped examples — keeps its behaviour
+**unchanged**: empty bundle, no loading, no guard. The operational semantics and
+the verbatim refusal message are in
+[`docs/realtime.md`](realtime.md) §3.1, and the layer itself in
+[`docs/forecasting.md`](forecasting.md).
+
 ### 4.11 La couche web — `trading_platform.web`
 
 Couche **7**, **bibliothèque standard uniquement** : `http.server.ThreadingHTTPServer`
@@ -967,6 +1012,9 @@ table, measured traps and the honesty section — is
 | `register_backend` | class decorator `register_backend(cls) -> type[ForecastBackend]` | registers a backend under its `name` (mirrors `strategy.registry`) |
 | `available_backends` / `installed_backends` | `() -> list[str]` | names known to the process / names that can actually run (`is_available()`) |
 | `get_backend` | `get_backend(name: str, **options) -> ForecastBackend` | builds a registered backend; `ForecastError` when the name is unknown or the extra is absent |
+| `ensure_forecast_backends` | `ensure_forecast_backends() -> None` (`forecast/bootstrap.py`) | imports both **offline** backends or raises one actionable `ForecastError`; called before any artifact work, so an installation defect is never reported as a `ModuleNotFoundError` |
+| `bootstrap_profile_forecast` | `bootstrap_profile_forecast(profiles_path, profile_id, *, config, backend="seasonal") -> tuple[Path, ArtifactMetadata]` (`forecast/bootstrap_profile.py`) | builds the artifact a **profile** declares, from the candle file its `symbol`/`timeframe` imply, with an offline backend only; cross-checks the declarations against the file name so an artifact is never stamped with a symbol/timeframe its numbers do not describe |
+| `candles_per_day` / `resolve_seasonal_period` | `candles_per_day(timeframe) -> int`, `resolve_seasonal_period(timeframe, override=None) -> int` (`forecast/series.py`) | the seasonal period per timeframe (`1440` on `1m` … `1` on `1d` and longer) and the explicit override; a hard-coded `24` was only right for hourly candles |
 | `naive` | backend `name = "naive"`, numpy/pandas only | random walk: flat median held at the last context point, dispersion from trailing absolute differences scaled by `sqrt(step)` |
 | `seasonal` | backend `name = "seasonal"`, numpy/pandas only | seasonal baseline drift-corrected in the de-seasonalised space; deterministic and calendar aware |
 | `timesfm` | backend `name = "timesfm"`, `[timesfm]` extra | TimesFM 2.5 (`google/timesfm-2.5-200m-pytorch`, Apache-2.0), lazy import, requests batched by context length, CPU on Apple silicon (MPS is not supported by the 2.5 path) |
@@ -977,7 +1025,7 @@ table, measured traps and the honesty section — is
 | --- | --- | --- |
 | `ForecastStore` | `ForecastStore.load(path) -> ForecastStore`, then `metadata`, `origins() -> pd.DatetimeIndex`, `origin_for(timestamp)`, `trajectory(origin)` (lazy per-origin cache) | read-only view of the artifact; an explicit `ForecastArtifactError` on a missing / corrupt / incompatible file, never a silent degradation |
 | `build_forecast_artifact` | `build_forecast_artifact(frame, out, config) -> Path` | builds the artifact origin by origin on the `reforecast_every` stride, each origin using **only** the candles `<= origin`, then writes the JSON metadata sidecar |
-| `ForecastBuildConfig` | build settings: `backend`, `context_length`, `horizon`, `reforecast_every`, `symbol`, `timeframe`, backend options | describes **what** is built (and feeds the sidecar) |
+| `ForecastBuildConfig` | build settings: `backend`, `context_length`, `horizon`, `reforecast_every`, `symbol`, `timeframe`, `seasonal_period` (`None` = derive it from the timeframe), backend options | describes **what** is built (and feeds the sidecar) |
 | skill report | offline helper used by `trading forecast-skill` | RMSE / MAE / MASE against the random walk, decile coverage, directional accuracy at the horizon |
 
 The artifact is a **parquet** file: a `DatetimeIndex` named `origin` (the last
@@ -994,9 +1042,17 @@ span and the licence note. The exact schema and the commands are in
 
 `trading forecast-build` (options `--config/-c`, `--data-file`, `--out`,
 `--backend naive|seasonal|timesfm`, `--context`, `--horizon`,
-`--reforecast-every`), `trading forecast-skill` (`--artifact`, `--data-file`) and
-`trading forecast-info` (`--artifact`) — all of them accept `--json`, like the
-rest of the CLI. The `make forecast-build` target calls the first one.
+`--reforecast-every`, `--seasonal-period`, `--seasonal-window`, `--model-id`,
+`--symbol`, `--timeframe`), `trading forecast-bootstrap` (`--profiles`,
+`--profile`, `--config/-c`, `--backend naive|seasonal`),
+`trading forecast-skill` (`--artifact`, `--data-file`) and
+`trading forecast-info` (`--artifact`, `--now`, `--profiles`, `--profile`,
+`--timeframe`, `--horizon`) — all of them accept `--json`, like the rest of the
+CLI. `forecast-info` is the operability seam of the startup guard: pointed at a
+profile it raises the **very same** refusal the realtime engine raises at
+startup. The `make forecast-build`, `make forecast-bootstrap`,
+`make forecast-profile`, `make forecast-info` and `make forecast-flow` targets
+call them.
 
 ### 4.14 The `timesfm` strategy — `trading_platform.strategy.timesfm_forecast`
 
@@ -1013,7 +1069,10 @@ rest of the CLI. The `make forecast-build` target calls the first one.
 The `basic` strategy stays **unchanged**: `timesfm` is an additional strategy in
 the registry, and the artifact is injected into it through the
 `trading_platform.strategy.features` seam, used by
-`run_backtest_on_config` / `make_runner`.
+`run_backtest_on_config` / `make_runner` **and** by
+`realtime.strategies.resolve_strategy` (§4.10.7). Every caller of a strategy
+therefore injects the same features through the same seam: the strategy itself
+never loads the artifact, never reads the clock and never touches the network.
 
 ---
 
@@ -1167,11 +1226,12 @@ ou de pydantic sont converties à la frontière de la couche concernée.
 
 ---
 
-## 7. Les deux coutures (*seams*)
+## 7. The three seams (*coutures*)
 
-L'architecture repose sur deux points d'injection volontaires. Ce ne sont pas
-des détails : ce sont eux qui rendent le projet développable en parallèle et
-testable hors ligne.
+The architecture rests on three deliberate injection points. They are not
+details: they are what makes the project developable in parallel and testable
+offline. The third one (7.3, *feature* injection) was added by the realtime
+`timesfm` strategy delivery.
 
 ### 7.1 `RunnerFn` — l'exécution est injectée
 
@@ -1216,6 +1276,28 @@ configuration s'appuie sur `AppConfig.model_dump()` (pydantic).
 Corollaire : **aucun objet du domaine ne rend un `DataFrame` brut dans un
 payload public**. Les séries (equity, drawdown) sont converties en listes ou en
 paires `(timestamp, valeur)` sérialisables.
+
+### 7.3 `strategy.features` — external features are injected
+
+`trading_platform.strategy.features` (`resolve_features` / `attach_features` /
+`FeatureBundle`) is the seam that brings a strategy what it cannot produce on its
+own — the offline forecast artifact — **without** introducing input/output into
+the pure `prepare()` / `signals()` contract. It is used by **every** execution
+path: `run_backtest_on_config` / `make_runner` for the backtest and the validation
+layers, and `realtime.strategies.resolve_strategy` for the realtime engine
+(§4.10.7).
+
+**Why:**
+
+- **A single loader** — the parquet is read only through this seam: neither the
+  engine, nor the orchestrator, nor the strategy knows the artifact format, and a
+  second loading mechanism cannot diverge from the first.
+- **The strategy stays pure** — the forecast enters by injection, so
+  `prepare()` / `signals()` stay deterministic, I/O-free and clock-free, and
+  testable without a model or a network.
+- **The same artifact everywhere** — a realtime profile and a backtest that
+  declare the same artifact receive identical features, which makes the parity of
+  the two engines verifiable.
 
 ---
 

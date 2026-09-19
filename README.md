@@ -52,6 +52,35 @@ Une fois la stratégie validée, **la même définition** est exposée à Freqtr
 et la section « Exposer une stratégie à Freqtrade / dry-run » de
 [`docs/usage.md`](docs/usage.md).
 
+## Strategy `timesfm`: the offline forecast flow
+
+The `timesfm` strategy consumes an **offline** forecast artifact built by
+`trading forecast-build` — the model never runs inside the strategy, so
+`prepare()`/`signals()` stay pure, deterministic and I/O-free. The same artifact
+feeds a **backtest** (`forecast.artifact`) and a **realtime profile** (`forecast`
+key), through the same feature-injection seam
+(`trading_platform.strategy.features`). A realtime profile that declares an
+artifact which is missing, corrupt, built for another symbol/timeframe or too
+stale to cover its decision horizon **refuses to start**, with an actionable
+message, instead of starting and silently never trading.
+
+The operational flow is three commands, all offline except the download:
+
+```bash
+make data-download SYMBOL=BTC/USDT TIMEFRAME=1h    # 1. candles (the only network step)
+make forecast-profile                              # 2. the artifact the profile declares
+make forecast-info PROFILE=config/profiles.timesfm.example.json   # is it still usable?
+make realtime-forecast                             # 3. the engine, on the forecast profile
+make forecast-flow                                 # the four, in order
+```
+
+The reference — artifact schema, backend contract, licences, measured traps,
+per-timeframe seasonal period and the operational workflow — is
+[`docs/forecasting.md`](docs/forecasting.md) and
+[`docs/realtime.md`](docs/realtime.md) §3.1 and §6.1. **A profile that starts and
+trades is observable, not validated**: the model predicts **risk**, not
+direction, and a positive backtest PnL is **not evidence of an edge**.
+
 **Monitoring dashboard.** The dashboard is a standalone **Next.js** application
 (App Router, React 19, Tailwind CSS v4, TypeScript strict) living in `dashboard/`:
 it runs as a real Node server — not a static export — and it polls the monitoring
@@ -67,8 +96,8 @@ asset**: `trading_platform.web` is a pure JSON API, so `GET /`,
 - [`docs/architecture.md`](docs/architecture.md) — architecture du projet, couches et interfaces
 - [`docs/backtesting-methodology.md`](docs/backtesting-methodology.md) — méthodes de validation et seuils de décision
 - [`docs/usage.md`](docs/usage.md) — installation, configuration, CLI, rapports, Docker
-- [`docs/forecasting.md`](docs/forecasting.md) — offline TimesFM-backed forecasting: artifact schema, backend contract, licences, measured library traps and the honesty section (a positive backtest PnL is not evidence of an edge)
-- [`docs/realtime.md`](docs/realtime.md) — temps réel multi-profils : moteur, paper/live, persistance, dashboard
+- [`docs/forecasting.md`](docs/forecasting.md) — offline TimesFM-backed forecasting: artifact schema, backend contract, licences, measured library traps, the per-timeframe seasonal period, the realtime injection and startup guard, and the honesty section (a positive backtest PnL is not evidence of an edge)
+- [`docs/realtime.md`](docs/realtime.md) — temps réel multi-profils : moteur, paper/live, persistance, dashboard, the forecast startup guard and the operator flow
 - [`docs/testing-policy.md`](docs/testing-policy.md) — politique de tests et de couverture
 - [`deploy/README.md`](deploy/README.md) — déploiement local du tableau de bord temps réel (Docker, nginx, TLS, fail2ban)
 

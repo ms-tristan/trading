@@ -352,6 +352,11 @@ unaffected.
 }
 ```
 
+A **realtime profile** declares the same artifact through its own `forecast` key
+(§11.3), and there it is *required* by a `timesfm` profile: the profile is
+refused at startup, with an actionable message, instead of running without ever
+trading ([`docs/realtime.md`](realtime.md) §3.1).
+
 Every other forecast setting lives in the strategy parameters
 (`strategy.params`, §4.7). The artifact itself, its schema, the backends, the
 licence table and the measured library traps are documented in
@@ -606,10 +611,10 @@ inconnues, les types, les timeframes supportés et la cohérence
 Freqtrade et rend `{"kind": "freqtrade", "valid": true, "issues": []}` (un
 `AppConfig` rend `{"kind": "appconfig", ...}`).
 
-### 4.7 `forecast-build` / `forecast-skill` / `forecast-info`
+### 4.7 `forecast-build` / `forecast-bootstrap` / `forecast-skill` / `forecast-info`
 
-These three commands build, measure and inspect the **offline** forecast
-artifact consumed by the `timesfm` strategy. None of them runs inside
+These four commands build, measure and inspect the **offline** forecast artifact
+consumed by the `timesfm` strategy. None of them runs inside
 `prepare()`/`signals()`: prediction is pre-computed here, once, and the strategy
 reads the result as a deterministic external input
 ([`docs/forecasting.md`](forecasting.md)).
@@ -628,6 +633,16 @@ python -m trading_platform.cli forecast-build \
     --out data/forecast/forecast_timesfm.parquet --backend timesfm \
     --context 1024 --horizon 24 --reforecast-every 8
 
+# any symbol, any supported timeframe: both are recorded in the artifact metadata
+python -m trading_platform.cli forecast-build \
+    --config config/backtest_default.json --data-file data/ETH_USDT-4h.csv \
+    --out data/forecast/eth-4h.parquet --backend seasonal \
+    --symbol ETH/USDT --timeframe 4h
+
+# build the artifact a PROFILE declares, from its own candle file (offline only)
+python -m trading_platform.cli forecast-bootstrap \
+    --profiles config/profiles.timesfm.example.json --backend seasonal
+
 # measure the artifact's forecast skill against the random walk
 python -m trading_platform.cli forecast-skill \
     --artifact data/forecast/forecast.parquet --data-file data/BTC_USDT-1h.csv
@@ -635,21 +650,45 @@ python -m trading_platform.cli forecast-skill \
 # inspect the metadata (backend, model, span, schema version, licence note)
 python -m trading_platform.cli forecast-info \
     --artifact data/forecast/forecast.parquet --json
+
+# ... and ask whether it is STILL USABLE right now, against the profile it feeds
+python -m trading_platform.cli forecast-info \
+    --artifact data/forecast/btc-timesfm-paper-1h-seasonal.parquet \
+    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
 ```
 
 | Command | Options | Output |
 | --- | --- | --- |
-| `trading forecast-build` | `--config/-c` (required), `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context N`, `--horizon H`, `--reforecast-every S` | writes the parquet artifact and its `<artifact>.meta.json` sidecar; prints the path, the number of origins and the covered window |
-| `trading forecast-skill` | `--artifact`, `--data-file` | RMSE / MAE / MASE against the random-walk baseline, decile coverage and directional accuracy at the horizon |
-| `trading forecast-info` | `--artifact` | metadata of the artifact (no candle file needed) |
+| `trading forecast-build` | `--config/-c` (required), `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context N`, `--horizon H`, `--reforecast-every S`, `--seasonal-period N`, `--seasonal-window N`, `--model-id`, `--symbol`, `--timeframe` | writes the parquet artifact and its `<artifact>.meta.json` sidecar; prints the path, the number of origins and the covered window |
+| `trading forecast-bootstrap` | `--profiles` (required), `--profile` (default: the first declared), `--config/-c`, `--backend naive\|seasonal` (default `seasonal`) | builds what the profile declares from the candle file its `symbol`/`timeframe` imply, writes it under `data/forecast/<profile-id>-<timeframe>-<backend>.parquet`, and prints the same `coverage` block as `forecast-info` |
+| `trading forecast-skill` | `--artifact`, `--data-file` | RMSE / MAE / MASE against the random-walk baseline, decile coverage and directional accuracy at the horizon, on the modelled target **and** on the real price |
+| `trading forecast-info` | `--artifact`, `--now ISO-8601`, `--profiles`, `--profile`, `--timeframe`, `--horizon` | metadata of the artifact (no candle file needed) plus `run['coverage']`: `first_origin`, `last_origin`, `usable_until`, `usable`, `seasonal_period`, `checked_at` |
 
 Each origin uses **only candles `<= origin`**, `--context` is the number of
 candles fed to the backend, `--horizon` the number of stored steps and
-`--reforecast-every` the stride between two stored origins. All three commands
+`--reforecast-every` the stride between two stored origins. All four commands
 accept `--json`. **Do not read a positive PnL as an edge**: read
 `forecast-skill` first — `rmse_skill_score <= 0`, `mase >= 1` or a directional
 accuracy near `0.5` mean the artifact carries no usable skill
 ([`docs/forecasting.md`](forecasting.md) §9).
+
+**The seasonal period follows the timeframe.** `--seasonal-period` defaults to
+the number of candles of one day at `--timeframe` — `1440` on `1m`, `288` on
+`5m`, `96` on `15m`, `48` on `30m`, `24` on `1h`, `6` on `4h`, `1` on `1d` (and
+longer) — instead of the historical hard-coded `24`, which was only correct for
+hourly candles. An explicit `--seasonal-period N` overrides the derivation, and
+the resolved value is recorded in the artifact metadata.
+
+**Is this artifact still usable right now?** `forecast-info` answers it through
+`run['coverage']`. Without `--profiles` the command only **reports** and never
+fails on staleness. Pointed at a real profile
+(`--profiles <file> [--profile <id>]`) it becomes a pre-flight of that profile:
+it reuses the realtime startup guard verbatim, so a symbol, timeframe or coverage
+failure raises the **same** message the engine raises at startup, and `coverage`
+gains `profile_id`, `symbol_ok` and `timeframe_ok`. `--now` makes the answer
+deterministic — useful in a script or a test — and `--timeframe` / `--horizon`
+override what the coverage is measured on. The guard itself is documented in
+[`docs/realtime.md`](realtime.md) §3.1.
 
 ---
 
@@ -789,7 +828,13 @@ exactement les mêmes commandes que `make check` en local.
 | `make monte-carlo` | `python -m trading_platform monte-carlo --config $(CONFIG)` | Monte Carlo |
 | `make data-download` | `python -m trading_platform data download …` | remplissage du cache (seule cible qui utilise le réseau) |
 | `make forecast-build` | `python -m trading_platform forecast-build --config $(CONFIG) --data-file $(DATA_FILE) --out $(FORECAST_ARTIFACT) --backend $(FORECAST_BACKEND)` | build the offline forecast artifact (`DATA_FILE`, `FORECAST_ARTIFACT`, `FORECAST_BACKEND` override the defaults) |
+| `make forecast-bootstrap` | same command with `--out $(FORECAST_DIR)/bootstrap-naive.parquet --backend naive` | build the naive-baseline artifact used to bootstrap a forecast profile |
+| `make forecast-bootstrap-seasonal` | same command with `--out $(FORECAST_DIR)/bootstrap-seasonal.parquet --backend seasonal` | build the seasonal-baseline artifact used to bootstrap a forecast profile |
+| `make forecast-profile` | `python -m trading_platform forecast-bootstrap --profiles $(TIMESFM_PROFILE) --config $(CONFIG) --backend $${BACKEND:-seasonal}` | build the artifact the forecast profile **declares**, from its own candle file (`BACKEND=…`, `TIMESFM_PROFILE=…` override the defaults) |
+| `make forecast-info` | `python -m trading_platform forecast-info --artifact $(FORECAST_ARTIFACT) [--profiles $(PROFILE)] --json` | report whether `$(FORECAST_ARTIFACT)` is still usable; `PROFILE=…` checks it against a profile through the same startup guard |
 | `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + API JSON (§11) ; dashboard : `make dashboard-dev` (§11.6) |
+| `make realtime-forecast` | `realtime run --profiles $(TIMESFM_PROFILE)` | run the realtime engine on the forecast profile, which therefore really trades (§11.7) |
+| `make forecast-flow` | `data-download forecast-bootstrap forecast-info realtime-forecast` | the documented three-command operational flow, end to end: download the candles, build the artifact, verify it, trade |
 | `make docker-build` | `docker build` | construction de l'image |
 | `make docker-test` | `docker build --target test` puis `docker run … pytest tests --cov-fail-under=85` | suite complète dans le conteneur |
 | `make clean` | suppression des caches et artefacts | nettoyage |
@@ -813,6 +858,21 @@ overridable on the command line:
 ```bash
 make forecast-build
 FORECAST_BACKEND=timesfm FORECAST_ARTIFACT=data/forecast/tfm.parquet make forecast-build
+```
+
+The forecast **profile** targets carry their own variables —
+`FORECAST_DIR` (`data/forecast`), `TIMESFM_PROFILE`
+(`config/profiles.timesfm.example.json`), `PROFILE`
+(`config/profiles.example.json`, the file `forecast-info` checks against) and
+`SYMBOL`/`TIMEFRAME` (`BTC/USDT`, `1h`, used by `data-download`) — and they are
+the operational flow of §11.7:
+
+```bash
+make data-download SYMBOL=BTC/USDT TIMEFRAME=1h           # candles (only network step)
+make forecast-profile TIMESFM_PROFILE=… BACKEND=seasonal  # the artifact the profile declares
+make forecast-info PROFILE=…                              # is it still usable right now?
+make realtime-forecast                                    # the engine, on the forecast profile
+make forecast-flow                                        # the four, in order
 ```
 
 ---
@@ -1080,6 +1140,13 @@ inconnue, dont `api_key`, est refusée bruyamment) :
 | `poll_interval_seconds` | `float > 0` | cadence de sondage propre au profil |
 | `risk` | `object` | bloc `RiskLimitsConfig` ci-dessous |
 | `entry_lookback_candles` | `int` dans `[0, 200]` (défaut `0`) | fenêtre de rattrapage **live uniquement** : la décision d'entrée peut porter sur un croisement survenu dans les `N` dernières bougies ; `0` conserve le comportement historique (seule la dernière ligne décide) ; le backtest l'ignore, il lit déjà chaque ligne |
+| `forecast` | `str \| null` (default `null`) | path of the offline forecast artifact consumed by a forecast-driven strategy (`trading forecast-build`); the **last field** of `ProfileConfig`, so the order of the existing fields does not move. `null` = no artifact, the historical behaviour of every `basic` profile. A `timesfm` profile requires it: at startup, an artifact that is missing, corrupt, stale or built for another symbol/timeframe **refuses to start** with an actionable message, instead of running without ever trading (§11.7) |
+
+The `forecast` key is documented in depth in
+[`docs/realtime.md`](realtime.md) §1 and §3.1 and in
+[`docs/forecasting.md`](forecasting.md); `config/profiles.example.json` keeps
+`"forecast": null` on both of its `basic` profiles, and the shipped forecast
+profile is `config/profiles.timesfm.example.json`.
 
 `risk` (`RiskLimitsConfig`) — toutes les limites sont optionnelles, `null`
 signifie « non appliquée », et `0` est une valeur **valide** pour les limites de
@@ -1267,6 +1334,84 @@ PROFILES=config/profiles.example.json make realtime
 La cible `realtime` appelle `realtime run --profiles
 ${PROFILES:-config/profiles.example.json}` et laisse `make check` intact.
 
+### 11.7.1 Operating a forecast profile: three commands
+
+A `timesfm` profile is inert without an artifact, and the startup guard refuses
+it rather than letting it run silently ([`docs/realtime.md`](realtime.md) §3.1).
+The operational path is **download → build → declare → start → confirm**, and the
+first three steps are wired as `make` targets:
+
+```bash
+# 1. the candles of the symbol/timeframe the profile declares (ONLY network step)
+make data-download SYMBOL=BTC/USDT TIMEFRAME=1h
+
+# 2. the artifact the profile declares, built offline and deterministically
+make forecast-profile TIMESFM_PROFILE=config/profiles.timesfm.example.json BACKEND=seasonal
+#    ... the equivalent CLI call, which is what the target runs:
+python -m trading_platform forecast-bootstrap \
+    --profiles config/profiles.timesfm.example.json --backend seasonal
+
+# 2b. is it still usable right now? (the very same guard the engine runs)
+make forecast-info PROFILE=config/profiles.timesfm.example.json
+python -m trading_platform forecast-info \
+    --artifact data/forecast/btc-timesfm-paper-1h-seasonal.parquet \
+    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+
+# 3. start the engine: the profile now really trades
+make realtime-forecast       # == realtime run --profiles $(TIMESFM_PROFILE)
+
+# the four, in order
+make forecast-flow
+```
+
+| Target | Underlying command | Role |
+| --- | --- | --- |
+| `make forecast-bootstrap` | `forecast-build … --backend naive --out $(FORECAST_DIR)/bootstrap-naive.parquet` | the *naive* baseline artifact |
+| `make forecast-bootstrap-seasonal` | `forecast-build … --backend seasonal --out $(FORECAST_DIR)/bootstrap-seasonal.parquet` | the *seasonal* baseline artifact |
+| `make forecast-profile` | `forecast-bootstrap --profiles $(TIMESFM_PROFILE) --backend $${BACKEND:-seasonal}` | the artifact the **profile declares**, from its own candle file |
+| `make forecast-info` | `forecast-info --artifact $(FORECAST_ARTIFACT) [--profiles $(PROFILE)] --json` | is the artifact still usable? `PROFILE=…` evaluates it against a profile |
+| `make realtime-forecast` | `realtime run --profiles $(TIMESFM_PROFILE)` | the engine, on the forecast profile |
+| `make forecast-flow` | `data-download forecast-bootstrap forecast-info realtime-forecast` | the whole chain, in order |
+
+**Declare the profile.** The forecast profile is a normal `ProfileConfig`: the only
+thing that distinguishes it is the `strategy` name (`timesfm`), its `params` and
+the `forecast` key:
+
+```json
+{
+  "id": "btc-timesfm-paper",
+  "symbol": "BTC/USDT",
+  "timeframe": "1h",
+  "strategy": "timesfm",
+  "mode": "paper",
+  "forecast": "data/forecast/btc-timesfm-paper-1h-seasonal.parquet"
+}
+```
+
+`symbol`, `timeframe` and the `forecast` path must agree with the artifact's own
+metadata: a mismatch is refused at startup rather than trading another
+instrument's forecast.
+
+**Confirm it trades.** "Started" is not "trading". Read the observable
+surface, not the log line:
+
+```bash
+# one deterministic tick, then exit 0 (no server)
+python -m trading_platform.cli realtime run \
+    --profiles config/profiles.timesfm.example.json --once --json
+
+# or, with the engine running, the per-profile snapshot of the JSON API
+curl -s http://127.0.0.1:8080/api/profiles
+```
+
+A profile that trades shows up in three places of the `ProfileSnapshot` (§11.6):
+`n_trades` becomes greater than `0`, `open_positions` reports the position held,
+and `last_block_reason` stays `null` as long as the risk layer refuses nothing.
+A profile whose `n_trades` stays at `0` while `status` is `running` **is not
+trading**: read its `forecast_*` columns and its `exit_code`, and remember that
+the entry gates are deliberately strict — a *wired* artifact is not an
+*informative* one (§12.4, and [`docs/forecasting.md`](forecasting.md) §9).
+
 The dashboard has its own targets, next to the Python ones:
 
 ```bash
@@ -1348,8 +1493,15 @@ the honesty section — is [`docs/forecasting.md`](forecasting.md).
 ```
 
 The heavy extras are never installed by CI and never required by the test suite:
-the three commands of §4.7, the offline backends and every test run with the
+the four commands of §4.7, the offline backends and every test run with the
 `dev` extra alone.
+
+**Realtime use.** The same artifact feeds a realtime profile through its
+`forecast` key, and the engine resolves it exactly as the backtest does — so a
+`timesfm` profile really trades, and a stale or mismatched artifact is refused at
+startup instead of running inert. The profile field, the startup guard and the
+three-command operational flow are documented in
+[`docs/realtime.md`](realtime.md) §1, §3.1 and §11.7.1 of this page.
 
 ### 12.2 End-to-end offline backtest
 
@@ -1422,6 +1574,14 @@ The artifact can be measured, and it must be measured: run
 on foundation models for financial series finds **no reliable directional edge**
 on returns, and a positive backtest PnL is **not evidence of an edge**. The
 exact numbers, the arXiv references and how to read the skill metrics are in
-[`docs/forecasting.md`](forecasting.md) §9. Tests and the coverage gate follow
+[`docs/forecasting.md`](forecasting.md) §9.
+
+**Making the strategy usable changes nothing about that.** The realtime
+integration (§12.1) is engineering: it makes an existing, already-researched
+strategy selectable, wired, generic and safely operable. It adds no directional
+edge and it tuned no threshold against data. A `timesfm` profile that now starts
+and trades is therefore *observable*, not *validated* — the model predicts
+**risk**, not direction, and it remains exactly as unprofitable as §9 says until
+`forecast-skill` says otherwise. Tests and the coverage gate follow
 [`docs/testing-policy.md`](testing-policy.md) — this document never duplicates
 it.

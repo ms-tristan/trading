@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from trading_platform.config import (
     AppConfig,
+    ForecastConfig,
     MonitoringConfig,
     ProfileConfig,
     RealtimeConfig,
@@ -1303,6 +1304,36 @@ def test_example_profiles_declare_every_documented_field() -> None:
         assert set(profile["risk"]) == risk_keys
     assert set(payload["realtime"]) == set(RealtimeConfig.model_fields)
     assert set(payload["monitoring"]) == set(MonitoringConfig.model_fields)
+
+
+def test_forecast_is_the_last_profile_field_and_keeps_its_shape() -> None:
+    """The additive ``forecast`` key never moves a pre-existing field.
+
+    ``forecast`` is the wiring a realtime profile uses to declare the offline
+    artifact its strategy consumes (see ``docs/realtime.md`` §3.1).  It is
+    declared **last** on purpose: every positional construction of the model --
+    and every field-order assertion of this suite -- keeps the exact order it had
+    before forecasting reached the realtime layer, so the key is purely additive.
+
+    Its own model is frozen at a single ``artifact`` path: the profile declares
+    *where* the artifact is, never how it is loaded.  Loading stays the single
+    job of ``strategy.features.resolve_features``, which is what keeps the
+    realtime layer free of a second artifact-loading mechanism.
+    """
+    assert list(ProfileConfig.model_fields)[-1] == "forecast"
+    assert ProfileConfig.model_fields["forecast"].default is None
+    assert set(ForecastConfig.model_fields) == {"artifact"}
+    assert ForecastConfig().artifact is None
+    # ... and the key really is validated, like every other profile field.
+    assert ProfileConfig(id="p", symbol="BTC/USDT", forecast="a.parquet").forecast == Path(
+        "a.parquet"
+    )
+    with pytest.raises(ValidationError):
+        ProfileConfig.model_validate(
+            {"id": "p", "symbol": "BTC/USDT", "forecast": {"unknown": "key"}}
+        )
+    with pytest.raises(ValidationError):
+        ProfileConfig.model_validate({"id": "p", "symbol": "BTC/USDT", "forecast_artifact": "x"})
 
 
 def test_gitignore_covers_the_realtime_runtime_state() -> None:

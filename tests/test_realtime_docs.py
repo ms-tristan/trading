@@ -24,6 +24,22 @@ REALTIME = REPO_ROOT / "docs" / "realtime.md"
 README = REPO_ROOT / "README.md"
 MAKEFILE = REPO_ROOT / "Makefile"
 EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.example.json"
+TIMESFM_EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.timesfm.example.json"
+
+#: The three-command operational flow of a forecast profile, frozen by name:
+#: download the candles, build the artifact, ask the guard, then start the engine.
+FORECAST_FLOW_TARGETS = (
+    "data-download",
+    "forecast-bootstrap",
+    "forecast-info",
+    "realtime-forecast",
+)
+
+#: The recipe of every target that must **not** reach the network.  ``data
+#: download`` is the only target of this delivery allowed to dial out, so any
+#: other recipe containing this subcommand would break the offline promise of
+#: the test-suite and of a locked-down machine.
+NETWORK_SUBCOMMAND = "data download"
 
 #: Every exception of the realtime branch (``core/errors.py``).
 REALTIME_ERRORS = (
@@ -58,7 +74,27 @@ REALTIME_SECTIONS = (
     "## 6. The three commands",
     "## 7. What is NOT proven",
     "## 8. Profile lifecycle and candle history",
+    "## 9. The shared platform wallet",
 )
+
+#: The guard block of the forecasting delivery, frozen by its heading **text**
+#: rather than by its level.
+#:
+#: The delivery was planned with the guard as a top-level ``## 10.`` section, and
+#: that exact title stays accepted below so a later promotion of the block keeps
+#: satisfying this contract.  What shipped in ``docs/realtime.md`` is the same
+#: content one level down, as ``### 3.1 The forecast startup guard``, placed
+#: immediately after the safety model whose §3.4 funding check it mirrors.  The
+#: heading is therefore matched at any level and the **content** below is what
+#: this module actually pins: moving a documented paragraph between levels is an
+#: editorial choice, silently dropping its contract is not.
+FORECAST_GUARD_TITLE = "The forecast startup guard"
+
+#: The title the delivery plan froze; accepted as an alias of the block above.
+FORECAST_GUARD_SECTION = "## 10. The forecast startup guard"
+
+#: A leading section number, e.g. ``3.1 `` in ``### 3.1 The forecast startup guard``.
+_HEADING_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*\.?)\s+")
 
 #: Routes the web-API table must enumerate.  The server is a pure JSON API: it
 #: serves no HTML page and no static asset, so the table carries the API rows
@@ -537,3 +573,269 @@ def test_usage_documents_the_new_endpoints_in_french() -> None:
         "chandeliers japonais",
     ):
         assert token in text, f"usage.md does not document {token!r}"
+
+
+# ---------------------------------------------------------------------------
+# 11. the forecast surface: the profile key, the guard, the operational flow
+# ---------------------------------------------------------------------------
+
+
+def test_realtime_page_documents_the_forecast_profile_field() -> None:
+    """The profile table must carry the ``forecast`` row with its whole contract.
+
+    ``forecast`` is the one key that turns a ``timesfm`` profile from an inert
+    strategy into a trading one, so the field table of §1 must state three
+    things and nothing less: the field name as it is written in the JSON, the
+    ``null`` default (which is what every pre-existing profile gets, unchanged),
+    and the fail-loud contract -- a declared artifact that is missing, corrupt,
+    stale or built for another symbol/timeframe refuses the profile at startup.
+    """
+    text = read(REALTIME)
+
+    assert "| `forecast` |" in text, "docs/realtime.md does not carry the `forecast` profile row"
+    row = text.split("| `forecast` |", 1)[1].split("\n", 1)[0]
+
+    assert "artifact" in row.lower(), "the `forecast` row must say it is an artifact path"
+    assert "`null`" in row, "the `forecast` row must document the `null` default"
+    assert "startup" in row, "the `forecast` row must state the refusal happens at startup"
+    for cause in ("missing", "corrupt", "stale"):
+        assert cause in row, f"the `forecast` row does not name the {cause!r} refusal"
+    assert "symbol/timeframe" in row, "the `forecast` row must cover the mismatch refusal"
+    assert "`basic`" in row, "the `forecast` row must state that `basic` is untouched"
+
+    # ... and the page really explains the mechanism behind the row.
+    for token in (
+        "forecast-bootstrap",
+        "forecast-info --profiles",
+        "realtime.features.resolve_profile_features",
+        "check_profile_forecast",
+        "resolve_features",
+        "attach_features",
+    ):
+        assert token in text, f"docs/realtime.md does not document {token!r}"
+
+
+def _forecast_guard_block(text: str) -> str:
+    """Return the body of the guard block of ``docs/realtime.md``.
+
+    The block is located by its heading **text** (``FORECAST_GUARD_TITLE``) at
+    whatever level the page carries it, so the frozen ``## 10.`` title and the
+    shipped ``### 3.1`` title both resolve to the same body.  The body runs to
+    the next heading of the same or a higher level, which is what keeps the
+    assertions below scoped to the guard rather than to the whole page.
+
+    Raises:
+        AssertionError: when no heading carries the frozen title.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("#"):
+            continue
+        level = len(line) - len(line.lstrip("#"))
+        title = _HEADING_NUMBER.sub("", line[level:].strip())
+        if title != FORECAST_GUARD_TITLE:
+            continue
+        body: list[str] = []
+        for following in lines[index + 1 :]:
+            if following.startswith("#"):
+                following_level = len(following) - len(following.lstrip("#"))
+                if following_level <= level:
+                    break
+            body.append(following)
+        return "\n".join(body)
+    raise AssertionError(
+        f"docs/realtime.md carries no heading titled {FORECAST_GUARD_TITLE!r} "
+        f"(expected {FORECAST_GUARD_SECTION!r} or its shipped subsection)"
+    )
+
+
+def test_realtime_page_has_the_forecast_startup_guard_block() -> None:
+    """The guard owns a block of its own: its checks, its boundary, its refusal.
+
+    The delivery plan reserved the top-level title ``## 10. The forecast startup
+    guard`` for this content; the shipped page carries the very same content as
+    ``### 3.1``, directly under the safety model whose funding check it mirrors.
+    Both are accepted, and what is pinned is the *contract*, not the heading
+    level: the block exists, it documents the four refusals in order, it states
+    that the guard is mandatory, it quotes the two commands that make the
+    refusal operable, and it says how an operator confirms the profile really
+    trades instead of merely starting.
+    """
+    text = read(REALTIME)
+
+    # --- the block exists, under either the frozen title or the shipped one
+    assert FORECAST_GUARD_TITLE in text, (
+        f"docs/realtime.md carries no {FORECAST_GUARD_TITLE!r} title "
+        f"(frozen as {FORECAST_GUARD_SECTION!r})"
+    )
+    section = _forecast_guard_block(text)
+    assert section.strip(), "the forecast guard block is empty"
+
+    # the four checks, in order, each one a loud refusal
+    for check in (
+        "symbol mismatch",
+        "timeframe mismatch",
+        "staleness",
+    ):
+        assert check in section, f"the guard block does not document the {check!r} check"
+    assert "ForecastArtifactError" in section
+    # the guard is not advisory: it runs with `required=True` and a profile that
+    # fails it is refused at startup, never started to run inert.
+    assert "required=True" in section, (
+        "the guard block must state that the guard runs with required=True"
+    )
+    assert "refused at startup" in section or "mandatory" in section, (
+        "the guard block must state that a refused profile never starts"
+    )
+    assert "never started to run inert" in section or "run inert" in section, (
+        "the guard block must state the failure it removes: an inert profile"
+    )
+
+    # the refusal is actionable: it names the rebuild and the pre-flight commands
+    assert "trading forecast-build" in section
+    assert "trading forecast-info" in section
+
+    # the boundary semantics are pinned rather than left to the reader
+    assert "usable_until" in section or "usable until" in section
+    assert "min_lead" in section
+    assert "forecast_age" in section
+    assert "age_bound" in section or "age bound" in section
+
+    # a profile that declares no forecast keeps the previous behaviour, and a
+    # `timesfm` profile that declares none fails just as loudly as a stale one.
+    assert "`basic`" in section
+    assert "no `forecast` path" in section or "declares no forecast" in section
+
+    # ... and the page states the observable proof that it trades, not starts.
+    # "Started is not trading" belongs to the operational flow of §6.1 rather
+    # than to the guard block itself, so it is pinned on the page.
+    assert "n_trades" in text, "docs/realtime.md must say how real trading is confirmed"
+    assert "open_positions" in text, (
+        "docs/realtime.md must name the second observable of a trading profile"
+    )
+
+
+def test_usage_documents_the_forecast_operational_flow() -> None:
+    """The usage page must show the flow an operator actually runs, command by command."""
+    text = read(USAGE)
+
+    for token in (
+        "forecast-bootstrap",
+        "--profiles",
+        "--profile",
+        "make forecast-flow",
+        "make realtime-forecast",
+        "make forecast-profile",
+        "make data-download",
+        "timesfm",
+        '"forecast"',
+    ):
+        assert token in text, f"usage.md does not document {token!r}"
+
+    # the three commands of the flow, in the order the operator runs them
+    section = text.split("### 11.7.1 Operating a forecast profile: three commands", 1)
+    assert len(section) == 2, "usage.md lost the dedicated forecast-operating section of §11.7.1"
+    body = section[1]
+    positions = [
+        body.index("make data-download"),
+        body.index("make forecast-profile"),
+        body.index("make realtime-forecast"),
+    ]
+    assert positions == sorted(positions), (
+        "usage.md must present the flow as download -> build -> start"
+    )
+
+
+def test_makefile_declares_the_forecast_flow() -> None:
+    """The three-command flow exists as a target, and only one target dials out.
+
+    The delivery makes the operational path a *flow*, not a paragraph: the
+    targets below must exist, the aggregated one must depend on the three others
+    in order, and -- the offline promise of the whole test-suite -- no recipe but
+    ``data-download`` may run the network-using subcommand.
+    """
+    text = read(MAKEFILE)
+
+    for target in FORECAST_FLOW_TARGETS:
+        assert re.search(rf"^{re.escape(target)}:", text, flags=re.MULTILINE), (
+            f"the Makefile has no {target!r} target"
+        )
+    assert re.search(r"^forecast-flow:", text, flags=re.MULTILINE), (
+        "the Makefile has no aggregated `forecast-flow` target"
+    )
+
+    flow = text.split("\nforecast-flow:", 1)[1].split("\n", 1)[0]
+    for target in FORECAST_FLOW_TARGETS:
+        assert target in flow, f"`forecast-flow` does not depend on {target!r}"
+    flow_positions = [flow.index(target) for target in FORECAST_FLOW_TARGETS]
+    assert flow_positions == sorted(flow_positions), (
+        "`forecast-flow` must run download -> build -> info -> realtime, in that order"
+    )
+    assert "download, bootstrap, verify, trade" in flow
+
+    # every recipe but `data-download` stays offline
+    recipes = re.findall(r"^([A-Za-z0-9_-]+):.*\n((?:\t.*\n)+)", text, flags=re.MULTILINE)
+    assert recipes, "the Makefile carries no recipe at all"
+    offenders = [
+        name
+        for name, body in recipes
+        if NETWORK_SUBCOMMAND in body
+        and name != "data-download"
+        and "data-download" not in name
+        and name != "forecast-flow"
+    ]
+    assert not offenders, f"these Makefile targets reach the network: {offenders}"
+
+
+def test_example_profiles_opt_into_no_forecast() -> None:
+    """The shipped example declares the key on every profile, and uses none of it.
+
+    ``"forecast": null`` is the load-bearing detail: the field exists (so its
+    absence from the file would fail the exact-key-set contract of
+    ``tests/test_realtime_models.py``), and every profile leaves it at ``None``,
+    so the example still describes two plain ``basic`` profiles whose behaviour
+    is byte-for-byte the one they had before forecasting existed.
+    """
+    document: dict[str, Any] = json.loads(read(EXAMPLE_PROFILES))
+
+    assert document["profiles"], "the example must declare at least one profile"
+    for entry in document["profiles"]:
+        assert "forecast" in entry, f"profile {entry['id']!r} does not carry the `forecast` key"
+        assert entry["forecast"] is None, (
+            f"profile {entry['id']!r} opts into a forecast; the shipped example opts into nothing"
+        )
+        assert entry["strategy"] != "timesfm", (
+            f"profile {entry['id']!r} uses `timesfm` without an artifact and would be refused"
+        )
+
+
+def test_timesfm_example_profile_is_valid_and_declares_its_artifact() -> None:
+    """The forecast example is a real, loadable profile -- not an illustration.
+
+    It is the profile the operational flow points at, so it must parse through
+    the project's own loader, declare the ``timesfm`` strategy and carry a
+    non-null ``forecast`` path; anything less and the documented three commands
+    would start an inert profile, which is the exact failure this delivery fixes.
+    """
+    assert TIMESFM_EXAMPLE_PROFILES.is_file(), "config/profiles.timesfm.example.json is missing"
+    document: dict[str, Any] = json.loads(read(TIMESFM_EXAMPLE_PROFILES))
+    assert set(document) == {"profiles", "realtime", "monitoring"}
+
+    from trading_platform.config import load_profiles
+
+    profiles = load_profiles(TIMESFM_EXAMPLE_PROFILES)
+
+    assert profiles, "the forecast example declares no profile"
+    for profile in profiles:
+        assert profile.strategy == "timesfm", (
+            f"profile {profile.id!r} of the forecast example is not a `timesfm` profile"
+        )
+        assert profile.forecast_artifact is not None, (
+            f"profile {profile.id!r} declares no forecast artifact"
+        )
+        assert profile.mode == "paper", "the shipped example never ships a live profile"
+        assert profile.timeframe in {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+    # the shipped example still carries no credential-ish key
+    lowered = read(TIMESFM_EXAMPLE_PROFILES).lower()
+    for key in FORBIDDEN_PROFILE_KEYS:
+        assert key not in lowered, f"the forecast example contains {key!r}"
