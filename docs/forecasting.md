@@ -437,6 +437,13 @@ which is why this layer measures its own skill instead of claiming one:
 
 ### Measured on this machine (2026-09-19, real BTC/USDT)
 
+> **Read this section before quoting any number from this page.** An earlier
+> revision of it reported a `0.650` directional accuracy and a positive skill
+> score. Those figures are **against the de-seasonalised target**, and it was
+> later measured that they do **not** carry over to the price a strategy is
+> actually paid on. Both targets are now reported side by side; see
+> [§9.1](#91-the-target-you-score-on-decides-whether-you-see-an-edge).
+
 The two offline baselines and the real TimesFM 2.5 checkpoint were run side by
 side on **2 000 real hourly Binance BTC/USDT candles** (2023-01-01 →
 2023-03-25, a `+66 %` buy-and-hold window), context `1024`, horizon `24`,
@@ -455,9 +462,38 @@ make data-download                                   # fills data/cache/binance/
 
 | Backend | `rmse_skill_score` | `mae_skill_score` | `directional_accuracy_horizon` | wall clock |
 | --- | --- | --- | --- | --- |
-| `timesfm` (2.5-200m, 41 origins batched, CPU) | **+0.0068** | **+0.0122** | **0.650** | 3.7 s (model load included) |
+| `timesfm` (2.5-200m, 41 origins batched, CPU) | **+0.0068** | **+0.0122** | 0.650 | 3.7 s (model load included) |
 | `naive` (random walk) | 0.0000 | 0.0000 | n/a (its median path is flat) | < 0.1 s |
 | `seasonal` (de-seasonalised drift) | −0.2734 | −0.2878 | 0.525 | < 0.1 s |
+
+### The two-year walk-forward (688 origins, TimesFM 3.0)
+
+The 41-origin figures above are a smoke test. The real measurement uses the
+**whole two-year file** — 17 543 hourly candles, 2023-01-01 → 2025-01-01 — as six
+overlapping quarterly folds, context `1024`, horizon `24`, stride `24`, through
+the backend with `--model-id google/timesfm-3.0-pytorch`.
+
+| fold | period | n | `rmse_skill_score` | `directional_accuracy_horizon` | `coverage_error_mean` |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 2023-01 → 05 | 80 | +0.0043 | 0.620 | 0.012 |
+| 1 | 2023-03 → 09 | 122 | −0.0069 | 0.579 | 0.036 |
+| 2 | 2023-07 → 2024-01 | 122 | +0.0137 | 0.620 | 0.007 |
+| 3 | 2023-11 → 2024-05 | 122 | +0.0161 | 0.612 | 0.012 |
+| 4 | 2024-03 → 09 | 122 | **+0.0446** | 0.612 | 0.011 |
+| 5 | 2024-07 → 12 | 122 | −0.0006 | 0.636 | 0.014 |
+| **pooled** | | **688** | **+0.0123** | **0.613** | 0.016 |
+
+Four folds of six beat the random walk on point error, and the quantile
+calibration is consistently tight (a 0.016 mean coverage error against a nominal
+0.10). But **the point-error improvement is not statistically significant**: with
+16 512 `(origin, step)` pairs the mean squared error is `0.00025146` against
+`0.00025461` for the random walk — a `+1.24 %` reduction — a Diebold–Mariano
+statistic of **−0.716 (p = 0.474)** and a block-bootstrap 95 % CI of
+**[−0.0134, +0.0252]**, which contains zero.
+
+The honest reading is the one the literature predicts: **the point forecast
+behaves like a random walk**, with excellent probabilistic calibration and no
+reliable edge in the magnitude of the move.
 
 **What that actually means — and it is not a green light.** On the 41 discrete
 `24 h` endpoints (the decision-relevant horizon of this strategy) the skill over
@@ -482,19 +518,64 @@ Two consequences are built into the design and were confirmed by this run:
   anything — which is precisely why this section exists.
 
 **How to check it yourself.** Run `trading forecast-skill --artifact … --data-file …`
-and read the numbers:
+and read the numbers **in this order**:
 
-- `rmse_skill_score <= 0` — the artifact is **no better than the random walk**;
-- `mase >= 1` — same conclusion, on the scaled absolute-error scale;
-- `directional_accuracy_horizon` near `0.5` — the sign of the predicted move
-  carries **no information**;
-- decile `coverage` far from the nominal level — the quantiles are not
-  calibrated, so the dispersion gates and the risk sizing are meaningless.
+1. `real_rmse_skill_score` and `real_directional_accuracy_horizon` — the two keys
+   measured against the **price actually traded**. These are the ones that speak
+   to profitability; ignore the others until these say something.
+2. `rmse_skill_score <= 0` — the artifact is **no better than the random walk**;
+3. `mase >= 1` — same conclusion, on the scaled absolute-error scale;
+4. `real_directional_accuracy_horizon` near `0.5` — the sign of the predicted move
+   carries **no information about the price**;
+5. decile `coverage` far from the nominal level — the quantiles are not
+   calibrated, so the dispersion gates and the risk sizing are meaningless.
 
 If any of these holds, the artifact carries **no usable skill**: the correct
 decision is to keep the `basic` strategy (or the naive baseline) and to treat
 any positive PnL of the `timesfm` strategy as noise. The strategy is designed so
 that this is visible, not hidden.
+
+### 9.1 The target you score on decides whether you see an edge
+
+This is the most important lesson of the whole layer, and it was a real defect.
+
+The skill report evaluates the forecast against the **de-seasonalised** target
+`z[t+k] − z[t]`, because `z` is what the model is asked to predict. But a trader
+is paid on the **real** price move `log(close[t+k]) − log(close[t])`. The
+de-seasonalisation removes a component whose standard deviation is **0.97 %**,
+while the real 24 h move has a standard deviation of **2.44 %** — and that removed
+component is *not* predicted by the model. The consequence, measured on 688
+origins:
+
+| scored against | `rmse_skill_score` | directional accuracy | correlation with the forecast |
+| --- | --- | --- | --- |
+| de-seasonalised target (what the model predicts) | +0.0062 | **0.593** (p < 0.0001) | +0.2285 |
+| **real price move** (what a strategy earns) | **−0.0378** | **0.519** | **−0.0227** |
+
+An earlier revision of this page quoted the `0.593`. It is a true statement about
+`z` and a **false** statement about PnL: the sign accuracy against the real price
+is `0.519`, the correlation is `−0.023` (noise), and trading `sign(forecast)` with
+a 24 h hold loses money on every variant tested, **before** fees:
+
+| selection | n | accuracy | gross/trade | net/trade (0.1 %/side) |
+| --- | --- | --- | --- | --- |
+| all signals | 688 | 0.519 | −0.058 % | **−0.258 %** |
+| top-2 \|forecast\| quintiles | 275 | 0.502 | −0.144 % | **−0.344 %** |
+| top \|forecast\| quintile | 138 | 0.536 | −0.014 % | **−0.214 %** |
+
+Buy & hold over the same two years: **+174 %**.
+
+**What was done about it.** The report now carries `real_rmse`,
+`real_baseline_rmse`, `real_rmse_skill_score` and
+`real_directional_accuracy_horizon`, measured on the same `(origin, step)` pairs
+but against the real log price. `trading forecast-skill` therefore cannot again
+show a confident, highly significant `0.593` for a model that loses money: the
+two numbers sit side by side and the divergence is visible in one screen.
+
+**The general rule.** Before trusting any skill metric, ask *which series it is
+scored on*. A transform that makes the modelling problem easier can also make the
+metric meaningless, and the two are indistinguishable until you score against the
+thing you actually trade.
 
 ---
 

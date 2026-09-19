@@ -61,6 +61,12 @@ SKILL_METRIC_KEYS = (
     "directional_accuracy",
     "directional_accuracy_horizon",
     "coverage_error_mean",
+    # What a strategy is actually paid on: the same measurements against the REAL
+    # price move, which keeps the seasonal component the target transform removes.
+    "real_rmse",
+    "real_baseline_rmse",
+    "real_rmse_skill_score",
+    "real_directional_accuracy_horizon",
 )
 
 #: Context/horizon/stride used by every artifact of this module.

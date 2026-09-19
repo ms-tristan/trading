@@ -53,6 +53,10 @@ _METRIC_NAMES: tuple[str, ...] = (
     "directional_accuracy",
     "directional_accuracy_horizon",
     "coverage_error_mean",
+    "real_rmse",
+    "real_baseline_rmse",
+    "real_rmse_skill_score",
+    "real_directional_accuracy_horizon",
 )
 
 #: Predictions of the random-walk baseline (the origin close is held).
@@ -167,12 +171,14 @@ def forecast_skill_report(store: ForecastStore, candles: pd.DataFrame) -> Foreca
     positions = stamps.get_indexer(origins)
     predictions: list[float] = []
     targets: list[float] = []
+    real_targets: list[float] = []
     steps: list[int] = []
     hits = np.zeros(len(levels), dtype="float64")
     covered = 0
     first_position: int | None = None
     last_position: int | None = None
     candle_count = len(stamps)
+    closing = close.to_numpy(dtype="float64")
 
     for position, origin in zip(positions.tolist(), origins, strict=True):
         if position < 0:
@@ -185,11 +191,15 @@ def forecast_skill_report(store: ForecastStore, candles: pd.DataFrame) -> Foreca
         median = np.asarray(trajectory.median, dtype="float64")
         quantiles = np.asarray(trajectory.quantiles, dtype="float64")
         base = float(values[position])
+        real_base = float(np.log(closing[position]))
         covered += 1
         first_position = position if first_position is None else min(first_position, position)
         for step in range(1, limit + 1):
             predictions.append(float(median[step - 1]))
             targets.append(float(values[position + step]) - base)
+            # What a trader is actually paid: the move in the PRICE, which still
+            # carries the seasonal component the target transform removed.
+            real_targets.append(float(np.log(closing[position + step])) - real_base)
             steps.append(step)
             hits += (targets[-1] <= quantiles[:, step - 1]).astype("float64")
             last_position = position + step
@@ -200,13 +210,17 @@ def forecast_skill_report(store: ForecastStore, candles: pd.DataFrame) -> Foreca
 
     prediction_array = np.asarray(predictions, dtype="float64")
     target_array = np.asarray(targets, dtype="float64")
+    real_array = np.asarray(real_targets, dtype="float64")
     step_array = np.asarray(steps, dtype="int64")
     error = prediction_array - target_array
+    real_error = prediction_array - real_array
 
     rmse = float(np.sqrt(np.mean(error**2)))
     mae = float(np.mean(np.abs(error)))
     baseline_rmse = float(np.sqrt(np.mean(target_array**2)))
     baseline_mae = float(np.mean(np.abs(target_array)))
+    real_rmse = float(np.sqrt(np.mean(real_error**2)))
+    real_baseline_rmse = float(np.sqrt(np.mean(real_array**2)))
 
     coverage = {
         _coverage_key(level): float(hits[index]) / float(n_pairs)
@@ -227,6 +241,17 @@ def forecast_skill_report(store: ForecastStore, candles: pd.DataFrame) -> Foreca
             prediction_array[step_array == horizon], target_array[step_array == horizon]
         ),
         "coverage_error_mean": float(np.mean(differences)) if differences else float("nan"),
+        # The same measurements against the REAL price move, which is what a
+        # strategy is paid on.  The de-seasonalised target is a modelling
+        # convenience: it has the seasonal component removed, so a model can score
+        # well here while earning nothing on the actual price.  These two keys are
+        # the ones to read before claiming an edge.
+        "real_rmse": real_rmse,
+        "real_baseline_rmse": real_baseline_rmse,
+        "real_rmse_skill_score": _skill_score(real_rmse, real_baseline_rmse),
+        "real_directional_accuracy_horizon": _directional_accuracy(
+            prediction_array[step_array == horizon], real_array[step_array == horizon]
+        ),
     }
     return ForecastSkillReport(
         metadata=metadata,

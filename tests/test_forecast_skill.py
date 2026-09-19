@@ -62,6 +62,12 @@ METRIC_KEYS = frozenset(
         "directional_accuracy",
         "directional_accuracy_horizon",
         "coverage_error_mean",
+        # Measured against the REAL price move, not the de-seasonalised target:
+        # the only pair of numbers that speaks to profitability.
+        "real_rmse",
+        "real_baseline_rmse",
+        "real_rmse_skill_score",
+        "real_directional_accuracy_horizon",
     }
 )
 
@@ -576,3 +582,40 @@ def test_a_non_frame_raises_a_forecast_error() -> None:
     store = store_from_rows(index[:1], [[[0.0], [0.0], [0.0]]], horizon=1)
     with pytest.raises(ForecastError, match="DataFrame"):
         forecast_skill_report(store, "not a frame")  # type: ignore[arg-type]
+
+
+def test_real_price_metrics_are_reported_next_to_the_deseasonalised_ones(
+    tmp_path: Path,
+) -> None:
+    """The report measures the REAL price move too, not only the modelled target.
+
+    A forecast can score well against the de-seasonalised target while carrying no
+    information about the price actually traded: the target transform removes a
+    seasonal component that is large and itself unpredictable.  The report must
+    therefore expose both, and on a strongly seasonal series the real-price RMSE
+    is strictly larger, because the real move keeps the seasonal swing.
+    """
+    candles = make_ohlcv(400)
+    config = ForecastBuildConfig(
+        symbol="BTC/USDT",
+        timeframe="1h",
+        backend="naive",
+        context_length=32,
+        horizon=12,
+        reforecast_every=32,
+        quantile_levels=LEVELS,
+        seasonal_window=168,
+    )
+    path, _ = build_forecast_artifact(candles, config, tmp_path / "seasonal.parquet")
+    report = forecast_skill_report(ForecastStore.load(path), candles)
+
+    assert np.isfinite(report.metrics["real_rmse"])
+    assert np.isfinite(report.metrics["real_rmse_skill_score"])
+    # The naive backend's median path is flat, so it makes no directional call at
+    # all: the accuracy is undefined (NaN), never a fabricated 0.5.
+    assert np.isnan(report.metrics["real_directional_accuracy_horizon"])
+    # The real price move keeps the seasonal component the target removed, so its
+    # baseline is strictly larger.
+    assert report.metrics["real_baseline_rmse"] > report.metrics["baseline_rmse"]
+    # Both targets are scored on exactly the same pairs.
+    assert report.n_pairs > 0
