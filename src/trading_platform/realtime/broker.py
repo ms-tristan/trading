@@ -167,15 +167,38 @@ def _reconcile_orders(
 ) -> ReconciliationReport:
     """Compare the locally known orders against the venue's view.
 
+    Reconciliation compares like with like.
+
+    The two sides do not describe the same window: the caller hands over the
+    profile's *complete durable history* (``ExecutionGateway.reconcile`` forwards
+    ``store.list_orders(profile_id, limit=RECONCILE_ORDER_LIMIT)``, terminal orders
+    included), while a venue only ever reports the orders it currently works.  So
+    a local order is compared only when the venue could legitimately still know it:
+
+    * an order whose state is still WORKING (``OPEN_ORDER_STATES``) is always
+      compared, whatever the venue says about it;
+    * a TERMINAL order (filled, cancelled, rejected) is compared only when the
+      venue's view also knows its ``client_order_id``;
+    * a terminal order the venue no longer holds is dropped from the comparison
+      entirely -- it is **not** a divergence, and it is never reported as
+      ``only_locally``.  Without this rule a healthy paper profile whose history
+      is made of filled orders would be degraded on every reconciliation pass.
+
     Classification
     --------------
-    * ``only_at_venue`` -- the venue holds an order the local state ignores;
-    * ``only_locally`` -- the local state believes in an order the venue ignores;
-    * ``mismatched`` -- both sides know the id but disagree on its *state*.
+    * ``only_at_venue`` -- the venue holds a working order the local state ignores;
+    * ``only_locally`` -- the local state believes in a *working* order the venue
+      ignores;
+    * ``mismatched`` -- both sides know the id but disagree on its *state* (a
+      terminal local state against a venue that still holds the order lands here,
+      because dropping it wholesale would silently disable this half of the
+      protocol).
 
     Following the frozen contract, a difference of ``filled_quantity`` with an
     identical state is reported in ``details`` only: it makes the report richer
     without turning a benign in-flight partial fill into a degraded profile.
+
+    The ``details`` counters describe the *compared* views, not the raw inputs.
     """
     local_states: dict[str, OrderState] = {}
     local_filled: dict[str, float] = {}
@@ -188,10 +211,25 @@ def _reconcile_orders(
         venue_states.setdefault(order.client_order_id, order.state)
         venue_filled.setdefault(order.client_order_id, float(order.filled_quantity))
 
-    both = set(local_states) & set(venue_states)
-    only_at_venue = tuple(sorted(set(venue_states) - set(local_states)))
-    only_locally = tuple(sorted(set(local_states) - set(venue_states)))
-    mismatched = tuple(sorted(key for key in both if local_states[key] is not venue_states[key]))
+    # The compared local view: a terminal order is only compared when the venue
+    # knows its id, so a closed order the venue has forgotten stops being scored
+    # against a venue that legitimately no longer holds it.
+    local_view = {
+        key: state
+        for key, state in local_states.items()
+        if state in OPEN_ORDER_STATES or key in venue_states
+    }
+
+    both = set(local_view) & set(venue_states)
+    only_at_venue = tuple(sorted(set(venue_states) - set(local_view)))
+    only_locally = tuple(
+        sorted(
+            key
+            for key in set(local_view) - set(venue_states)
+            if local_view[key] in OPEN_ORDER_STATES
+        )
+    )
+    mismatched = tuple(sorted(key for key in both if local_view[key] is not venue_states[key]))
     quantity_mismatches = tuple(
         sorted(
             key
@@ -205,7 +243,7 @@ def _reconcile_orders(
     if not resolved_profile:
         resolved_profile = next((order.profile_id for order in venue), "")
     details: dict[str, Any] = {
-        "local_orders": len(local_states),
+        "local_orders": len(local_view),
         "venue_orders": len(venue_states),
         "quantity_mismatches": list(quantity_mismatches),
     }

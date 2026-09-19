@@ -41,6 +41,7 @@ from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.models import (
     BrokerAck,
     CandleEvent,
+    Order,
     OrderSide,
     OrderState,
     OrderType,
@@ -257,8 +258,25 @@ def profile(identifier: str, symbol: str, **overrides: Any) -> ProfileConfig:
     return ProfileConfig(**payload)
 
 
+def terminal_order(profile_id: str, *, client_order_id: str | None = None) -> Order:
+    """Return a persisted FILLED order: the shape of a profile's durable history."""
+    return Order(
+        client_order_id=client_order_id
+        or f"{profile_id}-{SYMBOL_BTC.replace('/', '_')}-terminal-0000",
+        profile_id=profile_id,
+        symbol=SYMBOL_BTC,
+        side=OrderSide.BUY,
+        type=OrderType.MARKET,
+        quantity=1.0,
+        state=OrderState.FILLED,
+        mode=RunMode.PAPER,
+        created_at=START,
+        updated_at=START,
+        filled_quantity=1.0,
+    )
+
+
 def realtime_config(tmp_path: Path, **overrides: Any) -> RealtimeConfig:
-    """Return a realtime configuration rooted in the test's temporary directory."""
     payload: dict[str, Any] = {
         "state_db": tmp_path / "state.db",
         "logs_dir": tmp_path / "logs",
@@ -499,6 +517,44 @@ def test_a_successful_reconciliation_leaves_the_profile_running(tmp_path: Path) 
     state = store.load_status("btc-paper")
     assert state is not None
     assert state.status is ProfileStatus.RUNNING
+    store.close()
+
+
+def test_a_profile_holding_only_terminal_orders_stays_running(tmp_path: Path) -> None:
+    """A durable history made of terminal orders must not degrade against an empty venue.
+
+    This is the reported production defect seen end to end: the store holds the
+    profile's complete history -- here one filled order -- while the venue that
+    reconciles it holds nothing at all.  The profile stays ``RUNNING``.
+    """
+    terminal = terminal_order("btc-paper")
+    clock = ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC))
+    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    store.initialize()
+    store.upsert_order(terminal)
+
+    def empty_venue(target: ProfileConfig) -> PaperBroker:
+        """A venue that has forgotten every order of this profile."""
+        return PaperBroker(
+            clock=clock,
+            initial_balance=float(target.initial_balance),
+            seed=7,
+        )
+
+    orchestrator, _store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        [profile("btc-paper", SYMBOL_BTC)],
+        clock=clock,
+        store=store,
+        broker_factory=empty_venue,
+    )
+
+    run(orchestrator.run_once())
+
+    state = store.load_status("btc-paper")
+    assert state is not None
+    assert state.status is ProfileStatus.RUNNING
+    assert store.list_orders("btc-paper") == [terminal]  # nothing was "repaired"
     store.close()
 
 

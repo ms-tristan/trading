@@ -571,8 +571,13 @@ def test_run_once_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     assert second.exit_code == 0
     assert second_payload["ok"] is True
     assert second_payload["decisions"] == [], "a restart replays no candle"
-    # the very same client_order_id is on the wire and in the store, once
-    assert client_order_id in json.dumps(second_payload)
+    # the very same client_order_id is still the one and only order of the store,
+    # once: the restart replayed nothing and resubmitted nothing.  A profile whose
+    # durable history is a terminal order reconciles healthy against the fresh
+    # venue of the restart, so the identifier is read from the durable state --
+    # which is its truth -- and not from a reconciliation error the profile no
+    # longer has (see docs/realtime.md, "reconciliation compares like with like").
+    assert [order[0] for order in table_rows(database, "orders")] == [client_order_id]
     assert table_rows(database, "orders") == orders_before
     assert table_rows(database, "fills") == fills_before
     assert table_rows(database, "positions") == positions_before

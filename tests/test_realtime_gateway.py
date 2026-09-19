@@ -1188,10 +1188,68 @@ def test_reconcile_against_the_real_paper_broker() -> None:
     diverged = gateway.reconcile()
     assert diverged.ok is False
     assert "ghost-order" in diverged.only_at_venue
-    # ... and symmetrically: a local order the venue knows nothing about.
-    local_only = replace(submitted, client_order_id="local-only-order")
+    # ... and symmetrically: a WORKING local order the venue knows nothing about.
+    # (It must stay working: a terminal one is deliberately no longer a divergence.)
+    local_only = replace(submitted, client_order_id="local-only-order", state=OrderState.SUBMITTED)
     store.upsert_order(local_only)
     mirror = gateway.reconcile()
+    assert "local-only-order" in mirror.only_locally
+
+
+def test_reconcile_of_a_profile_holding_only_terminal_orders_is_healthy() -> None:
+    """The reported production defect: durable history against a venue that forgot.
+
+    A paper market order fills immediately, so the store's durable history is made
+    of terminal orders while a fresh venue holds nothing.  Reconciliation must stay
+    healthy, must report nothing as ``only_locally`` and must repair nothing.
+    """
+    broker_module = pytest.importorskip("trading_platform.realtime.broker")
+    clock = ManualClock(pd.Timestamp(TS).to_pydatetime())
+    venue = broker_module.PaperBroker(clock=clock, seed=0, partial_fill_probability=0.0)
+    gateway, _, store, _ = build_gateway(broker=venue)
+
+    submitted = gateway.submit(order_request(), **submit_kwargs())
+    assert submitted.state is OrderState.FILLED  # terminal, and the venue has finished with it
+    history = list(store.order_history)
+
+    # A fresh venue that never saw this profile: the "forgotten" venue of the report.
+    fresh = broker_module.PaperBroker(clock=clock, seed=0, partial_fill_probability=0.0)
+    fresh_gateway, _, fresh_store, _ = build_gateway(broker=fresh)
+    fresh_store.upsert_order(submitted)
+
+    report = fresh_gateway.reconcile()
+
+    assert report.ok is True
+    assert report.matched == 0
+    assert report.only_locally == ()
+    assert report.only_at_venue == ()
+    assert report.mismatched == ()
+    assert list(store.order_history) == history  # nothing was "fixed" silently
+    assert store.positions == {}
+
+
+def test_reconcile_keeps_the_degraded_path_for_genuine_divergences() -> None:
+    """Regression: the terminal-order rule must not weaken any divergence."""
+    broker_module = pytest.importorskip("trading_platform.realtime.broker")
+    clock = ManualClock(pd.Timestamp(TS).to_pydatetime())
+    venue = broker_module.PaperBroker(clock=clock, seed=0, partial_fill_probability=0.0)
+    gateway, _, store, _ = build_gateway(broker=venue)
+
+    submitted = gateway.submit(order_request(), **submit_kwargs())
+    assert submitted.state is OrderState.FILLED
+
+    # (a) a WORKING order only the venue holds still degrades the profile.
+    venue_only = replace(submitted, client_order_id="venue-only-order", state=OrderState.SUBMITTED)
+    venue.inject_venue_order(venue_only)
+    diverged = gateway.reconcile()
+    assert diverged.ok is False
+    assert "venue-only-order" in diverged.only_at_venue
+
+    # (b) a WORKING order only the local state knows still degrades the profile.
+    local_only = replace(submitted, client_order_id="local-only-order", state=OrderState.SUBMITTED)
+    store.upsert_order(local_only)
+    mirror = gateway.reconcile()
+    assert mirror.ok is False
     assert "local-only-order" in mirror.only_locally
 
 

@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
+import { OPERATOR_TOKEN_STORAGE_KEY, readOperatorToken } from '@/lib/operator-token';
 import type { CatalogPayload, CreateProfilePayload, ProfileSnapshot } from '@/lib/types';
 
 import { CREATE_PROFILE_MESSAGES, CreateProfileForm } from './create-profile-form';
@@ -311,7 +311,8 @@ describe('CreateProfileForm submission', () => {
     await waitFor(() => {
       expect(pushMock).toHaveBeenCalledWith('/');
     });
-    expect(screen.getByRole('status')).toHaveTextContent('Profile btc-paper created.');
+    // The creation notice is the success status line of the form.
+    expect(screen.getByText('Profile btc-paper created.')).toBeInTheDocument();
     expect(submitButton()).not.toBeDisabled();
     expect(submitButton()).toHaveTextContent('Create profile');
     // The token is a header, never a rendered value.
@@ -366,6 +367,79 @@ describe('CreateProfileForm submission', () => {
     const headers = calls[0]?.init?.headers as Record<string, string>;
     expect(headers['X-Operator-Token']).toBe(TOKEN);
   });
+
+  it('sends the token saved from the creation page itself', async () => {
+    const user = userEvent.setup();
+    const calls = renderForm(jsonResponse(CREATED), { operatorToken: '' });
+
+    await user.type(screen.getByLabelText(/operator token/i), TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Save token' }));
+
+    await fillValidForm(user);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(calls).toHaveLength(1);
+    });
+    expect(readOperatorToken()).toBe(TOKEN);
+    const headers = calls[0]?.init?.headers as Record<string, string>;
+    expect(headers['X-Operator-Token']).toBe(TOKEN);
+  });
+});
+
+describe('CreateProfileForm operator token reachability', () => {
+  it('renders the token form on the creation surface, before the fields', () => {
+    const seam = installFetch(jsonResponse(CREATED));
+    const { container } = render(
+      <CreateProfileForm catalog={CATALOG} operatorToken={TOKEN} fetchImpl={seam.impl} />,
+    );
+
+    const input = screen.getByLabelText(/operator token/i);
+    expect(input).toHaveAttribute('type', 'password');
+    expect(input).toHaveAttribute('autocomplete', 'off');
+    expect(screen.getByRole('button', { name: 'Save token' })).toBeInTheDocument();
+    expect(screen.getByText(/no token saved in this tab/i)).toBeInTheDocument();
+
+    // The token is set before the profile is described: the token form is the
+    // first block of the create form.
+    const form = container.querySelector('form');
+    expect(form).not.toBeNull();
+    const blocks = Array.from(form?.children ?? []);
+    const tokenForm = input.closest('form');
+    expect(tokenForm).not.toBe(form);
+    expect(blocks).toContain(tokenForm);
+    expect(blocks.indexOf(tokenForm as Element)).toBeLessThan(
+      blocks.findIndex((block) => block.querySelector('#create-profile-id') !== null),
+    );
+  });
+
+  it('reports the stored state of a token saved earlier in the tab', () => {
+    window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, TOKEN);
+    renderForm(jsonResponse(CREATED), { operatorToken: '' });
+
+    expect(screen.getByText(/token saved for this tab/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Clear token' })).toBeInTheDocument();
+  });
+
+  it('clears the token from the creation page', async () => {
+    const user = userEvent.setup();
+    window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, TOKEN);
+    renderForm(jsonResponse(CREATED), { operatorToken: '' });
+
+    await user.click(screen.getByRole('button', { name: 'Clear token' }));
+
+    expect(readOperatorToken()).toBeNull();
+    expect(screen.getByText(/no token saved in this tab/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Clear token' })).not.toBeInTheDocument();
+  });
+
+  it('never renders the stored token back', () => {
+    window.sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, TOKEN);
+    renderForm(jsonResponse(CREATED), { operatorToken: '' });
+
+    expect(document.body.textContent ?? '').not.toContain(TOKEN);
+    expect(document.body.innerHTML).not.toContain(TOKEN);
+  });
 });
 
 describe('CreateProfileForm failures', () => {
@@ -402,6 +476,41 @@ describe('CreateProfileForm failures', () => {
     },
   );
 
+  it('tells the operator what to do about a 403 refusal', async () => {
+    const user = userEvent.setup();
+    const message = 'missing or invalid operator token';
+    renderForm(errorResponse(403, message));
+
+    await fillValidForm(user);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(screen.getByText('The monitoring API refused the request')).toBeInTheDocument();
+    });
+
+    // The guidance is additive: the raw refusal stays verbatim in the detail.
+    const detail = screen.getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 403');
+    expect(detail).toHaveTextContent(message);
+    expect(screen.getByText(CREATE_PROFILE_MESSAGES.tokenRefused)).toBeInTheDocument();
+    // And the fix is right there on this page.
+    expect(screen.getByLabelText(/operator token/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save token' })).toBeInTheDocument();
+  });
+
+  it('keeps the 403 guidance away from a non-403 refusal', async () => {
+    const user = userEvent.setup();
+    renderForm(errorResponse(409, 'profile already exists: btc-paper'));
+
+    await fillValidForm(user);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(screen.getByText('The monitoring API answered an error')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(CREATE_PROFILE_MESSAGES.tokenRefused)).not.toBeInTheDocument();
+  });
+
   it('reports a network failure with the mapped headline and the raw cause', async () => {
     const user = userEvent.setup();
     renderForm(new TypeError('fetch failed'));
@@ -410,11 +519,12 @@ describe('CreateProfileForm failures', () => {
     await user.click(submitButton());
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent('The monitoring API is unreachable');
+      expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
     });
     expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
       'network error calling /api/profiles: fetch failed',
     );
+    expect(screen.queryByText(CREATE_PROFILE_MESSAGES.tokenRefused)).not.toBeInTheDocument();
     expect(submitButton()).not.toBeDisabled();
     expect(screen.getByLabelText('Profile id')).toHaveValue('btc-paper');
   });

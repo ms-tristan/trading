@@ -1066,6 +1066,109 @@ def test_reconcile_of_an_empty_broker_has_no_profile_and_is_ok() -> None:
     assert report.matched == 0
 
 
+def test_reconcile_ignores_terminal_orders_the_venue_no_longer_holds() -> None:
+    """The regressed production report: a durable history against an empty venue.
+
+    ``ExecutionGateway.reconcile`` hands the profile's COMPLETE durable history to
+    the comparison while the venue only reports what it currently works, so every
+    terminal order used to be reported as ``only_locally`` and degraded a healthy
+    paper profile.  A terminal order the venue no longer holds is not a divergence.
+    """
+    broker = make_paper()
+    terminal_states = (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED)
+    local = [
+        Order(
+            profile_id=PROFILE_ID,
+            client_order_id=f"test1-BTC_USDT-20240101T000000-{index:04d}",
+            symbol=SYMBOL,
+            side=OrderSide.BUY,
+            type=OrderType.MARKET,
+            quantity=1.0,
+            state=terminal_states[index % len(terminal_states)],
+            mode=RunMode.PAPER,
+            created_at=pd.Timestamp(START),
+            updated_at=pd.Timestamp(START),
+            filled_quantity=1.0,
+        )
+        for index in range(18)
+    ]
+
+    report = broker.reconcile(local)
+
+    assert report.ok is True
+    assert report.matched == 0
+    assert report.only_locally == ()
+    assert report.only_at_venue == ()
+    assert report.mismatched == ()
+    assert report.details["local_orders"] == 0
+    assert report.details["venue_orders"] == 0
+
+
+def test_reconcile_mixes_working_and_terminal_orders() -> None:
+    """Only working orders may be compared; terminal ones the venue forgot vanish."""
+    broker = make_paper()
+    broker.submit(make_request(order_type=OrderType.LIMIT, price=90.0), reference_price=100.0)
+    agreed = broker.open_orders()
+    working = dataclasses.replace(agreed[0], client_order_id="ghost")
+    terminal = dataclasses.replace(agreed[0], client_order_id="gone", state=OrderState.FILLED)
+
+    report = broker.reconcile([*agreed, working, terminal])
+
+    assert report.matched == 1
+    assert report.only_locally == ("ghost",)
+    assert report.ok is False
+    assert report.only_at_venue == ()
+    assert report.mismatched == ()
+    # The terminal order the venue no longer holds appears nowhere in the report.
+    for field in ("only_locally", "only_at_venue", "mismatched"):
+        assert "gone" not in getattr(report, field)
+    assert report.details["local_orders"] == 2
+
+
+def test_reconcile_reports_a_terminal_order_the_venue_still_holds_as_mismatched() -> None:
+    """A terminal order the venue still knows keeps being compared (the trap)."""
+    broker = make_paper()
+    broker.submit(make_request(order_type=OrderType.LIMIT, price=90.0), reference_price=100.0)
+    local = broker.open_orders()
+
+    report = broker.reconcile([dataclasses.replace(local[0], state=OrderState.FILLED)])
+
+    assert report.ok is False
+    assert report.mismatched == ("ord-1",)
+    assert report.matched == 0
+    assert report.only_locally == ()
+
+
+def test_reconcile_of_a_venue_only_order_lands_in_only_at_venue() -> None:
+    """An order only the venue holds is reported as ``only_at_venue``, never matched."""
+    broker = make_paper()
+    broker.inject_venue_order(
+        Order(
+            profile_id=PROFILE_ID,
+            client_order_id="venue-only",
+            symbol=SYMBOL,
+            side=OrderSide.BUY,
+            type=OrderType.LIMIT,
+            quantity=1.0,
+            price=90.0,
+            state=OrderState.SUBMITTED,
+            mode=RunMode.PAPER,
+            created_at=pd.Timestamp(START),
+            updated_at=pd.Timestamp(START),
+        )
+    )
+
+    report = broker.reconcile()
+
+    assert report.ok is False
+    assert report.only_at_venue == ("venue-only",)
+    assert report.only_locally == ()
+    assert report.mismatched == ()
+    assert report.matched == 0
+    assert report.details["local_orders"] == 0
+    assert report.details["venue_orders"] == 1
+
+
 # ---------------------------------------------------------------------------
 # 7. paper mode is never configurable
 # ---------------------------------------------------------------------------
