@@ -54,6 +54,16 @@ _DEFAULT_REPORT_FORMATS: list[ReportFormat] = ["markdown", "json"]
 #: Accepted profile identifiers: 1-64 characters, no dot, slash or space.
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
+#: Upper bound of ``ProfileConfig.entry_lookback_candles``.
+#:
+#: The value is deliberate: it equals the default ``warmup_candles`` and stays
+#: below the smallest ``history_candles`` (300) able to feed a full warmup, so
+#: the configured maximum is always satisfiable by a well-configured profile
+#: while an absurd value is refused loudly by the field bounds.  This constant
+#: is the single source of truth shared by the live runner guard and the tests;
+#: it is intentionally absent from ``__all__`` so the public surface is stable.
+MAX_ENTRY_LOOKBACK_CANDLES: int = 200
+
 
 class ExchangeConfig(BaseModel):
     """Exchange / market-microstructure settings."""
@@ -228,6 +238,13 @@ class ProfileConfig(BaseModel):
     (``None``) the profile's own ``initial_balance`` **is** its allocation, so
     every configuration written before the shared wallet existed keeps its exact
     previous behaviour.
+
+    ``entry_lookback_candles`` is the live-only catch-up window: ``0`` (the
+    default) keeps the historical behaviour where only the last row of the
+    signals frame decides, while ``N > 0`` lets the live engine act on a
+    crossover that occurred within the last ``N`` candles.  The backtest is
+    unaffected: it already reads every row.  The field is declared last so the
+    field order of every pre-existing configuration never moves.
     """
 
     model_config = {"extra": "forbid"}
@@ -246,6 +263,7 @@ class ProfileConfig(BaseModel):
     warmup_candles: int = Field(default=200, ge=1)
     poll_interval_seconds: float = Field(default=5.0, gt=0)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
+    entry_lookback_candles: int = Field(default=0, ge=0, le=MAX_ENTRY_LOOKBACK_CANDLES)
 
     @property
     def effective_allocation(self) -> float:

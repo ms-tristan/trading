@@ -46,6 +46,7 @@ which rejects any unknown key (`extra="forbid"`):
 | `warmup_candles` | number of past candles the strategy receives on every decision |
 | `poll_interval_seconds` | polling cadence specific to the profile |
 | `risk` | `RiskLimitsConfig` block (§3) |
+| `entry_lookback_candles` | live-only catch-up window: the entry decision may act on a crossover that occurred within the last N candles (0, the default, keeps the historical behaviour: only the last row decides); ignored by the backtest, which already reads every row; 0 <= N <= 200 |
 
 The complete document carries three root keys: `profiles`, `realtime`
 (`RealtimeConfig`: state base, directories, CSV or cache provider, `start_at`

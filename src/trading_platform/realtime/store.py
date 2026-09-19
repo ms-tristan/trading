@@ -116,6 +116,17 @@ _PROFILE_STATE_PREFIX = "profile_state:"
 #: Prefix of the ``meta`` key holding the last processed candle of a profile.
 _CANDLE_WATERMARK_PREFIX = "last_candle:"
 
+#: Prefix of the ``meta`` key holding the last entry crossing acted upon by a profile.
+#:
+#: Deliberately a **separate** key from :data:`_CANDLE_WATERMARK_PREFIX`, and a
+#: separate method pair, so the two watermarks can never be collapsed into one by
+#: accident: the candle watermark answers "which candle was processed", this one
+#: answers "which signal row was traded on".  It reuses the existing free-form
+#: ``meta`` table, so it needs no DDL change and no schema version bump -- the
+#: ``schema_version`` row stays at :data:`SCHEMA_VERSION` and a database written by
+#: the previous build opens with no migration at all.
+_ENTRY_WATERMARK_PREFIX = "entry_crossing:"
+
 _DDL: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -436,6 +447,14 @@ class StateStore(Protocol):
 
     def mark_candle_processed(self, profile_id: str, timestamp: pd.Timestamp) -> None:
         """Record a processed candle, keeping the maximum timestamp seen."""
+        ...
+
+    def last_acted_entry_crossing(self, profile_id: str) -> pd.Timestamp | None:
+        """Return the timestamp of the signal row an entry was last acted upon, or None."""
+        ...
+
+    def mark_acted_entry_crossing(self, profile_id: str, timestamp: pd.Timestamp) -> None:
+        """Record a signal row an entry was acted upon; keep the MAXIMUM timestamp seen."""
         ...
 
     def append_candle(self, candle: CandleEvent, *, profile_id: str) -> bool:
@@ -1186,6 +1205,75 @@ class SqliteStateStore:
             row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
             if row is not None and str(row["value"]) >= stamped:
                 return
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, stamped),
+            )
+
+    def last_acted_entry_crossing(self, profile_id: str) -> pd.Timestamp | None:
+        """Return the timestamp of the signal row an entry was last acted upon.
+
+        ``None`` -- never a silent default instant -- means "no crossover of this
+        profile has ever been acted upon", which is the exact state of every profile
+        written before this watermark existed.  It is stored as an ISO-8601 UTC text
+        in the ``meta`` table under ``entry_crossing:<profile_id>``, so one profile
+        never gates another.
+
+        A **corrupted** stored value also answers ``None`` rather than raising: this
+        read sits on the live entry path, and one bad byte in one key must never take
+        a tick down.  The tick then behaves as if nothing had ever been acted upon,
+        which at worst re-arms a single entry -- a bounded loss, unlike a profile that
+        stops trading.  Every other read error still surfaces as
+        :class:`~trading_platform.core.errors.StateStoreError` (the ``get_meta`` call
+        below is *not* wrapped, so a broken ``meta`` table is still reported).
+        """
+        raw = self.get_meta(_ENTRY_WATERMARK_PREFIX + profile_id)
+        try:
+            return _parse_timestamp(raw, operation="last_acted_entry_crossing", key=profile_id)
+        except StateStoreError:
+            logger.warning(
+                "state store %s: corrupted entry crossing watermark for profile %s, "
+                "treating it as absent",
+                self._path,
+                profile_id,
+            )
+            return None
+
+    def mark_acted_entry_crossing(self, profile_id: str, timestamp: pd.Timestamp) -> None:
+        """Record the signal row an entry was acted upon, keeping the maximum seen.
+
+        The watermark is what makes requirement 1 hold: once a crossover has been
+        acted upon, no replay of that same row -- a replayed tick, an out-of-order
+        replay, or a restart reading the same frame again -- can ever act on it a
+        second time.  The value is the timestamp of the **signal row** the entry came
+        from, never the processed candle and never the frame's last stamp, and
+        :func:`_utc_iso` normalises it to UTC so a naive input and the aware input of
+        the same instant can never produce two distinct watermarks.
+
+        Monotonic exactly like :meth:`mark_candle_processed`: writing an older or
+        equal value is a no-op, so the watermark can only ever move forward.
+
+        The comparison is made on *parsed instants*, not on the raw text: an
+        unparseable stored value (a corrupted row) is treated as absent and simply
+        overwritten.  A raw string comparison would be the opposite of safe here --
+        ``"not-a-timestamp" >= "2024-01-01T00:04:00+00:00"`` is ``True``, so one bad
+        byte in the key would silently swallow every later legitimate write and the
+        profile would never act on a crossover again.
+        """
+        stamped = _utc_iso(timestamp)
+        key = _ENTRY_WATERMARK_PREFIX + profile_id
+        with self._write("mark_acted_entry_crossing") as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            if row is not None:
+                try:
+                    current = _parse_timestamp(
+                        row["value"], operation="mark_acted_entry_crossing", key=profile_id
+                    )
+                except StateStoreError:
+                    current = None
+                if current is not None and _utc_iso(current) >= stamped:
+                    return
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
