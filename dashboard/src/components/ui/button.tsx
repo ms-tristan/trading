@@ -25,7 +25,16 @@ const VARIANT_CLASSES: Record<ButtonVariant, string> = {
   ghost: 'border border-border bg-transparent text-foreground hover:bg-muted',
 };
 
-const SIZE_CLASSES: Record<ButtonSize, string> = {
+/**
+ * Box metrics of every button size.
+ *
+ * Exported so a control that must sit in the same cluster as a button - the
+ * "New profile" anchor of the Profiles toolbar is one - can borrow the exact
+ * metrics instead of restating them. Both live controls of that toolbar are
+ * `size="sm"`, hence a measured height of 26px; a peer that restated the
+ * padding with `text-sm` measured 30px, and the cluster read as misaligned.
+ */
+export const BUTTON_SIZE_CLASSES: Record<ButtonSize, string> = {
   sm: 'gap-xs px-lg py-sm text-xs',
   md: 'gap-sm px-xl py-md text-sm',
 };
@@ -76,7 +85,7 @@ export function Button({
         'disabled:cursor-not-allowed disabled:opacity-50',
         isDisabled ? null : BUTTON_PRESSED_CLASSES[variant],
         VARIANT_CLASSES[variant],
-        SIZE_CLASSES[size],
+        BUTTON_SIZE_CLASSES[size],
         className,
       )}
     >

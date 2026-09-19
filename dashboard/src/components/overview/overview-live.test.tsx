@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
 import type { HealthPayload, KillSwitchPayload, ProfilesPayload, ProfileSnapshot } from '@/lib/types';
 
+import { BUTTON_SIZE_CLASSES } from '@/components/ui/button';
+
 import { OverviewLive } from './overview-live';
 
 // ---------------------------------------------------------------------------
@@ -277,6 +279,42 @@ describe('OverviewLive', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Pause live updates' }));
     expect(screen.getByText('Live updates paused')).toBeInTheDocument();
+  });
+
+  it('offers exactly one New profile action, inside the live toolbar of the Profiles section', () => {
+    const server = startServer();
+    renderLive(server);
+
+    // Exactly one: the header no longer carries a second, orphaned link.
+    const links = screen.getAllByRole('link', { name: 'New profile' });
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute('href', '/profiles/new');
+
+    // Placement: the same control cluster as 'Pause live updates' / 'Refresh now',
+    // inside the region labelled by the 'Profiles' heading.
+    const refresh = screen.getByRole('button', { name: 'Refresh now' });
+    expect(refresh.parentElement).toContainElement(links[0]);
+    expect(screen.getByRole('region', { name: 'Profiles' })).toContainElement(links[0]);
+
+    // The affordances of the action are unchanged by the move.
+    expect(links[0]).toHaveClass(
+      'cursor-pointer',
+      'hover:text-accent',
+      'active:bg-muted-pressed',
+      'active:border-accent',
+      'active:text-accent',
+      'motion-safe:transition-colors',
+      'focus-visible:ring-2',
+    );
+
+    // Peer parity with the two live controls it sits between: the action borrows
+    // the same `size="sm"` box metrics, so the three controls of the cluster
+    // share one height instead of the misaligned 26 / 26 / 30px measured in a
+    // browser when the action restated the padding with `text-sm`.
+    for (const metric of BUTTON_SIZE_CLASSES.sm.split(' ')) {
+      expect(links[0]).toHaveClass(metric);
+      expect(refresh).toHaveClass(metric);
+    }
   });
 
   it('renders the documented empty states', async () => {

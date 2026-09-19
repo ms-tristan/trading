@@ -14,7 +14,7 @@ import '@fontsource/fira-sans/latin-600.css';
 import '@fontsource/fira-sans/latin-700.css';
 import './globals.css';
 
-import { Activity, PlusCircle } from 'lucide-react';
+import { Activity } from 'lucide-react';
 
 import { AppShell } from '@/components/ui/app-shell';
 
@@ -48,15 +48,6 @@ export default function RootLayout({ children }: { children: ReactNode }) {
                 <span>Trading Platform</span>
                 <span className="font-normal text-muted-foreground">real-time monitor</span>
               </Link>
-              <nav aria-label="Profiles">
-                <Link
-                  href="/profiles/new"
-                  className={`inline-flex cursor-pointer items-center gap-sm rounded-button border border-border px-lg py-sm text-sm text-foreground motion-safe:transition-colors motion-safe:duration-200 hover:text-accent active:border-accent active:bg-muted-pressed active:text-accent ${FOCUS_RING}`}
-                >
-                  <PlusCircle aria-hidden="true" className="size-4 text-accent" />
-                  <span>New profile</span>
-                </Link>
-              </nav>
             </div>
             <p className="text-xs text-muted-foreground">Read-only by default</p>
           </header>

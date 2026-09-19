@@ -231,4 +231,14 @@ describe('DeleteProfileDialog', () => {
     expect(cancel).toHaveFocus();
     expect(trigger).not.toHaveFocus();
   });
+
+  it('keeps the confirmation dialog on the named md container step (28rem, 448px)', () => {
+    renderOpenDialog();
+
+    // `max-w-md` compiles to 28rem = 448px through the width-scale bridge of
+    // globals.css. Measured live before that bridge existed: this dialog was a
+    // 50 x 744 px sliver, because the name resolved to the 8px `--spacing-md`
+    // density token instead of the container step.
+    expect(screen.getByRole('dialog')).toHaveClass('max-w-md');
+  });
 });

@@ -2,13 +2,17 @@
 
 import { useCallback } from 'react';
 
-import { ShieldAlert } from 'lucide-react';
+import Link from 'next/link';
+
+import { PlusCircle, ShieldAlert } from 'lucide-react';
 
 import { ProfileCard } from '@/components/overview/profile-card';
+import { BUTTON_SIZE_CLASSES } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/empty-state';
 import { LiveToolbar } from '@/components/ui/live-toolbar';
 import { fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
 import { failureReport } from '@/lib/api-failure';
+import { cn } from '@/lib/cn';
 import { EMPTY_PLACEHOLDER, formatInteger, formatTimestamp } from '@/lib/format';
 import type { HealthPayload, KillSwitchPayload, ProfilesPayload } from '@/lib/types';
 import { usePolling } from '@/lib/use-polling';
@@ -37,6 +41,23 @@ export interface OverviewLiveProps {
 const HEADING_ID = 'overview-live-heading';
 
 /**
+ * Classes of the profile creation action.
+ *
+ * The action is an anchor, not a button: it navigates to the creation route, it
+ * does not act on the current payload. It is a *peer* of the two live controls
+ * it sits between, so it borrows their exact box metrics from
+ * {@link BUTTON_SIZE_CLASSES} (`size="sm"`) rather than restating them: measured
+ * in a browser, a version that restated the padding with `text-sm` stood 30px
+ * tall next to its 26px neighbours and the cluster read as misaligned. It keeps
+ * the visible focus ring and the pressed feedback of every other control.
+ */
+const NEW_PROFILE_ACTION_CLASSES = cn(
+  'inline-flex cursor-pointer select-none items-center rounded-button border border-border font-medium text-foreground',
+  BUTTON_SIZE_CLASSES.sm,
+  'motion-safe:transition-colors motion-safe:duration-200 hover:text-accent active:border-accent active:bg-muted-pressed active:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+);
+
+/**
  * Live region of the overview: the only Client Component of the page.
  *
  * One polling cycle refreshes health, the profile list and the kill-switch state
@@ -50,7 +71,9 @@ const HEADING_ID = 'overview-live-heading';
  * is keyed by `profile_id`, so a refresh updates it in place instead of
  * remounting it. Accessibility: the toolbar carries the polite live region with
  * the "checked at" stamp and the paused / running state, and the Pause control
- * is a plain, keyboard-operable button.
+ * is a plain, keyboard-operable button. The creation action of the section ("New
+ * profile") is injected into that same control cluster, so the action sits with
+ * the list it creates into and stays the last tab stop of the cluster.
  */
 export function OverviewLive({
   initialProfiles,
@@ -108,6 +131,12 @@ export function OverviewLive({
         // and keeps the underlying cause as the detail line.
         error={failure === null ? null : failureReport(failure).headline}
         errorDetail={failure === null ? null : failureReport(failure).detail}
+        actions={
+          <Link href="/profiles/new" className={NEW_PROFILE_ACTION_CLASSES}>
+            <PlusCircle aria-hidden="true" className="size-3.5 text-accent" />
+            <span>New profile</span>
+          </Link>
+        }
       />
 
       {isEngaged ? (
