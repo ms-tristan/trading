@@ -535,6 +535,38 @@ decision is to keep the `basic` strategy (or the naive baseline) and to treat
 any positive PnL of the `timesfm` strategy as noise. The strategy is designed so
 that this is visible, not hidden.
 
+### 9.0 What this model is actually good at: risk, not direction
+
+The one thing TimesFM does demonstrably well here is estimate **volatility**. On
+the same 688 origins, the predicted interquartile range of the path
+(`q80 − q20` at the horizon) ranks the *realised* volatility of the horizon that
+follows:
+
+| predictor | Spearman vs future realised vol | p |
+| --- | --- | --- |
+| **TimesFM predicted IQR (`forecast_iqr_term`)** | **+0.443** | 1.9e−34 |
+| trailing realised vol (free, no model) | +0.427 | 7.7e−32 |
+
+The spread is monotone across quintiles — from `0.00323` in the lowest to
+`0.00614` in the highest, a factor of **1.9×** — and the model is not merely
+echoing recent volatility: the **partial** Spearman, controlling for trailing
+volatility, is still **+0.163**. The forecast carries information about future
+risk that the free baseline does not.
+
+**This is the intended use of the layer, and it is not a directional edge.**
+Two things must be said plainly:
+
+- volatility *targeting* with this signal **reduces** PnL on a trending asset
+  (−0.27 Sharpe against a matched flat allocation), because cutting exposure when
+  volatility rises removes the best periods; but
+- it is a **much better risk input than trailing volatility** (+0.36 Sharpe over
+  that control, and a 76 % against 113 % maximum drawdown).
+
+So the honest framing of the delivered strategy is: **a risk-management tool
+built on a model whose direction is a random walk and whose dispersion is
+genuinely informative.** It is not alpha, and nothing in the backtests supports
+treating it as such.
+
 ### 9.1 The target you score on decides whether you see an edge
 
 This is the most important lesson of the whole layer, and it was a real defect.
