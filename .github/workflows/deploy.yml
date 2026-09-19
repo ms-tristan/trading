@@ -61,20 +61,43 @@ jobs:
           fi
           echo "deploy secrets present"
 
+      # The deployment runs from the HOST repository at
+      # /Users/mac/Projects/Trading, not from the runner's own checkout.
+      #
+      # That is not a shortcut, it is what the two mechanisms in play require:
+      #   * the images build with `context: ..`, i.e. the parent of deploy/ --
+      #     so whatever repository sits beside deploy/ is what gets built into
+      #     the images;
+      #   * the `trading-realtime` service declares `env_file: - .env`, which
+      #     compose resolves RELATIVE TO THE COMPOSE FILE. A checkout has no
+      #     deploy/.env (git-ignored, holds TB_OPERATOR_TOKEN), and passing
+      #     `--env-file <host path>` does NOT satisfy the service-level
+      #     `env_file` -- `up` still refuses to start.
+      # A runner checkout therefore cannot deploy this stack on its own. The
+      # host repository is fast-forwarded to the exact merged commit below, so
+      # the build context IS the revision this run is deploying.
+      #
       # Both containers are rebuilt together on purpose: the reconciliation fix
       # lives in the Python engine image and the operator-token fix lives in the
       # Next.js image, so deploying only one would ship half a change and leave
       # the dashboard and the API disagreeing.
-      #
+      - name: Fast-forward the host repository to the deployed commit
+        working-directory: /Users/mac/Projects/Trading
+        run: |
+          # Only a fast-forward is ever taken: a dirty or diverged host tree is
+          # an operator's problem to resolve, never something a deploy should
+          # force through with a reset.
+          git fetch origin main
+          git merge --ff-only "$GITHUB_SHA"
+
       # Persistent state is untouched: the named volumes deploy_trading-state
       # (SQLite state, kill-switch file, logs) and deploy_trading-cache (OHLCV)
       # survive a rebuild, and `--wait` blocks until both healthchecks pass --
       # the images already probe GET /api/health (realtime) and GET / (dashboard).
       - name: Rebuild and restart the trading stack
+        working-directory: /Users/mac/Projects/Trading
         run: |
-          docker compose --env-file /Users/mac/Projects/Trading/deploy/.env \
-            -f deploy/docker-compose.yml \
-            up -d --build --wait
+          docker compose -f deploy/docker-compose.yml up -d --build --wait
           docker image prune -f
 
       # `--wait` proves the containers are healthy; this proves the stack is
