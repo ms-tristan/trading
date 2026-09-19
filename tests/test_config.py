@@ -23,7 +23,11 @@ from trading_platform.config import (
     override_params,
 )
 from trading_platform.config.loader import load_profiles, save_profiles
-from trading_platform.config.models import ProfileConfig
+from trading_platform.config.models import (
+    ProfileConfig,
+    RealtimeConfig,
+    resolve_platform_initial_balance,
+)
 from trading_platform.core.constants import DEFAULT_TIMEFRAME
 from trading_platform.core.errors import ConfigError
 
@@ -544,3 +548,151 @@ def test_save_profiles_refuses_a_document_it_cannot_read(tmp_path: Path) -> None
     """Saving updates a document; it never invents one."""
     with pytest.raises(ConfigError, match="not found"):
         save_profiles(tmp_path / "missing.json", [ProfileConfig(id="aaa", symbol="BTC/USDT")])
+
+
+# ---------------------------------------------------------------------------
+# the shared platform wallet: per-profile allocation
+# ---------------------------------------------------------------------------
+
+
+def test_profile_allocation_defaults_to_none_and_falls_back_to_initial_balance() -> None:
+    """``allocation`` is optional: absent, the profile's ``initial_balance`` is it."""
+    profile = ProfileConfig(id="btc-paper", symbol="BTC/USDT", initial_balance=8000.0)
+    assert profile.allocation is None
+    assert profile.effective_allocation == 8000.0
+    assert profile.model_dump()["allocation"] is None
+
+
+def test_profile_allocation_wins_over_the_initial_balance() -> None:
+    """A configured allocation is the profile's share of the wallet."""
+    profile = ProfileConfig(
+        id="btc-paper", symbol="BTC/USDT", initial_balance=8000.0, allocation=2500.0
+    )
+    assert profile.allocation == 2500.0
+    assert profile.effective_allocation == 2500.0
+    # The legacy field keeps its own value: only the meaning of the attributed
+    # figures is refined, no existing field changes name or type.
+    assert profile.initial_balance == 8000.0
+    assert isinstance(profile.effective_allocation, float)
+
+
+def test_effective_allocation_is_float_even_for_an_int_allocation() -> None:
+    profile = ProfileConfig(id="btc-paper", symbol="BTC/USDT", allocation=2500)
+    assert profile.effective_allocation == 2500.0
+    assert isinstance(profile.effective_allocation, float)
+
+
+@pytest.mark.parametrize("allocation", [0.0, 0, -1.0, -2500.0])
+def test_profile_allocation_must_be_positive(tmp_path: Path, allocation: float) -> None:
+    """Zero and negative allocations are invalid, and the error names the field."""
+    with pytest.raises(ValidationError):
+        ProfileConfig(id="btc-paper", symbol="BTC/USDT", allocation=allocation)
+
+    path = profiles_document(tmp_path, ["aaa-paper"])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["profiles"][0]["allocation"] = allocation
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ConfigError) as excinfo:
+        load_profiles(path)
+    assert "allocation" in str(excinfo.value)
+
+
+def test_a_profiles_document_written_before_the_wallet_still_loads(tmp_path: Path) -> None:
+    """Backward compatibility: no ``allocation`` key, no platform key, no change."""
+    profiles = load_profiles(profiles_document(tmp_path, ["aaa-paper", "bbb-paper"]))
+    assert [profile.allocation for profile in profiles] == [None, None]
+    assert [profile.effective_allocation for profile in profiles] == [1000.0, 1000.0]
+
+
+# ---------------------------------------------------------------------------
+# the shared platform wallet: platform-wide configuration
+# ---------------------------------------------------------------------------
+
+
+def test_platform_configuration_fields_default_to_none() -> None:
+    """An absent platform field means "no platform cap" / "no initial balance"."""
+    realtime = default_config().realtime
+    assert realtime.platform_initial_balance is None
+    assert realtime.platform_max_total_notional is None
+    assert realtime.platform_max_daily_loss is None
+
+
+def test_platform_configuration_fields_are_read_back() -> None:
+    realtime = RealtimeConfig(
+        platform_initial_balance=15_000.0,
+        platform_max_total_notional=12_000.0,
+        platform_max_daily_loss=1_000.0,
+    )
+    assert realtime.platform_initial_balance == 15_000.0
+    assert realtime.platform_max_total_notional == 12_000.0
+    assert realtime.platform_max_daily_loss == 1_000.0
+    assert RealtimeConfig.model_validate(realtime.model_dump(mode="json")) == realtime
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["platform_initial_balance", "platform_max_total_notional", "platform_max_daily_loss"],
+)
+@pytest.mark.parametrize("value", [0.0, 0, -1.0])
+def test_platform_configuration_fields_reject_zero_and_negative(field: str, value: float) -> None:
+    """Each platform field must be strictly positive, and the error names it."""
+    with pytest.raises(ValidationError):
+        RealtimeConfig(**{field: value})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(overrides={"realtime": {field: value}})
+    assert field in str(excinfo.value)
+
+
+def test_an_unknown_platform_key_is_still_refused() -> None:
+    """``extra='forbid'`` stays: a typo in a platform key is a loud ConfigError."""
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RealtimeConfig(platform_max_leverage=3.0)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(overrides={"realtime": {"platform_max_leverage": 3.0}})
+    assert "platform_max_leverage" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# the shared platform wallet: the starting balance
+# ---------------------------------------------------------------------------
+
+
+def _allocation_profiles() -> list[ProfileConfig]:
+    """Return one profile falling back to ``initial_balance`` and one allocated."""
+    return [
+        ProfileConfig(id="btc-paper", symbol="BTC/USDT", initial_balance=10_000.0),
+        ProfileConfig(
+            id="eth-paper", symbol="ETH/USDT", initial_balance=5_000.0, allocation=2_500.0
+        ),
+    ]
+
+
+def test_resolve_platform_initial_balance_prefers_the_configured_value() -> None:
+    realtime = RealtimeConfig(platform_initial_balance=15_000.0)
+    assert resolve_platform_initial_balance(realtime, _allocation_profiles()) == 15_000.0
+
+
+def test_resolve_platform_initial_balance_falls_back_to_the_effective_allocations() -> None:
+    """Without a platform balance the wallet starts at the sum of the shares."""
+    profiles = _allocation_profiles()
+    assert resolve_platform_initial_balance(RealtimeConfig(), profiles) == 12_500.0
+    assert resolve_platform_initial_balance(RealtimeConfig(), profiles) == sum(
+        profile.effective_allocation for profile in profiles
+    )
+    # Any sequence is accepted, a tuple included.
+    assert resolve_platform_initial_balance(RealtimeConfig(), tuple(profiles)) == 12_500.0
+
+
+def test_resolve_platform_initial_balance_of_a_legacy_document_is_the_sum_of_balances() -> None:
+    """A configuration predating the wallet funds it with exactly its balances."""
+    profiles = [
+        ProfileConfig(id="btc-paper", symbol="BTC/USDT", initial_balance=10_000.0),
+        ProfileConfig(id="eth-paper", symbol="ETH/USDT", initial_balance=5_000.0),
+    ]
+    assert resolve_platform_initial_balance(RealtimeConfig(), profiles) == 15_000.0
+
+
+def test_resolve_platform_initial_balance_is_zero_without_profiles() -> None:
+    assert resolve_platform_initial_balance(RealtimeConfig(), []) == 0.0
+    assert isinstance(resolve_platform_initial_balance(RealtimeConfig(), []), float)

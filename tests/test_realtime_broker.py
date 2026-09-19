@@ -5,6 +5,10 @@ Covers, offline and deterministically:
 * ``PaperBroker``: market and limit fills, exact prices, fees and cash movements,
   the deterministic partial fill followed by its completion, idempotent
   submission, cancellation, open orders, equity and reconciliation;
+* the shared platform wallet the paper venue funds itself from: the broker owns no
+  cash of its own, ``fetch_balance`` is the wallet's, two brokers sharing one
+  injected wallet see one balance, a live wallet is refused, and ``restore_cash``
+  delegates to the wallet;
 * the error paths named by the delivery brief (limit without a price, non-positive
   quantity or reference price, duplicate identifier, reconciliation mismatch);
 * ``CcxtBroker``: the lazily imported optional extra, the idempotent
@@ -34,7 +38,7 @@ from typing import Any, ClassVar
 import pandas as pd
 import pytest
 
-from trading_platform.core.errors import BrokerError, BrokerUnavailableError
+from trading_platform.core.errors import BrokerError, BrokerUnavailableError, WalletError
 from trading_platform.realtime.broker import Broker, CcxtBroker, PaperBroker
 from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.credentials import ExchangeCredentials
@@ -50,6 +54,7 @@ from trading_platform.realtime.models import (
     RunMode,
     new_client_order_id,
 )
+from trading_platform.realtime.wallet import PlatformWallet
 
 SYMBOL = "BTC/USDT"
 PROFILE_ID = "btc-paper"
@@ -97,6 +102,12 @@ def make_paper(**kwargs: Any) -> PaperBroker:
     kwargs.setdefault("slippage", 0.0)
     kwargs.setdefault("seed", 0)
     return PaperBroker(**kwargs)
+
+
+def make_wallet(**kwargs: Any) -> PlatformWallet:
+    """Build the shared wallet a paper broker is funded from."""
+    kwargs.setdefault("initial_balance", 10_000.0)
+    return PlatformWallet(**kwargs)
 
 
 def make_credentials(**overrides: Any) -> ExchangeCredentials:
@@ -316,6 +327,9 @@ def test_paper_broker_is_a_broker_and_fills_a_market_buy_against_the_reference_p
     expected_price = 100.0 * 1.01  # the slippage always works against the trader
     expected_fee = 0.001 * 2.0 * expected_price
     assert broker.fetch_balance() == pytest.approx(10_000.0 - 2.0 * expected_price - expected_fee)
+    # That balance is not the venue's own counter any more: it is the shared wallet.
+    assert broker.wallet.cash == pytest.approx(broker.fetch_balance())
+    assert broker.wallet.initial_balance == pytest.approx(10_000.0)
 
     events = broker.poll()
     assert len(events) == 1
@@ -357,6 +371,7 @@ def test_paper_broker_marks_open_positions_in_its_equity() -> None:
     broker = make_paper(fee_rate=0.0)
     broker.submit(make_request(quantity=2.0), reference_price=100.0)
     cash = broker.fetch_balance()
+    assert broker.wallet.cash == pytest.approx(cash)
 
     assert broker.equity() == pytest.approx(cash + 2.0 * 100.0)  # last fill price
     assert broker.equity(reference_prices={SYMBOL: 150.0}) == pytest.approx(cash + 300.0)
@@ -834,7 +849,126 @@ def test_adding_to_a_long_keeps_both_units_open() -> None:
 
 
 def test_paper_broker_exposes_its_initial_balance() -> None:
-    assert make_paper(initial_balance=4321.0).initial_balance == pytest.approx(4321.0)
+    broker = make_paper(initial_balance=4321.0)
+
+    assert broker.initial_balance == pytest.approx(4321.0)
+    assert broker.wallet.initial_balance == pytest.approx(4321.0)
+
+
+# ---------------------------------------------------------------------------
+# 5c. the shared platform wallet the venue is funded from
+# ---------------------------------------------------------------------------
+
+
+def test_the_paper_broker_owns_no_cash_of_its_own() -> None:
+    broker = make_paper(initial_balance=2_000.0)
+
+    assert isinstance(broker.wallet, PlatformWallet)
+    assert broker.wallet is broker.wallet  # a read-only property, always the same object
+    assert broker.wallet.mode is RunMode.PAPER
+    assert broker.wallet.is_authoritative is True
+    assert broker.wallet.name == "paper-wallet"
+    assert broker.wallet.cash == pytest.approx(2_000.0)
+    assert broker.fetch_balance() == pytest.approx(broker.wallet.cash)
+    assert broker.initial_balance == pytest.approx(broker.wallet.initial_balance)
+    # The venue used to keep its own counter: it is gone, the wallet is the ledger.
+    assert not hasattr(broker, "_cash")
+    assert not hasattr(broker, "_initial_balance")
+
+
+def test_a_fill_moves_the_shared_wallet_and_nothing_else() -> None:
+    wallet = make_wallet()
+    broker = make_paper(wallet=wallet, fee_rate=0.0)
+
+    broker.submit(make_request(quantity=2.0), reference_price=100.0)
+
+    assert wallet.cash == pytest.approx(10_000.0 - 2.0 * 100.0)
+    assert broker.fetch_balance() == pytest.approx(10_000.0 - 2.0 * 100.0)
+    # The mark-to-market lives in the venue, the cash lives in the wallet.
+    assert broker.equity(reference_prices={SYMBOL: 150.0}) == pytest.approx(
+        10_000.0 - 2.0 * 100.0 + 2.0 * 150.0
+    )
+
+
+def test_two_brokers_sharing_one_wallet_see_one_balance() -> None:
+    wallet = make_wallet()
+    first = make_paper(wallet=wallet, fee_rate=0.0)
+    second = make_paper(wallet=wallet, fee_rate=0.0)
+
+    assert first.fetch_balance() == pytest.approx(10_000.0)
+    assert second.fetch_balance() == pytest.approx(10_000.0)
+
+    first.submit(make_request(quantity=1.0), reference_price=100.0)
+
+    # The debit of the first profile is immediately visible on the second one:
+    # there is exactly one ledger for the whole platform.
+    assert first.fetch_balance() == pytest.approx(9_900.0)
+    assert second.fetch_balance() == pytest.approx(9_900.0)
+    assert wallet.cash == pytest.approx(9_900.0)
+
+    second.submit(
+        make_request(client_order_id="ord-2", side=OrderSide.SELL, quantity=1.0),
+        reference_price=120.0,
+    )
+
+    assert first.fetch_balance() == pytest.approx(10_020.0)
+    assert second.fetch_balance() == pytest.approx(10_020.0)
+    assert wallet.cash == pytest.approx(10_020.0)
+
+
+def test_an_external_debit_of_the_shared_wallet_is_visible_on_the_venue() -> None:
+    wallet = make_wallet()
+    broker = make_paper(wallet=wallet, fee_rate=0.0)
+
+    wallet.debit(1_500.0, reason="allocation transfer")
+
+    assert broker.fetch_balance() == pytest.approx(8_500.0)
+    assert broker.equity() == pytest.approx(8_500.0)
+    assert broker.equity(reference_prices={SYMBOL: 100.0}) == pytest.approx(8_500.0)
+
+
+def test_a_paper_broker_refuses_a_live_wallet() -> None:
+    live = make_wallet(mode=RunMode.LIVE)
+
+    with pytest.raises(BrokerError, match="paper broker requires a paper wallet, got mode 'live'"):
+        make_paper(wallet=live)
+
+
+def test_restore_cash_delegates_to_the_shared_wallet() -> None:
+    wallet = make_wallet()
+    broker = make_paper(wallet=wallet)
+
+    broker.restore_cash(4_321.0)
+
+    assert wallet.cash == pytest.approx(4_321.0)
+    assert broker.fetch_balance() == pytest.approx(4_321.0)
+    # Every broker sharing the wallet is re-seeded by that one call.
+    assert make_paper(wallet=wallet).fetch_balance() == pytest.approx(4_321.0)
+
+
+def test_restore_cash_keeps_its_finiteness_contract() -> None:
+    wallet = make_wallet()
+    broker = make_paper(wallet=wallet)
+
+    with pytest.raises(ValueError, match="restored cash must be finite, got nan"):
+        broker.restore_cash(float("nan"))
+
+    assert wallet.cash == pytest.approx(10_000.0)
+    assert broker.fetch_balance() == pytest.approx(10_000.0)
+
+
+def test_an_unfunded_fill_is_refused_and_leaves_nothing_behind() -> None:
+    wallet = make_wallet(initial_balance=50.0)
+    broker = make_paper(wallet=wallet, fee_rate=0.0)
+
+    with pytest.raises(WalletError, match=r"platform wallet cannot debit 100\.00 USDT"):
+        broker.submit(make_request(quantity=1.0), reference_price=100.0)
+
+    assert wallet.cash == pytest.approx(50.0)
+    assert broker.fetch_balance() == pytest.approx(50.0)
+    assert broker.open_orders() == []
+    assert broker.poll() == []
+    assert broker.equity(reference_prices={SYMBOL: 100.0}) == pytest.approx(50.0)
 
 
 # ---------------------------------------------------------------------------

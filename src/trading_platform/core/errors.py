@@ -37,6 +37,7 @@ __all__ = [
     "TradingBacktestError",
     "ValidationLayerError",
     "WalkForwardError",
+    "WalletError",
 ]
 
 
@@ -138,6 +139,17 @@ class MarketStreamError(RealtimeError):
 
 class StateStoreError(RealtimeError):
     """The persistent state store failed, or its schema version is not supported."""
+
+
+class WalletError(RealtimeError):
+    """The shared platform wallet refused an operation, or an amount is unusable.
+
+    The wallet is the single source of truth for the USDT cash of the platform, so
+    a refusal here is never a silent one: an amount that is not a finite,
+    non-negative number, an attempt to mutate the read-only live mirror, a debit
+    the ledger cannot fund and a non-finite restored balance all raise this error
+    with an explicit message.
+    """
 
 
 class BrokerError(RealtimeError):

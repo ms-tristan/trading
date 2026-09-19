@@ -63,7 +63,54 @@ export interface ProfileHealth {
   counters: EngineCounters;
 }
 
-/** One profile as `GET /api/profiles` and `GET /api/profiles/{id}` emit it. */
+/**
+ * The one shared USDT wallet of the platform: the single source of truth for
+ * cash, and the only thing that can fund an order.
+ *
+ * Every profile draws its orders from this ledger; the per-profile figures are
+ * *attributed* shares of it (see {@link ProfileSnapshot}). `source` says where
+ * the cash actually lives: `'local'` is the persisted paper ledger the platform
+ * debits itself, `'venue'` is the account of the exchange in live mode, which
+ * the platform mirrors **read-only** and never debits locally.
+ */
+export interface WalletSnapshot {
+  /** Display name of the wallet (`platform` for the shared ledger). */
+  name: string;
+  /** Whether the wallet drives the simulated ledger or a real venue. */
+  mode: RunMode;
+  /** Balance the wallet started from; `null` when the venue does not report it. */
+  initial_balance: number | null;
+  /** USDT available right now to fund an order. */
+  cash: number | null;
+  /** Cash plus the mark-to-market value of every open position. */
+  equity: number | null;
+  /** Capital currently deployed in open positions, across every profile. */
+  deployed: number | null;
+  /** Realized profit and loss of the shared ledger. */
+  realized_pnl: number | null;
+  /** Unrealized profit and loss of the open positions. */
+  unrealized_pnl: number | null;
+  /** Total exposure of the open positions, across every profile. */
+  total_exposure: number | null;
+  /** How many profiles this wallet funds. */
+  profiles: number;
+  /** Where the cash is held: the local paper ledger or the venue account. */
+  source: 'local' | 'venue';
+  /** ISO-8601 stamp of the last wallet update. */
+  updated_at: string | null;
+}
+
+/**
+ * One profile as `GET /api/profiles` and `GET /api/profiles/{id}` emit it.
+ *
+ * Since the platform wallet landed, the money fields are **attributed**: `cash`
+ * is the attributed share of the shared wallet the profile has left
+ * (`allocation - deployed + realized_pnl`) and `equity` is that share marked to
+ * market (`allocation + realized_pnl + unrealized_pnl`). The field names and
+ * types are unchanged; only their meaning was refined. The attributed
+ * breakdown is optional because a server that does not emit it yet stays a
+ * valid producer — the dashboard then renders the em dash placeholder.
+ */
 export interface ProfileSnapshot {
   profile_id: string;
   symbol: string;
@@ -81,15 +128,41 @@ export interface ProfileSnapshot {
   health: ProfileHealth;
   started_at: string | null;
   updated_at: string | null;
+  /**
+   * Attributed share of the shared wallet: what the per-profile risk limits are
+   * measured against, and what the per-profile figures are attributed to. When
+   * the server does not emit it, `initial_balance` is the allocation.
+   */
+  allocation?: number | null;
+  /** Attributed capital currently deployed in open positions. */
+  deployed?: number | null;
+  /** Realized profit and loss attributed to this profile. */
+  realized_pnl?: number | null;
+  /** Unrealized profit and loss attributed to this profile. */
+  unrealized_pnl?: number | null;
+  /** Reason of the last order the risk layer refused, `null` when none. */
+  last_block_reason?: string | null;
 }
 
-/** Body of `GET /api/profiles`. */
+/**
+ * Body of `GET /api/profiles`.
+ *
+ * `wallet` is the shared platform wallet; it is optional here because a server
+ * that does not emit it yet stays a valid producer, and the read routes
+ * normalise that absence to an explicit `null`.
+ */
 export interface ProfilesPayload {
   profiles: ProfileSnapshot[];
   generated_at: string | null;
+  wallet?: WalletSnapshot | null;
 }
 
-/** Body of `GET /api/health`. */
+/**
+ * Body of `GET /api/health`.
+ *
+ * `wallet` is the shared platform wallet (same value as the one of
+ * `GET /api/profiles`), optional for the same backward-compatible reason.
+ */
 export interface HealthPayload {
   status: 'ok' | 'degraded';
   version: string;
@@ -98,6 +171,7 @@ export interface HealthPayload {
   profiles_running: number;
   kill_switch: boolean;
   checked_at: string | null;
+  wallet?: WalletSnapshot | null;
 }
 
 /** One point of a profile equity curve. */

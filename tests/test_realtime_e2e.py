@@ -58,7 +58,10 @@ ANCHOR = "2024-01-06T00:00:00+00:00"
 WARMUP = 40
 LAST_CANDLE = "2024-01-05T23:00:00+00:00"
 
-#: The exact key set of the ``/api/health`` body.
+#: The exact key set of the ``/api/health`` body served by the monitoring surface.
+#: ``wallet`` is the shared platform wallet view every profile funds its orders
+#: from: it is **additive**, always present, and ``null`` when the provider reports
+#: none.
 HEALTH_KEYS = frozenset(
     {
         "status",
@@ -68,6 +71,7 @@ HEALTH_KEYS = frozenset(
         "profiles_running",
         "kill_switch",
         "checked_at",
+        "wallet",
     }
 )
 
@@ -182,6 +186,21 @@ def tick(path: Path) -> dict[str, Any]:
     return json.loads(text[start : end + 1])
 
 
+def write_funding_scenario(directory: Path) -> Path:
+    """Write the scenario of a platform whose shared wallet cannot fund one order.
+
+    The configuration document is the regular one plus an explicit
+    ``realtime.platform_initial_balance`` of 500 USDT for the **whole** platform,
+    while ``btc-paper`` still declares a 1000 USDT stake: the one shared ledger can
+    never fund that entry, which is exactly the refusal this scenario pins.
+    """
+    path = write_scenario(directory)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["realtime"]["platform_initial_balance"] = 500.0
+    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    return path
+
+
 def rows(database: Path, table: str) -> list[tuple[Any, ...]]:
     """Return every row of ``table`` (read-only, so the test never locks the file)."""
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
@@ -270,17 +289,40 @@ def test_deterministic_tick_twice_then_the_read_only_monitoring_api(tmp_path: Pa
 
         status, payload = get(port, "/api/profiles")
         assert status == 200
-        assert set(payload) == {"profiles", "generated_at"}
+        assert set(payload) == {"profiles", "generated_at", "wallet"}
         assert [item["profile_id"] for item in payload["profiles"]] == [
             "btc-paper",
             "eth-paper",
         ]
+        # the served wallet is the platform ledger this run started from, byte for
+        # byte the same object the engine's own health body carries.
+        assert payload["wallet"]["cash"] == pytest.approx(13_999.0)
+        assert payload["wallet"]["initial_balance"] == pytest.approx(15_000.0)
+        assert payload["wallet"]["source"] == "local"
+        assert payload["wallet"]["profiles"] == 2
         snapshot = {item["profile_id"]: item for item in payload["profiles"]}
         assert snapshot["btc-paper"]["open_positions"] == 1
         assert snapshot["btc-paper"]["health"]["last_candle_at"] == LAST_CANDLE
         # the read model rebuilds the curve from the persisted rows, not from an
-        # in-process balance: the equity of the dashboard is the stored one
-        assert snapshot["btc-paper"]["equity"] == pytest.approx(9999.0)
+        # in-process balance: the equity of the dashboard is the stored one.  It is
+        # the *attributed* equity (allocation + realized + unrealized), so the entry
+        # fee of the still-open position is not charged to the profile yet: it is
+        # attributed when the round trip closes (the ledger has paid it already).
+        assert snapshot["btc-paper"]["equity"] == pytest.approx(10_000.0)
+        assert snapshot["btc-paper"]["allocation"] == pytest.approx(10_000.0)
+        assert snapshot["btc-paper"]["deployed"] == pytest.approx(1_000.0)
+        assert snapshot["btc-paper"]["cash"] == pytest.approx(9_000.0)
+        assert snapshot["btc-paper"]["equity"] == pytest.approx(
+            snapshot["btc-paper"]["cash"] + snapshot["btc-paper"]["position_value"]
+        )
+        assert snapshot["btc-paper"]["last_block_reason"] is None
+        # the shared wallet of the platform is the durable ledger: its view is
+        # carried by the platform health/snapshot of the engine (pinned in
+        # tests/test_realtime_orchestrator.py), and the row below is its truth
+        ledger = rows(database, "wallet")
+        assert len(ledger) == 1
+        assert ledger[0][1] == pytest.approx(13_999.0), "1000 notional + 1.00 fee"
+        assert ledger[0][2] == pytest.approx(15_000.0), "the platform initial balance"
 
         status, detail = get(port, "/api/profiles/btc-paper")
         assert status == 200
@@ -388,14 +430,17 @@ def test_a_restart_in_the_middle_of_a_position_resubmits_nothing(tmp_path: Path)
         store.close()
 
 
-def test_a_restart_restores_the_simulated_cash_from_the_durable_state(tmp_path: Path) -> None:
-    """D7: after a restart the durable state -- not the venue's amnesia -- is the truth.
+def test_a_restart_restores_the_shared_platform_wallet_once(tmp_path: Path) -> None:
+    """The one shared wallet is restored once; the per-profile figures are attributed.
 
-    A simulated venue starts again from its configured initial balance while the
-    open position is restored from the store, so without an explicit re-seeding the
-    restarted platform counts that position *twice*: the dashboard would display an
-    equity the persisted curve contradicts.  The last equity point of the profile is
-    the durable cash, and the boot wiring hands it back to the venue.
+    Rewritten deliberately with the shared-wallet semantics (this test used to pin
+    a per-profile simulated cash): every profile funds its orders from **one**
+    persisted USDT ledger, so a restart restores *that* ledger -- exactly once, and
+    without rewriting it -- and the cash each profile reports is an **attributed**
+    figure rebuilt from its own allocation, its deployed capital and its realized
+    P&L.  A simulated venue has no memory of its own, so without the persisted
+    ledger the restarted platform would count the restored position twice; with it,
+    the numbers are identical across the restart, and the durable curve agrees.
     """
     path = write_scenario(tmp_path)
     database = tmp_path / "state.db"
@@ -405,8 +450,21 @@ def test_a_restart_restores_the_simulated_cash_from_the_durable_state(tmp_path: 
     assert opened["btc-paper"]["open_positions"] == 1
     cash = opened["btc-paper"]["cash"]
     equity = opened["btc-paper"]["equity"]
-    assert cash < opened["btc-paper"]["initial_balance"], "the entry spent the cash"
+    allocation = opened["btc-paper"]["allocation"]
+    assert allocation == pytest.approx(10_000.0)
+    assert cash < allocation, "the entry spent the profile's share of the wallet"
     assert equity == pytest.approx(cash + opened["btc-paper"]["position_value"])
+    # the ledger paid the notional *and* the entry fee, while the attributed cash
+    # only reflects the deployed capital: the fee is charged when the trip closes
+    assert opened["btc-paper"]["deployed"] == pytest.approx(1_000.0)
+    assert cash == pytest.approx(allocation - 1_000.0)
+
+    # the shared wallet is the durable truth of the platform's cash
+    ledger = rows(database, "wallet")
+    assert len(ledger) == 1, "the wallet is one row, always"
+    wallet_cash = ledger[0][1]
+    assert wallet_cash == pytest.approx(15_000.0 - 1_000.0 - 1.0)
+    assert ledger[0][2] == pytest.approx(15_000.0), "the platform initial balance"
 
     # a brand-new process over the same file: fresh PaperBroker, restored position
     second = tick(path)
@@ -414,13 +472,19 @@ def test_a_restart_restores_the_simulated_cash_from_the_durable_state(tmp_path: 
     assert restarted["btc-paper"]["open_positions"] == 1
     assert restarted["btc-paper"]["cash"] == pytest.approx(cash)
     assert restarted["btc-paper"]["equity"] == pytest.approx(equity)
+    assert restarted["btc-paper"]["allocation"] == pytest.approx(allocation)
     assert restarted["btc-paper"]["equity"] == pytest.approx(
         restarted["btc-paper"]["cash"] + restarted["btc-paper"]["position_value"]
     )
-    # the profile without a position is untouched by the re-seeding
+    # the profile without a position is untouched by the restore
     assert restarted["eth-paper"]["cash"] == pytest.approx(
         restarted["eth-paper"]["initial_balance"]
     )
+    assert restarted["eth-paper"]["cash"] == pytest.approx(restarted["eth-paper"]["allocation"])
+    # the restart adopted the ledger, it never reset nor rewrote it (no order was
+    # routed, so the wallet was not persisted again)
+    assert rows(database, "wallet") == ledger
+    assert ledger[0][1] == pytest.approx(wallet_cash)
 
     # ... and the durable curve says exactly the same thing
     clock = SystemClock()
@@ -431,8 +495,51 @@ def test_a_restart_restores_the_simulated_cash_from_the_durable_state(tmp_path: 
         assert len(points) == 1, "the restart replays no candle, so it appends no point"
         assert points[-1].cash == pytest.approx(cash)
         assert points[-1].equity == pytest.approx(restarted["btc-paper"]["equity"])
+        assert store.load_wallet() is not None
+        assert store.load_wallet().cash == pytest.approx(wallet_cash)  # type: ignore[union-attr]
     finally:
         store.close()
+
+
+def test_an_order_the_shared_wallet_cannot_fund_is_refused_end_to_end(tmp_path: Path) -> None:
+    """The shared wallet funds every order; when it cannot, the order is refused.
+
+    The scenario gives the whole platform a ledger of 500 USDT while ``btc-paper``
+    still wants a 1000 USDT entry, so the funding check refuses it *before*
+    anything is persisted: no order row, no fill, no position, no equity point and
+    no cash movement.  The refusal is attributed to the profile that asked for it
+    and it is readable on the decision *and* on the profile snapshot.
+    """
+    path = write_funding_scenario(tmp_path)
+    database = tmp_path / "state.db"
+
+    payload = tick(path)
+    refusals = [item for item in payload["decisions"] if item["blocked"]]
+    assert len(refusals) == 1
+    refusal = refusals[0]
+    assert refusal["profile_id"] == "btc-paper"
+    assert refusal["client_order_id"], "the deterministic id is computed before the check"
+    assert refusal["quantity"] > 0.0
+    assert "platform wallet cannot fund order" in refusal["block_reason"]
+    assert "available 500.00 USDT" in refusal["block_reason"]
+
+    profiles = {item["profile_id"]: item for item in payload["profiles"]}
+    assert "platform wallet cannot fund order" in profiles["btc-paper"]["last_block_reason"]
+    assert profiles["btc-paper"]["allocation"] == pytest.approx(10_000.0)
+    assert profiles["btc-paper"]["deployed"] == pytest.approx(0.0)
+    assert profiles["btc-paper"]["realized_pnl"] == pytest.approx(0.0)
+    assert profiles["eth-paper"]["last_block_reason"] is None
+
+    # nothing is left half-applied
+    assert rows(database, "orders") == []
+    assert rows(database, "fills") == []
+    assert rows(database, "positions") == []
+    assert {row[0] for row in rows(database, "equity")} == {"eth-paper"}
+    # ... and the shared ledger was never debited
+    ledger = rows(database, "wallet")
+    assert len(ledger) == 1
+    assert ledger[0][1] == pytest.approx(500.0)
+    assert ledger[0][2] == pytest.approx(500.0)
 
 
 def test_the_global_kill_switch_halts_the_whole_platform_end_to_end(tmp_path: Path) -> None:

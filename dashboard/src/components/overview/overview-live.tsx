@@ -7,6 +7,7 @@ import Link from 'next/link';
 import { PlusCircle, ShieldAlert } from 'lucide-react';
 
 import { ProfileCard } from '@/components/overview/profile-card';
+import { WalletPanel } from '@/components/overview/wallet-panel';
 import { BUTTON_SIZE_CLASSES } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/empty-state';
 import { LiveToolbar } from '@/components/ui/live-toolbar';
@@ -60,20 +61,26 @@ const NEW_PROFILE_ACTION_CLASSES = cn(
 /**
  * Live region of the overview: the only Client Component of the page.
  *
- * One polling cycle refreshes health, the profile list and the kill-switch state
- * together, so a card never mixes two different snapshots. The Server Component
- * already rendered the first payload — mounting therefore performs no request,
- * and the first refresh happens on the documented cadence (2 s by default).
+ * One polling cycle refreshes health, the profile list, the shared platform
+ * wallet and the kill-switch state together, so a card never mixes two different
+ * snapshots. The Server Component already rendered the first payload — mounting
+ * therefore performs no request, and the first refresh happens on the documented
+ * cadence (2 s by default).
+ *
+ * The wallet panel is the first block of the live region, seeded with the wallet
+ * of the server payload: it is the one instance of the panel on the page, so the
+ * overview never shows the shared wallet twice.
  *
  * Robustness: a failed cycle is caught by `usePolling`, shows the non-blocking
  * banner of the toolbar — in the shared operator-facing vocabulary, never as a
- * raw proxy status — and keeps the last known good bundle on screen; a card
- * is keyed by `profile_id`, so a refresh updates it in place instead of
- * remounting it. Accessibility: the toolbar carries the polite live region with
- * the "checked at" stamp and the paused / running state, and the Pause control
- * is a plain, keyboard-operable button. The creation action of the section ("New
- * profile") is injected into that same control cluster, so the action sits with
- * the list it creates into and stays the last tab stop of the cluster.
+ * raw proxy status — and keeps the last known good bundle on screen (the shared
+ * wallet included); a card is keyed by `profile_id`, so a refresh updates it in
+ * place instead of remounting it. Accessibility: the toolbar carries the polite
+ * live region with the "checked at" stamp and the paused / running state, and
+ * the Pause control is a plain, keyboard-operable button. The creation action of
+ * the section ("New profile") is injected into that same control cluster, so the
+ * action sits with the list it creates into and stays the last tab stop of the
+ * cluster.
  */
 export function OverviewLive({
   initialProfiles,
@@ -109,72 +116,79 @@ export function OverviewLive({
   const reason = data.killSwitch.reason.trim();
 
   return (
-    <section aria-labelledby={HEADING_ID} className="flex flex-col gap-lg">
-      <header className="flex flex-wrap items-end justify-between gap-md">
-        <div className="min-w-0">
-          <h2 id={HEADING_ID} className="font-mono text-base font-semibold text-foreground">
-            Profiles
-          </h2>
-          <p className="mt-xs text-sm text-muted-foreground">
-            One card per configured profile, refreshed by HTTP polling.
+    <>
+      {/* The shared wallet of the server payload, refreshed by every cycle and
+          kept as the last known good value when a cycle fails. `?? null`
+          tolerates a payload without the wallet key at all. */}
+      <WalletPanel wallet={data.profiles.wallet ?? null} />
+
+      <section aria-labelledby={HEADING_ID} className="flex flex-col gap-lg">
+        <header className="flex flex-wrap items-end justify-between gap-md">
+          <div className="min-w-0">
+            <h2 id={HEADING_ID} className="font-mono text-base font-semibold text-foreground">
+              Profiles
+            </h2>
+            <p className="mt-xs text-sm text-muted-foreground">
+              One card per configured profile, refreshed by HTTP polling.
+            </p>
+          </div>
+        </header>
+
+        <LiveToolbar
+          checkedAt={checkedAt}
+          isPaused={isPaused}
+          onToggle={toggle}
+          onRefresh={handleRefresh}
+          // The failure is never printed raw: the mapping turns a 502/503/504, a
+          // connection failure or a timeout into the same operator-facing headline
+          // and keeps the underlying cause as the detail line.
+          error={failure === null ? null : failureReport(failure).headline}
+          errorDetail={failure === null ? null : failureReport(failure).detail}
+          actions={
+            <Link href="/profiles/new" className={NEW_PROFILE_ACTION_CLASSES}>
+              <PlusCircle aria-hidden="true" className="size-3.5 text-accent" />
+              <span>New profile</span>
+            </Link>
+          }
+        />
+
+        {isEngaged ? (
+          <p
+            role="status"
+            aria-live="polite"
+            className="flex flex-wrap items-center gap-sm rounded-card border border-loss/40 bg-loss/10 px-lg py-md text-sm text-foreground"
+          >
+            <ShieldAlert aria-hidden="true" className="size-4 shrink-0 text-loss" />
+            <span className="font-medium">Kill switch engaged — every profile is halted.</span>
+            <span className="min-w-0 break-words text-muted-foreground">
+              Reason: {reason === '' ? EMPTY_PLACEHOLDER : reason} · changed at{' '}
+              {formatTimestamp(data.killSwitch.changed_at)}
+            </span>
           </p>
-        </div>
-      </header>
+        ) : null}
 
-      <LiveToolbar
-        checkedAt={checkedAt}
-        isPaused={isPaused}
-        onToggle={toggle}
-        onRefresh={handleRefresh}
-        // The failure is never printed raw: the mapping turns a 502/503/504, a
-        // connection failure or a timeout into the same operator-facing headline
-        // and keeps the underlying cause as the detail line.
-        error={failure === null ? null : failureReport(failure).headline}
-        errorDetail={failure === null ? null : failureReport(failure).detail}
-        actions={
-          <Link href="/profiles/new" className={NEW_PROFILE_ACTION_CLASSES}>
-            <PlusCircle aria-hidden="true" className="size-3.5 text-accent" />
-            <span>New profile</span>
-          </Link>
-        }
-      />
-
-      {isEngaged ? (
-        <p
-          role="status"
-          aria-live="polite"
-          className="flex flex-wrap items-center gap-sm rounded-card border border-loss/40 bg-loss/10 px-lg py-md text-sm text-foreground"
-        >
-          <ShieldAlert aria-hidden="true" className="size-4 shrink-0 text-loss" />
-          <span className="font-medium">Kill switch engaged — every profile is halted.</span>
-          <span className="min-w-0 break-words text-muted-foreground">
-            Reason: {reason === '' ? EMPTY_PLACEHOLDER : reason} · changed at{' '}
-            {formatTimestamp(data.killSwitch.changed_at)}
-          </span>
-        </p>
-      ) : null}
-
-      {profiles.length === 0 ? (
-        data.health.profiles_total > 0 ? (
-          <EmptyState
-            title="No profile reported yet"
-            description={`Configured profiles: ${formatInteger(
-              data.health.profiles_total,
-            )}. None has published a snapshot yet — reload once a profile has started.`}
-          />
+        {profiles.length === 0 ? (
+          data.health.profiles_total > 0 ? (
+            <EmptyState
+              title="No profile reported yet"
+              description={`Configured profiles: ${formatInteger(
+                data.health.profiles_total,
+              )}. None has published a snapshot yet — reload once a profile has started.`}
+            />
+          ) : (
+            <EmptyState
+              title="No profile configured"
+              description="The monitoring server has no profile configured. Add one to its configuration, then reload this page."
+            />
+          )
         ) : (
-          <EmptyState
-            title="No profile configured"
-            description="The monitoring server has no profile configured. Add one to its configuration, then reload this page."
-          />
-        )
-      ) : (
-        <div className="grid gap-xl lg:grid-cols-2 2xl:grid-cols-3">
-          {profiles.map((profile) => (
-            <ProfileCard key={profile.profile_id} profile={profile} />
-          ))}
-        </div>
-      )}
-    </section>
+          <div className="grid gap-xl lg:grid-cols-2 2xl:grid-cols-3">
+            {profiles.map((profile) => (
+              <ProfileCard key={profile.profile_id} profile={profile} />
+            ))}
+          </div>
+        )}
+      </section>
+    </>
   );
 }

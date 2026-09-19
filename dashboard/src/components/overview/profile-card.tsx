@@ -24,6 +24,7 @@ import {
   formatInteger,
   formatMoney,
   formatRatioAsPercent,
+  formatSignedMoney,
   formatTimestamp,
   isFiniteNumber,
   trendLabel,
@@ -104,10 +105,36 @@ function Field({ label, value, children }: FieldProps) {
   return (
     <div className="rounded-button border border-border/60 bg-muted/30 px-lg py-md">
       <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</dt>
-      <dd className="mt-xs font-mono text-sm tabular-nums text-foreground">
+      <dd className="mt-xs break-words font-mono text-sm tabular-nums text-foreground">
         {children ?? (text.trim() === '' ? EMPTY_PLACEHOLDER : text)}
       </dd>
     </div>
+  );
+}
+
+interface TrendValueProps {
+  /** Already formatted value, rendered next to its trend claim. */
+  text: string;
+  /** Raw value the trend is read from. */
+  value: number | null | undefined;
+}
+
+/**
+ * A signed value with its direction.
+ *
+ * The tone is never the only signal: the direction is carried by the colour,
+ * by an icon and by the explicit {@link trendLabel} text together.
+ */
+function TrendValue({ text, value }: TrendValueProps) {
+  const trend = trendOf(value);
+  return (
+    <span className="inline-flex flex-wrap items-center gap-xs">
+      <span aria-hidden="true" className={TREND_TEXT_CLASSES[trend]}>
+        {TREND_ICONS[trend]}
+      </span>
+      <span className={TREND_TEXT_CLASSES[trend]}>{text}</span>
+      <span className="text-muted-foreground">{trendLabel(value)}</span>
+    </span>
   );
 }
 
@@ -122,9 +149,16 @@ function Field({ label, value, children }: FieldProps) {
  * above the stretched overlay so its buttons stay clickable, because a link may
  * never wrap a button. The footer renders the shared lifecycle island (pause,
  * resume, delete) of the profile, exactly like the detail header, so both entry
- * points offer the same controls. Every value carries an explicit label, every
- * state pairs its tone with a text label and an icon, and every absent value
- * renders the em dash placeholder — never `NaN`, `undefined` or an empty cell.
+ * points offer the same controls.
+ *
+ * Money is **attributed**: every profile funds its orders from the one shared
+ * platform wallet, so `equity` and `cash` are labelled "Attributed ..." — they
+ * are this profile's share of the shared ledger, never a pot of its own. The
+ * attributed breakdown (allocation, deployed capital, realized and unrealized
+ * P&L) and the reason of the last refused order are rendered beside them.
+ * Every value carries an explicit label, every state pairs its tone with a text
+ * label and an icon, and every absent value renders the em dash placeholder —
+ * never `NaN`, `undefined` or an empty cell.
  */
 export function ProfileCard({ profile, className }: ProfileCardProps) {
   const mode = MODE_BADGES[profile.mode] ?? {
@@ -138,8 +172,10 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
     icon: <CircleX className={BADGE_ICON_CLASSES} />,
   };
   const hasReturn = isFiniteNumber(profile.total_return);
-  const trend = trendOf(profile.total_return);
+  const hasRealized = isFiniteNumber(profile.realized_pnl);
+  const hasUnrealized = isFiniteNumber(profile.unrealized_pnl);
   const lastError = profile.health.last_error;
+  const lastBlockReason = profile.last_block_reason;
 
   return (
     <article
@@ -191,23 +227,37 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
         <Field label="Symbol" value={textOrPlaceholder(profile.symbol)} />
         <Field label="Timeframe" value={textOrPlaceholder(profile.timeframe)} />
         <Field label="Strategy" value={textOrPlaceholder(profile.strategy)} />
-        <Field label="Equity" value={formatMoney(profile.equity)} />
-        <Field label="Cash" value={formatMoney(profile.cash)} />
+        <Field label="Attributed equity" value={formatMoney(profile.equity)} />
+        <Field label="Attributed cash" value={formatMoney(profile.cash)} />
+        <Field label="Allocation" value={formatMoney(profile.allocation)} />
+        <Field label="Deployed" value={formatMoney(profile.deployed)} />
         <Field label="Position value" value={formatMoney(profile.position_value)} />
         <Field label="Initial balance" value={formatMoney(profile.initial_balance)} />
         <Field label="Total return" value={formatRatioAsPercent(profile.total_return, { signed: true })}>
           {hasReturn ? (
-            <span className="inline-flex flex-wrap items-center gap-xs">
-              <span aria-hidden="true" className={TREND_TEXT_CLASSES[trend]}>
-                {TREND_ICONS[trend]}
-              </span>
-              <span className={TREND_TEXT_CLASSES[trend]}>
-                {formatRatioAsPercent(profile.total_return, { signed: true })}
-              </span>
-              <span className="text-muted-foreground">{trendLabel(profile.total_return)}</span>
-            </span>
+            <TrendValue
+              text={formatRatioAsPercent(profile.total_return, { signed: true })}
+              value={profile.total_return}
+            />
           ) : undefined}
         </Field>
+        <Field label="Realized P&L" value={formatSignedMoney(profile.realized_pnl)}>
+          {hasRealized ? (
+            <TrendValue
+              text={formatSignedMoney(profile.realized_pnl)}
+              value={profile.realized_pnl}
+            />
+          ) : undefined}
+        </Field>
+        <Field label="Unrealized P&L" value={formatSignedMoney(profile.unrealized_pnl)}>
+          {hasUnrealized ? (
+            <TrendValue
+              text={formatSignedMoney(profile.unrealized_pnl)}
+              value={profile.unrealized_pnl}
+            />
+          ) : undefined}
+        </Field>
+        <Field label="Last blocked order" value={textOrPlaceholder(lastBlockReason)} />
         <Field label="Trades" value={formatInteger(profile.n_trades)} />
         <Field label="Open positions" value={formatInteger(profile.open_positions)} />
         <Field label="Last candle" value={formatTimestamp(profile.health.last_candle_at)} />

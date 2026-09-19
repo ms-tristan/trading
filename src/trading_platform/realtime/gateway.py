@@ -35,6 +35,19 @@ enters the drain buffer twice, and never moves a position twice.
 The equity point is **not** written here: the runner owns that cadence, and
 :meth:`snapshot_fields` hands it the numbers.
 
+Attributed accounting (:meth:`cash`, :meth:`snapshot_fields`)
+-------------------------------------------------------------
+Every profile funds its orders from the **one shared platform wallet**, so the
+gateway never reports the wallet's balance as a profile figure: that would make
+each profile claim the whole platform's cash.  The figures it publishes are
+*attributed* to its profile -- ``allocation - deployed + realized_pnl`` for the
+cash, ``allocation + realized_pnl + unrealized_pnl`` for the equity, with
+``unrealized_pnl = position_value - deployed`` -- and the wallet balance stays
+what :meth:`balance` reports.  The entry fees of a position that is still open
+are not yet attributed to any profile: they are charged to the round trip when it
+closes, so the sum of the profiles' attributed cash equals the shared wallet's
+cash **plus** those open entry fees -- a documented deviation, never a hidden one.
+
 Restart semantics
 -----------------
 The gateway is reconstructed around the *persisted* store on every boot, so the
@@ -270,7 +283,8 @@ class ExecutionGateway:
     ----------
     profile:
         The profile this gateway serves; its ``mode`` picks the run mode and its
-        ``initial_balance`` is the fallback cash when the venue reports no balance.
+        ``effective_allocation`` is the share of the shared platform wallet every
+        figure of this gateway is attributed to.
     broker:
         The injected venue adapter (``PaperBroker`` or ``CcxtBroker``).  The
         gateway never learns which one it holds beyond the ``mode`` assertion.
@@ -595,14 +609,22 @@ class ExecutionGateway:
         return None if value is None else float(value)
 
     def cash(self) -> float:
-        """Return the cash used by the equity maths (falls back to the initial balance).
+        """Return the profile's **attributed** cash: its share of the shared wallet.
 
-        A venue that cannot report a balance (some ``ccxt`` exchanges in restricted
-        modes) must not make equity unreadable, so the profile's configured initial
-        balance is used instead of inventing a ``0.0``.
+        The platform funds every order from one shared wallet, so reading the
+        wallet's balance here would make *every* profile report the whole
+        platform's cash.  The attributed cash is the profile's own view of the
+        ledger instead::
+
+            cash = allocation - deployed + realized_pnl
+
+        where ``allocation`` is :attr:`ProfileConfig.effective_allocation`, the
+        deployed capital is the entry value of the open positions and the realized
+        P&L is the sum of the profile's closed round trips.  It is what the runner
+        sizes an order on and what the dashboard shows as the profile's cash.
         """
-        value = self.balance()
-        return float(self._profile.initial_balance) if value is None else float(value)
+        allocation, deployed, _position_value, realized_pnl = self._attributed()
+        return allocation - deployed + realized_pnl
 
     def equity(self, *, reference_price: float) -> float:
         """Return ``cash + quantity * reference_price`` for the profile's symbol."""
@@ -615,28 +637,76 @@ class ExecutionGateway:
         resolved = str(self._profile.symbol) if symbol is None else str(symbol)
         return self._store.get_position(self.profile_id, resolved)
 
+    def publish_platform_state(self, *, exposure: float, daily_pnl: float) -> None:
+        """Publish this profile's figures to the injected platform aggregation.
+
+        The aggregation is reached through the *injected* risk manager -- never
+        through a global -- and the call is a no-op when no risk manager was
+        injected, exactly like the other optional seams of this class.  A failure
+        to publish is never allowed to make an order fail: publishing is an
+        observability side channel that feeds the platform-wide caps.
+        """
+        risk = self._risk
+        publisher = getattr(risk, "publish_platform_state", None)
+        if publisher is None:
+            return
+        publisher(self.profile_id, exposure=float(exposure), daily_pnl=float(daily_pnl))
+
     def snapshot_fields(self) -> dict[str, Any]:
-        """Return the read-model inputs of this profile: equity, cash, positions.
+        """Return the read-model inputs of this profile: attributed equity and cash.
 
         The mark price is the last reference price the gateway saw (the runner
         submits its orders with the candle open, so it is always fresh in
         production); before the first order -- and after a restart -- the position's
         average entry price is used instead, then ``0.0``.  No HTTP concern lives
         here: the monitor turns these numbers into a payload.
+
+        Every figure is attributed to the profile, never read off the shared
+        wallet: ``cash`` is ``allocation - deployed + realized_pnl``, ``equity`` is
+        ``cash + position_value`` and ``unrealized_pnl`` is
+        ``position_value - deployed``.
         """
-        position = self.position()
-        quantity = 0.0 if position is None else float(position.quantity)
-        mark = self._mark_price
-        if mark is None:
-            mark = 0.0 if position is None else float(position.average_price)
-        cash = self.cash()
-        position_value = quantity * float(mark)
+        allocation, deployed, position_value, realized_pnl = self._attributed()
+        cash = allocation - deployed + realized_pnl
         return {
             "equity": cash + position_value,
             "cash": cash,
             "position_value": position_value,
-            "open_positions": len(self._store.list_positions(self.profile_id)),
+            "open_positions": len(self._positions()),
+            "allocation": allocation,
+            "deployed": deployed,
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": position_value - deployed,
         }
+
+    # -- internals: the attributed read model --------------------------------
+
+    def _positions(self) -> list[Position]:
+        """Return every open position of the profile, ordered by symbol."""
+        return list(self._store.list_positions(self.profile_id))
+
+    def _attributed(self) -> tuple[float, float, float, float]:
+        """Return ``(allocation, deployed, position_value, realized_pnl)``.
+
+        ``deployed`` is the entry value of the open positions and
+        ``position_value`` is their mark-to-market value: the position's average
+        entry price when the gateway has no mark yet, the last reference price it
+        saw otherwise.  ``realized_pnl`` aggregates the closed round trips the
+        store holds.  The four numbers are the profile's attributed share of the
+        shared ledger -- the gateway never reads the wallet's balance here.
+        """
+        allocation = float(self._profile.effective_allocation)
+        deployed = 0.0
+        position_value = 0.0
+        for position in self._positions():
+            quantity = float(position.quantity)
+            deployed += abs(quantity * float(position.average_price))
+            mark = self._mark_price
+            if mark is None:
+                mark = float(position.average_price)
+            position_value += quantity * float(mark)
+        realized_pnl = sum(float(trade.pnl) for trade in self._store.list_trades(self.profile_id))
+        return allocation, deployed, position_value, realized_pnl
 
     # -- internals: submission guards ---------------------------------------
 

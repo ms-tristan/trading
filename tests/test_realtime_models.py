@@ -662,6 +662,176 @@ def test_nested_payloads_delegate_to_their_own_to_dict() -> None:
     assert event.to_dict()["fill"] is None
 
 
+#: The keys a :class:`ProfileSnapshot` published before the shared platform wallet.
+LEGACY_PROFILE_SNAPSHOT_KEYS = frozenset(
+    {
+        "profile_id",
+        "symbol",
+        "timeframe",
+        "strategy",
+        "mode",
+        "status",
+        "initial_balance",
+        "equity",
+        "cash",
+        "position_value",
+        "total_return",
+        "n_trades",
+        "open_positions",
+        "health",
+        "started_at",
+        "updated_at",
+    }
+)
+
+#: The attributed figures appended after ``updated_at`` (all with defaults).
+ATTRIBUTED_PROFILE_SNAPSHOT_KEYS = frozenset(
+    {"allocation", "deployed", "realized_pnl", "unrealized_pnl", "last_block_reason"}
+)
+
+
+def attributed_snapshot(**overrides: Any) -> ProfileSnapshot:
+    """Return a profile snapshot carrying the attributed platform figures."""
+    payload: dict[str, Any] = {
+        "profile_id": "btc-paper",
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "strategy": "basic",
+        "mode": RunMode.PAPER,
+        "status": ProfileStatus.RUNNING,
+        "initial_balance": 10_000.0,
+        "equity": 10_025.0,
+        "cash": 9_750.0,
+        "position_value": 275.0,
+        "total_return": 0.0025,
+        "n_trades": 2,
+        "open_positions": 1,
+        "health": ProfileHealth(profile_id="btc-paper", status=ProfileStatus.RUNNING),
+        "allocation": 10_000.0,
+        "deployed": 250.0,
+        "realized_pnl": 25.0,
+        "unrealized_pnl": 0.0,
+        "last_block_reason": "platform wallet cannot fund order",
+    }
+    payload.update(overrides)
+    return ProfileSnapshot(**payload)
+
+
+def test_profile_snapshot_appends_the_attributed_figures() -> None:
+    """The five new keys are additive: the legacy ones keep their name and type."""
+    payload = attributed_snapshot().to_dict()
+
+    assert set(payload) == LEGACY_PROFILE_SNAPSHOT_KEYS | ATTRIBUTED_PROFILE_SNAPSHOT_KEYS
+    assert payload["allocation"] == 10_000.0
+    assert payload["deployed"] == 250.0
+    assert payload["realized_pnl"] == 25.0
+    assert payload["unrealized_pnl"] == 0.0
+    assert payload["last_block_reason"] == "platform wallet cannot fund order"
+    assert payload["cash"] == 9_750.0
+    assert payload["initial_balance"] == 10_000.0
+    assert_json_native(payload)
+
+
+def test_profile_snapshot_defaults_keep_every_existing_construction_working() -> None:
+    """Without the new fields the payload is exactly the historical one, plus nulls."""
+    snapshot = ProfileSnapshot(
+        profile_id="btc-paper",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        strategy="basic",
+        mode=RunMode.PAPER,
+        status=ProfileStatus.RUNNING,
+        initial_balance=10_000.0,
+        equity=10_000.0,
+        cash=10_000.0,
+        position_value=0.0,
+        total_return=0.0,
+        n_trades=0,
+        open_positions=0,
+        health=ProfileHealth(profile_id="btc-paper", status=ProfileStatus.RUNNING),
+    )
+    payload = snapshot.to_dict()
+
+    assert set(payload) == LEGACY_PROFILE_SNAPSHOT_KEYS | ATTRIBUTED_PROFILE_SNAPSHOT_KEYS
+    assert payload["allocation"] == 0.0
+    assert payload["deployed"] == 0.0
+    assert payload["realized_pnl"] == 0.0
+    assert payload["unrealized_pnl"] == 0.0
+    assert payload["last_block_reason"] is None
+    assert_json_native(payload)
+
+
+def test_profile_snapshot_never_publishes_a_non_finite_attributed_float() -> None:
+    """``NaN``/``Infinity`` collapse to ``None``, exactly like every other float."""
+    payload = attributed_snapshot(
+        allocation=float("nan"),
+        deployed=float("inf"),
+        realized_pnl=float("-inf"),
+        unrealized_pnl=float("nan"),
+    ).to_dict()
+
+    assert payload["allocation"] is None
+    assert payload["deployed"] is None
+    assert payload["realized_pnl"] is None
+    assert payload["unrealized_pnl"] is None
+    assert_json_native(payload)
+
+
+def test_platform_snapshot_carries_the_shared_wallet_view() -> None:
+    """The wallet view is the platform's single ledger, JSON-native in every field."""
+    from trading_platform.realtime.wallet import PlatformWallet
+
+    wallet = PlatformWallet(initial_balance=15_000.0, name="platform")
+    view = wallet.snapshot(
+        positions_value=275.0,
+        deployed=250.0,
+        realized_pnl=25.0,
+        unrealized_pnl=25.0,
+        total_exposure=275.0,
+        profiles=2,
+    )
+    platform = PlatformSnapshot(
+        profiles=(attributed_snapshot(),),
+        generated_at=TS,
+        kill_switch=False,
+        wallet=view,
+    )
+    payload = platform.to_dict()
+
+    assert payload["wallet"] == view.to_dict()
+    assert payload["wallet"]["name"] == "platform"
+    assert payload["wallet"]["cash"] == 15_000.0
+    assert payload["wallet"]["initial_balance"] == 15_000.0
+    assert payload["wallet"]["equity"] == 15_275.0
+    assert payload["wallet"]["total_exposure"] == 275.0
+    assert payload["wallet"]["profiles"] == 2
+    assert_json_native(payload)
+
+
+def test_platform_snapshot_wallet_is_null_when_absent() -> None:
+    """A platform read model built without a wallet serialises ``null``, never a gap."""
+    payload = PlatformSnapshot(profiles=(), generated_at=TS, kill_switch=True).to_dict()
+
+    assert "wallet" in payload
+    assert payload["wallet"] is None
+    assert payload["profiles"] == []
+    assert_json_native(payload)
+
+
+def test_platform_snapshot_wallet_field_is_optional_and_frozen() -> None:
+    """The field is the last one and it is optional: positional use keeps working."""
+    bare = PlatformSnapshot((), TS, False, "", None, "0.1.0", TS, 1.0)
+    assert bare.wallet is None
+
+    from trading_platform.realtime.wallet import PlatformWallet
+
+    wallet = PlatformWallet(initial_balance=1.0).snapshot()
+    with_wallet = PlatformSnapshot((), TS, False, "", None, "0.1.0", TS, 1.0, wallet)
+    assert with_wallet.wallet == wallet
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        with_wallet.wallet = None  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # 4. new_client_order_id
 # ---------------------------------------------------------------------------

@@ -358,7 +358,12 @@ def test_real_round_trip_on_health_and_profiles(server: MonitoringServer) -> Non
         "status",
         "uptime_seconds",
         "version",
+        "wallet",
     ]
+    # The shared platform wallet is **additive**: the key is always present, and a
+    # provider that reports no wallet answers an explicit ``null`` instead of
+    # omitting the key, so a consumer never has to guess whether it is missing.
+    assert body["wallet"] is None
     assert body["status"] == "ok"
     assert body["version"] == "0.1.0"
     # ``create_server`` owns the clock (no clock argument in the frozen
@@ -369,7 +374,8 @@ def test_real_round_trip_on_health_and_profiles(server: MonitoringServer) -> Non
     status, _, payload = http_request(server, "GET", "/api/profiles")
     assert status == 200
     profiles = decode(payload)
-    assert sorted(profiles) == ["generated_at", "profiles"]
+    assert sorted(profiles) == ["generated_at", "profiles", "wallet"]
+    assert profiles["wallet"] is None
     assert [item["profile_id"] for item in profiles["profiles"]] == [PROFILE_A]
 
 
@@ -703,7 +709,7 @@ def test_serve_can_handle_exactly_one_request(provider: FakeProvider, monitor: M
     try:
         status, _, payload = http_request(built, "GET", "/api/profiles")
         assert status == 200
-        assert sorted(decode(payload)) == ["generated_at", "profiles"]
+        assert sorted(decode(payload)) == ["generated_at", "profiles", "wallet"]
         worker.join(timeout=SHUTDOWN_TIMEOUT)
         assert not worker.is_alive()
     finally:

@@ -15,7 +15,9 @@ The group numbering follows the work-package brief:
 6. thread safety;
 7. error paths (uninitialized store, unwritable directory, empty limits, failing write);
 8. candle watermark;
-9. ``profile_state`` on an unknown profile.
+9. ``profile_state`` on an unknown profile;
+10. the bounded candle history;
+11. the shared platform wallet (schema version 3): persistence, single row, migration.
 
 Corruption is injected through a *second*, direct SQLite connection: the store's
 ``flock`` protects writers that go through the store, it is not a file-system lock.
@@ -59,6 +61,7 @@ from trading_platform.realtime.store import (
     CandleRow,
     SqliteStateStore,
     StateStore,
+    WalletRow,
 )
 
 #: A fixed anchor: every test starts the virtual clock here.
@@ -274,10 +277,12 @@ def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
         "list_trades",
         "load_profiles",
         "load_status",
+        "load_wallet",
         "mark_candle_processed",
         "profile_state",
         "save_profile",
         "save_status",
+        "save_wallet",
         "set_meta",
         "upsert_order",
         "upsert_position",
@@ -935,6 +940,8 @@ def test_every_method_requires_initialize(db_path: Path) -> None:
     calls: list[tuple[str, Callable[[], object]]] = [
         ("save_profile", lambda: store.save_profile(make_profile())),
         ("load_profiles", store.load_profiles),
+        ("save_wallet", lambda: store.save_wallet(cash=1.0, initial_balance=1.0)),
+        ("load_wallet", store.load_wallet),
         ("upsert_order", lambda: store.upsert_order(make_order())),
         ("get_order", lambda: store.get_order("x")),
         ("list_orders", lambda: store.list_orders("btc-paper")),
@@ -1162,10 +1169,13 @@ def write_version_1_database(db_path: Path, *, version: int = 1) -> None:
     """Create a deployed version-1 database with one real row per table.
 
     The rows are written by hand, exactly as build 1 wrote them, so the migration
-    test can compare them byte for byte afterwards.
+    test can compare them byte for byte afterwards.  The two profiles are the two
+    the deployed database holds (``btc-paper`` at 10 000 and ``eth-paper`` at
+    5 000), so the fixture reproduces the shape the migration has to carry.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     profile = make_profile("btc-paper", mode="live")
+    second_profile = make_profile("eth-paper", symbol="ETH/USDT", initial_balance=5_000.0)
     order = make_order()
     fill = make_fill()
     position = make_position()
@@ -1192,6 +1202,14 @@ def write_version_1_database(db_path: Path, *, version: int = 1) -> None:
                 "btc-paper",
                 json.dumps(profile.model_dump(mode="json"), sort_keys=True),
                 "2024-01-01",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO profiles (profile_id, payload, updated_at) VALUES (?, ?, ?)",
+            (
+                "eth-paper",
+                json.dumps(second_profile.model_dump(mode="json"), sort_keys=True),
+                "2024-01-02",
             ),
         )
         connection.execute(
@@ -1275,6 +1293,27 @@ def table_snapshot(db_path: Path) -> dict[str, list[tuple[Any, ...]]]:
         return {
             table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}")]
             for table in _DOMAIN_TABLES
+        }
+
+
+def _table_names(db_path: Path) -> list[str]:
+    """Return the name of every table of the database, sorted."""
+    with raw_connection(db_path) as conn:
+        return [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+
+
+def _row_counts(db_path: Path) -> dict[str, int]:
+    """Return the number of rows of every table of the database."""
+    with raw_connection(db_path) as conn:
+        return {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in _table_names(db_path)
+            if not table.startswith("sqlite_")
         }
 
 
@@ -1375,12 +1414,30 @@ def test_candle_series_limit_boundaries(store: SqliteStateStore) -> None:
     assert store.candle_series("never-seen") == []
 
 
-def test_a_version_1_database_is_migrated_to_version_2_without_touching_a_row(
+def test_a_version_1_database_is_migrated_to_version_3_without_touching_a_row(
     db_path: Path, clock: ManualClock
 ) -> None:
+    """A deployed version-1 database is carried to version 3, losing nothing.
+
+    Version 3 adds the ``wallet`` table. The migration is purely additive, so every
+    row the deployed build wrote must survive it byte for byte -- that is the
+    property this test pins, and it is the reason the assertion compares whole
+    snapshots rather than a count.
+    """
     write_version_1_database(db_path)
     before = table_snapshot(db_path)
     assert all(rows for rows in before.values()), "the fixture must hold one row per table"
+    assert _row_counts(db_path) == {
+        "schema_version": 1,
+        "profiles": 2,
+        "orders": 1,
+        "fills": 1,
+        "positions": 1,
+        "equity": 1,
+        "trades": 1,
+        "status": 1,
+        "meta": 2,
+    }
 
     store = SqliteStateStore(db_path, clock=clock)
     store.initialize()
@@ -1390,15 +1447,81 @@ def test_a_version_1_database_is_migrated_to_version_2_without_touching_a_row(
         # (b) the stored version is now the one of this build
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [2]
-        # (c) the migrated file accepts a candle, and the old data still decodes
+        assert versions == [SCHEMA_VERSION] == [3]
+        # (c) the wallet table exists, is empty, and records no wallet at all: the
+        #     engine must initialise the configured value instead of a silent 0.0
+        assert "wallet" in _table_names(db_path)
+        assert _row_counts(db_path)["wallet"] == 0
+        assert store.load_wallet() is None
+        # (d) both deployed profiles survive the migration with their balances: a
+        #     profile whose configuration carries no explicit allocation resolves to
+        #     its initial balance, which is the backward-compatibility rule
+        profiles = store.load_profiles()
+        assert [item.id for item in profiles] == ["btc-paper", "eth-paper"]
+        allocated = {
+            item.id: (
+                item.initial_balance
+                if getattr(item, "allocation", None) is None
+                else float(item.allocation)
+            )
+            for item in profiles
+        }
+        assert allocated == {"btc-paper": 10_000.0, "eth-paper": 5_000.0}
+        # (e) the migrated file accepts a candle *and* a wallet, and the old data
+        #     still decodes with the same meaning as before
         candle = make_candle(9)
         assert store.append_candle(candle, profile_id="btc-paper") is True
         assert store.candle_series("btc-paper") == [make_candle_row(candle)]
-        assert [item.id for item in store.load_profiles()] == ["btc-paper"]
+        store.save_wallet(cash=7_500.0, initial_balance=10_000.0)
+        assert store.load_wallet() == WalletRow(
+            cash=7_500.0, initial_balance=10_000.0, updated_at=START
+        )
         assert store.get_order("btc-paper-BTC_USDT-20240101T000000Z-0000") is not None
         assert store.profile_state("btc-paper").status is ProfileStatus.RUNNING
         assert store.last_processed_candle("btc-paper") == stamp(5)
+    finally:
+        store.close()
+
+    # (f) the eight tables the deployed build shipped are untouched by the migration
+    #     itself: only ``candles``/``wallet`` gained rows, and they did so after it
+    after = table_snapshot(db_path)
+    assert after == before
+
+
+def test_a_version_2_database_gains_the_wallet_table(db_path: Path, clock: ManualClock) -> None:
+    """Version 2 had the candles table but no wallet: reopening it only adds the wallet.
+
+    The DDL is applied to a database of *any* older version, so the same additive
+    migration that carries version 1 to version 3 has to carry version 2 as well.
+    """
+    first = SqliteStateStore(db_path, clock=clock)
+    first.initialize()
+    first.save_profile(make_profile("btc-paper"))
+    first.append_candle(make_candle(1), profile_id="btc-paper")
+    first.close()
+
+    # rebuild the version-2 shape: candles yes, wallet no
+    with raw_connection(db_path) as conn:
+        conn.execute("DROP TABLE wallet")
+        conn.execute("UPDATE schema_version SET version = 2")
+    assert "wallet" not in _table_names(db_path)
+    before = table_snapshot(db_path)
+
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    try:
+        assert table_snapshot(db_path) == before
+        with raw_connection(db_path) as conn:
+            versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
+        assert versions == [SCHEMA_VERSION] == [3]
+        assert _row_counts(db_path)["wallet"] == 0
+        assert store.load_wallet() is None
+        assert [item.id for item in store.load_profiles()] == ["btc-paper"]
+        assert [row.timestamp for row in store.candle_series("btc-paper")] == [stamp(1)]
+        store.save_wallet(cash=1_234.5, initial_balance=10_000.0)
+        row = store.load_wallet()
+        assert row is not None
+        assert row.cash == pytest.approx(1_234.5)
     finally:
         store.close()
 
@@ -1435,3 +1558,179 @@ def test_a_broken_candles_table_is_reported_as_a_store_error(
         store.candle_series("btc-paper")
     with pytest.raises(StateStoreError, match=r"state store write failed \(append_candle\)"):
         store.append_candle(make_candle(2), profile_id="btc-paper")
+
+
+# ---------------------------------------------------------------------------
+# 11. the shared platform wallet (schema version 3)
+# ---------------------------------------------------------------------------
+
+
+def test_the_wallet_table_is_created_by_the_current_schema(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    """A brand new database ships the wallet table, empty."""
+    assert "wallet" in _table_names(db_path)
+    assert _row_counts(db_path)["wallet"] == 0
+    assert SCHEMA_VERSION == 3
+
+
+def test_load_wallet_of_an_empty_table_is_none(store: SqliteStateStore) -> None:
+    """``None`` -- never a silent ``0.0`` -- is what makes the engine initialise config."""
+    assert store.load_wallet() is None
+
+
+def test_wallet_round_trip(store: SqliteStateStore) -> None:
+    store.save_wallet(cash=9_750.25, initial_balance=10_000.0)
+
+    row = store.load_wallet()
+    assert row is not None
+    assert isinstance(row, WalletRow)
+    assert row.cash == pytest.approx(9_750.25)
+    assert row.initial_balance == pytest.approx(10_000.0)
+    assert row.updated_at == START
+    assert row.to_dict() == {
+        "cash": 9_750.25,
+        "initial_balance": 10_000.0,
+        "updated_at": START.isoformat(),
+    }
+
+
+def test_save_wallet_upserts_the_single_row(store: SqliteStateStore, db_path: Path) -> None:
+    """Saving twice updates the one row in place: the wallet can never be duplicated."""
+    store.save_wallet(cash=10_000.0, initial_balance=10_000.0)
+    store.save_wallet(cash=8_500.0, initial_balance=12_000.0)
+
+    assert _row_counts(db_path)["wallet"] == 1
+    row = store.load_wallet()
+    assert row is not None
+    assert row.cash == pytest.approx(8_500.0)
+    assert row.initial_balance == pytest.approx(12_000.0)
+    # the primary key is pinned to 1 by a CHECK constraint, not only by convention
+    with raw_connection(db_path) as conn:
+        wallet_ids = [row[0] for row in conn.execute("SELECT wallet_id FROM wallet")]
+    assert wallet_ids == [1]
+
+
+def test_a_wallet_id_other_than_one_is_refused_by_the_schema(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    with raw_connection(db_path) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
+            "VALUES (2, 1.0, 1.0, '2024-01-01T00:00:00+00:00')"
+        )
+
+
+def test_a_zero_cash_wallet_round_trips(store: SqliteStateStore) -> None:
+    """An empty wallet is a value, not an absence: ``0.0`` is stored and read back."""
+    store.save_wallet(cash=0.0, initial_balance=10_000.0)
+
+    row = store.load_wallet()
+    assert row is not None
+    assert row.cash == 0.0
+    assert row.cash is not None
+    assert row.initial_balance == pytest.approx(10_000.0)
+
+
+def test_a_non_finite_wallet_cash_is_refused(store: SqliteStateStore, db_path: Path) -> None:
+    """``NaN`` is refused, so nothing is ever funded from a meaningless wallet.
+
+    SQLite stores ``NaN`` as ``NULL``, which violates ``cash REAL NOT NULL`` exactly
+    like the other numeric writers of this store (see ``append_equity``).  The write
+    is refused as a :class:`StateStoreError` and the previous wallet is left intact.
+    """
+    store.save_wallet(cash=4_000.0, initial_balance=10_000.0)
+
+    with pytest.raises(StateStoreError, match=r"state store write failed \(save_wallet\)"):
+        store.save_wallet(cash=float("nan"), initial_balance=10_000.0)
+
+    assert _row_counts(db_path)["wallet"] == 1
+    row = store.load_wallet()
+    assert row is not None
+    assert row.cash == pytest.approx(4_000.0)
+
+
+def test_a_malformed_wallet_timestamp_is_a_store_error(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    store.save_wallet(cash=1_000.0, initial_balance=10_000.0)
+    with raw_connection(db_path) as conn:
+        conn.execute("UPDATE wallet SET updated_at = ?", ("not-a-timestamp",))
+
+    with pytest.raises(StateStoreError, match=r"state store read failed \(load_wallet\)"):
+        store.load_wallet()
+
+
+def test_a_missing_wallet_table_is_reported_as_a_store_error(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    with raw_connection(db_path) as conn:
+        conn.execute("DROP TABLE wallet")
+
+    with pytest.raises(StateStoreError, match=r"state store read failed \(load_wallet\)"):
+        store.load_wallet()
+    with pytest.raises(StateStoreError, match=r"state store write failed \(save_wallet\)"):
+        store.save_wallet(cash=1.0, initial_balance=1.0)
+
+
+def test_the_wallet_survives_a_close_and_reopen(db_path: Path, clock: ManualClock) -> None:
+    """A restart must never reset the shared wallet to the configured value."""
+    first = SqliteStateStore(db_path, clock=clock)
+    first.initialize()
+    first.save_wallet(cash=3_210.5, initial_balance=15_000.0)
+    first.close()
+
+    second = SqliteStateStore(db_path, clock=clock)
+    second.initialize()
+    try:
+        assert second.load_wallet() == WalletRow(
+            cash=3_210.5, initial_balance=15_000.0, updated_at=START
+        )
+    finally:
+        second.close()
+
+
+def test_the_wallet_row_carries_the_clock_instant(db_path: Path) -> None:
+    clock = ManualClock(start=START.to_pydatetime())
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    try:
+        store.save_wallet(cash=1.0, initial_balance=2.0)
+        clock.advance(30 * 60)
+        store.save_wallet(cash=1.5, initial_balance=2.0)
+
+        row = store.load_wallet()
+        assert row is not None
+        assert row.updated_at == stamp(30)
+        assert row.to_dict()["updated_at"] == stamp(30).isoformat()
+    finally:
+        store.close()
+
+
+def test_two_threads_can_write_the_wallet_through_one_store(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    """The store serialises the concurrent cash writes of the profile threads."""
+    errors: list[BaseException] = []
+    written = {float(index * 100 + step) for index in range(4) for step in range(20)}
+
+    def writer(index: int) -> None:
+        try:
+            for step in range(20):
+                store.save_wallet(cash=float(index * 100 + step), initial_balance=10_000.0)
+        except BaseException as exc:  # pragma: no cover - only on a regression
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # no exception, one single row, and a value one of the writers actually wrote:
+    # a torn or interleaved update would leave something outside this set
+    assert errors == []
+    assert _row_counts(db_path)["wallet"] == 1
+    row = store.load_wallet()
+    assert row is not None
+    assert row.cash in written

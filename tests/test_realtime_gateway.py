@@ -59,6 +59,7 @@ from trading_platform.realtime.risk import (
     RiskLimits,
     RiskManager,
 )
+from trading_platform.realtime.wallet import PlatformWallet
 
 LOGGER_NAME = "trading_platform.realtime.gateway"
 
@@ -361,10 +362,16 @@ class FakeRisk:
     def __init__(self, decision: RiskDecision | None = None) -> None:
         self.decision = RiskDecision.allow() if decision is None else decision
         self.calls: list[dict[str, Any]] = []
+        self.published: list[dict[str, float]] = []
 
     def check_order(self, request: OrderRequest, **kwargs: Any) -> RiskDecision:
         self.calls.append({"request": request, **kwargs})
         return self.decision
+
+    def publish_platform_state(self, profile_id: str, *, exposure: float, daily_pnl: float) -> None:
+        self.published.append(
+            {"profile_id": profile_id, "exposure": float(exposure), "daily_pnl": float(daily_pnl)}
+        )
 
 
 def _logged_events(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -1229,6 +1236,13 @@ def test_paper_broker_shares_the_whole_lifecycle() -> None:
 
 
 def test_equity_position_and_snapshot_fields() -> None:
+    """The read model is attributed, and its exact key set is frozen.
+
+    This test pinned the *venue* cash before the shared platform wallet existed;
+    it now pins the attributed figures deliberately: a profile funds its orders
+    from one ledger shared by the whole platform, so ``cash`` is its own share
+    (``allocation - deployed + realized_pnl``), never the wallet's balance.
+    """
     gateway, broker, _, _ = build_gateway()
     empty = gateway.snapshot_fields()
     assert empty == {
@@ -1236,24 +1250,111 @@ def test_equity_position_and_snapshot_fields() -> None:
         "cash": 10_000.0,
         "position_value": 0.0,
         "open_positions": 0,
+        "allocation": 10_000.0,
+        "deployed": 0.0,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
     }
     assert gateway.equity(reference_price=100.0) == pytest.approx(10_000.0)
     assert gateway.position() is None
     assert gateway.position("ETH/USDT") is None
+    # the venue balance is a different question, answered by ``balance()``
+    assert gateway.balance() == pytest.approx(10_000.0)
 
     request = order_request()
     gateway.submit(request, **submit_kwargs())  # marks the gateway at 100.0
     broker.queue_fill(client_order_id=request.client_order_id, quantity=1.0, price=100.0)
     gateway.poll()
 
-    assert gateway.equity(reference_price=120.0) == pytest.approx(10_120.0)
+    assert gateway.equity(reference_price=120.0) == pytest.approx(10_020.0)
     assert gateway.position().symbol == SYMBOL  # type: ignore[union-attr]
     assert gateway.position("ETH/USDT") is None
     snapshot = gateway.snapshot_fields()
-    assert snapshot["equity"] == pytest.approx(10_100.0)
-    assert snapshot["cash"] == pytest.approx(10_000.0)
+    assert snapshot["equity"] == pytest.approx(10_000.0)
+    assert snapshot["cash"] == pytest.approx(9_900.0)
     assert snapshot["position_value"] == pytest.approx(100.0)
     assert snapshot["open_positions"] == 1
+    assert snapshot["allocation"] == pytest.approx(10_000.0)
+    assert snapshot["deployed"] == pytest.approx(100.0)
+    assert snapshot["realized_pnl"] == pytest.approx(0.0)
+    assert snapshot["unrealized_pnl"] == pytest.approx(0.0)
+    # the attributed identity of a long position holds exactly
+    assert snapshot["equity"] == pytest.approx(snapshot["cash"] + snapshot["position_value"])
+    assert snapshot["equity"] == pytest.approx(
+        snapshot["allocation"] + snapshot["realized_pnl"] + snapshot["unrealized_pnl"]
+    )
+
+
+def test_a_partial_close_frees_the_deployed_capital() -> None:
+    """A reduction shrinks ``deployed``; the round trip is realized only when it closes."""
+    gateway, broker, store, _ = build_gateway()
+    entry = order_request()
+    gateway.submit(entry, **submit_kwargs())
+    broker.queue_fill(client_order_id=entry.client_order_id, quantity=1.0, price=100.0)
+    gateway.poll()
+
+    partial = order_request(client_order_id="c-partial", side=OrderSide.SELL)
+    gateway.submit(partial, **submit_kwargs(reference_price=110.0), closes_position=True)
+    broker.queue_fill(
+        client_order_id=partial.client_order_id,
+        quantity=0.4,
+        price=110.0,
+        side=OrderSide.SELL,
+    )
+    gateway.poll()
+
+    snapshot = gateway.snapshot_fields()
+    assert snapshot["open_positions"] == 1
+    assert snapshot["deployed"] == pytest.approx(60.0)
+    assert snapshot["position_value"] == pytest.approx(66.0)  # 0.6 marked at the new 110.0
+    assert snapshot["cash"] == pytest.approx(9_940.0)
+    assert snapshot["unrealized_pnl"] == pytest.approx(6.0)
+    assert snapshot["equity"] == pytest.approx(10_006.0)
+    # the closed *part* is not a stored round trip yet: nothing is claimed as realized
+    assert snapshot["realized_pnl"] == pytest.approx(0.0)
+    assert store.list_trades("btc-paper") == []
+    assert snapshot["equity"] == pytest.approx(snapshot["cash"] + snapshot["position_value"])
+
+
+def test_two_gateways_sharing_one_wallet_report_their_own_attributed_cash() -> None:
+    """The wallet is shared; the *figures* stay attributed to each profile.
+
+    The mechanical proof that no profile can ever read the platform's cash as its
+    own: two gateways spend from one :class:`PlatformWallet`, yet each reports the
+    cash of its own allocation -- neither the wallet's balance nor the venue's.
+    """
+    broker_module = pytest.importorskip("trading_platform.realtime.broker")
+    clock = ManualClock(pd.Timestamp(TS).to_pydatetime())
+    wallet = PlatformWallet(initial_balance=1_000.0, mode=RunMode.PAPER, name="platform")
+    store = FakeStore()
+    first, first_venue, _, _ = build_gateway(
+        profile_config=profile(profile_id="btc-paper", initial_balance=600.0),
+        broker=broker_module.PaperBroker(clock=clock, seed=1, wallet=wallet),
+        store=store,
+        clock=clock,
+    )
+    second, _second_venue, _, _ = build_gateway(
+        profile_config=profile(profile_id="eth-paper", initial_balance=400.0),
+        broker=broker_module.PaperBroker(clock=clock, seed=2, wallet=wallet),
+        store=store,
+        clock=clock,
+    )
+
+    assert first.balance() == pytest.approx(1_000.0)
+    assert second.balance() == pytest.approx(1_000.0)
+    assert first.cash() == pytest.approx(600.0)
+    assert second.cash() == pytest.approx(400.0)
+
+    entry = order_request(quantity=1.0)
+    first.submit(entry, **submit_kwargs(reference_price=100.0))
+    first.poll()  # the real paper venue fills immediately, into the shared wallet
+
+    assert wallet.cash < 1_000.0, "the shared ledger really paid for the order"
+    assert first.cash() == pytest.approx(500.0), "the buyer spent its own share"
+    assert second.cash() == pytest.approx(400.0), "the other profile is untouched"
+    assert first.balance() == pytest.approx(wallet.cash)
+    assert first.balance() != pytest.approx(first.cash())
+    assert first_venue.wallet is wallet
 
 
 def test_snapshot_fields_without_a_mark_use_the_entry_price() -> None:
@@ -1274,8 +1375,11 @@ def test_snapshot_fields_without_a_mark_use_the_entry_price() -> None:
     snapshot = gateway.snapshot_fields()
 
     assert snapshot["position_value"] == pytest.approx(100.0)
-    assert snapshot["equity"] == pytest.approx(10_100.0)
+    assert snapshot["equity"] == pytest.approx(10_000.0)
     assert snapshot["open_positions"] == 1
+    assert snapshot["deployed"] == pytest.approx(100.0)
+    assert snapshot["unrealized_pnl"] == pytest.approx(0.0)
+    assert snapshot["cash"] == pytest.approx(9_900.0)
 
 
 def test_balance_none_falls_back_to_the_initial_balance() -> None:
@@ -1287,6 +1391,12 @@ def test_balance_none_falls_back_to_the_initial_balance() -> None:
 
 
 def test_shorts_reduce_cash_the_same_way() -> None:
+    """A short is attributed like a long: its mark-to-market enters the cash.
+
+    Rewritten deliberately with the shared-wallet semantics: the entry deploys
+    100.0 of the allocation whatever the venue reports, so the attributed cash is
+    ``allocation - deployed`` and the equity adds the (negative) position value.
+    """
     gateway, broker, _, _ = build_gateway(broker=FakeBroker(name="fake", balance=11_000.0))
     request = order_request(side=OrderSide.SELL)
     gateway.submit(request, **submit_kwargs())
@@ -1295,7 +1405,64 @@ def test_shorts_reduce_cash_the_same_way() -> None:
     )
     gateway.poll()
 
-    assert gateway.equity(reference_price=90.0) == pytest.approx(10_910.0)
+    assert gateway.balance() == pytest.approx(11_000.0), "the venue balance is unchanged"
+    assert gateway.cash() == pytest.approx(9_900.0)
+    assert gateway.equity(reference_price=90.0) == pytest.approx(9_810.0)
+    snapshot = gateway.snapshot_fields()
+    assert snapshot["deployed"] == pytest.approx(100.0)
+    assert snapshot["position_value"] == pytest.approx(-100.0)  # a short marked at 100.0
+    assert snapshot["unrealized_pnl"] == pytest.approx(-200.0)
+    assert snapshot["equity"] == pytest.approx(9_800.0)
+    assert snapshot["equity"] == pytest.approx(snapshot["cash"] + snapshot["position_value"])
+
+
+def test_publish_platform_state_forwards_the_profile_and_both_numbers() -> None:
+    """The optional platform seam forwards through the injected risk manager."""
+    risk = FakeRisk()
+    gateway, _, _, _ = build_gateway(risk=risk)
+
+    gateway.publish_platform_state(exposure=123.5, daily_pnl=-4.25)
+
+    assert risk.published == [{"profile_id": "btc-paper", "exposure": 123.5, "daily_pnl": -4.25}]
+
+
+def test_publish_platform_state_is_a_no_op_without_the_seam() -> None:
+    """Neither an absent risk manager nor one without the seam may raise."""
+
+    class SilentRisk:
+        """A manager written before the platform aggregation existed."""
+
+        def check_order(self, request: OrderRequest, **kwargs: Any) -> RiskDecision:
+            return RiskDecision.allow()
+
+    bare, _, _, _ = build_gateway(risk=None)
+    bare.publish_platform_state(exposure=1.0, daily_pnl=2.0)
+
+    silent, _, _, _ = build_gateway(risk=SilentRisk())
+    silent.publish_platform_state(exposure=1.0, daily_pnl=2.0)
+
+
+def test_an_unfunded_order_is_refused_and_persists_nothing() -> None:
+    """The shared wallet funds every entry; when it cannot, nothing is left half-applied."""
+    clock = ManualClock(pd.Timestamp(TS).to_pydatetime())
+    risk = RiskManager(RiskLimits(), clock=clock, wallet=PlatformWallet(initial_balance=50.0))
+    gateway, broker, store, _ = build_gateway(risk=risk)
+
+    with pytest.raises(RiskLimitExceededError) as excinfo:
+        gateway.submit(order_request(quantity=1.0), **submit_kwargs(reference_price=100.0))
+
+    assert excinfo.value.issues == ("platform_wallet",)
+    assert str(excinfo.value).startswith(
+        "platform wallet cannot fund order: requires 100.00 USDT, available 50.00 USDT"
+    )
+    assert broker.submits == []
+    assert store.order_history == []
+    assert store.orders == {}
+    assert store.fills == {}
+    assert store.positions == {}
+    assert store.trades == []
+    assert gateway.counters.risk_rejections == 1
+    assert gateway.snapshot_fields()["open_positions"] == 0
 
 
 def test_event_without_an_order_patches_the_stored_row() -> None:

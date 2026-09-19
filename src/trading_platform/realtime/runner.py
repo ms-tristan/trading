@@ -75,6 +75,7 @@ from trading_platform.core.errors import (
     OrderRejectedError,
     RealtimeError,
     RiskLimitExceededError,
+    WalletError,
 )
 from trading_platform.core.models import Direction, ExitReason
 from trading_platform.data.validation import ensure_ohlcv
@@ -296,10 +297,11 @@ class ProfileRunner:
         self._started_at: pd.Timestamp | None = None
         self._paused = False
         self._history_seeded = False
-        self._peak_equity = float(profile.initial_balance)
-        self._day_start_equity = float(profile.initial_balance)
+        self._peak_equity = float(profile.effective_allocation)
+        self._day_start_equity = float(profile.effective_allocation)
         self._day: Any = None
         self._daily_trades = 0
+        self._last_block_reason = ""
 
     # -- introspection ------------------------------------------------------
 
@@ -327,6 +329,18 @@ class ProfileRunner:
     def paused(self) -> bool:
         """Return whether the entry gate of this profile is closed."""
         return self._paused
+
+    @property
+    def last_block_reason(self) -> str:
+        """Return why the last routed order was refused (empty when none was).
+
+        Set on **every** blocked path of :meth:`_route` -- the shared-wallet
+        funding refusal, a platform cap, a per-profile limit, the kill switch, a
+        venue rejection and a non-positive quantity -- and cleared as soon as an
+        order is accepted, so the dashboard can always answer "why is this profile
+        not trading?" without reading the log stream.
+        """
+        return self._last_block_reason
 
     def counters(self) -> EngineCounters:
         """Return the counters of this profile, reconnect count included."""
@@ -736,11 +750,24 @@ class ProfileRunner:
         )
 
     def snapshot(self) -> ProfileSnapshot:
-        """Return everything the monitoring layer shows for this profile."""
+        """Return everything the monitoring layer shows for this profile.
+
+        Every cash figure is read from the gateway's *attributed* read model -- the
+        profile's share of the one shared wallet -- with a backward-compatible
+        fallback per field, so a gateway written before the shared wallet existed
+        reports exactly what it used to.
+        """
         fields = self._gateway.snapshot_fields()
-        cash = float(fields.get("cash", self._profile.initial_balance))
+        allocation = float(fields.get("allocation", self._profile.effective_allocation))
+        cash = float(fields.get("cash", allocation))
         position_value = float(fields.get("position_value", 0.0))
-        equity = float(fields.get("equity", cash + position_value))
+        position = self._gateway.position()
+        quantity = 0.0 if position is None else float(position.quantity)
+        average = 0.0 if position is None else float(position.average_price)
+        deployed = float(fields.get("deployed", abs(quantity * average)))
+        realized_pnl = float(fields.get("realized_pnl", 0.0))
+        unrealized_pnl = float(fields.get("unrealized_pnl", position_value - deployed))
+        equity = float(fields.get("equity", allocation + realized_pnl + unrealized_pnl))
         initial = float(self._profile.initial_balance)
         return ProfileSnapshot(
             profile_id=self.profile_id,
@@ -753,12 +780,17 @@ class ProfileRunner:
             equity=equity,
             cash=cash,
             position_value=position_value,
-            total_return=(equity - initial) / initial if initial else 0.0,
+            total_return=(equity - allocation) / allocation if allocation else 0.0,
             n_trades=len(self._store.list_trades(self.profile_id)),
             open_positions=int(fields.get("open_positions", 0)),
             health=self.health(),
             started_at=self._started_at,
             updated_at=_as_utc(self._clock.now()),
+            allocation=allocation,
+            deployed=deployed,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            last_block_reason=self._last_block_reason or None,
         )
 
     # -- internals: decision -------------------------------------------------
@@ -986,7 +1018,15 @@ class ProfileRunner:
     def _route(
         self, stamp: pd.Timestamp, plan: _OrderPlan, state: _EquityState
     ) -> TradeSignalDecision:
-        """Build the deterministic order, submit it, and report the outcome."""
+        """Build the deterministic order, submit it, and report the outcome.
+
+        Every refusal leaves its reason on :attr:`last_block_reason` -- a blocked
+        order is a decision the operator must be able to read, not only a log
+        line -- and an accepted order clears it.  A refusal raised by the *venue*
+        counts too, the shared wallet's own one included: the ledger is debited
+        only after every check passed, so a refused fill leaves no position and no
+        cash movement behind.
+        """
         side = plan.side
         if side is None:  # pragma: no cover - only HOLD has no side, handled by the caller
             return self._hold_decision(stamp, plan)
@@ -1000,6 +1040,7 @@ class ProfileRunner:
                 action=plan.action.value,
                 reason="non-positive quantity",
             )
+            self._last_block_reason = "non-positive quantity"
             return TradeSignalDecision(
                 profile_id=self.profile_id,
                 timestamp=stamp,
@@ -1040,7 +1081,12 @@ class ProfileRunner:
                 peak_equity=float(state.peak_equity),
                 closes_position=bool(plan.closes_position),
             )
-        except (RiskLimitExceededError, KillSwitchActiveError, OrderRejectedError) as exc:
+        except (
+            RiskLimitExceededError,
+            KillSwitchActiveError,
+            OrderRejectedError,
+            WalletError,
+        ) as exc:
             self._counters.increment(
                 "orders_rejected" if isinstance(exc, OrderRejectedError) else "risk_rejections"
             )
@@ -1055,6 +1101,7 @@ class ProfileRunner:
                 error=type(exc).__name__,
                 reason=str(exc),
             )
+            self._last_block_reason = str(exc)
             return TradeSignalDecision(
                 profile_id=self.profile_id,
                 timestamp=stamp,
@@ -1068,6 +1115,7 @@ class ProfileRunner:
                 block_reason=str(exc),
                 reason=plan.reason,
             )
+        self._last_block_reason = ""
         self._counters.increment("orders_submitted")
         self._daily_trades += 1
         log_event(
@@ -1113,9 +1161,26 @@ class ProfileRunner:
     # -- internals: accounting ----------------------------------------------
 
     def _equity_state(self, stamp: pd.Timestamp, price: float) -> _EquityState:
-        """Return the equity read of the profile at ``price`` and refresh the peaks."""
+        """Return the equity read of the profile at ``price`` and refresh the peaks.
+
+        The figures are *attributed*: the cash is the profile's share of the one
+        shared wallet (``allocation - deployed + realized_pnl``), never the whole
+        wallet, and the open position is marked at ``price`` -- the price of the
+        candle being decided on.  Marking at the tick price (instead of the last
+        price the gateway routed an order at) is what keeps the published equity
+        curve following the market between two orders; for a consistent attributed
+        read it *is* the frozen formula ``allocation + realized_pnl +
+        unrealized_pnl``, with ``unrealized_pnl = quantity * price - deployed``,
+        because ``cash + position_value`` reduces to it exactly.
+
+        Every read falls back to its historical local computation when the gateway
+        does not publish it, so a gateway written before the shared wallet existed
+        reports what it always did.  At the end of the read the platform-wide
+        aggregates are published through the *optional* gateway seam (the house
+        idiom of ``restore_cash``): that is what feeds the platform caps.
+        """
         fields = self._gateway.snapshot_fields()
-        cash = float(fields.get("cash", self._profile.initial_balance))
+        cash = float(fields.get("cash", self._profile.effective_allocation))
         position = self._gateway.position()
         quantity = 0.0 if position is None else float(position.quantity)
         position_value = quantity * float(price)
@@ -1126,7 +1191,7 @@ class ProfileRunner:
             self._day_start_equity = equity
             self._daily_trades = 0
         self._peak_equity = max(self._peak_equity, equity)
-        return _EquityState(
+        state = _EquityState(
             equity=equity,
             cash=cash,
             position_value=position_value,
@@ -1136,11 +1201,29 @@ class ProfileRunner:
             daily_trades=int(self._daily_trades),
             peak_equity=float(self._peak_equity),
         )
+        # The platform aggregation is fed through the optional gateway seam: the
+        # exposure published is the absolute notional the profile holds, and the
+        # daily P&L is the one just computed.  A gateway without the seam (or with
+        # no platform state injected) is simply left alone.
+        publish = getattr(self._gateway, "publish_platform_state", None)
+        if publish is not None:
+            publish(
+                exposure=abs(float(state.position_value)),
+                daily_pnl=float(state.daily_pnl),
+            )
+        return state
 
     def _restore_curve(self) -> None:
-        """Restore the peak equity, the day baseline and the day from the curve."""
+        """Restore the peak equity, the day baseline and the day from the curve.
+
+        Without a persisted curve the peak and the day baseline start at the
+        profile's **allocation** -- its share of the shared wallet -- because that
+        is the capital its drawdown and its daily loss are measured against.  A
+        profile with no ``allocation`` configured falls back to its own
+        ``initial_balance``, exactly as before.
+        """
         points = self._store.equity_curve(self.profile_id)
-        initial = float(self._profile.initial_balance)
+        initial = float(self._profile.effective_allocation)
         if not points:
             self._peak_equity = initial
             self._day_start_equity = initial

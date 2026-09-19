@@ -66,6 +66,7 @@ from trading_platform.realtime.models import (
     ReconciliationReport,
     RunMode,
 )
+from trading_platform.realtime.wallet import PlatformWallet
 
 __all__ = ["Broker", "CcxtBroker", "PaperBroker"]
 
@@ -292,6 +293,14 @@ class PaperBroker:
     this object holds.  :meth:`inject_venue_order` is the documented seam that
     puts an order on the venue side without a network, which is how the
     reconciliation-mismatch path is exercised offline.
+
+    The broker owns **no cash of its own**: the simulated balance lives in the
+    shared :class:`~trading_platform.realtime.wallet.PlatformWallet` injected at
+    construction (or privately built here when the caller injects none, so every
+    existing construction keeps working unchanged).  Every fill moves the cash
+    through :meth:`PlatformWallet.apply_fill` and nothing else, which is what makes
+    several profiles share one ledger.  The wallet is never resolved through a
+    module-level global.
     """
 
     def __init__(
@@ -305,6 +314,7 @@ class PaperBroker:
         partial_fill_probability: float = 0.0,
         max_fill_fraction: float = 0.5,
         name: str = "paper",
+        wallet: PlatformWallet | None = None,
     ) -> None:
         if initial_balance <= 0:
             raise ValueError(f"initial_balance must be positive, got {initial_balance}")
@@ -319,14 +329,26 @@ class PaperBroker:
         if not 0.0 < max_fill_fraction <= 1.0:
             raise ValueError(f"max_fill_fraction must be within (0, 1], got {max_fill_fraction}")
         self._clock = clock
-        self._initial_balance = float(initial_balance)
-        self._cash = float(initial_balance)
         self._fee_rate = float(fee_rate)
         self._slippage = float(slippage)
         self._seed = int(seed)
         self._partial_fill_probability = float(partial_fill_probability)
         self._max_fill_fraction = float(max_fill_fraction)
         self._name = str(name) or "paper"
+        if wallet is None:
+            # A private wallet keeps every existing construction byte-identical:
+            # the simulated account starts at the configured balance and nothing
+            # else can spend from it.
+            wallet = PlatformWallet(
+                initial_balance=float(initial_balance),
+                mode=RunMode.PAPER,
+                name=f"{self._name}-wallet",
+            )
+        elif not wallet.is_authoritative:
+            raise BrokerError(
+                f"paper broker requires a paper wallet, got mode {wallet.mode.value!r}"
+            )
+        self._wallet = wallet
         self._orders: dict[str, Order] = {}
         self._events: deque[BrokerEvent] = deque()
         self._positions: dict[str, _BookPosition] = {}
@@ -343,6 +365,11 @@ class PaperBroker:
     def name(self) -> str:
         """Return the configured broker name (``"paper"`` by default)."""
         return self._name
+
+    @property
+    def wallet(self) -> PlatformWallet:
+        """Return the shared wallet this venue funds its fills from (read-only)."""
+        return self._wallet
 
     @property
     def mode(self) -> RunMode:
@@ -463,8 +490,8 @@ class PaperBroker:
         return sorted(working, key=lambda order: (order.created_at, order.client_order_id))
 
     def fetch_balance(self) -> float:
-        """Return the simulated cash balance."""
-        return self._cash
+        """Return the cash of the shared wallet this venue funds its fills from."""
+        return self._wallet.cash
 
     def restore_cash(self, cash: float) -> None:
         """Re-seed the simulated cash from the durable state (D7 boot seeding).
@@ -475,6 +502,10 @@ class PaperBroker:
         recorded back to the venue before the first tick, so the restored position
         is not counted twice (``cash + quantity * mark`` stays equal to the
         persisted equity instead of jumping by the position notional).
+
+        The cash itself lives in the shared wallet now, so the value is delegated
+        to :meth:`PlatformWallet.restore_cash`; the finiteness contract of this
+        seam is unchanged and still checked here first.
 
         This is deliberately a *restore* seam, not a general balance setter: it is
         never called by the order lifecycle and it changes no position, no order
@@ -488,7 +519,7 @@ class PaperBroker:
         value = float(cash)
         if not math.isfinite(value):
             raise ValueError(f"restored cash must be finite, got {cash!r}")
-        self._cash = value
+        self._wallet.restore_cash(value)
 
     def reconcile(self, expected: Sequence[Order] = ()) -> ReconciliationReport:
         """Compare ``expected`` (the local state) against the venue's book."""
@@ -516,11 +547,13 @@ class PaperBroker:
     def equity(self, *, reference_prices: Mapping[str, float] | None = None) -> float:
         """Return cash plus the mark-to-market value of the open positions.
 
-        A symbol absent from ``reference_prices`` is marked at its last observed
-        fill price, falling back to its average entry price -- never at an
-        invented value, so an unmarked book reports the entry value.
+        The cash is the shared wallet's, so the equity of this venue is only ever a
+        *view* of the platform ledger; a symbol absent from ``reference_prices`` is
+        marked at its last observed fill price, falling back to its average entry
+        price -- never at an invented value, so an unmarked book reports the entry
+        value.
         """
-        total = self._cash
+        total = self._wallet.cash
         for symbol, position in self._positions.items():
             if position.quantity == 0.0:
                 continue
@@ -532,8 +565,8 @@ class PaperBroker:
 
     @property
     def initial_balance(self) -> float:
-        """Return the balance the simulated account started with."""
-        return self._initial_balance
+        """Return the balance the shared wallet started with."""
+        return self._wallet.initial_balance
 
     # -- internals ---------------------------------------------------------
 
@@ -621,15 +654,20 @@ class PaperBroker:
             )
 
     def _apply_fill(self, order: Order, quantity: float, price: float) -> Fill:
-        """Move the cash, update the book and return the resulting fill."""
+        """Move the shared wallet's cash, update the book and return the fill.
+
+        The cash movement is exactly one call to
+        :meth:`PlatformWallet.apply_fill`: the venue no longer owns a balance of its
+        own, so a buy pays the notional plus the fee and a sell receives the
+        notional minus the fee *in the platform ledger*.  The book is updated after
+        the wallet accepted the movement, so a refused (unfunded) fill leaves no
+        position behind either.
+        """
         fee = self._fee_rate * quantity * price
         notional = quantity * price
-        if order.side is OrderSide.BUY:
-            self._cash -= notional + fee
-            self._update_book(order.symbol, quantity, price)
-        else:
-            self._cash += notional - fee
-            self._update_book(order.symbol, -quantity, price)
+        self._wallet.apply_fill(side=order.side, notional=notional, fee=fee)
+        signed_quantity = quantity if order.side is OrderSide.BUY else -quantity
+        self._update_book(order.symbol, signed_quantity, price)
         self._last_price[order.symbol] = price
         index = self._fills_per_order.get(order.client_order_id, 0) + 1
         self._fills_per_order[order.client_order_id] = index

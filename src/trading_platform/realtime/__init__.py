@@ -2,9 +2,11 @@
 
 Public surface
 --------------
-The **vocabulary** (:mod:`trading_platform.realtime.models`) and the **time seam**
-(:mod:`trading_platform.realtime.clock`) are exported eagerly: they are pure
-declarations with no optional dependency, and every other layer imports them.
+The **vocabulary** (:mod:`trading_platform.realtime.models`), the **time seam**
+(:mod:`trading_platform.realtime.clock`) and the **shared wallet**
+(:mod:`trading_platform.realtime.wallet`) are exported eagerly: the wallet is the
+single source of truth for the USDT cash of the whole platform, every layer
+injects it, and importing it pulls in no optional dependency.
 
 Every **engine class** is exported lazily through PEP 562 ``__getattr__``.  The
 decision is deliberate and has two consequences that the rest of the project
@@ -49,6 +51,7 @@ from trading_platform.realtime.models import (
     TradeSignalDecision,
     new_client_order_id,
 )
+from trading_platform.realtime.wallet import PlatformWallet, WalletSnapshot
 
 #: Public name -> submodule that defines it, resolved on first attribute access.
 _LAZY: dict[str, str] = {
@@ -127,6 +130,7 @@ __all__ = [
     "OrderType",
     "PaperBroker",
     "PlatformSnapshot",
+    "PlatformWallet",
     "PollingMarketStream",
     "Position",
     "ProfileHealth",
@@ -148,6 +152,7 @@ __all__ = [
     "StateStore",
     "SystemClock",
     "TradeSignalDecision",
+    "WalletSnapshot",
     "configure_logging",
     "credentials_from_env",
     "freqtrade_strategy_for",

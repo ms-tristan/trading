@@ -663,6 +663,63 @@ def test_serve_is_read_only_over_the_persisted_state(
     assert snapshot["btc-paper"]["health"]["last_candle_at"] == "2024-01-05T23:00:00+00:00"
 
 
+def test_serve_publishes_the_persisted_shared_wallet(tmp_path: Path) -> None:
+    """The read-only surface reports the durable ledger, never a configured guess.
+
+    ``realtime serve`` runs no engine, but the shared wallet **is** persisted: the
+    snapshot it rebuilds therefore carries the stored cash of the one ledger, and
+    every profile carries the share *attributed* to it (its allocation, its
+    deployed capital and its own P&L) instead of defaulting to zero.
+    """
+    from trading_platform.cli import _PersistedSnapshotProvider
+    from trading_platform.config import load_realtime_config
+    from trading_platform.realtime.models import RunMode
+
+    path = write_profiles(tmp_path)
+    database = tmp_path / "state.db"
+    assert invoke("realtime", "run", "--profiles", str(path), "--once").exit_code == 0
+
+    realtime = load_realtime_config(path)
+    clock = ManualClock(datetime.fromisoformat(ANCHOR))
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        provider = _PersistedSnapshotProvider(store, clock=clock, realtime=realtime)
+        snapshot = provider.snapshot()
+        wallet = snapshot.wallet
+        assert wallet is not None
+        assert wallet.source == "local"
+        assert wallet.mode == RunMode.PAPER
+        assert wallet.initial_balance == pytest.approx(15_000.0), "the durable initial balance"
+        assert wallet.cash == pytest.approx(13_999.0), "15000 - 1000 notional - 1.00 fee"
+        assert wallet.profiles == 2
+        assert wallet.equity == pytest.approx(
+            wallet.cash + sum(float(item.position_value) for item in snapshot.profiles)
+        )
+        assert provider.health()["wallet"] == wallet.to_dict()
+
+        attributed = {item.profile_id: item.to_dict() for item in snapshot.profiles}
+        assert attributed["btc-paper"]["allocation"] == pytest.approx(10_000.0)
+        assert attributed["btc-paper"]["deployed"] == pytest.approx(1_000.0)
+        assert attributed["btc-paper"]["realized_pnl"] == pytest.approx(0.0)
+        assert attributed["eth-paper"]["allocation"] == pytest.approx(5_000.0)
+        assert attributed["eth-paper"]["deployed"] == pytest.approx(0.0)
+        # the cash of a profile is its attributed share, never the whole wallet
+        assert attributed["eth-paper"]["cash"] == pytest.approx(5_000.0)
+    finally:
+        store.close()
+
+    # a store that never saw a wallet answers None, never an invented ledger
+    empty = SqliteStateStore(tmp_path / "empty.db", clock=clock)
+    empty.initialize()
+    try:
+        provider = _PersistedSnapshotProvider(empty, clock=clock, realtime=realtime)
+        assert provider.snapshot().wallet is None
+        assert provider.health()["wallet"] is None
+    finally:
+        empty.close()
+
+
 def test_run_starts_the_monitoring_server_and_stops_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

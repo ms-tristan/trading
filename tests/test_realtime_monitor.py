@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -71,8 +72,14 @@ def make_spec(
     strategy: str = "basic",
     mode: str = "paper",
     initial_balance: float = 10_000.0,
+    allocation: float | None = None,
 ) -> ProfileConfig:
-    """Return one fully deterministic profile specification."""
+    """Return one fully deterministic profile specification.
+
+    ``allocation`` is the profile's share of the one shared platform wallet and
+    stays optional: when it is absent the profile's own ``initial_balance`` **is**
+    its allocation (the backward-compatible rule of the delivery brief).
+    """
     return ProfileConfig(
         id=profile_id,
         symbol=symbol,
@@ -81,6 +88,7 @@ def make_spec(
         params={"fast": 10, "slow": 30},
         mode=mode,
         initial_balance=initial_balance,
+        allocation=allocation,
         warmup_candles=50,
         poll_interval_seconds=1.0,
     )
@@ -374,6 +382,7 @@ def make_store(
     timeframe: str = "1h",
     symbol: str = "BTC/USDT",
     initial_balance: float = 10_000.0,
+    allocation: float | None = None,
     equity_points: int | None = 50,
     trade_count: int = 3,
     with_position: bool = True,
@@ -387,6 +396,7 @@ def make_store(
             symbol=symbol,
             timeframe=timeframe,
             initial_balance=initial_balance,
+            allocation=allocation,
         )
     )
     if equity_points:
@@ -556,6 +566,67 @@ def test_initial_balance_prefers_the_persisted_profile() -> None:
 
     assert monitor.initial_balance(PROFILE_ID) == pytest.approx(2_500.0)
     assert monitor.build_result(PROFILE_ID).initial_balance == pytest.approx(2_500.0)
+
+
+def test_the_capital_base_is_attributed_to_the_allocation() -> None:
+    """A profile is measured against its *share* of the one shared wallet.
+
+    The profile is configured with ``initial_balance = 10000`` and
+    ``allocation = 2500``: the read model reports the allocation as its capital
+    base, so every metric and every report line is attributed to 2500 -- never to
+    the whole platform ledger -- while the configured capital itself is untouched.
+    """
+    store = make_store(initial_balance=10_000.0, allocation=2_500.0)
+    monitor = build_monitor(store)
+    spec = store.load_profiles()[0]
+    points = store.equity_curve(PROFILE_ID)
+
+    result = monitor.build_result(PROFILE_ID)
+    report = monitor.report(PROFILE_ID)
+
+    assert spec.initial_balance == pytest.approx(10_000.0)
+    assert spec.effective_allocation == pytest.approx(2_500.0)
+    assert monitor.initial_balance(PROFILE_ID) == pytest.approx(2_500.0)
+    assert result.initial_balance == pytest.approx(2_500.0)
+    assert report.initial_balance == pytest.approx(2_500.0)
+    # the equity curve itself is the profile's own, untouched
+    assert result.final_balance == pytest.approx(points[-1].equity)
+    assert report.final_balance == pytest.approx(points[-1].equity)
+    # the metric set is exactly the one of the attributed capital base ...
+    attributed = replace(result, initial_balance=2_500.0)
+    assert (
+        monitor.metrics(PROFILE_ID)
+        == compute_metrics(attributed, timeframe="1h", risk_free_rate=0.0).as_dict()
+    )
+    # ... and the return denominator is the allocation, derived by hand here
+    expected_return = (points[-1].equity - 2_500.0) / 2_500.0
+    assert monitor.metrics(PROFILE_ID)["total_return"] == pytest.approx(expected_return)
+    assert report.total_return == pytest.approx(expected_return)
+
+
+def test_a_profile_without_an_allocation_is_unchanged() -> None:
+    """Backward compatibility: no ``allocation`` means ``initial_balance`` **is** it."""
+    store = make_store(initial_balance=10_000.0)
+    monitor = build_monitor(store)
+    spec = store.load_profiles()[0]
+
+    result = monitor.build_result(PROFILE_ID)
+    report = monitor.report(PROFILE_ID)
+
+    assert spec.allocation is None
+    assert spec.effective_allocation == pytest.approx(10_000.0)
+    assert monitor.initial_balance(PROFILE_ID) == pytest.approx(10_000.0)
+    assert result.initial_balance == pytest.approx(10_000.0)
+    assert report.initial_balance == pytest.approx(10_000.0)
+    # the numbers are exactly the ones the profile reported before the shared
+    # wallet existed: the configured balance is the capital base of the metrics
+    assert (
+        monitor.metrics(PROFILE_ID)
+        == compute_metrics(result, timeframe="1h", risk_free_rate=0.0).as_dict()
+    )
+    assert report.total_return == pytest.approx(
+        compute_metrics(result, timeframe="1h", risk_free_rate=0.0).as_dict()["total_return"]
+    )
 
 
 def test_window_falls_back_to_the_trades_and_the_positions() -> None:

@@ -8,7 +8,16 @@ import type { ControlPayload, ProfileSnapshot, ProfileStatus } from '@/lib/types
 
 import { ProfileCard } from './profile-card';
 
-/** One profile snapshot exactly as `GET /api/profiles` emits it. */
+/**
+ * One profile snapshot exactly as `GET /api/profiles` emits it.
+ *
+ * The money fields are attributed shares of the shared platform wallet:
+ * `allocation` 10,000 is the profile's share, `deployed` 2,245.50 is the capital
+ * it has in the market, so `cash = allocation - deployed + realized_pnl`
+ * (8,000 = 10,000 - 2,245.50 + 245.50) and
+ * `equity = allocation + realized_pnl + unrealized_pnl`
+ * (10,450.50 = 10,000 + 245.50 + 205).
+ */
 function makeProfile(overrides: Partial<ProfileSnapshot> = {}): ProfileSnapshot {
   return {
     profile_id: 'alpha',
@@ -43,6 +52,11 @@ function makeProfile(overrides: Partial<ProfileSnapshot> = {}): ProfileSnapshot 
     },
     started_at: '2023-12-01T00:00:00+00:00',
     updated_at: '2024-01-01T00:00:00+00:00',
+    allocation: 10000,
+    deployed: 2245.5,
+    realized_pnl: 245.5,
+    unrealized_pnl: 205,
+    last_block_reason: null,
     ...overrides,
   };
 }
@@ -118,8 +132,15 @@ describe('ProfileCard', () => {
     expect(field('Symbol')).toHaveTextContent('BTC/USDT');
     expect(field('Timeframe')).toHaveTextContent('1h');
     expect(field('Strategy')).toHaveTextContent('BasicStrategy');
-    expect(field('Equity')).toHaveTextContent('$10,450.50');
-    expect(field('Cash')).toHaveTextContent('$8,000.00');
+    // The money fields of the profile are its attributed share of the one
+    // shared platform wallet, and they are labelled as such.
+    expect(field('Attributed equity')).toHaveTextContent('$10,450.50');
+    expect(field('Attributed cash')).toHaveTextContent('$8,000.00');
+    expect(field('Allocation')).toHaveTextContent('$10,000.00');
+    expect(field('Deployed')).toHaveTextContent('$2,245.50');
+    expect(field('Realized P&L')).toHaveTextContent('+$245.50');
+    expect(field('Unrealized P&L')).toHaveTextContent('+$205.00');
+    expect(field('Last blocked order')).toHaveTextContent(EMPTY_PLACEHOLDER);
     expect(field('Position value')).toHaveTextContent('$2,450.50');
     expect(field('Initial balance')).toHaveTextContent('$10,000.00');
     expect(field('Trades')).toHaveTextContent('12');
@@ -128,6 +149,49 @@ describe('ProfileCard', () => {
     expect(field('Candle lag')).toHaveTextContent('12s');
     expect(field('Started at')).toHaveTextContent('2023-12-01 00:00:00 UTC');
     expect(field('Updated at')).toHaveTextContent('2024-01-01 00:00:00 UTC');
+  });
+
+  it('never labels a per-profile cash figure as a pot of its own', async () => {
+    await renderCard(makeProfile());
+
+    // The bare labels are gone: `cash` and `equity` are attributed shares of the
+    // shared wallet, and the card says so.
+    expect(screen.queryByText('Cash')).not.toBeInTheDocument();
+    expect(screen.queryByText('Equity')).not.toBeInTheDocument();
+  });
+
+  it('pairs each attributed P&L with its sign, a trend label and an icon', async () => {
+    const { unmount } = await renderCard(
+      makeProfile({ realized_pnl: -120.5, unrealized_pnl: 0 }),
+    );
+
+    expect(field('Realized P&L')).toHaveTextContent('-$120.50');
+    expect(field('Realized P&L')).toHaveTextContent('Down');
+    expect(field('Realized P&L').querySelector('svg')).not.toBeNull();
+
+    expect(field('Unrealized P&L')).toHaveTextContent('$0.00');
+    expect(field('Unrealized P&L')).toHaveTextContent('Flat');
+    unmount();
+
+    await renderCard(makeProfile({ realized_pnl: 245.5, unrealized_pnl: 205 }));
+
+    expect(field('Realized P&L')).toHaveTextContent('+$245.50');
+    expect(field('Realized P&L')).toHaveTextContent('Up');
+    expect(field('Unrealized P&L')).toHaveTextContent('+$205.00');
+    expect(field('Unrealized P&L')).toHaveTextContent('Up');
+  });
+
+  it('shows the reason of the last blocked order verbatim', async () => {
+    const refusal =
+      'platform_wallet: the shared wallet cannot fund this order — needs 500.00 USDT, holds 120.00 USDT';
+    const { unmount } = await renderCard(makeProfile({ last_block_reason: refusal }));
+
+    expect(field('Last blocked order')).toHaveTextContent(refusal);
+    unmount();
+
+    // No refusal -> the documented em dash, never an empty cell.
+    await renderCard(makeProfile({ last_block_reason: null }));
+    expect(field('Last blocked order')).toHaveTextContent(EMPTY_PLACEHOLDER);
   });
 
   it('labels the card with its heading and links it to the profile detail route', async () => {
@@ -207,6 +271,11 @@ describe('ProfileCard', () => {
         cash: null,
         position_value: null,
         total_return: null,
+        allocation: null,
+        deployed: null,
+        realized_pnl: null,
+        unrealized_pnl: null,
+        last_block_reason: null,
         started_at: null,
         updated_at: null,
         n_trades: null as unknown as number,
@@ -236,10 +305,15 @@ describe('ProfileCard', () => {
       'Timeframe',
       'Strategy',
       'Initial balance',
-      'Equity',
-      'Cash',
+      'Attributed equity',
+      'Attributed cash',
+      'Allocation',
+      'Deployed',
       'Position value',
       'Total return',
+      'Realized P&L',
+      'Unrealized P&L',
+      'Last blocked order',
       'Trades',
       'Open positions',
       'Last candle',
@@ -250,12 +324,45 @@ describe('ProfileCard', () => {
       expect(field(label)).toHaveTextContent(EMPTY_PLACEHOLDER);
     }
 
-    expect(screen.getAllByText(EMPTY_PLACEHOLDER).length).toBeGreaterThanOrEqual(14);
+    expect(screen.getAllByText(EMPTY_PLACEHOLDER).length).toBeGreaterThanOrEqual(19);
     const text = document.body.textContent ?? '';
     expect(text).not.toContain('NaN');
     expect(text).not.toContain('undefined');
-    // An absent total return carries no trend claim at all.
+    // An absent total return or P&L carries no trend claim at all.
     expect(field('Total return')).not.toHaveTextContent('Flat');
+    expect(field('Realized P&L')).not.toHaveTextContent('Flat');
+    expect(field('Unrealized P&L')).not.toHaveTextContent('Flat');
+  });
+
+  it('renders an older payload without the attributed keys as the em dash state', async () => {
+    // A server that does not emit the attributed breakdown yet stays valid: the
+    // absent keys are not formatted into a wrong figure, they are em dashes.
+    await renderCard(
+      makeProfile({
+        allocation: undefined,
+        deployed: undefined,
+        realized_pnl: undefined,
+        unrealized_pnl: undefined,
+        last_block_reason: undefined,
+      }),
+    );
+
+    for (const label of [
+      'Allocation',
+      'Deployed',
+      'Realized P&L',
+      'Unrealized P&L',
+      'Last blocked order',
+    ]) {
+      expect(field(label)).toHaveTextContent(EMPTY_PLACEHOLDER);
+    }
+
+    // The pre-existing figures keep rendering: nothing was removed.
+    expect(field('Attributed equity')).toHaveTextContent('$10,450.50');
+    expect(field('Attributed cash')).toHaveTextContent('$8,000.00');
+    const text = document.body.textContent ?? '';
+    expect(text).not.toContain('NaN');
+    expect(text).not.toContain('undefined');
   });
 
   it('surfaces a non-null last error as a labelled warning row', async () => {

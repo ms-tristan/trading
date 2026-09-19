@@ -1,8 +1,15 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { EMPTY_PLACEHOLDER } from '@/lib/format';
 import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
-import type { HealthPayload, KillSwitchPayload, ProfilesPayload, ProfileSnapshot } from '@/lib/types';
+import type {
+  HealthPayload,
+  KillSwitchPayload,
+  ProfilesPayload,
+  ProfileSnapshot,
+  WalletSnapshot,
+} from '@/lib/types';
 
 import { BUTTON_SIZE_CLASSES } from '@/components/ui/button';
 
@@ -62,6 +69,41 @@ const health: HealthPayload = {
 
 const killSwitch: KillSwitchPayload = { kill_switch: false, reason: '', changed_at: null };
 
+/**
+ * The shared platform wallet of the fixtures.
+ *
+ * `cash = initial_balance - deployed + realized_pnl`
+ * (21,500 = 25,000 - 4,500 + 1,000) and
+ * `equity = initial_balance + realized_pnl + unrealized_pnl`
+ * (25,750 = 25,000 + 1,000 - 250).
+ */
+const wallet: WalletSnapshot = {
+  name: 'usdt',
+  mode: 'paper',
+  initial_balance: 25000,
+  cash: 21500,
+  equity: 25750,
+  deployed: 4500,
+  realized_pnl: 1000,
+  unrealized_pnl: -250,
+  total_exposure: 4700,
+  profiles: 2,
+  source: 'local',
+  updated_at: '2024-01-01T00:00:00+00:00',
+};
+
+/** The wallet after one refresh: cash and equity have moved. */
+const refreshedWallet: WalletSnapshot = {
+  ...wallet,
+  cash: 23800.25,
+  deployed: 2600,
+  equity: 26951,
+  realized_pnl: 1400.25,
+  unrealized_pnl: 550.75,
+  total_exposure: 2600,
+  updated_at: '2024-06-01T12:00:02+00:00',
+};
+
 function jsonResponse(body: unknown, status = 200): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -92,10 +134,11 @@ interface StubServer {
  */
 function startServer(): StubServer {
   const server: StubServer = {
-    health: { ...health },
+    health: { ...health, wallet: { ...wallet } },
     profiles: {
       profiles: [makeProfile('alpha'), makeProfile('beta')],
       generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
     },
     killSwitch: { ...killSwitch },
     failing: false,
@@ -319,7 +362,7 @@ describe('OverviewLive', () => {
 
   it('renders the documented empty states', async () => {
     const server = startServer();
-    server.profiles = { profiles: [], generated_at: null };
+    server.profiles = { profiles: [], generated_at: null, wallet: { ...wallet } };
     server.health = { ...health, profiles_total: 0, profiles_running: 0 };
     const view = renderLive(server);
 
@@ -332,6 +375,82 @@ describe('OverviewLive', () => {
 
     expect(screen.getByText('No profile reported yet')).toBeInTheDocument();
     expect(screen.getByText(/Configured profiles: 2/)).toBeInTheDocument();
+  });
+
+  it('renders the shared wallet of the server payload without a request', () => {
+    const server = startServer();
+    renderLive(server);
+
+    // One panel, seeded from the server payload: mounting issues no request.
+    expect(server.calls).toEqual([]);
+    const panel = screen.getByRole('region', { name: 'Platform wallet' });
+    expect(within(panel).getAllByText('Platform wallet')).toHaveLength(1);
+    expect(
+      within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Local ledger')).toBeInTheDocument();
+    // And it is the *only* wallet panel of the page.
+    expect(screen.getAllByRole('region', { name: 'Platform wallet' })).toHaveLength(1);
+  });
+
+  it('refreshes the shared wallet with the polling cycle', async () => {
+    const server = startServer();
+    renderLive(server);
+
+    const tiles = screen.getByTestId('wallet-tiles');
+    expect(within(tiles).getByText('$21,500.00')).toBeInTheDocument();
+    expect(within(tiles).queryByText('$23,800.25')).not.toBeInTheDocument();
+
+    server.profiles = {
+      profiles: [makeProfile('alpha'), makeProfile('beta')],
+      generated_at: '2024-06-01T12:00:02+00:00',
+      wallet: { ...refreshedWallet },
+    };
+    server.health = { ...server.health, wallet: { ...refreshedWallet } };
+    await advance(2000);
+
+    expect(server.calls).toEqual(['/api/health', '/api/profiles', '/api/kill-switch']);
+    expect(within(tiles).getByText('$23,800.25')).toBeInTheDocument();
+    expect(within(tiles).getByText('$26,951.00')).toBeInTheDocument();
+    // The panel is updated in place, never remounted.
+    expect(screen.getByTestId('wallet-tiles')).toBe(tiles);
+  });
+
+  it('keeps the last known good wallet when a cycle fails', async () => {
+    const server = startServer();
+    renderLive(server);
+    await advance(2000);
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00')).toBeInTheDocument();
+
+    server.failing = true;
+    await advance(2000);
+
+    // The failure is announced by the toolbar, and the wallet of the last good
+    // payload stays on screen instead of collapsing to em dashes.
+    expect(screen.getByRole('status')).toHaveTextContent('The monitoring API is unreachable');
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00')).toBeInTheDocument();
+    expect(screen.getByText('Local ledger')).toBeInTheDocument();
+  });
+
+  it('renders the em dash state of a payload without a wallet key', async () => {
+    const server = startServer();
+    // An older monitoring server: the payload carries no wallet key at all.
+    server.profiles = {
+      profiles: [makeProfile('alpha'), makeProfile('beta')],
+      generated_at: '2024-01-01T00:00:00+00:00',
+    };
+    renderLive(server);
+
+    expect(screen.getByText('No shared wallet reported')).toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getAllByText(EMPTY_PLACEHOLDER)).toHaveLength(
+      8,
+    );
+    // The cards of the profiles keep rendering, and nothing crashed.
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+
+    await advance(2000);
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+    expect(screen.getByText('No shared wallet reported')).toBeInTheDocument();
   });
 
   it('surfaces a kill switch engaged while the page is open', async () => {

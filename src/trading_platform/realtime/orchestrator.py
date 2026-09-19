@@ -67,6 +67,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -75,7 +76,12 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 from trading_platform.config.loader import load_profiles, save_profiles
-from trading_platform.config.models import MonitoringConfig, ProfileConfig, RealtimeConfig
+from trading_platform.config.models import (
+    MonitoringConfig,
+    ProfileConfig,
+    RealtimeConfig,
+    resolve_platform_initial_balance,
+)
 from trading_platform.core.errors import (
     BrokerError,
     ConfigError,
@@ -86,6 +92,7 @@ from trading_platform.core.errors import (
     ProfileError,
     RealtimeError,
     RiskLimitExceededError,
+    WalletError,
 )
 from trading_platform.core.models import Direction, TradeRecord
 from trading_platform.realtime.clock import Clock
@@ -113,11 +120,14 @@ if TYPE_CHECKING:
         KillSwitch,
         KillSwitchState,
         LiveTradingGate,
+        PlatformRiskLimits,
+        PlatformRiskState,
         RiskManager,
     )
     from trading_platform.realtime.runner import ProfileRunner
     from trading_platform.realtime.store import CandleRow, StateStore
     from trading_platform.realtime.stream import MarketStream
+    from trading_platform.realtime.wallet import PlatformWallet
 
 __all__ = [
     "BrokerFactory",
@@ -158,7 +168,13 @@ _DELETE_ORDER_SEQUENCE = 0
 
 
 def make_risk_manager(
-    profile: ProfileConfig, *, clock: Clock, kill_switch: KillSwitch | None = None
+    profile: ProfileConfig,
+    *,
+    clock: Clock,
+    kill_switch: KillSwitch | None = None,
+    platform: PlatformRiskLimits | None = None,
+    wallet: PlatformWallet | None = None,
+    state: PlatformRiskState | None = None,
 ) -> RiskManager:
     """Build the per-profile risk manager enforcing ``profile.risk``.
 
@@ -170,10 +186,25 @@ def make_risk_manager(
         Time seam used by the daily counters of the manager.
     kill_switch:
         Optional global halt; when injected it is the first limit evaluated.
+    platform:
+        Optional platform-wide caps, enforced in addition to the per-profile ones.
+    wallet:
+        Optional shared wallet; when injected every entry is checked against the
+        cash it can really fund.
+    state:
+        Optional aggregation of the figures every profile published, read by the
+        platform-wide caps.
     """
     from trading_platform.realtime.risk import RiskLimits, RiskManager
 
-    return RiskManager(RiskLimits.from_config(profile.risk), clock=clock, kill_switch=kill_switch)
+    return RiskManager(
+        RiskLimits.from_config(profile.risk),
+        clock=clock,
+        kill_switch=kill_switch,
+        platform=platform,
+        wallet=wallet,
+        state=state,
+    )
 
 
 def make_live_gate(environ: Mapping[str, str] | None = None) -> LiveTradingGate:
@@ -194,6 +225,7 @@ def default_broker_factory(
     *,
     clock: Clock | None = None,
     environ: Mapping[str, str] | None = None,
+    wallet: PlatformWallet | None = None,
 ) -> Broker:
     """Build the venue adapter of ``profile`` -- paper simulated, live real.
 
@@ -212,6 +244,13 @@ def default_broker_factory(
         Time seam handed to the adapter; the system clock is used when omitted.
     environ:
         Environment mapping the credentials are read from.
+    wallet:
+        Optional shared wallet of the platform.  A paper venue funds its fills from
+        it -- that is what makes every simulated profile spend the *same* USDT
+        ledger -- and a private simulated wallet is built when none is injected, so
+        every existing construction keeps its exact previous behaviour.  A live
+        venue ignores it: there the wallet *mirrors* the account the venue reports,
+        and the venue itself is the source of truth.
 
     Raises
     ------
@@ -248,6 +287,7 @@ def default_broker_factory(
         initial_balance=float(profile.initial_balance),
         seed=seed,
         name="paper",
+        wallet=wallet,
     )
 
 
@@ -279,6 +319,12 @@ class RealtimeOrchestrator:
         switch; defaults to the process environment.
     version:
         Version string reported by :meth:`health`.
+    wallet:
+        Optional shared platform wallet.  When it is omitted the orchestrator builds
+        its own, lazily and exactly once, from the configuration -- the platform
+        initial balance (or the sum of the profiles' allocations) -- and hands it to
+        every paper venue and to every risk manager, so every profile funds its
+        orders from the *same* USDT ledger.
     """
 
     def __init__(
@@ -293,6 +339,7 @@ class RealtimeOrchestrator:
         broker_factory: BrokerFactory | None = None,
         environ: Mapping[str, str] | None = None,
         version: str = "",
+        wallet: PlatformWallet | None = None,
     ) -> None:
         self._profiles: tuple[ProfileConfig, ...] = tuple(profiles)
         if not self._profiles:
@@ -320,6 +367,14 @@ class RealtimeOrchestrator:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._started_ids: set[str] = set()
         self._kill_switch: KillSwitch | None = None
+        self._wallet = wallet
+        #: Guards the one-shot restore of the shared wallet: the boot runs on the
+        #: engine thread while the monitoring API answers on its own thread, and
+        #: "restored once" is a contract, not an approximation.
+        self._wallet_lock = threading.Lock()
+        self._wallet_restored = False
+        self._restored_cash: float | None = None
+        self._platform_state: PlatformRiskState | None = None
         self._monotonic_start: float | None = None
         self._started_at: pd.Timestamp | None = None
         self._prepared = False
@@ -330,6 +385,35 @@ class RealtimeOrchestrator:
     def profiles(self) -> tuple[ProfileConfig, ...]:
         """Return every profile of the platform, in the order it was given."""
         return self._profiles
+
+    @property
+    def wallet(self) -> PlatformWallet:
+        """Return the one shared wallet every profile funds its orders from.
+
+        The wallet is built **once** per orchestrator instance, lazily, and never
+        resolved through a module-level global: it is the same object the paper
+        venues spend from, the same one the risk managers check before an order and
+        the same one the snapshot reports.  Its mode follows the profiles -- a
+        platform that runs any enabled ``live`` profile has a wallet that *mirrors*
+        the venue account (read-only, never locally debited), every other platform
+        has the local simulated ledger.
+
+        The starting cash is :func:`resolve_platform_initial_balance`: the
+        configured ``realtime.platform_initial_balance`` when there is one, else the
+        sum of the profiles' effective allocations -- which is what keeps a
+        configuration written before the shared wallet existed unchanged.
+        """
+        if self._wallet is None:
+            from trading_platform.realtime.wallet import PlatformWallet
+
+            self._wallet = PlatformWallet(
+                initial_balance=resolve_platform_initial_balance(self._realtime, self._profiles),
+                mode=RunMode.LIVE if self._has_enabled_live_profile() else RunMode.PAPER,
+                store=self._store,
+                clock=self._clock,
+                name="platform",
+            )
+        return self._wallet
 
     @property
     def monitoring(self) -> MonitoringConfig | None:
@@ -446,11 +530,21 @@ class RealtimeOrchestrator:
         return self._fallback_snapshot(profile)
 
     def snapshot(self) -> PlatformSnapshot:
-        """Return the whole platform as the monitoring layer sees it."""
-        profiles = tuple(self.profile_snapshot(profile_id) for profile_id in self.profile_ids())
+        """Return the whole platform as the monitoring layer sees it.
+
+        The shared wallet view is aggregated from the profile snapshots collected
+        here -- their position values, their deployed capital and their P&L -- so
+        the platform-wide cash, equity and exposure are always the exact sum of the
+        attributed per-profile figures the same payload carries.  The ledger is
+        restored first, so the reported cash is the durable one even when this
+        process never booted the engine (see :meth:`_ensure_wallet_restored`).
+        """
+        self._ensure_wallet_restored()
+        collected = tuple(self.profile_snapshot(profile_id) for profile_id in self.profile_ids())
         state = self.kill_switch_state()
+        profiles = tuple(item for item in collected if item is not None)
         return PlatformSnapshot(
-            profiles=tuple(item for item in profiles if item is not None),
+            profiles=profiles,
             generated_at=pd.Timestamp(self._clock.now()),
             kill_switch=bool(state.engaged),
             kill_switch_reason=str(state.reason),
@@ -458,13 +552,23 @@ class RealtimeOrchestrator:
             version=self._version,
             started_at=self._started_at,
             uptime_seconds=self._uptime(),
+            wallet=self.wallet.snapshot(
+                positions_value=sum(item.position_value for item in profiles),
+                deployed=sum(item.deployed for item in profiles),
+                realized_pnl=sum(item.realized_pnl for item in profiles),
+                unrealized_pnl=sum(item.unrealized_pnl for item in profiles),
+                total_exposure=sum(abs(item.position_value) for item in profiles),
+                profiles=len(collected),
+            ),
         )
 
     def health(self) -> dict[str, Any]:
         """Return the ``/api/health`` body of the platform (no HTTP concern here)."""
-        profiles = self.snapshot().profiles
+        snapshot = self.snapshot()
+        profiles = snapshot.profiles
         engaged = self.kill_switch_state().engaged
         degraded = engaged or any(item.status in _UNHEALTHY_STATUSES for item in profiles)
+        wallet = snapshot.wallet
         return {
             "status": "degraded" if degraded else "ok",
             "version": self._version,
@@ -473,6 +577,7 @@ class RealtimeOrchestrator:
             "profiles_running": sum(1 for item in profiles if item.status is ProfileStatus.RUNNING),
             "kill_switch": bool(engaged),
             "checked_at": self._clock.now().isoformat(),
+            "wallet": None if wallet is None else wallet.to_dict(),
         }
 
     def stats(self) -> dict[str, Any]:
@@ -659,6 +764,11 @@ class RealtimeOrchestrator:
         self._started_ids.discard(resolved)
         self._profiles = tuple(item for item in self._profiles if str(item.id) != resolved)
         self._by_id.pop(resolved, None)
+        platform_state = self._platform_state
+        if platform_state is not None:
+            # A deleted profile must stop contributing to the platform-wide caps:
+            # its last exposure would otherwise cap the platform for ever.
+            platform_state.forget(resolved)
         self._store.set_meta(_PAUSED_META_PREFIX + resolved, "0")
         log_event(_LOGGER, "profile_deleted", profile_id=resolved, profiles=len(self._profiles))
         return resolved
@@ -707,7 +817,15 @@ class RealtimeOrchestrator:
     # -- wiring -------------------------------------------------------------
 
     def _prepare_runners(self) -> list[str]:
-        """Initialize the store, build every runner and reconcile it, once."""
+        """Initialize the store, build every runner and reconcile it, once.
+
+        The boot order is a safety property, not an implementation detail: the
+        store is opened, every profile is persisted, and only then is the shared
+        wallet restored **exactly once** from the durable state -- so a restart
+        never resets the platform's cash, and the restore can never interleave with
+        a profile that is already trading.  A live platform additionally mirrors the
+        venue's balance once, best-effort (see :meth:`_sync_live_wallet`).
+        """
         if self._prepared:
             return self._enabled_ids()
         factory = self._stream_factory
@@ -716,32 +834,82 @@ class RealtimeOrchestrator:
         self._ensure_store()
         for profile in self._profiles:
             self._store.save_profile(profile)
+        self._ensure_wallet_restored()
         for profile_id in self._enabled_ids():
             profile = self._by_id[profile_id]
             self._build_runner(profile, factory)
+        self._sync_live_wallet()
         self._prepared = True
         return self._enabled_ids()
+
+    def _ensure_wallet_restored(self) -> None:
+        """Adopt the persisted ledger, exactly once, before anything reports it.
+
+        :meth:`_prepare_runners` calls this at boot; the read model calls it too,
+        because a process that only *reads* the platform -- the monitoring API of
+        ``realtime run`` answers before the engine loop has booted, and a read-only
+        composition never boots at all -- must report the **durable** cash.  Serving
+        the configured initial balance while the store holds a different row would
+        be a lie about the platform's money.
+
+        The call is idempotent (a lock and a flag make "once" exact across the
+        engine thread and the API thread) and best-effort: a store that cannot be
+        read logs ``platform_wallet_restore_failed`` and leaves the configured
+        balance in place, and the restore is retried on the next boot.  A store that
+        has not been initialized yet is left to its owner: initializing it here
+        would race the boot that opens it.
+        """
+        with self._wallet_lock:
+            if self._wallet_restored or not self._store_ready():
+                return
+            wallet = self.wallet
+            try:
+                restored_cash = wallet.restore()
+            except RealtimeError as exc:
+                log_event(
+                    _LOGGER,
+                    "platform_wallet_restore_failed",
+                    level=logging.WARNING,
+                    error=str(exc),
+                )
+                return
+            self._wallet_restored = True
+            self._restored_cash = restored_cash
+        log_event(
+            _LOGGER,
+            "platform_wallet_restored",
+            cash=float(wallet.cash),
+            restored=restored_cash is not None,
+            mode=wallet.mode.value,
+        )
 
     def _build_runner(self, profile: ProfileConfig, factory: StreamFactory) -> None:
         """Build the gateway and the runner of one profile, then reconcile it."""
         from trading_platform.realtime.gateway import ExecutionGateway
+        from trading_platform.realtime.risk import PlatformRiskLimits
         from trading_platform.realtime.runner import ProfileRunner
 
         profile_id = str(profile.id)
         broker_factory = self._broker_factory
         broker = (
-            default_broker_factory(profile, clock=self._clock, environ=self._environ)
+            default_broker_factory(
+                profile, clock=self._clock, environ=self._environ, wallet=self.wallet
+            )
             if broker_factory is None
             else broker_factory(profile)
         )
-        self._seed_paper_cash(profile, broker)
         gateway = ExecutionGateway(
             profile=profile,
             broker=broker,
             store=self._store,
             clock=self._clock,
             risk=make_risk_manager(
-                profile, clock=self._clock, kill_switch=self._kill_switch_instance()
+                profile,
+                clock=self._clock,
+                kill_switch=self._kill_switch_instance(),
+                platform=PlatformRiskLimits.from_config(self._realtime),
+                wallet=self.wallet,
+                state=self._risk_state(),
             ),
             live_gate=make_live_gate(self._environ),
         )
@@ -777,38 +945,61 @@ class RealtimeOrchestrator:
             # position the operator asked not to open.
             runner.pause()
 
-    def _seed_paper_cash(self, profile: ProfileConfig, broker: Broker) -> None:
-        """Re-seed a simulated venue with the cash the durable state remembers (D7).
+    def _sync_live_wallet(self) -> None:
+        """Mirror the venue account into the shared wallet once, best-effort.
 
-        A **simulated** venue has no memory of its own: after a restart its cash
-        starts again at the configured initial balance while the position is
-        restored from the store, so equity would jump by the position notional and
-        the dashboard would display a number the persisted curve contradicts.  The
-        last equity point of the profile *is* the durable truth (``cash`` column),
-        so it is handed back to the venue here, before the first tick.
+        In live mode the wallet **is** the venue's account: the local ledger is
+        never debited, and the only honest thing the boot can do is ask the venue
+        what it holds.  The balance of the first enabled live profile answers for
+        the whole platform, exactly like the mode itself does.  The call is
+        best-effort by contract: any :class:`~trading_platform.core.errors.RealtimeError`
+        (an unreachable venue, a missing credential) is logged and the platform
+        starts anyway -- the wallet then falls back to its configured initial
+        balance rather than inventing a ``0.0``.
 
-        Only a paper profile is seeded: a real venue reports its own balance
-        (``CcxtBroker.fetch_balance``) and overwriting it would be a lie.  The seam
-        is optional by contract, so an injected broker that does not expose
-        ``restore_cash`` is left untouched.
+        A paper platform has nothing to mirror and returns immediately, so no test
+        and no simulated run ever reaches a venue here.
         """
-        if str(profile.mode) != RunMode.PAPER.value:
+        wallet = self.wallet
+        if wallet.is_authoritative:
             return
-        restore = getattr(broker, "restore_cash", None)
-        if restore is None:
+        for profile_id in self._enabled_ids():
+            profile = self._by_id[profile_id]
+            runner = self._runners.get(profile_id)
+            if runner is None or RunMode(profile.mode) is not RunMode.LIVE:
+                continue
+            try:
+                balance = runner.gateway.balance()
+                if balance is not None:
+                    wallet.sync_from_venue(balance, at=pd.Timestamp(self._clock.now()))
+            except RealtimeError as exc:
+                log_event(
+                    _LOGGER,
+                    "platform_wallet_venue_sync_failed",
+                    level=logging.WARNING,
+                    profile_id=profile_id,
+                    error=str(exc),
+                )
             return
-        points = self._store.equity_curve(str(profile.id))
-        if not points:
-            return
-        cash = float(points[-1].cash)
-        restore(cash)
-        log_event(
-            _LOGGER,
-            "paper_cash_restored",
-            profile_id=str(profile.id),
-            cash=cash,
-            at=points[-1].timestamp.isoformat(),
+
+    def _has_enabled_live_profile(self) -> bool:
+        """Return whether any enabled profile runs against a real venue."""
+        return any(
+            str(profile.mode) == RunMode.LIVE.value for profile in self._profiles if profile.enabled
         )
+
+    def _risk_state(self) -> PlatformRiskState:
+        """Return the platform-wide aggregation of the profiles' figures (one per run).
+
+        It is built once per orchestrator and injected into every risk manager of
+        the platform, so the platform caps read the *same* aggregate whatever
+        profile is asking.
+        """
+        if self._platform_state is None:
+            from trading_platform.realtime.risk import PlatformRiskState
+
+            self._platform_state = PlatformRiskState(clock=self._clock)
+        return self._platform_state
 
     async def _start_runner(self, profile_id: str) -> None:
         """Start the stream and the runner of one profile, exactly once.
@@ -983,6 +1174,7 @@ class RealtimeOrchestrator:
             KillSwitchActiveError,
             OrderRejectedError,
             GatewayError,
+            WalletError,
         ) as exc:
             raise ProfileError(
                 f"cannot delete profile {profile_id!r}: the open position could not be flattened"
@@ -1045,6 +1237,19 @@ class RealtimeOrchestrator:
         if not initialized:
             self._store.initialize()
 
+    def _store_ready(self) -> bool:
+        """Return whether the store is usable, **without** opening it.
+
+        It accepts both shapes of the attribute a store may expose (a property and
+        a method) and assumes a store that cannot answer is ready, exactly like
+        :meth:`_ensure_store`.  A closed store reports ``False``: it must never be
+        reopened behind its owner's back by a read.
+        """
+        probe = getattr(self._store, "is_initialized", None)
+        if probe is None:
+            return True
+        return bool(probe() if callable(probe) else probe)
+
     def _kill_switch_instance(self) -> KillSwitch:
         """Build the global kill switch lazily, over the shared store."""
         if self._kill_switch is None:
@@ -1067,7 +1272,7 @@ class RealtimeOrchestrator:
 
     def _persisted(
         self, profile_id: str
-    ) -> tuple[ProfileState, list[EquityPoint], list[TradeRecord], int]:
+    ) -> tuple[ProfileState, list[EquityPoint], list[TradeRecord], list[Position]]:
         """Read the persisted state of a profile that has no live runner.
 
         A store that is not readable (never opened, closed, or damaged) must not
@@ -1084,7 +1289,7 @@ class RealtimeOrchestrator:
             state = self._store.profile_state(profile_id)
             curve = self._store.equity_curve(profile_id)
             trades = self._store.list_trades(profile_id)
-            open_positions = len(self._store.list_positions(profile_id))
+            positions = self._store.list_positions(profile_id)
         except RealtimeError:
             log_event(
                 _LOGGER,
@@ -1092,18 +1297,31 @@ class RealtimeOrchestrator:
                 level=logging.WARNING,
                 profile_id=profile_id,
             )
-            return fallback, [], [], 0
-        return state, curve, trades, open_positions
+            return fallback, [], [], []
+        return state, curve, trades, positions
 
     def _fallback_snapshot(self, profile: ProfileConfig) -> ProfileSnapshot:
-        """Build the snapshot of a profile that is not running (disabled, or late)."""
+        """Build the attributed snapshot of a profile that is not running.
+
+        Every figure is rebuilt from what the store proves -- the position's entry
+        value, the closed round trips, the last equity point -- so the payload is
+        the *attributed* view of the shared wallet, exactly like a running profile
+        reports it.  Nothing is invented: without a curve the position value is
+        ``0.0`` and without a position nothing is deployed.
+        """
         profile_id = str(profile.id)
-        state, curve, trades, open_positions = self._persisted(profile_id)
+        state, curve, trades, positions = self._persisted(profile_id)
+        allocation = float(profile.effective_allocation)
         initial = float(profile.initial_balance)
         point = curve[-1] if curve else None
-        cash = initial if point is None else float(point.cash)
         position_value = 0.0 if point is None else float(point.position_value)
-        equity = cash + position_value
+        deployed = sum(
+            abs(float(position.quantity) * float(position.average_price)) for position in positions
+        )
+        realized_pnl = sum(float(trade.pnl) for trade in trades)
+        unrealized_pnl = position_value - deployed
+        cash = allocation - deployed + realized_pnl
+        equity = allocation + realized_pnl + unrealized_pnl
         return ProfileSnapshot(
             profile_id=profile_id,
             symbol=str(profile.symbol),
@@ -1115,12 +1333,17 @@ class RealtimeOrchestrator:
             equity=equity,
             cash=cash,
             position_value=position_value,
-            total_return=(equity - initial) / initial if initial else 0.0,
+            total_return=(equity - allocation) / allocation if allocation else 0.0,
             n_trades=len(trades),
-            open_positions=open_positions,
+            open_positions=len(positions),
             health=self._fallback_health(profile_id, state),
             started_at=self._started_at,
             updated_at=state.updated_at,
+            allocation=allocation,
+            deployed=deployed,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            last_block_reason=None,
         )
 
     def _fallback_health(self, profile_id: str, state: ProfileState) -> ProfileHealth:
