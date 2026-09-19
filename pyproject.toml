@@ -32,6 +32,12 @@ dependencies = [
 # and the whole test suite must stay runnable offline without it.
 freqtrade = ["freqtrade>=2024.4"]
 exchange = ["ccxt>=4.2.0", "requests>=2.31"]
+# TimesFM is OPTIONAL and heavy (torch), and it stays out of CI and out of `all`.
+# `google/timesfm-2.5-200m-pytorch` is the default backend and its weights are
+# Apache-2.0; the 3.0 weights ship under the TimesFM Non-Commercial License v1.0
+# and are therefore opt-in through `--model-id`, never a default.
+timesfm = ["timesfm[torch]>=3.0.2"]
+timesfm-xreg = ["timesfm[torch,xreg]>=3.0.2"]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",

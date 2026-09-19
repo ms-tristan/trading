@@ -35,6 +35,9 @@
     "rate_limit_ms": 200,
     "slippage": 0.0005
   },
+  "forecast": {
+    "artifact": null
+  },
   "log_level": "INFO",
   "monitoring": {
     "host": "127.0.0.1",

@@ -65,10 +65,13 @@ Trading/
 │   │   ├── loader.py                 # OHLCVLoader + providers (ccxt paresseux, CSV hors ligne)
 │   │   ├── validation.py             # contrôles qualité OHLCV (tri, doublons, NaN, trous)
 │   │   └── synthetic.py              # générateur de données synthétiques déterministes (tests)
+│   ├── forecast/                     # layer 2.5: offline forecasting (backends, parquet artifact, skill report)
 │   ├── strategy/
 │   │   ├── indicators.py             # EMA, RSI, ATR — calculs purs, sans dépendance externe
 │   │   ├── base.py                   # Strategy : contrat prepare / signals / run
 │   │   ├── basic.py                  # BasicStrategy : croisement EMA + filtre RSI + stop ATR
+│   │   ├── timesfm_forecast.py       # TimesfmForecastStrategy : entries/exits driven by the forecast artifact
+│   │   ├── features.py               # feature-injection seam: resolves the forecast artifact into a ForecastStore
 │   │   ├── registry.py               # register_strategy / get_strategy (résolution par nom)
 │   │   ├── engine.py                 # run_backtest / make_runner : boucle d'exécution + seam RunnerFn
 │   │   ├── freqtrade_parameters.py   # traduction ParamsModel / PARAM_SPACE -> IntParameter, DecimalParameter, CategoricalParameter
@@ -109,7 +112,8 @@ Trading/
 │   │   ├── routes.py                 # routage pur requête -> réponse + couture SnapshotProvider
 │   │   └── server.py                 # ThreadingHTTPServer, create_server, serve, start_in_thread
 │   └── cli.py                        # CLI Typer (couche 8) : backtest, walk-forward, robustness,
-│                                     # monte-carlo, data, config et `realtime run|serve|check`
+│                                     # monte-carlo, forecast-build / forecast-skill / forecast-info,
+│                                     # data, config et `realtime run|serve|check`
 ├── tests/                            # suite pytest hors ligne (voir docs/testing-policy.md)
 ├── dashboard/                        # standalone Next.js dashboard (App Router, Tailwind v4, 2 s polling)
 ├── user_data/
@@ -169,6 +173,10 @@ un import et une déclaration de classe d'une ligne. Tout le reste de
   3     │ strategy (+ engine.py) │     metrics     │   décision, boucle d'exécution, mesure
         └────────────────────────┴─────────────────┘
                             │
+        ┌──────────────────────────────────────────┐
+  2.5   │                forecast                  │   offline forecasting: backends, artifact, skill report
+        └──────────────────────────────────────────┘
+                            │
         ┌───────────┬───────────┬──────────────────┐
   2     │  config   │   data    │    freqtrade     │   configuration, marché, configs Freqtrade
         └───────────┴───────────┴──────────────────┘
@@ -185,7 +193,8 @@ bas de cette liste.**
 | --- | --- | --- |
 | 1 | `trading_platform.core` | la bibliothèque standard, `pandas` |
 | 2 | `trading_platform.config`, `trading_platform.data`, `trading_platform.freqtrade` | couche 1 |
-| 3 | `trading_platform.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_platform.metrics` | couches 1–2 (`strategy.engine` importe `config` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
+| 2.5 | `trading_platform.forecast` | layer 1 **only** — standard library + `numpy` / `pandas` / `pyarrow`; `torch`, `timesfm` and `jax` stay optional and are imported lazily inside functions |
+| 3 | `trading_platform.strategy` (dont `strategy.engine` et `strategy.freqtrade_*`), `trading_platform.metrics` | couches 1–2.5 (`strategy.engine` importe `config` ; `strategy.timesfm_forecast` importe `forecast` ; `strategy.freqtrade_*` importe `freqtrade` ; `metrics` n'importe que `core`) |
 | 4 | `trading_platform.reporting` | couches 1–3 (`core` et `metrics`) |
 | 5 | `trading_platform.validation` | couches 1–4 (`core`, `data.validation`, `metrics` importé paresseusement) |
 | 6 | `trading_platform.realtime` | couches 1–5 (moteur temps réel : flux, courtier, passerelle, risque, état, read model ; `ccxt` reste paresseux) |
@@ -203,8 +212,17 @@ bas de cette liste.**
 Conséquences pratiques :
 
 - `core` n'importe **rien** du projet : c'est le vocabulaire commun.
+- `forecast` is the **offline prediction** layer (2.5): it may import `core` and
+  the scientific stack only, and it is the *only* place where a forecasting
+  backend (including TimesFM) can be instantiated. It never imports `strategy`,
+  `config` or the CLI, so the direction `core -> forecast -> strategy -> cli`
+  stays strictly downward. `torch`, `timesfm` and `jax` are imported inside
+  functions, which keeps the whole suite green with the `.[dev]` extra alone.
 - Une stratégie ne connaît ni le cache disque ni la CLI : elle reçoit un
-  `DataFrame` OHLCV et rend des signaux.
+  `DataFrame` OHLCV et rend des signaux. The `timesfm` strategy additionally
+  receives **pre-computed** forecast trajectories through the feature-injection
+  seam (`trading_platform.strategy.features`): it never runs the model itself,
+  never reads the artifact inside `signals()`, and never touches the network.
 - `validation` orchestre un exécuteur *injecté* (`RunnerFn`) et `metrics`, jamais
   l'inverse : elle n'importe **jamais** `strategy.engine` — c'est l'appelant
   (la CLI) qui construit le runner avec `make_runner(cfg)`. Le moteur, lui,
@@ -319,7 +337,7 @@ de test ne peut pas sortir sur le réseau.
 | `RunnerFn` | `Callable[[pandas.DataFrame, Mapping[str, Any] \| None], BacktestResult]` | type de la fonction d'exécution injectable : `runner(data, params) -> BacktestResult`, où `params=None` signifie « paramètres par défaut de la stratégie » |
 | `make_runner` | `make_runner(cfg: AppConfig, *, symbol: str \| None = None) -> RunnerFn` | construit l'exécuteur par défaut à partir de la configuration (`symbol=None` laisse `UNKNOWN/USDT`) |
 | `run_backtest` | `run_backtest(strategy, data, *, initial_balance=10000.0, fee_rate=0.001, slippage=0.0, stake_amount=None, symbol="UNKNOWN/USDT", timeframe="1h", allow_short=None, params_id="") -> BacktestResult` | exécute une **instance** de stratégie sur une frame (`strategy` et `data` sont positionnels) |
-| `run_backtest_on_config` | `run_backtest_on_config(cfg: AppConfig, data, *, params=None, symbol=None) -> BacktestResult` | exécute la stratégie décrite par la configuration : `params` surcharge `cfg.strategy.params`, le reste vient de `cfg.backtest.*` / `cfg.exchange.*` / `cfg.data.timeframe` |
+| `run_backtest_on_config` | `run_backtest_on_config(cfg: AppConfig, data, *, params=None, symbol=None, features=None) -> BacktestResult` | exécute la stratégie décrite par la configuration : `params` surcharge `cfg.strategy.params`, le reste vient de `cfg.backtest.*` / `cfg.exchange.*` / `cfg.data.timeframe`. `features` is the **keyword-only** injection seam for external features (`None` = default resolution from the configuration, i.e. the artifact of `cfg.forecast.artifact` through `trading_platform.strategy.features`) |
 
 ### 4.4 Stratégies — `trading_platform.strategy`
 
@@ -330,6 +348,7 @@ de test ne peut pas sortir sur le réseau.
 | `Strategy.signals` | `signals(data: pd.DataFrame) -> pd.DataFrame` | ajoute les colonnes de signal (`entry_long`, `exit_long`, `entry_short`, `exit_short`, `stop_loss` ; le squelette est *long only* par défaut, les colonnes *short* restent déclarées) |
 | `Strategy.run` | `run(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]` | rend `(prepared, signals)` — le point d'entrée du moteur |
 | `BasicStrategy` | `name = "basic"` ; paramètres `ema_fast=9`, `ema_slow=21`, `rsi_period=14`, `rsi_min=30.0`, `rsi_max=70.0`, `atr_period=14`, `atr_stop_multiplier=2.0`, `allow_short=False` | croisement EMA + filtre RSI + stop ATR (`stop_loss` = `close − atr_stop_multiplier × ATR` sur la bougie de signal) |
+| `TimesfmForecastStrategy` | `name = "timesfm"`; `TimesFMForecastParams` (pydantic) + `PARAM_SPACE` | strategy driven by the forecast artifact: AND-composed entries, a priority-ordered exit decision tree, the `forecast_*` diagnostic columns and `exit_code` (§4.14) |
 | `register_strategy` | `register_strategy(cls: type[Strategy]) -> type[Strategy]` | décorateur de classe qui enregistre la stratégie dans `STRATEGIES` |
 | `get_strategy` | `get_strategy(name: str, params: Mapping[str, Any] \| None = None) -> Strategy` | instancie une stratégie enregistrée |
 | `strategy_names` / `strategy_param_space` | `strategy_names() -> list[str]`, `strategy_param_space(name: str) -> dict[str, list[float \| int]]` | noms disponibles et grille de paramètres d'une stratégie (base du balayage de robustesse) |
@@ -425,6 +444,9 @@ identiques donnent des résultats identiques.
 | `trading walk-forward` | options de `backtest` + `--windows`, `--is-ratio`, `--mode`, `--metric` | walk-forward sur les fenêtres de `validation.make_windows` |
 | `trading robustness` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--metric`, `--max-combinations`, `--output-dir`, `--formats`, `--no-network` (pas de `--start`/`--end`) | balayage paramétrique du `validation.robustness_grid` (grille vide ⇒ `strategy.PARAM_SPACE` de la stratégie) |
 | `trading monte-carlo` | `--config`, `--symbol`, `--timeframe`, `--data-file`, `--simulations`, `--method`, `--seed`, `--output-dir`, `--formats` (pas de `--no-network`) | Monte Carlo sur les trades d'un backtest |
+| `trading forecast-build` | `--config/-c`, `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context`, `--horizon`, `--reforecast-every` | builds the forecast **parquet artifact** (plus its `*.meta.json` sidecar) from a candle file, offline and origin by origin |
+| `trading forecast-skill` | `--artifact`, `--data-file` | offline skill report: RMSE/MAE/MASE against the random walk, decile coverage, directional accuracy at the horizon |
+| `trading forecast-info` | `--artifact` | artifact metadata (schema, backend, model, span, licence) |
 | `trading data download` | `--config`, `--symbol`, `--timeframe`, `--start`, `--end` (tous obligatoires) | téléchargement OHLCV vers le cache — seule commande qui peut sortir sur le réseau |
 | `trading config show` / `config validate` | `--config/-c` | affiche la configuration effective / valide un fichier `AppConfig` **ou** Freqtrade (type détecté automatiquement) |
 | `trading realtime run` | `--profiles/-p` (obligatoire), `--host`, `--port` (0 = port éphémère), `--once`, `--json` | démarre le moteur **et** le serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
@@ -914,6 +936,85 @@ n'attache aucun contrôleur).
   si l'aplatissement échoue. Le détail (payloads, codes d'erreur, sémantique) est
   dans `docs/realtime.md` §5 et §8.
 
+### 4.13 The forecasting layer — `trading_platform.forecast`
+
+Layer **2.5**: it sits between `core` and `strategy` (`core -> forecast ->
+strategy -> cli`) and may import `core` plus the standard library, `numpy`,
+`pandas` and `pyarrow` — nothing else. `torch`, `timesfm` and `jax` are optional
+and imported **lazily inside functions**, so importing the package, running the
+CLI and running the whole suite stay green with the `.[dev]` extra alone. The
+TimesFM model therefore **never** runs inside `Strategy.prepare()` /
+`Strategy.signals()`: prediction is pre-computed **offline** by the CLI into a
+versioned parquet artifact that the strategy consumes as a deterministic
+external input. The full reference — artifact schema, backend contract, licence
+table, measured traps and the honesty section — is
+[`docs/forecasting.md`](forecasting.md).
+
+#### 4.13.1 Types and errors
+
+| Symbol | Key signature | Role |
+| --- | --- | --- |
+| `ForecastRequest` | `@dataclass(frozen=True)`: `origin: pd.Timestamp`, `context: tuple[float, ...]` | one forecast request: the origin and the **past** context window (never the future) |
+| `ForecastTrajectory` | `@dataclass(frozen=True)`: `origin`, `timeframe`, `horizon`, `quantile_levels: tuple[float, ...]`, `quantiles: np.ndarray` `(len(quantile_levels), horizon)` `float32`; `median` property (the `0.5` row) and path-shape helpers (`alpha(k)`) | one probabilistic trajectory per origin |
+| `ForecastError` | `core.errors`, listed in `core.errors.__all__` | forecasting-layer failure (unknown backend, missing optional extra) |
+| `ForecastArtifactError` | `core.errors`, listed in `core.errors.__all__` | artifact missing, corrupt, truncated or of an incompatible schema |
+
+#### 4.13.2 Backends and registry
+
+| Symbol | Key signature | Role |
+| --- | --- | --- |
+| `ForecastBackend` | `Protocol`: `name: str`, `is_available() -> bool`, `predict(requests, *, horizon) -> list[ForecastTrajectory]` | the backend contract; `is_available()` returns `False` (never raises) when the extra is missing |
+| `register_backend` | class decorator `register_backend(cls) -> type[ForecastBackend]` | registers a backend under its `name` (mirrors `strategy.registry`) |
+| `available_backends` / `installed_backends` | `() -> list[str]` | names known to the process / names that can actually run (`is_available()`) |
+| `get_backend` | `get_backend(name: str, **options) -> ForecastBackend` | builds a registered backend; `ForecastError` when the name is unknown or the extra is absent |
+| `naive` | backend `name = "naive"`, numpy/pandas only | random walk: flat median held at the last context point, dispersion from trailing absolute differences scaled by `sqrt(step)` |
+| `seasonal` | backend `name = "seasonal"`, numpy/pandas only | seasonal baseline drift-corrected in the de-seasonalised space; deterministic and calendar aware |
+| `timesfm` | backend `name = "timesfm"`, `[timesfm]` extra | TimesFM 2.5 (`google/timesfm-2.5-200m-pytorch`, Apache-2.0), lazy import, requests batched by context length, CPU on Apple silicon (MPS is not supported by the 2.5 path) |
+
+#### 4.13.3 Artifact, store and skill report
+
+| Symbol | Key signature | Role |
+| --- | --- | --- |
+| `ForecastStore` | `ForecastStore.load(path) -> ForecastStore`, then `metadata`, `origins() -> pd.DatetimeIndex`, `origin_for(timestamp)`, `trajectory(origin)` (lazy per-origin cache) | read-only view of the artifact; an explicit `ForecastArtifactError` on a missing / corrupt / incompatible file, never a silent degradation |
+| `build_forecast_artifact` | `build_forecast_artifact(frame, out, config) -> Path` | builds the artifact origin by origin on the `reforecast_every` stride, each origin using **only** the candles `<= origin`, then writes the JSON metadata sidecar |
+| `ForecastBuildConfig` | build settings: `backend`, `context_length`, `horizon`, `reforecast_every`, `symbol`, `timeframe`, backend options | describes **what** is built (and feeds the sidecar) |
+| skill report | offline helper used by `trading forecast-skill` | RMSE / MAE / MASE against the random walk, decile coverage, directional accuracy at the horizon |
+
+The artifact is a **parquet** file: a `DatetimeIndex` named `origin` (the last
+context candle), the `horizon` / `stride` / `n_quantiles` columns (`int16`) and
+the `quantile_levels` / `median` / `quantiles` columns (`list<float32>`, with
+`quantiles` in **row-major** order, length `n_quantiles × horizon`). The sidecar
+`<artifact>.meta.json` carries the schema version, the symbol, the timeframe, the
+backend, the model id, the context length, the stride, the horizon, the quantile
+levels, the feature list, the creation timestamp, the package version, the data
+span and the licence note. The exact schema and the commands are in
+[`docs/forecasting.md`](forecasting.md) §2 and §5.
+
+#### 4.13.4 CLI commands
+
+`trading forecast-build` (options `--config/-c`, `--data-file`, `--out`,
+`--backend naive|seasonal|timesfm`, `--context`, `--horizon`,
+`--reforecast-every`), `trading forecast-skill` (`--artifact`, `--data-file`) and
+`trading forecast-info` (`--artifact`) — all of them accept `--json`, like the
+rest of the CLI. The `make forecast-build` target calls the first one.
+
+### 4.14 The `timesfm` strategy — `trading_platform.strategy.timesfm_forecast`
+
+| Element | Frozen content |
+| --- | --- |
+| Registered name | `timesfm` (`TimesfmForecastStrategy.name`), resolved by `get_strategy("timesfm")` and therefore by `strategy.name` in the configuration |
+| Parameters | `TimesFMForecastParams` (pydantic, `extra="forbid"`, cross-field validator) + `PARAM_SPACE` for the robustness sweep: artifact wiring, `context_length`, `horizon`, `reforecast_every`, `min_lead`, the forecast-age bound, the entry gates, the exit thresholds, the ATR stop, cooldown / maximum holding time, `allow_short` |
+| `prepare` | adds the house indicators (`rsi`, `atr`, `ema`) **and** the diagnostic columns: `forecast_alpha_<k>`, `forecast_slope`, `forecast_mfe`, `forecast_mae`, `forecast_path_eff`, `forecast_iqr_term`, `forecast_iqr_per_bar`, `forecast_reliability`, `forecast_agreement`, `vol_ratio`, `forecast_age`, `atr_pct`, `exit_code` |
+| `signals` | **AND-composed** entries (sign and size of the predicted edge, edge vs ATR, reliability, decile agreement, path efficiency, volatility regime, ATR-percentile window, optional RSI filter, freshness guard, cooldown) and a **priority-ordered exit tree**: `FORECAST_FLIP`, `EDGE_DECAY`, `TARGET_REACHED`, `PATH_DEGRADED`, `TIME_STOP`, `VOL_REGIME`, plus the static ATR stop carried by the `stop_loss` column and the stale-forecast guard |
+| Missing data | missing artifact, unknown origin, stale origin or a decision outside the covered window ⇒ **no signal at all**: never an exception, never a guess |
+| Auditability | `exit_code` (an integer) names the exit reason that fired, in priority order (`docs/forecasting.md` §10) |
+| Short / long | *shorts* mirror *longs* exactly (the engine reads `stop_loss` as the mirror of the long formula) |
+
+The `basic` strategy stays **unchanged**: `timesfm` is an additional strategy in
+the registry, and the artifact is injected into it through the
+`trading_platform.strategy.features` seam, used by
+`run_backtest_on_config` / `make_runner`.
+
 ---
 
 ## 5. Contrat de données OHLCV
@@ -1125,6 +1226,7 @@ paires `(timestamp, valeur)` sérialisables.
 | Nouvelle stratégie | hériter de `Strategy` (en implémentant `prepare` et `signals`, et en déclarant `ParamsModel` / `PARAM_SPACE`) et décorer la classe avec `@register_strategy`, puis référencer `cls.name` dans `strategy.name` de la configuration |
 | Nouvel indicateur | fonction pure ajoutée à `trading_platform.strategy.indicators`, sans effet de bord |
 | Nouvelle métrique | entrée ajoutée au dictionnaire `values` de `compute_metrics` + nom ajouté à `METRIC_NAMES` (l'ordre de `METRIC_NAMES` est l'ordre de calcul ; le tableau du rapport markdown trie les clés par ordre alphabétique) |
+| New forecast backend | implement the `ForecastBackend` `Protocol` (`name`, `is_available`, `predict`) and decorate the class with `@register_backend` in `trading_platform.forecast`: the CLI (`--backend <name>`) and the artifact builder resolve it by name, without touching the strategy |
 | Nouvel exécuteur | fonction conforme à `RunnerFn`, passée aux fonctions de validation (`walk_forward`, `parameter_sweep`) à la place de `make_runner(cfg)` |
 | Nouveau mode de validation | nouveau module dans `trading_platform.validation`, exposé par la CLI, sans toucher au moteur |
 | Nouvel exchange | implémentation dans `trading_platform.data`, l'import `ccxt` restant paresseux |

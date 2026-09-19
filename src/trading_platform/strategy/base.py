@@ -21,6 +21,12 @@ every strategy self-documenting, immutable and JSON-serialisable through
 
 Every contract violation is reported as
 :class:`~trading_platform.core.errors.StrategyError`.
+
+Both methods stay **pure and I/O-free**.  A strategy that needs an external
+input (a pre-computed forecast artifact, for example) receives it through
+:meth:`Strategy.set_feature_bundle` — the seam implemented by
+:mod:`trading_platform.strategy.features` — and never reads it back from disk
+inside ``prepare`` or ``signals``.
 """
 
 from __future__ import annotations
@@ -226,11 +232,39 @@ class Strategy(ABC):
                 f"params must be a mapping or a {self.ParamsModel.__name__} instance, "
                 f"got {type(params).__name__}"
             )
+        #: External, pre-resolved inputs (see
+        #: :func:`trading_platform.strategy.features.attach_features`).  ``None``
+        #: means "this strategy has no external input"; the base class never reads
+        #: it, so a strategy with no external dependency is unaffected.
+        self._feature_bundle: object | None = None
 
     @property
     def params(self) -> StrategyParams:
         """The validated, immutable parameters of this strategy."""
         return self._params
+
+    def set_feature_bundle(self, features: object | None = None) -> None:
+        """Attach the external features of this run (documented no-op hook).
+
+        The base implementation accepts **any** value — including ``None`` — and
+        simply stores it: a strategy that consumes no external input (such as
+        :class:`~trading_platform.strategy.basic.BasicStrategy`) therefore keeps
+        its exact previous behaviour whether or not the engine injects a bundle.
+        A strategy that does consume external features overrides this method,
+        narrows the argument by validation and reports a wrong type as
+        :class:`~trading_platform.core.errors.StrategyError`.
+
+        Parameters
+        ----------
+        features:
+            The resolved features.  ``None`` clears them.
+        """
+        self._feature_bundle = features
+
+    @property
+    def feature_bundle(self) -> object | None:
+        """The external features attached to this instance, or ``None``."""
+        return self._feature_bundle
 
     def param_space(self) -> dict[str, list[float | int]]:
         """Return a **copy** of the parameter grid of this strategy."""

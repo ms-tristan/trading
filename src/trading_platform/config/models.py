@@ -34,6 +34,7 @@ __all__ = [
     "BenchmarkConfig",
     "DataConfig",
     "ExchangeConfig",
+    "ForecastConfig",
     "MonitoringConfig",
     "ProfileConfig",
     "RealtimeConfig",
@@ -116,6 +117,24 @@ class StrategyConfig(BaseModel):
     name: str = "basic"
     timeframe: str = DEFAULT_TIMEFRAME
     params: dict[str, ParamValue] = Field(default_factory=dict)
+
+
+class ForecastConfig(BaseModel):
+    """Offline forecast artifact consumed by the ``timesfm`` strategy.
+
+    The artifact is built *outside* the strategy (``trading forecast-build``) and
+    read once per run through
+    :func:`trading_platform.strategy.features.resolve_features`, so a strategy
+    never performs I/O of its own and the whole decision path stays deterministic
+    and testable without any machine-learning dependency installed.
+
+    A missing path is a valid configuration: the strategy then produces **no
+    signal at all** (rather than guessing or raising).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    artifact: Path | None = None
 
 
 class BacktestConfig(BaseModel):
@@ -412,6 +431,9 @@ class AppConfig(BaseSettings):
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     realtime: RealtimeConfig = Field(default_factory=RealtimeConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    #: Declared last on purpose: the field order of every pre-existing
+    #: configuration therefore never moves.
+    forecast: ForecastConfig = Field(default_factory=ForecastConfig)
 
     @property
     def timezone(self) -> str:
