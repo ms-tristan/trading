@@ -435,6 +435,52 @@ which is why this layer measures its own skill instead of claiming one:
 | [arXiv:2607.12248](https://arxiv.org/abs/2607.12248) — *When Directional Accuracy Lies* | The reported ~80 % directional accuracy of a LoRA-adapted TimesFM-2.5 is a **base-rate artifact** (an always-up rule already scores ~0.70); no directional skill over the base rate at any horizon. |
 | [arXiv:2607.05291](https://arxiv.org/abs/2607.05291) — *Forecasting Realized Volatility with TSFMs* | TimesFM-2.5 **loses to Log-HAR at every horizon** on realised volatility (QLIKE ratios 1.086 / 1.201 / 1.331). |
 
+### Measured on this machine (2026-09-19, real BTC/USDT)
+
+The two offline baselines and the real TimesFM 2.5 checkpoint were run side by
+side on **2 000 real hourly Binance BTC/USDT candles** (2023-01-01 →
+2023-03-25, a `+66 %` buy-and-hold window), context `1024`, horizon `24`,
+stride `24`: **41 non-overlapping origins**, **984 `(origin, step)` pairs**. The
+data is *not* committed (`.gitignore` ignores `/data/`); reproduce it with the
+repository's own downloader, then score each backend:
+
+```bash
+make data-download                                   # fills data/cache/binance/BTC_USDT/1h.parquet
+.venv/bin/python -m trading_platform forecast-build --config config/backtest_default.json \
+    --data-file <candles.csv> --out forecast.parquet --backend timesfm \
+    --context 1024 --horizon 24 --reforecast-every 24 \
+    --model-id google/timesfm-2.5-200m-pytorch --symbol BTC/USDT
+.venv/bin/python -m trading_platform forecast-skill --artifact forecast.parquet --data-file <candles.csv>
+```
+
+| Backend | `rmse_skill_score` | `mae_skill_score` | `directional_accuracy_horizon` | wall clock |
+| --- | --- | --- | --- | --- |
+| `timesfm` (2.5-200m, 41 origins batched, CPU) | **+0.0068** | **+0.0122** | **0.650** | 3.7 s (model load included) |
+| `naive` (random walk) | 0.0000 | 0.0000 | n/a (its median path is flat) | < 0.1 s |
+| `seasonal` (de-seasonalised drift) | −0.2734 | −0.2878 | 0.525 | < 0.1 s |
+
+**What that actually means — and it is not a green light.** On the 41 discrete
+`24 h` endpoints (the decision-relevant horizon of this strategy) the skill over
+the random walk **vanishes**: mean squared error `0.001489` (TimesFM) versus
+`0.001480` (random walk), a Diebold–Mariano statistic of **+0.055 → two-sided
+p = 0.956**. The 65 % directional accuracy is *not* a base-rate artifact on this
+sample (the up-rate of those 41 windows is only `0.475`, so an always-long rule
+scores `0.525`) and the forecast/realised correlation is weakly positive
+(`+0.113`) — but `n = 41` inside a single `+66 %` trend window is **not**
+evidence of a tradeable edge. The honest reading is the one the literature
+predicts: **the point forecast behaves like a random walk shrunk mildly toward
+zero**.
+
+Two consequences are built into the design and were confirmed by this run:
+
+- the default gates (`min_reliability = 0.5`, `min_path_efficiency = 0.2`,
+  `min_agreement = 0.6`) are **materially stricter** than what this checkpoint
+  produces on 1h crypto, so the honest default behaviour is *few or no trades*
+  instead of a forced position;
+- the `seasonal` baseline **loses** to the random walk by a wide margin on real
+  data, so "the strategy made money on synthetic candles" is not evidence of
+  anything — which is precisely why this section exists.
+
 **How to check it yourself.** Run `trading forecast-skill --artifact … --data-file …`
 and read the numbers:
 
