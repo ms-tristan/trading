@@ -34,7 +34,14 @@ Frozen order of one tick (each step numbered as in the delivery brief)
 4. run the strategy -- ``prepare`` then ``signals`` -- and read the **last** row,
    which is the just-closed candle;
 5. check the static stop of an open position *first*, intrabar;
-6. otherwise map the signal row to an action;
+6. otherwise map the signal row to an action.  The **entry** decision may read the
+   last ``1 + entry_lookback_candles`` rows (``0``, the default, keeps reading the
+   last row only): a crossover that happened within that window is caught up on
+   when the current row still confirms the trend and that signal row has never
+   been acted upon, while **exits and stops keep reading the last row only**.  A
+   catch-up entry is an ordinary entry: it travels the frozen risk path of step 8
+   (same counters, same daily cap, same risk inputs, same shared-wallet funding
+   check) and is never marked as acted upon until that path accepted it;
 7. build the deterministic order (client id from profile + symbol + candle
    timestamp + per-candle sequence, reference price = the candle close);
 8. submit through the gateway, turning a risk/kill-switch/venue refusal into a
@@ -68,7 +75,7 @@ from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
-from trading_platform.config.models import ProfileConfig
+from trading_platform.config.models import MAX_ENTRY_LOOKBACK_CANDLES, ProfileConfig
 from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
 from trading_platform.core.errors import (
     KillSwitchActiveError,
@@ -183,6 +190,30 @@ class _OrderPlan:
 
 
 @dataclass(frozen=True)
+class _EntryBasis:
+    """Which row of the signals frame the entry decision is taken from.
+
+    ``row_index`` is a **positional** index into the signals frame and ``-1`` is
+    the historical decision: the last row.  ``timestamp`` is the timestamp of the
+    signal row itself -- *not* the candle being processed -- and ``reference_price``
+    is the close of that very same row.
+
+    Keeping the reference price and the ATR stop on the **same** row is what makes
+    the coherence of a catch-up entry structural rather than a convention: the stop
+    flows from :meth:`ProfileRunner._catch_up_plan` into the same ``_OrderPlan`` as
+    the reference price, :meth:`ProfileRunner._route` passes that reference price as
+    the fill reference and :meth:`ProfileRunner._quantity` divides the stake by it,
+    so the size, the fill and the protective stop can never describe two different
+    rows of the market.
+    """
+
+    row_index: int
+    timestamp: pd.Timestamp
+    reference_price: float
+    is_catch_up: bool
+
+
+@dataclass(frozen=True)
 class _EquityState:
     """The accounting read of one profile at one candle, risk inputs included."""
 
@@ -290,6 +321,7 @@ class ProfileRunner:
         self._status = ProfileStatus.STOPPED
         self._degraded_detail = ""
         self._last_processed: pd.Timestamp | None = None
+        self._last_acted_entry_crossing: pd.Timestamp | None = None
         self._lag_seconds = 0.0
         self._last_error: str | None = None
         self._sequence = 0
@@ -381,6 +413,14 @@ class ProfileRunner:
         self._status = ProfileStatus.STARTING
         state = self._store.profile_state(self.profile_id)
         self._last_processed = _as_utc_optional(self._store.last_processed_candle(self.profile_id))
+        # The entry watermark is durable and per profile: without this read a
+        # restart would forget the crossover it already acted upon and open the
+        # same entry a second time.  A store that does not expose the pair at all
+        # answers "nothing was ever acted upon", which is the exact behaviour of
+        # every store written before it existed.
+        crossing_reader = getattr(self._store, "last_acted_entry_crossing", None)
+        crossing_value = None if crossing_reader is None else crossing_reader(self.profile_id)
+        self._last_acted_entry_crossing = _as_utc_optional(crossing_value)
         self._lag_seconds = float(state.lag_seconds)
         previous_error = state.last_error
         self._last_error = (
@@ -601,7 +641,7 @@ class ProfileRunner:
             return None
 
         # 4. the strategy is the only producer of indicators and rules.
-        _prepared, signals = self._strategy_run(frame)
+        prepared, signals = self._strategy_run(frame)
 
         # 3b. seed the persisted candle history once, from the very window the
         #     strategy just consumed. It is display only: these rows feed the
@@ -615,7 +655,8 @@ class ProfileRunner:
             self._history_seeded = True
 
         # 5. and 6. stop first, then the signal row of the just-closed candle.
-        plan = self._plan(candle, signals)
+        basis = self._entry_basis(signals, float(candle.close), prepared)
+        plan = self._plan(candle, signals, prepared)
         state = self._equity_state(stamp, plan.reference_price)
 
         # 7. and 8. the order, routed through the one lifecycle.
@@ -648,6 +689,12 @@ class ProfileRunner:
             # persisted: the tick stops here, the candle is not watermarked, and
             # the loop lives on (the refusal is a decision, not a crash).
             return decision
+
+        # 8b. only a catch-up entry the risk path accepted is marked as acted
+        #     upon: a refused one must be retried on the next tick, through this
+        #     very same path, and never through a side door of its own.
+        if basis.is_catch_up and decision.action is SignalAction.ENTER_LONG:
+            self._record_catch_up(basis)
 
         # 9. fold the venue's answer back into the local state.
         self._gateway.poll()
@@ -874,8 +921,20 @@ class ProfileRunner:
             return row
         return pd.concat([window, row])
 
-    def _plan(self, candle: CandleEvent, signals: pd.DataFrame) -> _OrderPlan:
-        """Decide what to do on this candle: the static stop first, the signal else."""
+    def _plan(
+        self,
+        candle: CandleEvent,
+        signals: pd.DataFrame,
+        prepared: pd.DataFrame | None = None,
+    ) -> _OrderPlan:
+        """Decide what to do on this candle: the static stop first, the signal else.
+
+        The static stop of an open position is read intrabar, **on the current
+        candle**, exactly as it always was: exits and stops act on the last row
+        only and never consult the entry lookback.  The entry decision is the only
+        one the lookback widens (see :meth:`_entry_basis`), and a catch-up entry
+        only happens when the frame's last row still confirms the trend.
+        """
         close = float(candle.close)
         position = self._gateway.position()
         if position is not None and position.stop_price is not None:
@@ -892,7 +951,14 @@ class ProfileRunner:
                     stop_price=stop,
                     closes_position=True,
                 )
-        row = signals.iloc[-1]
+        if position is None and self._entry_lookback() > 0:
+            basis = self._entry_basis(signals, close, prepared)
+            if basis.is_catch_up and basis.row_index != -1:
+                return self._catch_up_plan(basis, signals, candle, position)
+        return self._plan_at(signals.iloc[-1], close, position)
+
+    def _plan_at(self, row: pd.Series, close: float, position: Position | None) -> _OrderPlan:
+        """Map one signal row to a plan (the historical decision, unchanged)."""
         raw_stop = _finite_or_none(row["stop_loss"]) if "stop_loss" in row.index else None
         params = self._strategy.params if self._strategy is not None else None
         short_enabled = bool(getattr(params, "allow_short", False))
@@ -939,6 +1005,226 @@ class ProfileRunner:
                 closes_position=True,
             )
         return _OrderPlan(action=SignalAction.HOLD, direction=None, reference_price=close)
+
+    def _entry_lookback(self) -> int:
+        """Return the effective catch-up window of this profile, clamped.
+
+        ``ProfileConfig`` already refuses a negative or absurd value, so the clamp
+        is unreachable for a validated configuration -- it is what keeps "an
+        absurd lookback degrades safely instead of raising" true even for a
+        profile object built in memory that bypassed validation.
+        """
+        lookback = int(getattr(self._profile, "entry_lookback_candles", 0))
+        return min(max(lookback, 0), MAX_ENTRY_LOOKBACK_CANDLES)
+
+    def _entry_basis(
+        self,
+        signals: pd.DataFrame,
+        close: float,
+        prepared: pd.DataFrame | None = None,
+    ) -> _EntryBasis:
+        """Return the row of the signals frame the entry decision is taken from.
+
+        With no lookback configured -- or with a frame too short to hold a
+        decision -- this is the historical basis: the last row, no catch-up.
+        Otherwise the last ``1 + lookback`` rows are scanned **newest first** and
+        the first admissible crossover wins, provided that
+
+        * the row carries ``entry_long``;
+        * the row is strictly newer than the persisted entry watermark, so a
+          crossover already acted upon can never trigger again;
+        * the **current last row still confirms the trend**: ``entry_long`` is a
+          one-candle cross event, so a cross N candles old is confirmed by the
+          current row *not* carrying its reversal (see :meth:`_trend_reversed`).
+          A cross whose trend has already reversed is refused, and every older
+          candidate fails the same test, so the outcome is a ``HOLD``.
+
+        A candidate that *is* the last row is not a catch-up at all: it is the
+        historical single-row decision, and the lookback leaves it to ``_plan``.
+        ``entry_lookback_candles=0`` and ``entry_lookback_candles=N`` therefore
+        agree whenever the crossover sits on the current row.  The scan is bounded
+        by ``len(signals)``, so a lookback larger than the frame degrades into
+        scanning the whole frame -- never an index error, never a raise.
+
+        The reference price of a row is its ``close``.  The frozen signal contract
+        (:data:`~trading_platform.core.constants.SIGNAL_COLUMNS`) carries no OHLCV
+        column, so the price is read from ``prepared`` -- the frame the strategy
+        just consumed, indexed exactly like ``signals`` -- and falls back to the
+        injected candle close when that column is unavailable.
+        """
+        last_index = signals.index[-1]
+        prices = self._candidate_prices(signals, prepared)
+        last_price = None if prices is None else _finite_or_none(prices.iloc[-1])
+        fallback_price = float(close) if last_price is None else float(last_price)
+        flat = _EntryBasis(
+            row_index=-1,
+            timestamp=_as_utc(last_index),
+            reference_price=fallback_price,
+            is_catch_up=False,
+        )
+        lookback = self._entry_lookback()
+        if lookback <= 0 or len(signals) < MIN_FRAME_ROWS or prices is None:
+            return flat
+        last_row = signals.iloc[-1]
+        watermark = self._last_acted_entry_crossing
+        window = min(1 + lookback, len(signals))
+        for offset in range(1, window + 1):
+            index = len(signals) - offset
+            row = signals.iloc[index]
+            if not _flag(row, "entry_long"):
+                continue
+            if offset == 1:
+                # The candidate is the last row itself, so this is not a
+                # catch-up at all: the historical single-row branch of ``_plan``
+                # takes it, and the lookback stays out of the way.  It is the
+                # last candidate of the scan, because nothing older can confirm
+                # a trend the current row has already acted upon.
+                return flat
+            if self._trend_reversed(last_row):
+                # A cross N candles old whose trend has already reversed is
+                # stale: ``entry_long`` is a one-candle cross event, so the
+                # confirmation available on the current row is the absence of
+                # its reversal.  Every older candidate fails the same test, so
+                # the outcome is a HOLD.
+                self._log_catch_up_refused(
+                    signals, index, "the current row no longer confirms the trend"
+                )
+                return flat
+            row_timestamp = _as_utc(signals.index[index])
+            if watermark is not None and row_timestamp <= watermark:
+                # Already acted upon: this candidate can never trigger again.
+                continue
+            price = _finite_or_none(prices.iloc[index])
+            if price is None or price <= 0.0:
+                # An unusable price is never traded on: skip the candidate.
+                continue
+            return _EntryBasis(
+                row_index=index,
+                timestamp=row_timestamp,
+                reference_price=float(price),
+                is_catch_up=True,
+            )
+        return flat
+
+    @staticmethod
+    def _trend_reversed(last_row: pd.Series) -> bool:
+        """Return whether the frame's last row signals the reversal of the trend.
+
+        The frozen signal contract exposes no regime column: ``entry_long`` and
+        ``exit_long`` are one-candle **cross events** of ``BasicStrategy`` (a
+        cross is true on the single candle where the fast line overtakes the slow
+        one).  A crossover that happened N candles ago therefore *cannot* coexist
+        with ``entry_long`` on the current row, and the confirmation requirement 2
+        asks for is the current row **not** carrying the opposite event: an
+        ``exit_long`` on the last row means the bullish trend the old cross opened
+        has already been reversed, so the catch-up is refused.  A short-enabled
+        profile mirrors it with ``entry_short``.
+        """
+        return _flag(last_row, "exit_long") or _flag(last_row, "entry_short")
+
+    @staticmethod
+    def _candidate_prices(signals: pd.DataFrame, prepared: pd.DataFrame | None) -> pd.Series | None:
+        """Return the per-row close aligned with ``signals``, or ``None``.
+
+        ``prepared`` is preferred -- it is the strategy's own frame, indexed like
+        the signal one -- and a foreign signal frame carrying its own ``close``
+        column is accepted as well.  Anything else returns ``None``, and the
+        caller then keeps the historical last-row decision rather than raising.
+        """
+        for source in (prepared, signals):
+            if source is None or "close" not in source.columns:
+                continue
+            if len(source) != len(signals) or not source.index.equals(signals.index):
+                # A frame that is not aligned with the signal one cannot price a
+                # signal row: an unaligned lookup would be worse than no price.
+                continue
+            return source["close"]
+        return None
+
+    def _catch_up_plan(
+        self,
+        basis: _EntryBasis,
+        signals: pd.DataFrame,
+        candle: CandleEvent,
+        position: Position | None,
+    ) -> _OrderPlan:
+        """Return the plan of a catch-up entry, through the ordinary risk path.
+
+        The plan is an ordinary ``ENTER_LONG``: it is routed by :meth:`_route`,
+        counted by the same counters and funded by the same shared wallet as any
+        other entry.  The reference price and the stop both come from the signal
+        row the decision was taken on, so the pair can never disagree.
+        """
+        close = float(candle.close)
+        if position is not None:
+            return self._entry_while_open(close, position)
+        if self._paused:
+            return self._paused_plan(close)
+        params = self._strategy.params if self._strategy is not None else None
+        if bool(getattr(params, "allow_short", False)) and _flag(signals.iloc[-1], "entry_short"):
+            # The catch-up window covers the long entry only: the short entry has
+            # its own mirrored reference and no measured problem to solve.
+            log_event(
+                _LOGGER,
+                "catch_up_refused",
+                level=logging.WARNING,
+                profile_id=self.profile_id,
+                symbol=str(self._profile.symbol),
+                reason="catch-up unavailable for short entries",
+                signal_row_timestamp=basis.timestamp.isoformat(),
+            )
+            return _OrderPlan(
+                action=SignalAction.HOLD,
+                direction=None,
+                reference_price=close,
+                reason="catch-up unavailable for short entries",
+            )
+        row = signals.iloc[basis.row_index]
+        raw_stop = _finite_or_none(row["stop_loss"]) if "stop_loss" in row.index else None
+        log_event(
+            _LOGGER,
+            "catch_up_entry",
+            profile_id=self.profile_id,
+            symbol=str(self._profile.symbol),
+            signal_row_timestamp=basis.timestamp.isoformat(),
+            candles_behind=int(len(signals) - 1 - basis.row_index),
+            reference_price=float(basis.reference_price),
+            stop_price=None if raw_stop is None else float(raw_stop),
+        )
+        return _OrderPlan(
+            action=SignalAction.ENTER_LONG,
+            direction=Direction.LONG,
+            reference_price=float(basis.reference_price),
+            reason=ExitReason.SIGNAL.value,
+            stop_price=raw_stop,
+        )
+
+    def _log_catch_up_refused(self, signals: pd.DataFrame, index: int, reason: str) -> None:
+        """Record why an entry candidate of the lookback window was not acted upon."""
+        log_event(
+            _LOGGER,
+            "catch_up_refused",
+            level=logging.WARNING,
+            profile_id=self.profile_id,
+            symbol=str(self._profile.symbol),
+            reason=reason,
+            signal_row_timestamp=_as_utc(signals.index[index]).isoformat(),
+        )
+
+    def _record_catch_up(self, basis: _EntryBasis) -> None:
+        """Persist the signal row acted upon and move the in-memory cursor, once.
+
+        Called from the single point of :meth:`run_once` where the tick has been
+        accepted, so a refused catch-up entry leaves the watermark untouched and
+        the very same crossover is retried on the next tick through the ordinary
+        risk path.  The store's own write is monotonic, and a store that does not
+        expose it is simply left alone -- its runner then keeps the in-memory
+        cursor, which is exactly one tick's worth of protection.
+        """
+        writer = getattr(self._store, "mark_acted_entry_crossing", None)
+        if writer is not None:
+            writer(self.profile_id, basis.timestamp)
+        self._last_acted_entry_crossing = basis.timestamp
 
     def _entry_while_open(self, close: float, position: Position) -> _OrderPlan:
         """Ignore an entry signal while a position is open, exactly like the engine.

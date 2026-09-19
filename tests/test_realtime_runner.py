@@ -112,7 +112,12 @@ def candle_at(frame: pd.DataFrame, index: int) -> CandleEvent:
 
 
 def profile(**overrides: Any) -> ProfileConfig:
-    """Return a valid paper profile, overridable field by field."""
+    """Return a valid paper profile, overridable field by field.
+
+    ``entry_lookback_candles`` is omitted unless a test states it, so every
+    historical test keeps building the profile it always built: the default
+    (``0``) is applied by the model and reproduces the last-row behaviour.
+    """
     payload: dict[str, Any] = {
         "id": "btc-paper",
         "symbol": SYMBOL,
@@ -211,6 +216,8 @@ class FakeStore:
         self.appended_trades: list[tuple[TradeRecord, str]] = []
         self.marked: list[tuple[str, pd.Timestamp]] = []
         self.profiles: list[ProfileConfig] = []
+        self.entry_crossings: dict[str, pd.Timestamp] = {}
+        self.acted_crossings: list[tuple[str, pd.Timestamp]] = []
 
     def initialize(self) -> None:  # pragma: no cover - the runner never calls it
         return None
@@ -235,6 +242,22 @@ class FakeStore:
     def mark_candle_processed(self, profile_id: str, timestamp: pd.Timestamp) -> None:
         self.marked.append((profile_id, pd.Timestamp(timestamp)))
         self.last_processed = pd.Timestamp(timestamp)
+
+    def last_acted_entry_crossing(self, profile_id: str) -> pd.Timestamp | None:
+        """Return the signal row an entry was last acted upon, or ``None``."""
+        return self.entry_crossings.get(profile_id)
+
+    def mark_acted_entry_crossing(self, profile_id: str, timestamp: pd.Timestamp) -> None:
+        """Record an acted-upon crossing, keeping the maximum, like the store."""
+        stamp = pd.Timestamp(timestamp)
+        known = self.entry_crossings.get(profile_id)
+        if known is None or stamp > known:
+            self.entry_crossings[profile_id] = stamp
+        self.acted_crossings.append((profile_id, stamp))
+
+    def acted_crossings_of(self, profile_id: str = "btc-paper") -> list[tuple[str, pd.Timestamp]]:
+        """Return the recorded crossing writes of one profile, in append order."""
+        return [item for item in self.acted_crossings if item[0] == profile_id]
 
     def append_candle(self, candle: CandleEvent, *, profile_id: str) -> bool:
         """Record one processed candle, mirroring the store's upsert answer."""

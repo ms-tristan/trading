@@ -987,6 +987,7 @@ inconnue, dont `api_key`, est refusée bruyamment) :
 | `warmup_candles` | `int >= 1` | bougies passées fournies à la stratégie à chaque décision |
 | `poll_interval_seconds` | `float > 0` | cadence de sondage propre au profil |
 | `risk` | `object` | bloc `RiskLimitsConfig` ci-dessous |
+| `entry_lookback_candles` | `int` dans `[0, 200]` (défaut `0`) | fenêtre de rattrapage **live uniquement** : la décision d'entrée peut porter sur un croisement survenu dans les `N` dernières bougies ; `0` conserve le comportement historique (seule la dernière ligne décide) ; le backtest l'ignore, il lit déjà chaque ligne |
 
 `risk` (`RiskLimitsConfig`) — toutes les limites sont optionnelles, `null`
 signifie « non appliquée », et `0` est une valeur **valide** pour les limites de
@@ -1022,6 +1023,31 @@ comptage :
 | `risk_free_rate` | `0.0` | taux sans risque annuel du benchmark du read model |
 | `benchmark_variant` | `buy_and_hold` | variante de benchmark (`none` la désactive) |
 | `kill_switch_file` | `null` | fichier drapeau du kill switch global |
+
+Une entrée de `profiles` accepte aussi `entry_lookback_candles` (`int` dans
+`[0, 200]`, défaut `0`) : la fenêtre de rattrapage **live uniquement** — `0`
+conserve le comportement historique (seule la dernière bougie décide), `N > 0`
+autorise l'entrée sur un croisement survenu dans les `N` dernières bougies. Le
+backtest ignore ce champ, il lit déjà chaque ligne :
+
+```json
+{
+  "profiles": [
+    {
+      "id": "btc-paper",
+      "symbol": "BTC/USDT",
+      "timeframe": "1h",
+      "strategy": "basic",
+      "mode": "paper",
+      "initial_balance": 10000.0,
+      "warmup_candles": 200,
+      "poll_interval_seconds": 5.0,
+      "risk": {},
+      "entry_lookback_candles": 3
+    }
+  ]
+}
+```
 
 `monitoring` (`MonitoringConfig`) :
 
