@@ -33,6 +33,21 @@
   --color-warn: #f59e0b;
   --color-info: #38bdf8;
 
+  /* -- pressed surfaces (a press must be visible, never a layout shift) --- */
+  /*
+   * Primary darkens (on-accent #0f172a stays at 5.55:1). Destructive LIGHTENS
+   * because #ef4444 is already the darkest red that keeps on-destructive
+   * #000000 at 4.5:1 (5.58:1, while #f87171 gives 7.59:1). Secondary and ghost
+   * lighten to stay distinguishable from their own hover shade. Every pressed
+   * shade keeps >= 4.5:1 for its label (secondary #ffffff on #334155 = 10.35:1;
+   * ghost #f8fafc on #2a3050 = 12.2:1). Colour only: no size, padding or
+   * offset change, so a press can never reflow the layout.
+   */
+  --color-accent-pressed: #16a34a;
+  --color-secondary-pressed: #334155;
+  --color-destructive-pressed: #f87171;
+  --color-muted-pressed: #2a3050;
+
   /* -- chart series ------------------------------------------------------- */
   --color-chart-equity: #22c55e;
   --color-chart-cash: #38bdf8;

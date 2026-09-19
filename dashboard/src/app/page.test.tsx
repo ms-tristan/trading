@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The page is an async Server Component: awaiting it runs the real fetch seam,
@@ -159,10 +159,18 @@ describe('OverviewPage', () => {
 
     render(await OverviewPage());
 
-    expect(screen.getByRole('status')).toHaveTextContent(
+    const banner = screen.getByRole('status');
+    // The headline is the mapped one: the transport message is never the
+    // explanation the operator reads first...
+    expect(within(banner).getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    // ...it stays visible, verbatim, as the detail line under it.
+    expect(within(banner).getByTestId('error-banner-detail')).toHaveTextContent(
       'network error calling /api/profiles: fetch failed',
     );
-    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+
+    // The empty state keeps its documented title (the banner repeats it).
+    expect(screen.getAllByText('The monitoring API is unreachable')).toHaveLength(2);
+    expect(screen.getByText(/No payload was returned by/)).toBeInTheDocument();
     expect(screen.getByText(/API_ORIGIN/)).toBeInTheDocument();
     expect(screen.getByText(new RegExp(API_ORIGIN))).toBeInTheDocument();
 
@@ -174,5 +182,26 @@ describe('OverviewPage', () => {
     expect(fetchHealth).toHaveBeenCalledTimes(1);
     expect(fetchProfiles).toHaveBeenCalledTimes(1);
     expect(fetchKillSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads a proxy 502 as the monitoring API being unreachable, never as a bare status', async () => {
+    vi.mocked(fetchProfiles).mockRejectedValue(
+      new ApiError('http', 'HTTP 502', { status: 502, path: '/api/profiles' }),
+    );
+
+    render(await OverviewPage());
+
+    const banner = screen.getByRole('status');
+    expect(within(banner).getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    // The raw status is never hidden — it is the detail, not the headline.
+    const detail = within(banner).getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 502');
+    expect(detail).toHaveTextContent('/api/profiles');
+    expect(screen.queryByText('HTTP 502')).not.toBeInTheDocument();
+
+    // The page is an ordinary render, not an error screen: no polling starts.
+    expect(screen.getByText(/No payload was returned by/)).toBeInTheDocument();
+    expect(screen.queryByText(/checked at/i)).not.toBeInTheDocument();
+    expect(fetchHealth).toHaveBeenCalledTimes(1);
   });
 });

@@ -46,6 +46,12 @@ export interface UsePollingResult<T> {
   checkedAt: string | null;
   /** Message of the last failure, or `null`. */
   error: string | null;
+  /**
+   * The value the fetcher rejected with, or `null`. `error` is its message;
+   * this keeps the original failure so a view can hand it to
+   * `failureReport` and show the operator-facing headline and detail.
+   */
+  failure: unknown | null;
   /** Whether live updates are currently paused. */
   isPaused: boolean;
   /** Stop the timer (keeps the data on screen). */
@@ -71,6 +77,7 @@ export function usePolling<T>({
   const [data, setData] = useState<T>(initialData);
   const [checkedAt, setCheckedAt] = useState<string | null>(initialCheckedAt);
   const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<unknown | null>(null);
   const [isPaused, setIsPaused] = useState<boolean>(!enabled);
 
   const fetcherRef = useRef(fetcher);
@@ -98,11 +105,13 @@ export function usePolling<T>({
       setData(next);
       setCheckedAt(new Date().toISOString());
       setError(null);
-    } catch (failure) {
+      setFailure(null);
+    } catch (thrown) {
       if (disposedRef.current || controller.signal.aborted) {
         return;
       }
-      setError(errorMessage(failure));
+      setError(errorMessage(thrown));
+      setFailure(thrown);
     }
   }, []);
 
@@ -148,5 +157,5 @@ export function usePolling<T>({
     };
   }, [isPaused, intervalMs, runCycle]);
 
-  return { data, checkedAt, error, isPaused, pause, resume, toggle, refreshNow };
+  return { data, checkedAt, error, failure, isPaused, pause, resume, toggle, refreshNow };
 }

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
@@ -235,7 +235,12 @@ describe('OverviewLive', () => {
     await advance(2000);
 
     const banner = screen.getByRole('status');
-    expect(banner).toHaveTextContent('network error calling /api/health');
+    // The operator reads the mapped headline, never the bare transport message.
+    expect(within(banner).getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    // The raw cause stays visible, verbatim, as the detail line.
+    expect(within(banner).getByTestId('error-banner-detail')).toHaveTextContent(
+      'network error calling /api/health',
+    );
     // The last known good payload and its stamp stay on screen.
     expect(screen.getByText('$10,450.50')).toBeInTheDocument();
     expect(screen.getAllByRole('article')).toHaveLength(2);

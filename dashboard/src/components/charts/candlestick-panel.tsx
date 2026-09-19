@@ -13,6 +13,12 @@
  *
  * Robustness: an empty series renders the chart's empty state, and a failed poll
  * shows the error banner **while keeping the last known good candles** on screen.
+ * A failure is never printed raw: the panel translates it once with
+ * {@link failureReport}, so the operator reads a monitoring-level headline (a
+ * `502`, `503` or `504` from the proxy, a connection failure and a timeout all
+ * say the monitoring API is unreachable) and the underlying status stays as the
+ * banner's detail line. The panel carries the machine-readable degraded state
+ * (`data-candles-stale`, `data-candles-count`) and offers an explicit retry.
  */
 
 import { useCallback, useMemo } from 'react';
@@ -26,6 +32,7 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { fetchCandles } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { CANDLE_RENDER_LIMIT, positionPriceLines, tradeMarkers } from '@/lib/candles';
 import type { CandlesPayload, PositionsPayload, TradesPayload } from '@/lib/types';
 import { usePolling } from '@/lib/use-polling';
@@ -94,12 +101,17 @@ export function CandlestickPanel({
     [baseUrl, fetchImpl, profileId],
   );
 
-  const { data, error, refreshNow } = usePolling<CandlesPayload>({
+  const { data, failure, refreshNow } = usePolling<CandlesPayload>({
     fetcher,
     // The server-rendered window is the first paint; the loop only refreshes it.
     initialData: initialCandles ?? EMPTY_CANDLES,
     intervalMs: detailIntervalMs,
   });
+
+  // The single translation layer of the dashboard: the banner shows the
+  // monitoring-level headline and keeps the raw status, the server text and the
+  // requested path in its detail line. `null` means "no failure on screen".
+  const report = failure === null ? null : failureReport(failure);
 
   const markers = useMemo(() => tradeMarkers(trades.trades), [trades]);
   const priceLines = useMemo(() => positionPriceLines(positions.positions), [positions]);
@@ -130,8 +142,21 @@ export function CandlestickPanel({
         </Button>
       }
     >
-      <div className="flex flex-col gap-lg">
-        <ErrorBanner message={error} onRetry={handleRefresh} />
+      <div
+        data-testid="candlestick-panel"
+        // Degraded state, readable without looking at the screen: a failed poll
+        // leaves the last known good payload in place, so the count stays at the
+        // last good one while the stale marker turns on.
+        data-candles-stale={report === null ? 'false' : 'true'}
+        data-candles-count={String(data.candles.length)}
+        className="flex flex-col gap-lg"
+      >
+        <ErrorBanner
+          message={report?.headline ?? null}
+          detail={report?.detail ?? null}
+          onRetry={handleRefresh}
+          retryLabel="Retry candles"
+        />
         <CandlestickChart
           candles={data.candles}
           markers={markers}

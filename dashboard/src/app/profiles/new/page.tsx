@@ -5,7 +5,8 @@ import { ServerCrash } from 'lucide-react';
 import { CreateProfileForm } from '@/components/profiles/create-profile-form';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { errorMessage, fetchCatalog } from '@/lib/api';
+import { fetchCatalog } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { serverApiBaseUrl } from '@/lib/config';
 import type { CatalogPayload } from '@/lib/types';
 
@@ -19,10 +20,11 @@ import type { CatalogPayload } from '@/lib/types';
  * and the overview it navigates back to is the surface that refreshes.
  *
  * A failure of the catalogue call renders the unreachable panel below instead of
- * throwing: an API outage never becomes a Next.js error screen. The operator
- * token is not fetched here — it lives in the browser `sessionStorage` and is
- * read by the form itself at submit time, because a Server Component never sees
- * the browser storage.
+ * throwing: an API outage never becomes a Next.js error screen, and the panel
+ * speaks the shared operator-facing copy (headline plus raw detail) rather than
+ * echoing a proxy status. The operator token is not fetched here — it lives in
+ * the browser `sessionStorage` and is read by the form itself at submit time,
+ * because a Server Component never sees the browser storage.
  */
 
 /**
@@ -54,15 +56,16 @@ function PageHeading() {
  * First paint rendered when the catalogue cannot be read.
  *
  * It is an ordinary page render, not an error screen: the operator gets the
- * documented failure message, the origin the dashboard tried to call (the
- * `API_ORIGIN` configuration) and what to check — and no form that could not be
- * submitted anyway.
+ * mapped failure headline plus its raw detail, the origin the dashboard tried to
+ * call (the `API_ORIGIN` configuration) and what to check — and no form that
+ * could not be submitted anyway.
  */
-function ApiUnreachable({ message, baseUrl }: { message: string; baseUrl: string }) {
+function ApiUnreachable({ failure, baseUrl }: { failure: unknown; baseUrl: string }) {
+  const report = failureReport(failure);
   return (
     <div className="flex flex-col gap-xl">
       <h1 className="font-mono text-xl font-semibold text-foreground">New profile</h1>
-      <ErrorBanner message={message} />
+      <ErrorBanner message={report.headline} detail={report.detail} />
       <EmptyState
         title="API unreachable"
         description={`The monitoring API is unreachable: no catalogue payload was returned by ${baseUrl}, so the profile form was not started. Check that the Python monitoring server is running and that API_ORIGIN points at it.`}
@@ -80,7 +83,7 @@ export default async function CreateProfilePage(): Promise<JSX.Element> {
   try {
     catalog = await fetchCatalog({ baseUrl });
   } catch (error) {
-    return <ApiUnreachable message={errorMessage(error)} baseUrl={baseUrl} />;
+    return <ApiUnreachable failure={error} baseUrl={baseUrl} />;
   }
 
   return (

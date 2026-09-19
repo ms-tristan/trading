@@ -147,6 +147,10 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
       className={cn(
         'group relative flex flex-col rounded-card border border-border bg-card p-xl text-card-foreground shadow-md',
         'hover:border-accent/50 focus-within:border-accent/50',
+        // Press feedback of the stretched link: the card lights up only while
+        // the overlay itself is pressed. A ring is a box-shadow, so nothing
+        // reflows — the design system forbids a pressed state that shifts layout.
+        'has-[a:active]:border-accent has-[a:active]:ring-1 has-[a:active]:ring-accent',
         'motion-safe:transition-colors motion-safe:duration-200',
         className,
       )}
@@ -162,6 +166,7 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
               className={cn(
                 'rounded-button underline decoration-border underline-offset-4',
                 'hover:text-accent hover:decoration-accent',
+                'active:text-accent active:decoration-accent',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
                 'motion-safe:transition-colors motion-safe:duration-200',
                 // Stretched link: the pseudo-element covers the whole card, so a

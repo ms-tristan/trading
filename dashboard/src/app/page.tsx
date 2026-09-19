@@ -5,7 +5,8 @@ import { OverviewLive } from '@/components/overview/overview-live';
 import { PlatformSummary } from '@/components/overview/platform-summary';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { errorMessage, fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
+import { fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { resolvePollIntervalMs, serverApiBaseUrl } from '@/lib/config';
 import type { HealthPayload, KillSwitchPayload, ProfilesPayload } from '@/lib/types';
 
@@ -39,14 +40,17 @@ function PageHeading() {
  * First paint rendered when the monitoring API cannot be reached.
  *
  * It is an ordinary page render, not an error screen: the operator gets the
- * documented failure message, the origin the dashboard tried to call (the
+ * mapped failure headline, the origin the dashboard tried to call (the
  * `API_ORIGIN` configuration) and what to check — and no polling is started.
+ * The raw cause (status, server text, requested path) stays visible under the
+ * headline, never as the headline itself.
  */
-function ApiUnreachable({ message, baseUrl }: { message: string; baseUrl: string }) {
+function ApiUnreachable({ failure, baseUrl }: { failure: unknown; baseUrl: string }) {
+  const report = failureReport(failure);
   return (
     <div className="flex flex-col gap-xl">
       <PageHeading />
-      <ErrorBanner message={message} />
+      <ErrorBanner message={report.headline} detail={report.detail} />
       <EmptyState
         title="The monitoring API is unreachable"
         description={`No payload was returned by ${baseUrl}. Check that the Python monitoring server is running and that API_ORIGIN points at it.`}
@@ -82,7 +86,7 @@ export default async function OverviewPage() {
     ]);
     overview = { health, profiles, killSwitch };
   } catch (error) {
-    return <ApiUnreachable message={errorMessage(error)} baseUrl={baseUrl} />;
+    return <ApiUnreachable failure={error} baseUrl={baseUrl} />;
   }
 
   const { health, profiles, killSwitch } = overview;

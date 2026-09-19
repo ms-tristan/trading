@@ -9,6 +9,7 @@ import { DeleteProfileDialog } from '@/components/profile/delete-profile-dialog'
 import { Button } from '@/components/ui/button';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { StatusBadge } from '@/components/ui/status-badge';
+import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { hasOperatorToken } from '@/lib/operator-token';
 import { useProfileControl } from '@/lib/use-profile-control';
@@ -117,8 +118,26 @@ export function ProfileActions({ profileId, className }: ProfileActionsProps) {
     [pathname, router],
   );
 
-  const { paused, pendingAction, error, notice, canPause, canResume, canDelete, pause, resume, remove } =
-    useProfileControl(profileId, { onDeleted: handleDeleted });
+  const {
+    paused,
+    pendingAction,
+    failure,
+    notice,
+    canPause,
+    canResume,
+    canDelete,
+    pause,
+    resume,
+    remove,
+  } = useProfileControl(profileId, { onDeleted: handleDeleted });
+
+  /*
+   * A refused lifecycle action (pause, resume, delete) speaks the shared
+   * operator-facing vocabulary: a 502/503/504, a connection failure and a
+   * timeout all read as the monitoring API being unreachable, and the raw cause
+   * stays in the detail line instead of becoming the headline.
+   */
+  const report = failure === null ? null : failureReport(failure);
 
   const handlePause = useCallback((): void => {
     void pause();
@@ -203,13 +222,18 @@ export function ProfileActions({ profileId, className }: ProfileActionsProps) {
         Inside the dialog the very same failure is rendered next to the button
         that caused it, so the banner is not duplicated while it is open.
       */}
-      <ErrorBanner message={isDeleteOpen ? null : error} className="w-full" />
+      <ErrorBanner
+        message={isDeleteOpen ? null : report?.headline ?? null}
+        detail={isDeleteOpen ? null : report?.detail ?? null}
+        className="w-full"
+      />
 
       <DeleteProfileDialog
         open={isDeleteOpen}
         profileId={profileId}
         pending={pendingAction === 'delete'}
-        error={isDeleteOpen ? error : null}
+        error={isDeleteOpen ? report?.headline ?? null : null}
+        errorDetail={isDeleteOpen ? report?.detail ?? null : null}
         onConfirm={handleConfirmDelete}
         onCancel={handleCancelDelete}
       />

@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor, type RenderHookResult } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { OPERATOR_TOKEN_HEADER } from './api';
+import { ApiError, OPERATOR_TOKEN_HEADER } from './api';
 import { OPERATOR_TOKEN_STORAGE_KEY } from './operator-token';
 import type { ControlPayload, ProfileSnapshot } from './types';
 import {
@@ -683,5 +683,97 @@ describe('profile mutations', () => {
 
     expect(calls[0]?.url).toBe('http://trading-realtime:8080/api/control');
     expect(callsTo(calls, 'http://trading-realtime:8080/api/profiles/alpha/pause')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// failure passthrough (the input of the operator-facing mapping)
+// ---------------------------------------------------------------------------
+
+describe('failure passthrough', () => {
+  it('exposes the thrown value of a failed mutation and clears it on the next success', async () => {
+    saveToken();
+    let refuse = true;
+    const { impl } = routeFetch((url) =>
+      url === '/api/control'
+        ? jsonResponse(controlPayload())
+        : refuse
+          ? jsonResponse({ error: 'read-only mode: mutations are disabled' }, 403)
+          : jsonResponse({ profile, paused: true }),
+    );
+
+    const { result } = await renderControl('alpha', { fetchImpl: impl });
+    expect(result.current.failure).toBeNull();
+
+    await act(async () => {
+      await result.current.pause();
+    });
+
+    // `error` keeps its message, `failure` keeps the whole failure: a view maps
+    // the second one and never prints the first one raw.
+    expect(result.current.error).toBe('read-only mode: mutations are disabled');
+    expect(result.current.failure).toBeInstanceOf(ApiError);
+    const refused = result.current.failure as ApiError;
+    expect(refused.kind).toBe('http');
+    expect(refused.status).toBe(403);
+    expect(refused.path).toBe('/api/profiles/alpha/pause');
+
+    refuse = false;
+    await act(async () => {
+      await result.current.pause();
+    });
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.failure).toBeNull();
+  });
+
+  it('exposes the thrown value of a failed poll and clears it once a poll succeeds', async () => {
+    saveToken();
+    let failing = false;
+    const { impl } = routeFetch(() =>
+      failing ? jsonResponse({ error: 'bad gateway' }, 502) : jsonResponse(controlPayload()),
+    );
+
+    const { result } = await renderControl('alpha', { fetchImpl: impl });
+    expect(result.current.failure).toBeNull();
+
+    failing = true;
+    await act(async () => {
+      await result.current.refresh();
+    });
+
+    expect(result.current.error).toBe('bad gateway');
+    expect(result.current.failure).toBeInstanceOf(ApiError);
+    expect((result.current.failure as ApiError).status).toBe(502);
+    // The last known state stays on screen: only the message changed.
+    expect(result.current.known).toBe(true);
+
+    failing = false;
+    await act(async () => {
+      await result.current.refresh();
+    });
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.failure).toBeNull();
+    expect(result.current.known).toBe(true);
+  });
+
+  it('never rejects: a failed poll and a failed mutation both resolve', async () => {
+    saveToken();
+    const impl = (async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+
+    const view = await renderControl('alpha', { fetchImpl: impl }, false);
+
+    await act(async () => {
+      await expect(view.result.current.refresh()).resolves.toBeUndefined();
+      await expect(view.result.current.pause()).resolves.toBe(false);
+      await expect(view.result.current.resume()).resolves.toBe(false);
+      await expect(view.result.current.remove()).resolves.toBe(false);
+    });
+
+    expect(view.result.current.error).toContain('network error calling');
+    expect(view.result.current.failure).toBeInstanceOf(ApiError);
   });
 });

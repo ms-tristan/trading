@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CANDLE_RENDER_LIMIT, type CandleMarker, type CandlePriceLine } from '@/lib/candles';
 import type { Candle } from '@/lib/types';
 
+import { BUTTON_PRESSED_CLASSES } from '@/components/ui/button';
+
 import { CandlestickChart } from './candlestick-chart';
 
 /**
@@ -620,5 +622,31 @@ describe('CandlestickChart resize', () => {
     unmount();
 
     expect(observers[0]?.disconnects).toBe(1);
+  });
+});
+
+describe('CandlestickChart press feedback', () => {
+  it('acknowledges a press on the Candle data summary', () => {
+    renderChart();
+
+    const summary = screen.getByText('Candle data');
+    expect(summary.tagName).toBe('SUMMARY');
+    expect(summary).toHaveClass('active:bg-muted-pressed');
+    expect(summary).toHaveClass('active:text-foreground');
+    // Still an obvious click target with its keyboard focus ring intact.
+    expect(summary).toHaveClass('cursor-pointer');
+    expect(summary).toHaveClass('focus-visible:ring-2');
+  });
+
+  it('acknowledges a press on the three zoom controls', () => {
+    renderChart({ candles: MANY_CANDLES });
+
+    for (const name of ['Zoom in', 'Zoom out', 'Reset zoom']) {
+      const control = screen.getByRole('button', { name });
+      expect(control).toHaveClass('cursor-pointer');
+      // The chart's own controls are the shared ghost Button: they inherit its
+      // press feedback instead of redefining one.
+      expect(control).toHaveClass(BUTTON_PRESSED_CLASSES.ghost);
+    }
   });
 });

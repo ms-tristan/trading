@@ -1,6 +1,7 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from './api';
 import { usePolling } from './use-polling';
 
 beforeEach(() => {
@@ -189,6 +190,115 @@ describe('usePolling', () => {
         await result.current.refreshNow();
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it('exposes the thrown value as the failure, next to the unchanged message', async () => {
+    const thrown = new ApiError('http', 'HTTP 502', { status: 502, path: '/api/health' });
+    const fetcher = async (): Promise<string> => {
+      throw thrown;
+    };
+    const { result } = renderHook(() => usePolling({ fetcher, initialData: 'good' }));
+
+    expect(result.current.failure).toBeNull();
+
+    await act(async () => {
+      await result.current.refreshNow();
+    });
+
+    expect(result.current.failure).toBe(thrown);
+    // `error` keeps its exact previous meaning: the message of the failure.
+    expect(result.current.error).toBe('HTTP 502');
+    // ... and the last known good payload is still on screen.
+    expect(result.current.data).toBe('good');
+  });
+
+  it('clears the failure together with the error after the next success', async () => {
+    const thrown = new Error('poll failed');
+    let call = 0;
+    const fetcher = async (): Promise<string> => {
+      call += 1;
+      if (call === 1) {
+        throw thrown;
+      }
+      return 'fresh';
+    };
+    const { result } = renderHook(() => usePolling({ fetcher, initialData: 'good' }));
+
+    await act(async () => {
+      await result.current.refreshNow();
+    });
+    expect(result.current.failure).toBe(thrown);
+
+    await act(async () => {
+      await result.current.refreshNow();
+    });
+    expect(result.current.failure).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.data).toBe('fresh');
+  });
+
+  it('resolves refreshNow and keeps the failure when the fetcher rejects', async () => {
+    const thrown = new TypeError('Failed to fetch');
+    const fetcher = async (): Promise<string> => {
+      throw thrown;
+    };
+    const { result } = renderHook(() => usePolling({ fetcher, initialData: 'good' }));
+
+    await expect(
+      act(async () => {
+        await result.current.refreshNow();
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(result.current.failure).toBe(thrown);
+  });
+
+  it('does not record a failure for an aborted request', async () => {
+    const fetcher = (signal: AbortSignal): Promise<string> =>
+      new Promise<string>((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    const { result } = renderHook(() => usePolling({ fetcher, initialData: 'good' }));
+
+    act(() => {
+      void result.current.refreshNow();
+      result.current.pause();
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.failure).toBeNull();
+    expect(result.current.error).toBeNull();
+  });
+
+  it('ignores a late success that lands after unmount', async () => {
+    let release: (value: string) => void = () => {};
+    const fetcher = (): Promise<string> =>
+      new Promise<string>((resolve) => {
+        release = resolve;
+      });
+    const { result, unmount } = renderHook(() => usePolling({ fetcher, initialData: 'good' }));
+
+    let cycle: Promise<void> = Promise.resolve();
+    act(() => {
+      cycle = result.current.refreshNow();
+    });
+
+    unmount();
+    release('late');
+
+    await act(async () => {
+      await cycle;
+    });
+
+    // Nothing was recorded: the hook is gone and never threw.
+    expect(result.current.data).toBe('good');
+    expect(result.current.error).toBeNull();
+    expect(result.current.failure).toBeNull();
   });
 
   it('clears the error after the next success', async () => {

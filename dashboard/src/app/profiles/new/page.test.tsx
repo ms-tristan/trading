@@ -86,7 +86,10 @@ describe('CreateProfilePage', () => {
 
     render(await CreateProfilePage());
 
-    expect(screen.getByRole('status')).toHaveTextContent(
+    const banner = screen.getByRole('status');
+    // The mapped headline explains the outage; the raw cause is the detail.
+    expect(within(banner).getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    expect(within(banner).getByTestId('error-banner-detail')).toHaveTextContent(
       'network error calling /api/catalog: fetch failed',
     );
     expect(screen.getByText('API unreachable')).toBeInTheDocument();

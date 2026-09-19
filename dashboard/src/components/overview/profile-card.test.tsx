@@ -1,4 +1,5 @@
 import { act, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { EMPTY_PLACEHOLDER } from '@/lib/format';
@@ -316,5 +317,66 @@ describe('ProfileCard', () => {
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Resume' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Pause' })).toBeDisabled();
+  });
+});
+
+describe('ProfileCard press feedback', () => {
+  it('acknowledges a press on the stretched link', async () => {
+    await renderCard(makeProfile());
+
+    const link = screen.getByRole('link', { name: 'alpha' });
+    expect(link).toHaveClass('active:text-accent');
+    expect(link).toHaveClass('active:decoration-accent');
+    // The hover styling and the stretched overlay are untouched: the press
+    // state adds no element and no size, so nothing can reflow.
+    expect(link).toHaveClass('hover:text-accent');
+    expect(link).toHaveClass('hover:decoration-accent');
+    expect(link).toHaveClass('after:absolute');
+    expect(link).toHaveClass('after:inset-0');
+    expect(link.className).toContain('after:content-[""]');
+    expect(link).toHaveClass('motion-safe:duration-200');
+  });
+
+  it('lights the card up while the stretched link is pressed, and only then', async () => {
+    await renderCard(makeProfile());
+
+    const link = screen.getByRole('link', { name: 'alpha' });
+    const card = link.closest('article') as HTMLElement;
+
+    // Scoped to `a:active`: pressing a button of the footer never puts the link
+    // in the active state, so the card cannot light up for a lifecycle click.
+    expect(card).toHaveClass('has-[a:active]:border-accent');
+    expect(card).toHaveClass('has-[a:active]:ring-1');
+    expect(card).toHaveClass('has-[a:active]:ring-accent');
+    // A ring is a box-shadow: no reflow, and the existing states stay intact.
+    expect(card).toHaveClass('hover:border-accent/50');
+    expect(card).toHaveClass('focus-within:border-accent/50');
+    expect(card).toHaveClass('motion-safe:transition-colors');
+    expect(card).toHaveClass('motion-safe:duration-200');
+  });
+
+  it('never lets the card press affordance swallow a lifecycle click', async () => {
+    await renderCard(makeProfile());
+    fetchMock.mockClear();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Pause' }));
+    await settle();
+
+    // The handler of the footer button ran: the click reached the button, not
+    // the stretched link that covers the rest of the card.
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/profiles/alpha/pause',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('keeps the delete action reachable from the footer', async () => {
+    await renderCard(makeProfile());
+
+    await userEvent.click(screen.getByRole('button', { name: 'Delete profile' }));
+
+    // The first click opens the confirmation instead of navigating away: the
+    // pressed affordance of the card never captures it.
+    expect(screen.getByRole('dialog')).toHaveTextContent('Delete profile alpha?');
   });
 });

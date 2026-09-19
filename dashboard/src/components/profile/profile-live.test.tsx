@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '@/lib/api';
@@ -364,12 +364,23 @@ describe('ProfileLive', () => {
     renderLive();
 
     await advance(2000);
-    expect(screen.getByText(/Live updates: network error calling/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Live updates: The monitoring API is unreachable/),
+    ).toBeInTheDocument();
 
     await advance(8000);
-    const banner = screen.getByText(/Detail data: unexpected response/);
-    expect(banner).toBeInTheDocument();
-    expect(banner.textContent).toContain('Live updates: network error calling');
+    // ONE banner carries both loops, each with its own operator-facing headline.
+    const headline = screen.getByText(
+      /Detail data: The monitoring API returned an unexpected response/,
+    );
+    const banner = headline.closest('[role="status"]');
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toContain('Live updates: The monitoring API is unreachable');
+
+    // The raw cause of each loop survives as the shared detail line.
+    const detail = within(banner as HTMLElement).getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('network error calling /api/profiles/btc-paper');
+    expect(detail).toHaveTextContent('unexpected response from /api/profiles/btc-paper/equity');
 
     // Nothing was cleared: the last known good bundles are still on screen.
     expect(screen.getByRole('heading', { level: 1, name: 'btc-paper' })).toBeInTheDocument();
@@ -385,10 +396,12 @@ describe('ProfileLive', () => {
     renderLive();
 
     await advance(2000);
-    expect(screen.getByText(/Live updates: network error/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Live updates: The monitoring API is unreachable/),
+    ).toBeInTheDocument();
 
     await advance(2000);
-    expect(screen.queryByText(/Live updates: network error/)).toBeNull();
+    expect(screen.queryByText(/Live updates: The monitoring API is unreachable/)).toBeNull();
   });
 
   it('stops polling when it unmounts', async () => {

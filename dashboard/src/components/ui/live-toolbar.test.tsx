@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { EMPTY_PLACEHOLDER } from '@/lib/format';
 
+import { BUTTON_PRESSED_CLASSES } from './button';
 import { LiveToolbar } from './live-toolbar';
 
 describe('LiveToolbar', () => {
@@ -124,5 +125,52 @@ describe('LiveToolbar', () => {
     );
 
     expect(screen.getByText('Profile updates')).toBeInTheDocument();
+  });
+
+  it('shows the failure detail next to the error headline', () => {
+    render(
+      <LiveToolbar
+        checkedAt="2024-01-01T00:00:00Z"
+        isPaused={false}
+        onToggle={vi.fn()}
+        onRefresh={vi.fn()}
+        error="The monitoring API is unreachable"
+        errorDetail="HTTP 502 · /api/profiles"
+      />,
+    );
+
+    const region = screen.getByRole('status');
+    expect(region).toHaveTextContent('The monitoring API is unreachable');
+    const detail = screen.getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 502 · /api/profiles');
+    expect(detail).toHaveClass('text-muted-foreground');
+    // The last known good timestamp is still on screen.
+    expect(screen.getByText(/checked at/i)).toHaveTextContent('2024-01-01 00:00:00 UTC');
+  });
+
+  it('renders no detail element when only an error is given', () => {
+    render(
+      <LiveToolbar
+        checkedAt={null}
+        isPaused={false}
+        onToggle={vi.fn()}
+        onRefresh={vi.fn()}
+        error="network error calling /api/profiles"
+      />,
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent('network error calling /api/profiles');
+    expect(screen.queryByTestId('error-banner-detail')).not.toBeInTheDocument();
+  });
+
+  it('gives both controls the pressed state of their variant', () => {
+    render(<LiveToolbar checkedAt={null} isPaused={false} onToggle={vi.fn()} onRefresh={vi.fn()} />);
+
+    expect(screen.getByRole('button', { name: 'Pause live updates' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.secondary,
+    );
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.ghost,
+    );
   });
 });

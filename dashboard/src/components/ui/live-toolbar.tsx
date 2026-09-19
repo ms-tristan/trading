@@ -19,6 +19,8 @@ export interface LiveToolbarProps {
   onRefresh: () => void;
   /** Last polling error, shown in a non-blocking banner. */
   error?: string | null;
+  /** Underlying cause of that error, kept as a secondary detail. */
+  errorDetail?: string | null;
   /** Name of the live region ('Live updates' by default). */
   liveLabel?: string;
   className?: string;
@@ -38,6 +40,7 @@ export function LiveToolbar({
   onToggle,
   onRefresh,
   error = null,
+  errorDetail = null,
   liveLabel = 'Live updates',
   className,
 }: LiveToolbarProps) {
@@ -84,7 +87,7 @@ export function LiveToolbar({
           </Button>
         </div>
       </div>
-      <ErrorBanner message={error} />
+      <ErrorBanner message={error} detail={errorDetail} />
     </div>
   );
 }
