@@ -33,7 +33,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className="bg-background font-sans text-foreground">
         <a
           href="#content"
-          className={`sr-only focus:not-sr-only focus:fixed focus:left-xl focus:top-xl focus:z-50 focus:rounded-button focus:border focus:border-border focus:bg-card focus:px-lg focus:py-sm focus:text-sm focus:text-foreground ${FOCUS_RING}`}
+          className={`sr-only focus:not-sr-only focus:fixed focus:left-xl focus:top-xl focus:z-50 focus:rounded-button focus:border focus:border-border focus:bg-card focus:px-lg focus:py-sm focus:text-sm focus:text-foreground active:bg-muted-pressed ${FOCUS_RING}`}
         >
           Skip to content
         </a>
@@ -42,7 +42,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <div className="flex flex-wrap items-center gap-xl">
               <Link
                 href="/"
-                className={`inline-flex items-center gap-sm rounded-button font-mono text-base font-semibold text-foreground motion-safe:transition-colors motion-safe:duration-200 hover:text-accent ${FOCUS_RING}`}
+                className={`inline-flex items-center gap-sm rounded-button font-mono text-base font-semibold text-foreground motion-safe:transition-colors motion-safe:duration-200 hover:text-accent active:bg-muted-pressed active:text-accent ${FOCUS_RING}`}
               >
                 <Activity aria-hidden="true" className="size-4 text-accent" />
                 <span>Trading Platform</span>
@@ -51,7 +51,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
               <nav aria-label="Profiles">
                 <Link
                   href="/profiles/new"
-                  className={`inline-flex cursor-pointer items-center gap-sm rounded-button border border-border px-lg py-sm text-sm text-foreground motion-safe:transition-colors motion-safe:duration-200 hover:text-accent ${FOCUS_RING}`}
+                  className={`inline-flex cursor-pointer items-center gap-sm rounded-button border border-border px-lg py-sm text-sm text-foreground motion-safe:transition-colors motion-safe:duration-200 hover:text-accent active:border-accent active:bg-muted-pressed active:text-accent ${FOCUS_RING}`}
                 >
                   <PlusCircle aria-hidden="true" className="size-4 text-accent" />
                   <span>New profile</span>

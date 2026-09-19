@@ -359,3 +359,74 @@ describe('ProfileCombobox pointer and lifecycle', () => {
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
   });
 });
+
+describe('ProfileCombobox press feedback', () => {
+  it('acknowledges a press on the enabled trigger', () => {
+    render(<Harness />);
+
+    const field = input();
+    expect(field).not.toBeDisabled();
+    expect(field).toHaveClass('enabled:active:bg-muted-pressed');
+    // The press shade never replaces the motion contract or the focus ring.
+    expect(field).toHaveClass('motion-safe:transition-colors');
+    expect(field).toHaveClass('motion-safe:duration-200');
+    expect(field).toHaveClass('focus-visible:ring-2');
+  });
+
+  it('gives no press feedback on a disabled trigger', () => {
+    render(<Harness disabled />);
+
+    const field = input();
+    expect(field).toBeDisabled();
+    expect(field).not.toHaveClass('enabled:active:bg-muted-pressed');
+    expect(field).toHaveClass('disabled:cursor-not-allowed');
+  });
+
+  it('acknowledges a press on every rendered option row', async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(input());
+
+    const rows = screen.getAllByRole('option');
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      expect(row).toHaveClass('active:bg-muted-pressed');
+      // The rows stay clickable, and no press state reflows them.
+      expect(row).toHaveClass('cursor-pointer');
+      expect(row).toHaveClass('motion-safe:transition-colors');
+      expect(row).toHaveClass('motion-safe:duration-200');
+    }
+  });
+
+  it('keeps the active row, the hover row and the pressed row three distinct states', async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(input());
+
+    const active = screen.getAllByRole('option')[0] as HTMLElement;
+    const hoverOnly = screen.getAllByRole('option')[1] as HTMLElement;
+    expect(active).toHaveAttribute('data-active', 'true');
+    expect(active).toHaveClass('bg-muted');
+    expect(hoverOnly).not.toHaveClass('bg-muted');
+    expect(hoverOnly).toHaveClass('hover:bg-muted');
+    // Both still carry the pressed shade, which is lighter than the active row
+    // (`--color-muted`), so the press reads as a third, distinct state.
+    expect(active).toHaveClass('active:bg-muted-pressed');
+    expect(hoverOnly).toHaveClass('active:bg-muted-pressed');
+  });
+
+  it('gives no press feedback on the non-selectable no-match row', async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(input());
+    await user.type(input(), 'zzz');
+
+    const row = within(listbox()).getByText(DEFAULT_EMPTY_MESSAGE);
+    expect(row).toHaveAttribute('role', 'presentation');
+    expect(row).not.toHaveClass('active:bg-muted-pressed');
+    expect(row).not.toHaveClass('cursor-pointer');
+  });
+});

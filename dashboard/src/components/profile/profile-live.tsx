@@ -15,8 +15,9 @@
  *   `CandlestickPanel`, so the page never runs a third rhythm.
  *
  * A single {@link LiveToolbar} drives both, a single error banner combines both
- * failures, and a failed poll never clears the screen: the last known good
- * bundles stay rendered.
+ * failures — mapped into operator-facing copy by {@link failureReport}, so a
+ * proxy status is never the headline — and a failed poll never clears the
+ * screen: the last known good bundles stay rendered.
  */
 
 import { useCallback } from 'react';
@@ -36,6 +37,7 @@ import {
   fetchProfile,
   fetchTrades,
 } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { usePolling } from '@/lib/use-polling';
 import type { CandlesPayload, ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
 
@@ -69,16 +71,36 @@ export interface ProfileLiveProps {
   detailIntervalMs: number;
 }
 
-/** Fold the two loop failures into the single banner message. */
-function combineErrors(liveError: string | null, detailError: string | null): string | null {
-  const parts: string[] = [];
-  if (liveError !== null) {
-    parts.push(`Live updates: ${liveError}`);
-  }
-  if (detailError !== null) {
-    parts.push(`Detail data: ${detailError}`);
-  }
-  return parts.length === 0 ? null : parts.join(' · ');
+/** A combined failure line: the operator-facing headline and its raw detail. */
+interface CombinedFailure {
+  headline: string | null;
+  detail: string | null;
+}
+
+/**
+ * Fold the two loop failures into the single banner of the page.
+ *
+ * This ONE banner IS the error surface of the equity, positions, trades, orders,
+ * metrics and benchmark panels: they are all fed by the detail loop, so the
+ * mapping is applied once, here, instead of duplicating six banners. Each loop
+ * keeps its own headline and its own raw detail; the underlying cause (status,
+ * server text, requested path) is never dropped.
+ */
+function combineFailures(liveFailure: unknown | null, detailFailure: unknown | null): CombinedFailure {
+  const liveReport = liveFailure === null ? null : failureReport(liveFailure);
+  const detailReport = detailFailure === null ? null : failureReport(detailFailure);
+  const headline =
+    [
+      liveReport !== null && `Live updates: ${liveReport.headline}`,
+      detailReport !== null && `Detail data: ${detailReport.headline}`,
+    ]
+      .filter(Boolean)
+      .join(' · ') || null;
+  const detail =
+    [liveReport?.detail, detailReport?.detail]
+      .filter((part) => part !== undefined && part !== '')
+      .join(' · ') || null;
+  return { headline, detail };
 }
 
 /** Live profile detail: header, kill switch, equity curve, tables and panels. */
@@ -131,6 +153,7 @@ export function ProfileLive({
   });
 
   const isPaused = live.isPaused || detail.isPaused;
+  const failure = combineFailures(live.failure, detail.failure);
 
   const handleToggle = useCallback((): void => {
     // One control drives both loops: live updates are on or off as a whole.
@@ -155,7 +178,8 @@ export function ProfileLive({
         isPaused={isPaused}
         onToggle={handleToggle}
         onRefresh={handleRefresh}
-        error={combineErrors(live.error, detail.error)}
+        error={failure.headline}
+        errorDetail={failure.detail}
         liveLabel="Live updates"
       />
 

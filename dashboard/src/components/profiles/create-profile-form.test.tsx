@@ -370,30 +370,39 @@ describe('CreateProfileForm submission', () => {
 
 describe('CreateProfileForm failures', () => {
   it.each([
-    [409, 'profile already exists: btc-paper'],
-    [400, 'unknown strategy: nope (available: basic)'],
-    [403, 'read-only mode: lifecycle routes are disabled'],
-  ])('shows the HTTP %i message verbatim and keeps every entered value', async (status, message) => {
-    const user = userEvent.setup();
-    renderForm(errorResponse(status, message));
+    [409, 'The monitoring API answered an error', 'profile already exists: btc-paper'],
+    [400, 'The monitoring API answered an error', 'unknown strategy: nope (available: basic)'],
+    [403, 'The monitoring API refused the request', 'read-only mode: lifecycle routes are disabled'],
+  ])(
+    'explains an HTTP %i refusal with the mapped headline and keeps every entered value',
+    async (status, headline, message) => {
+      const user = userEvent.setup();
+      renderForm(errorResponse(status, message));
 
-    await fillValidForm(user);
-    await user.click(submitButton());
+      await fillValidForm(user);
+      await user.click(submitButton());
 
-    await waitFor(() => {
-      expect(screen.getByText(message)).toBeInTheDocument();
-    });
+      await waitFor(() => {
+        expect(screen.getByText(headline)).toBeInTheDocument();
+      });
 
-    expect(submitButton()).not.toBeDisabled();
-    expect(submitButton()).toHaveTextContent('Create profile');
-    expect(screen.getByLabelText('Profile id')).toHaveValue('btc-paper');
-    expect(combobox('Asset')).toHaveValue('BTC/USDT');
-    expect(combobox('Strategy')).toHaveValue('basic');
-    expect(pushMock).not.toHaveBeenCalled();
-    expect(screen.queryByText(/created\./)).not.toBeInTheDocument();
-  });
+      // The server refusal is never hidden: it stays verbatim as the detail,
+      // right after the raw status.
+      const detail = screen.getByTestId('error-banner-detail');
+      expect(detail).toHaveTextContent(`HTTP ${status}`);
+      expect(detail).toHaveTextContent(message);
 
-  it('reports a network failure explicitly', async () => {
+      expect(submitButton()).not.toBeDisabled();
+      expect(submitButton()).toHaveTextContent('Create profile');
+      expect(screen.getByLabelText('Profile id')).toHaveValue('btc-paper');
+      expect(combobox('Asset')).toHaveValue('BTC/USDT');
+      expect(combobox('Strategy')).toHaveValue('basic');
+      expect(pushMock).not.toHaveBeenCalled();
+      expect(screen.queryByText(/created\./)).not.toBeInTheDocument();
+    },
+  );
+
+  it('reports a network failure with the mapped headline and the raw cause', async () => {
     const user = userEvent.setup();
     renderForm(new TypeError('fetch failed'));
 
@@ -401,10 +410,12 @@ describe('CreateProfileForm failures', () => {
     await user.click(submitButton());
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent(
-        'network error calling /api/profiles: fetch failed',
-      );
+      expect(screen.getByRole('status')).toHaveTextContent('The monitoring API is unreachable');
     });
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'network error calling /api/profiles: fetch failed',
+    );
     expect(submitButton()).not.toBeDisabled();
+    expect(screen.getByLabelText('Profile id')).toHaveValue('btc-paper');
   });
 });

@@ -277,7 +277,11 @@ describe('ProfileDetailPage', () => {
 
     await renderPage();
 
-    expect(screen.getByText('network error calling /api/profiles/btc-paper')).toBeInTheDocument();
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    // The raw transport message is not hidden: it is the detail line.
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'network error calling /api/profiles/btc-paper',
+    );
     expect(screen.getByText('Profile unavailable')).toBeInTheDocument();
     expect(screen.queryByRole('table')).toBeNull();
     expect(screen.queryByRole('img')).toBeNull();
@@ -296,8 +300,11 @@ describe('ProfileDetailPage', () => {
     await renderPage();
 
     expect(
-      screen.getByText('unexpected response from /api/profiles/btc-paper/equity'),
+      screen.getByText('The monitoring API returned an unexpected response'),
     ).toBeInTheDocument();
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'unexpected response from /api/profiles/btc-paper/equity',
+    );
     expect(screen.getByText('Profile unavailable')).toBeInTheDocument();
   });
 
@@ -309,7 +316,30 @@ describe('ProfileDetailPage', () => {
     await renderPage();
 
     expect(vi.mocked(notFound)).not.toHaveBeenCalled();
-    expect(screen.getByText('HTTP 500')).toBeInTheDocument();
+    // The status is a server-side error, so it reads as an answered error...
+    expect(screen.getByText('The monitoring API answered an error')).toBeInTheDocument();
+    // ...and the raw status plus the requested path survive as the detail.
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'HTTP 500 · /api/profiles/btc-paper',
+    );
     expect(screen.getByText('Profile unavailable')).toBeInTheDocument();
+  });
+
+  it('reads a proxy 502 as an outage and never as a missing profile', async () => {
+    vi.mocked(api.fetchProfile).mockRejectedValue(
+      new ApiError('http', 'HTTP 502', { status: 502, path: '/api/profiles/btc-paper' }),
+    );
+
+    await renderPage();
+
+    // Only the documented 404 maps to notFound(): a gateway failure is an outage.
+    expect(vi.mocked(notFound)).not.toHaveBeenCalled();
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    const detail = screen.getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 502');
+    expect(detail).toHaveTextContent('/api/profiles/btc-paper');
+    expect(screen.queryByText('HTTP 502')).not.toBeInTheDocument();
+    expect(screen.getByText('Profile unavailable')).toBeInTheDocument();
+    expect(api.fetchEquity).not.toHaveBeenCalled();
   });
 });

@@ -7,7 +7,6 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import {
   ApiError,
-  errorMessage,
   fetchCandles,
   fetchEquity,
   fetchHealth,
@@ -18,6 +17,7 @@ import {
   fetchProfile,
   fetchTrades,
 } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { CANDLE_RENDER_LIMIT } from '@/lib/candles';
 import { resolveDetailPollIntervalMs, resolvePollIntervalMs, serverApiBaseUrl } from '@/lib/config';
 import type { ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
@@ -48,7 +48,9 @@ import type { ProfileDetailBundle, ProfileLiveBundle } from '@/lib/types';
  *   the root `not-found.tsx` renders;
  * * any other failure (network, malformed payload, 5xx) renders a non-blocking
  *   banner plus an empty state and **starts no polling at all** — a page that
- *   cannot read the API must not hammer it every two seconds.
+ *   cannot read the API must not hammer it every two seconds. The banner goes
+ *   through the shared failure mapping, so a `502`/`503`/`504` reads as the
+ *   monitoring API being unreachable and never as a bare proxy status.
  */
 
 /** Next 16 hands the route params to the page as a promise. */
@@ -64,14 +66,21 @@ function isNotFoundFailure(failure: unknown): boolean {
   return failure instanceof ApiError && failure.kind === 'http' && failure.status === 404;
 }
 
-/** Outage view: no data, no polling, no crash. */
-function OutageView({ profileId, message }: { profileId: string; message: string }) {
+/**
+ * Outage view: no data, no polling, no crash.
+ *
+ * The failure is rendered through the shared mapping, so a `502` from the proxy
+ * reads as the monitoring API being unreachable and the raw status stays as the
+ * detail line.
+ */
+function OutageView({ profileId, failure }: { profileId: string; failure: unknown }) {
+  const report = failureReport(failure);
   return (
     <div className="flex flex-col gap-xl">
       <h1 className="font-mono text-xl font-semibold text-foreground">
         Profile <span className="font-mono">{profileId}</span>
       </h1>
-      <ErrorBanner message={message} />
+      <ErrorBanner message={report.headline} detail={report.detail} />
       <EmptyState
         title="Profile unavailable"
         description="The monitoring API did not answer, so no live view was started. Reload the page once the server is reachable."
@@ -96,7 +105,7 @@ export default async function ProfileDetailPage({
     if (isNotFoundFailure(profileResult.failure)) {
       notFound();
     }
-    return <OutageView profileId={id} message={errorMessage(profileResult.failure)} />;
+    return <OutageView profileId={id} failure={profileResult.failure} />;
   }
 
   const bundlesResult = await Promise.all([
@@ -116,7 +125,7 @@ export default async function ProfileDetailPage({
   );
 
   if (!bundlesResult.ok) {
-    return <OutageView profileId={id} message={errorMessage(bundlesResult.failure)} />;
+    return <OutageView profileId={id} failure={bundlesResult.failure} />;
   }
 
   const [equity, positions, trades, orders, metrics, candles, health, killSwitch] =

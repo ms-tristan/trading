@@ -159,6 +159,19 @@ describe('EquityChart', () => {
     expect(within(table).getByText('$10,100.00')).toBeInTheDocument();
   });
 
+  it('acknowledges the press on the data-table disclosure', () => {
+    render(<EquityChart points={POINTS} />);
+
+    const summary = screen.getByText('Data table');
+    // Same affordance as the candle-data disclosure: a colour-only pressed
+    // shade that cannot reflow the panel, with the focus ring intact.
+    expect(summary).toHaveClass('active:bg-muted-pressed');
+    expect(summary).toHaveClass('active:text-foreground');
+    expect(summary).toHaveClass('cursor-pointer');
+    expect(summary).toHaveClass('focus-visible:ring-2');
+    expect(summary.className).not.toMatch(/(?:^|\s)scale-/);
+  });
+
   it('renders the empty state instead of an empty frame', () => {
     render(<EquityChart points={[]} />);
 

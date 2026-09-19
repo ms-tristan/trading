@@ -9,6 +9,12 @@ import { Button } from './button';
 export interface ErrorBannerProps {
   /** Message to display; `null` renders nothing at all. */
   message: string | null;
+  /**
+   * Underlying cause of the failure, shown under the message in a secondary
+   * style (raw status, server text, requested path). The headline stays the
+   * first thing the operator reads.
+   */
+  detail?: string | null;
   /** Optional retry handler; the button is hidden when absent. */
   onRetry?: () => void;
   /** Label of the retry button. */
@@ -23,7 +29,13 @@ export interface ErrorBannerProps {
  * last known good payload stays visible. Announced politely so it does not
  * interrupt what a screen reader is currently reading.
  */
-export function ErrorBanner({ message, onRetry, retryLabel = 'Retry', className }: ErrorBannerProps) {
+export function ErrorBanner({
+  message,
+  detail = null,
+  onRetry,
+  retryLabel = 'Retry',
+  className,
+}: ErrorBannerProps) {
   if (message === null) {
     return null;
   }
@@ -38,6 +50,14 @@ export function ErrorBanner({ message, onRetry, retryLabel = 'Retry', className 
     >
       <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-loss" />
       <span className="min-w-0 flex-1 break-words">{message}</span>
+      {detail !== null && detail !== '' ? (
+        <span
+          data-testid="error-banner-detail"
+          className="min-w-0 break-words font-mono text-xs text-muted-foreground"
+        >
+          {detail}
+        </span>
+      ) : null}
       {onRetry !== undefined ? (
         <Button
           size="sm"

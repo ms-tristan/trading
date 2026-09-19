@@ -326,6 +326,9 @@ export function ProfileCombobox({
             'placeholder:text-muted-foreground',
             'motion-safe:transition-colors motion-safe:duration-200',
             FOCUS_RING,
+            // Press feedback only while the field can actually be opened: a
+            // disabled control never acknowledges the click.
+            disabled ? null : 'enabled:active:bg-muted-pressed',
             'disabled:cursor-not-allowed disabled:opacity-50',
             errorMessage === null ? 'border-border' : 'border-loss',
           )}
@@ -361,6 +364,10 @@ export function ProfileCombobox({
                 className={cn(
                   'flex cursor-pointer items-center justify-between gap-md rounded-button px-lg py-sm text-sm',
                   'motion-safe:transition-colors motion-safe:duration-200',
+                  // Pressed shade (`--color-muted-pressed`) is lighter than both
+                  // the active row (`bg-muted`) and the hover row, so hover,
+                  // active and pressed stay three distinguishable states.
+                  'active:bg-muted-pressed',
                   isActive ? 'bg-muted text-foreground' : 'text-foreground hover:bg-muted',
                 )}
               >

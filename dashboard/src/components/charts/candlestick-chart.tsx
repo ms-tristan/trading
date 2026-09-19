@@ -598,6 +598,9 @@ export function CandlestickChart({
         <summary
           className={cn(
             'cursor-pointer font-mono text-xs font-medium text-muted-foreground',
+            // A real click target: it acknowledges the press like every other
+            // control of the dashboard, without moving or resizing anything.
+            'active:bg-muted-pressed active:text-foreground',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
           )}
         >

@@ -7,7 +7,8 @@ import { KeyRound, OctagonAlert, ShieldCheck, Trash2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { ApiError, errorMessage, postKillSwitch } from '@/lib/api';
+import { postKillSwitch } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { EMPTY_PLACEHOLDER, formatTimestamp } from '@/lib/format';
 import {
@@ -59,21 +60,6 @@ function notifyTokenSaved(): void {
 }
 
 /**
- * Message shown after a failed mutation.
- *
- * A 403 is the documented refusal of the server (read-only mode or a missing /
- * invalid token): the payload text is shown verbatim so the operator knows which
- * of the two applies. The status is prefixed when the body was not JSON.
- */
-function mutationErrorMessage(failure: unknown): string {
-  if (failure instanceof ApiError && failure.status === 403) {
-    const message = failure.message.trim();
-    return message.startsWith('HTTP') ? message : `HTTP 403 · ${message}`;
-  }
-  return errorMessage(failure);
-}
-
-/**
  * Kill-switch control: state, operator token and the engage / release commands.
  *
  * Security and accessibility rules that this panel implements:
@@ -84,11 +70,14 @@ function mutationErrorMessage(failure: unknown): string {
  * * engaging the emergency stop is destructive, so it always goes through an
  *   explicit confirmation dialog that requires a reason; releasing confirms too;
  * * a failure never throws and never clears the state on screen: it shows a
- *   non-blocking banner and keeps the previous state.
+ *   non-blocking banner and keeps the previous state. The banner carries the
+ *   shared operator-facing headline, and the raw cause (status, server text,
+ *   requested path) as its detail — only the already-scrubbed `ApiError` of the
+ *   API client ever reaches it, so the token can never be echoed back.
  */
 export function KillSwitchPanel({ initialState, state = null, className }: KillSwitchPanelProps) {
   const [localState, setLocalState] = useState<KillSwitchPayload>(initialState);
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<unknown | null>(null);
   const [pending, setPending] = useState<boolean>(false);
   const [dialogAction, setDialogAction] = useState<DialogAction | null>(null);
   const [reason, setReason] = useState<string>('');
@@ -121,7 +110,7 @@ export function KillSwitchPanel({ initialState, state = null, className }: KillS
       input.value = '';
     }
     notifyTokenSaved();
-    setError(null);
+    setFailure(null);
   }, []);
 
   const handleClearToken = useCallback(() => {
@@ -135,15 +124,15 @@ export function KillSwitchPanel({ initialState, state = null, className }: KillS
 
   const submit = useCallback(async (engage: boolean, submittedReason: string): Promise<void> => {
     setPending(true);
-    setError(null);
+    setFailure(null);
     try {
       const next = await postKillSwitch(
         { engage, reason: submittedReason },
         { operatorToken: readOperatorToken() ?? '' },
       );
       setLocalState(next);
-    } catch (failure) {
-      setError(mutationErrorMessage(failure));
+    } catch (thrown) {
+      setFailure(thrown);
     } finally {
       setPending(false);
     }
@@ -200,6 +189,12 @@ export function KillSwitchPanel({ initialState, state = null, className }: KillS
   }, [closeDialog, dialogAction, pending, reason, submit]);
 
   const reasonText = effective.reason.trim();
+  /*
+   * A 403 stays readable verbatim: the mapping keeps the server text as the
+   * detail (`HTTP 403 · <server text>`), so the operator still learns which of
+   * the two documented refusals — read-only mode, invalid token — applies.
+   */
+  const report = failure === null ? null : failureReport(failure);
 
   return (
     <section
@@ -318,7 +313,11 @@ export function KillSwitchPanel({ initialState, state = null, className }: KillS
         </Button>
       </div>
 
-      <ErrorBanner message={error} className="mt-lg" />
+      <ErrorBanner
+        message={report?.headline ?? null}
+        detail={report?.detail ?? null}
+        className="mt-lg"
+      />
 
       {dialogAction !== null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-xl">

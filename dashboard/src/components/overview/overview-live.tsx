@@ -8,6 +8,7 @@ import { ProfileCard } from '@/components/overview/profile-card';
 import { EmptyState } from '@/components/ui/empty-state';
 import { LiveToolbar } from '@/components/ui/live-toolbar';
 import { fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { EMPTY_PLACEHOLDER, formatInteger, formatTimestamp } from '@/lib/format';
 import type { HealthPayload, KillSwitchPayload, ProfilesPayload } from '@/lib/types';
 import { usePolling } from '@/lib/use-polling';
@@ -44,7 +45,8 @@ const HEADING_ID = 'overview-live-heading';
  * and the first refresh happens on the documented cadence (2 s by default).
  *
  * Robustness: a failed cycle is caught by `usePolling`, shows the non-blocking
- * banner of the toolbar and keeps the last known good bundle on screen; a card
+ * banner of the toolbar — in the shared operator-facing vocabulary, never as a
+ * raw proxy status — and keeps the last known good bundle on screen; a card
  * is keyed by `profile_id`, so a refresh updates it in place instead of
  * remounting it. Accessibility: the toolbar carries the polite live region with
  * the "checked at" stamp and the paused / running state, and the Pause control
@@ -68,7 +70,7 @@ export function OverviewLive({
     return { health, profiles, killSwitch };
   }, []);
 
-  const { data, checkedAt, error, isPaused, toggle, refreshNow } = usePolling<OverviewBundle>({
+  const { data, checkedAt, failure, isPaused, toggle, refreshNow } = usePolling<OverviewBundle>({
     fetcher,
     initialData: { health: initialHealth, profiles: initialProfiles, killSwitch: initialKillSwitch },
     initialCheckedAt,
@@ -101,7 +103,11 @@ export function OverviewLive({
         isPaused={isPaused}
         onToggle={toggle}
         onRefresh={handleRefresh}
-        error={error}
+        // The failure is never printed raw: the mapping turns a 502/503/504, a
+        // connection failure or a timeout into the same operator-facing headline
+        // and keeps the underlying cause as the detail line.
+        error={failure === null ? null : failureReport(failure).headline}
+        errorDetail={failure === null ? null : failureReport(failure).detail}
       />
 
       {isEngaged ? (

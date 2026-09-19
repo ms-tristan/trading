@@ -22,7 +22,7 @@ export default function NotFound() {
       <p>
         <Link
           href="/"
-          className="inline-flex cursor-pointer items-center gap-sm rounded-button border border-border bg-secondary px-lg py-md text-sm font-medium text-on-secondary motion-safe:transition-colors motion-safe:duration-200 hover:bg-secondary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          className="inline-flex cursor-pointer items-center gap-sm rounded-button border border-border bg-secondary px-lg py-md text-sm font-medium text-on-secondary motion-safe:transition-colors motion-safe:duration-200 hover:bg-secondary/80 active:bg-secondary-pressed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         >
           Back to the overview
         </Link>

@@ -17,4 +17,17 @@ describe('NotFound', () => {
     const link = screen.getByRole('link', { name: 'Back to the overview' });
     expect(link).toHaveAttribute('href', '/');
   });
+
+  it('acknowledges the press on the link back to the overview', () => {
+    render(<NotFound />);
+
+    const link = screen.getByRole('link', { name: 'Back to the overview' });
+    // Same affordance as the secondary Button: a colour-only pressed shade,
+    // distinguishable from the hover shade, with the focus ring intact.
+    expect(link).toHaveClass('active:bg-secondary-pressed');
+    expect(link).toHaveClass('hover:bg-secondary/80');
+    expect(link).toHaveClass('cursor-pointer');
+    expect(link).toHaveClass('focus-visible:ring-2');
+    expect(link.className).not.toMatch(/(?:^|\s)scale-/);
+  });
 });

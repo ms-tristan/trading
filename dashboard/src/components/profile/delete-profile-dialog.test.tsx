@@ -3,6 +3,8 @@ import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { BUTTON_PRESSED_CLASSES } from '@/components/ui/button';
+
 import { DeleteProfileDialog } from './delete-profile-dialog';
 
 /** Props of the {@link Harness} of the dialog. */
@@ -37,7 +39,7 @@ function Harness({ onConfirm = () => {}, pending = false, error = null }: Harnes
 
 /** Render an open dialog whose handlers are spies. */
 function renderOpenDialog(
-  props: Partial<{ pending: boolean; error: string | null }> = {},
+  props: Partial<{ pending: boolean; error: string | null; errorDetail: string | null }> = {},
 ): { onConfirm: ReturnType<typeof vi.fn>; onCancel: ReturnType<typeof vi.fn> } {
   const onConfirm = vi.fn();
   const onCancel = vi.fn();
@@ -47,6 +49,7 @@ function renderOpenDialog(
       profileId="alpha"
       pending={props.pending ?? false}
       error={props.error ?? null}
+      errorDetail={props.errorDetail ?? null}
       onConfirm={onConfirm}
       onCancel={onCancel}
     />,
@@ -162,6 +165,49 @@ describe('DeleteProfileDialog', () => {
 
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByText('read-only mode: mutations are disabled')).toBeInTheDocument();
+  });
+
+  it('keeps the raw cause of the failure as a detail line under the headline', () => {
+    renderOpenDialog({
+      error: 'The monitoring API refused the request',
+      errorDetail: 'HTTP 403 · read-only mode: mutations are disabled',
+    });
+
+    const dialog = screen.getByRole('dialog');
+    // The headline is what the operator reads first...
+    expect(within(dialog).getByText('The monitoring API refused the request')).toBeInTheDocument();
+    // ...and the raw status plus the server text stay visible just below it.
+    expect(within(dialog).getByTestId('error-banner-detail')).toHaveTextContent(
+      'HTTP 403 · read-only mode: mutations are disabled',
+    );
+  });
+
+  it('paints a pressed state on the cancel and on the destructive confirmation', () => {
+    renderOpenDialog();
+
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    const confirm = screen.getByRole('button', { name: 'Delete profile' });
+
+    expect(cancel).toHaveClass(BUTTON_PRESSED_CLASSES.ghost);
+    expect(confirm).toHaveClass(BUTTON_PRESSED_CLASSES.danger);
+    expect(cancel).toHaveClass('cursor-pointer');
+    expect(confirm).toHaveClass('cursor-pointer');
+  });
+
+  it('never paints a pressed state on a confirmation that cannot be pressed', () => {
+    renderOpenDialog({ pending: true });
+
+    const confirm = screen.getByRole('button', { name: 'Delete profile' });
+    expect(confirm).toBeDisabled();
+    expect(confirm).not.toHaveClass(BUTTON_PRESSED_CLASSES.danger);
+    // Not one `active:` utility survives on the locked control.
+    expect(Array.from(confirm.classList).some((name) => name.includes('active:'))).toBe(false);
+
+    // The way out keeps both its press feedback and its focus ring.
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toBeEnabled();
+    expect(cancel).toHaveClass(BUTTON_PRESSED_CLASSES.ghost);
+    expect(cancel).toHaveClass('focus-visible:ring-2');
   });
 
   it('keeps the keyboard focus cycling through the controls of the dialog only', async () => {

@@ -13,8 +13,8 @@
  *
  * * the whole form is validated before any request leaves the browser, and every
  *   message is rendered next to the field it belongs to (`aria-invalid` +
- *   `aria-describedby`) — the server still validates, and its message is shown
- *   verbatim when it refuses the creation;
+ *   `aria-describedby`) — the server still validates, and its refusal is shown
+ *   verbatim as the detail of the mapped failure banner;
  * * the profile id `new` is refused on purpose: `/profiles/new` is the route of
  *   this form, so a profile named `new` would have no reachable detail page;
  * * the submit button is disabled and `aria-busy` while the request is in
@@ -32,7 +32,8 @@ import { useRouter } from 'next/navigation';
 
 import { Button } from '@/components/ui/button';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { createProfile, errorMessage } from '@/lib/api';
+import { createProfile } from '@/lib/api';
+import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { readOperatorToken } from '@/lib/operator-token';
 import type { CatalogPayload, CreateProfileBody, RunMode } from '@/lib/types';
@@ -217,7 +218,7 @@ export function CreateProfileForm({
   const [errors, setErrors] = useState<CreateProfileErrors>(NO_ERRORS);
   const [pending, setPending] = useState<boolean>(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
+  const [failure, setFailure] = useState<unknown | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
 
   const assetOptions = useMemo<ProfileComboboxOption[]>(
@@ -279,9 +280,11 @@ export function CreateProfileForm({
         await createProfile(body, { operatorToken: token, baseUrl, fetchImpl });
         setNotice(`Profile ${body.profile_id} created.`);
         router.push('/');
-      } catch (error) {
-        // The server message is shown verbatim; every entered value is kept.
-        setFailure(errorMessage(error));
+      } catch (thrown) {
+        // A refused creation speaks the shared operator-facing copy; the raw
+        // cause (status, server text, requested path) stays as the detail, and
+        // every entered value is kept.
+        setFailure(thrown);
       } finally {
         setPending(false);
       }
@@ -301,6 +304,13 @@ export function CreateProfileForm({
     ],
   );
 
+  /*
+   * A failed creation is never explained by a raw status: the shared mapping
+   * produces the headline the operator reads and keeps the underlying cause —
+   * the server's own refusal text included — as the detail line.
+   */
+  const report = failure === null ? null : failureReport(failure);
+
   return (
     <form
       ref={formRef}
@@ -310,7 +320,7 @@ export function CreateProfileForm({
       noValidate
       className="flex w-full max-w-2xl flex-col gap-xl"
     >
-      {failure === null ? null : <ErrorBanner message={failure} />}
+      {report === null ? null : <ErrorBanner message={report.headline} detail={report.detail} />}
 
       {notice === null ? null : (
         <p

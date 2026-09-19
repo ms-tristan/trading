@@ -377,7 +377,11 @@ describe('pause and resume', () => {
     await user.click(button('Pause'));
     await settle();
 
-    expect(screen.getByText('read-only mode: mutations are disabled')).toBeInTheDocument();
+    // The headline is the mapped copy; the server refusal stays verbatim below.
+    expect(screen.getByText('The monitoring API refused the request')).toBeInTheDocument();
+    const detail = screen.getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 403');
+    expect(detail).toHaveTextContent('read-only mode: mutations are disabled');
     expect(button('Pause')).toBeEnabled();
     expect(button('Delete profile')).toBeEnabled();
   });
@@ -396,11 +400,36 @@ describe('pause and resume', () => {
     await user.click(button('Resume'));
     await settle();
 
-    expect(
-      screen.getByText(`network error calling ${RESUME_PATH}: Failed to fetch`),
-    ).toBeInTheDocument();
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      `network error calling ${RESUME_PATH}: Failed to fetch`,
+    );
     expect(button('Resume')).toBeEnabled();
     expect(nav.refresh).not.toHaveBeenCalled();
+  });
+
+  it('reads a proxy 502 on a lifecycle action as the monitoring API being unreachable', async () => {
+    saveToken();
+    const server = startServer();
+    server.mutation = (target, init) =>
+      init?.method === 'POST' && target === PAUSE_PATH
+        ? jsonResponse({ error: 'Bad Gateway' }, 502)
+        : undefined;
+
+    await mountActions();
+    await user.click(button('Pause'));
+    await settle();
+
+    // The raw status is the detail of the failure, never its headline.
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    const detail = screen.getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 502');
+    expect(detail).toHaveTextContent('Bad Gateway');
+    expect(screen.queryByText('HTTP 502')).not.toBeInTheDocument();
+
+    // The action stays usable: the operator can simply press it again.
+    expect(button('Pause')).toBeEnabled();
+    expect(button('Delete profile')).toBeEnabled();
   });
 });
 
@@ -524,9 +553,14 @@ describe('delete', () => {
 
     const dialog = screen.getByRole('dialog');
     expect(dialog).toBeInTheDocument();
-    // The failure is rendered once, inside the dialog that caused it.
-    expect(screen.getAllByText('cannot flatten the open position')).toHaveLength(1);
-    expect(within(dialog).getByText('cannot flatten the open position')).toBeInTheDocument();
+    // The failure is rendered once, inside the dialog that caused it: the
+    // island banner stays silent while the dialog is open.
+    expect(screen.getAllByText('The monitoring API answered an error')).toHaveLength(1);
+    expect(within(dialog).getByText('The monitoring API answered an error')).toBeInTheDocument();
+    // The server text is not lost: it is the raw detail of the failure.
+    const detail = within(dialog).getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 409');
+    expect(detail).toHaveTextContent('cannot flatten the open position');
     expect(within(dialog).getByRole('button', { name: 'Delete profile' })).toBeEnabled();
     expect(nav.refresh).not.toHaveBeenCalled();
     expect(nav.push).not.toHaveBeenCalled();

@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { BUTTON_PRESSED_CLASSES } from '@/components/ui/button';
 import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
 import type { KillSwitchPayload } from '@/lib/types';
 
@@ -262,8 +263,13 @@ describe('KillSwitchPanel failures', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Engage kill switch' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/mutations are disabled on this server/)).toBeInTheDocument();
+      expect(screen.getByText('The monitoring API refused the request')).toBeInTheDocument();
     });
+    // The documented 403 contract survives: the server text stays verbatim, with
+    // its status, as the detail of the mapped headline.
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'HTTP 403 · mutations are disabled on this server',
+    );
     expect(screen.getByText('Released')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Engage kill switch' })).toBeEnabled();
   });
@@ -279,8 +285,11 @@ describe('KillSwitchPanel failures', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Engage kill switch' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/missing or invalid operator token/)).toBeInTheDocument();
+      expect(screen.getByText('The monitoring API refused the request')).toBeInTheDocument();
     });
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'HTTP 403 · missing or invalid operator token',
+    );
     expect(screen.getByText('Released')).toBeInTheDocument();
   });
 
@@ -295,9 +304,34 @@ describe('KillSwitchPanel failures', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Engage kill switch' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/network error calling \/api\/kill-switch/)).toBeInTheDocument();
+      expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
     });
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'network error calling /api/kill-switch',
+    );
     expect(screen.getByText('Released')).toBeInTheDocument();
+  });
+
+  it('reads a proxy 502 as the monitoring API being unreachable, never as a bare status', async () => {
+    const user = userEvent.setup();
+    installFetch(jsonResponse({ error: 'Bad Gateway' }, 502));
+    render(<KillSwitchPanel initialState={released} />);
+
+    await user.click(screen.getByRole('button', { name: 'Engage kill switch' }));
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByLabelText(/reason/i), 'manual stop');
+    await user.click(within(dialog).getByRole('button', { name: 'Engage kill switch' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    });
+    const detail = screen.getByTestId('error-banner-detail');
+    expect(detail).toHaveTextContent('HTTP 502');
+    expect(detail).toHaveTextContent('Bad Gateway');
+    expect(screen.queryByText('HTTP 502')).not.toBeInTheDocument();
+    // The previous state stays on screen and the control stays usable.
+    expect(screen.getByText('Released')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Engage kill switch' })).toBeEnabled();
   });
 
   it('never leaks the operator token into the displayed error', async () => {
@@ -312,8 +346,78 @@ describe('KillSwitchPanel failures', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Engage kill switch' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/network error calling \/api\/kill-switch/)).toBeInTheDocument();
+      expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
     });
+    // The mapping only ever receives the already-scrubbed ApiError.
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(
+      'network error calling /api/kill-switch: connection refused for token ***',
+    );
     expect(document.body.textContent ?? '').not.toContain('operator-secret');
+    expect(document.body.innerHTML).not.toContain('operator-secret');
+  });
+});
+
+describe('KillSwitchPanel press feedback', () => {
+  it('gives every control of the panel its pressed state', async () => {
+    const user = userEvent.setup();
+    installFetch(jsonResponse(engaged));
+    const view = render(<KillSwitchPanel initialState={released} />);
+
+    // A control that can be pressed carries the pressed state of its variant.
+    expect(screen.getByRole('button', { name: 'Engage kill switch' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.danger,
+    );
+    expect(screen.getByRole('button', { name: 'Save token' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.secondary,
+    );
+
+    // The confirmation dialog follows the shared Button of the design system too.
+    await user.click(screen.getByRole('button', { name: 'Engage kill switch' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.ghost,
+    );
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    // Release is only offered while the kill switch is engaged.
+    view.rerender(<KillSwitchPanel initialState={released} state={engaged} />);
+    expect(screen.getByRole('button', { name: 'Release kill switch' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.secondary,
+    );
+  });
+
+  it('strips the pressed state from a control locked by a pending mutation', async () => {
+    const user = userEvent.setup();
+    // A request that never answers: the panel stays pending for the whole test.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+    render(<KillSwitchPanel initialState={released} />);
+
+    await user.click(screen.getByRole('button', { name: 'Engage kill switch' }));
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByLabelText(/reason/i), 'manual stop');
+    await user.click(within(dialog).getByRole('button', { name: 'Engage kill switch' }));
+
+    // The panel announces the in-flight mutation...
+    const panel = screen.getByRole('heading', { name: 'Kill switch' }).closest('section');
+    expect(panel).toHaveAttribute('aria-busy', 'true');
+
+    // ...and every locked control loses its press feedback.
+    const release = screen.getByRole('button', { name: 'Release kill switch' });
+    expect(release).toBeDisabled();
+    expect(release).not.toHaveClass(BUTTON_PRESSED_CLASSES.secondary);
+    expect(Array.from(release.classList).some((name) => name.includes('active:'))).toBe(false);
+
+    const engage = screen.getByRole('button', { name: 'Engage kill switch' });
+    expect(engage).toBeDisabled();
+    expect(engage).not.toHaveClass(BUTTON_PRESSED_CLASSES.danger);
+
+    // A control that stays usable keeps its press feedback.
+    expect(screen.getByRole('button', { name: 'Save token' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.secondary,
+    );
   });
 });

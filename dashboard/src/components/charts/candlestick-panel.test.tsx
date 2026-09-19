@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { BUTTON_PRESSED_CLASSES } from '@/components/ui/button';
 import type { Candle, CandlesPayload, Position, PositionsPayload, TradesPayload } from '@/lib/types';
 
 import { CandlestickPanel } from './candlestick-panel';
@@ -276,7 +277,10 @@ describe('CandlestickPanel', () => {
     handler = async () => jsonResponse({ error: 'unknown profile' }, 404);
     await advance(DETAIL_INTERVAL_MS);
 
-    expect(screen.getByText('unknown profile')).toBeInTheDocument();
+    // The monitoring-level headline comes first; the server's own text and the
+    // raw status stay in the detail line.
+    expect(screen.getByText('The monitoring API has no such resource')).toBeInTheDocument();
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent('unknown profile');
     // The last known good series is still on screen.
     expect(chart.record.setData.at(-1)).toHaveLength(2);
     expect(screen.queryByText('No candle yet')).toBeNull();
@@ -288,7 +292,88 @@ describe('CandlestickPanel', () => {
 
     await advance(DETAIL_INTERVAL_MS);
 
-    expect(screen.getByText('HTTP 500')).toBeInTheDocument();
+    expect(screen.getByText('The monitoring API answered an error')).toBeInTheDocument();
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent('HTTP 500');
+  });
+
+  it('keeps the last candles and offers the retry when a poll fails', async () => {
+    renderPanel();
+
+    await advance(DETAIL_INTERVAL_MS);
+    expect(screen.getByTestId('candlestick-panel')).toHaveAttribute('data-candles-stale', 'false');
+    expect(screen.getByTestId('candlestick-panel')).toHaveAttribute('data-candles-count', '2');
+
+    handler = async () => new Response('', { status: 502 });
+    await advance(DETAIL_INTERVAL_MS);
+
+    // The reason is the monitoring-level one, the raw status stays the detail.
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent('HTTP 502');
+
+    // The chart still receives the last known good series: an outage never
+    // blanks it, and the empty state stays away.
+    const series = chart.record.setData.at(-1) as Array<Record<string, number>>;
+    expect(series).toHaveLength(2);
+    expect(series.map((candle) => candle.close)).toEqual([20400, 20200]);
+    expect(screen.queryByText('No candle yet')).toBeNull();
+
+    // Degraded state, machine-readable.
+    const panel = screen.getByTestId('candlestick-panel');
+    expect(panel).toHaveAttribute('data-candles-stale', 'true');
+    expect(panel).toHaveAttribute('data-candles-count', '2');
+
+    // An explicit retry, with the pressed state of its variant, issues exactly
+    // one more candle request — the loop itself is unchanged.
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const retry = screen.getByRole('button', { name: 'Retry candles' });
+    expect(retry).toHaveClass(BUTTON_PRESSED_CLASSES.secondary);
+    fireEvent.click(retry);
+    await advance(1);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(requestedUrl(2)).toBe('/api/profiles/btc-paper/candles?limit=500');
+  });
+
+  it.each([502, 503, 504])(
+    'maps a %i from the proxy to the unreachable headline, never a bare status',
+    async (status) => {
+      renderPanel();
+      handler = async () => new Response('', { status });
+
+      await advance(DETAIL_INTERVAL_MS);
+
+      expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+      // The bare proxy status is never what the operator reads first.
+      expect(screen.queryByText(String(status))).toBeNull();
+      expect(screen.getByTestId('error-banner-detail')).toHaveTextContent(`HTTP ${status}`);
+
+      // A failure before the first success has no last known good series: the
+      // panel's own empty state is the right thing to show.
+      const panel = screen.getByTestId('candlestick-panel');
+      expect(panel).toHaveAttribute('data-candles-stale', 'true');
+      expect(panel).toHaveAttribute('data-candles-count', '0');
+      expect(screen.getByText('No candle yet')).toBeInTheDocument();
+    },
+  );
+
+  it('drops the banner and the stale marker after a successful recovery poll', async () => {
+    renderPanel();
+    await advance(DETAIL_INTERVAL_MS);
+
+    handler = async () => new Response('', { status: 503 });
+    await advance(DETAIL_INTERVAL_MS);
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    expect(screen.getByTestId('candlestick-panel')).toHaveAttribute('data-candles-stale', 'true');
+
+    handler = async () => jsonResponse(CANDLES_PAYLOAD);
+    await advance(DETAIL_INTERVAL_MS);
+
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByTestId('error-banner-detail')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry candles' })).toBeNull();
+    const panel = screen.getByTestId('candlestick-panel');
+    expect(panel).toHaveAttribute('data-candles-stale', 'false');
+    expect(panel).toHaveAttribute('data-candles-count', '2');
   });
 
   it('reports a network failure without throwing', async () => {
@@ -299,10 +384,31 @@ describe('CandlestickPanel', () => {
 
     await advance(DETAIL_INTERVAL_MS);
 
+    // A connection failure reads as the monitoring API being unreachable, and
+    // the transport text stays visible in the detail line.
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
     expect(
       screen.getByText('network error calling /api/profiles/btc-paper/candles: Failed to fetch'),
     ).toBeInTheDocument();
     expect(screen.getByText('No candle yet')).toBeInTheDocument();
+  });
+
+  it('reads a timeout as the API being unreachable and keeps the last candles', async () => {
+    renderPanel();
+    await advance(DETAIL_INTERVAL_MS);
+    expect(chart.record.setData.at(-1)).toHaveLength(2);
+
+    handler = async () => {
+      const timeout = new Error('The operation timed out');
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    };
+    await advance(DETAIL_INTERVAL_MS);
+
+    expect(screen.getByText('The monitoring API is unreachable')).toBeInTheDocument();
+    expect(screen.getByTestId('error-banner-detail')).toHaveTextContent('The operation timed out');
+    expect(chart.record.setData.at(-1)).toHaveLength(2);
+    expect(screen.queryByText('No candle yet')).toBeNull();
   });
 
   it('renders the empty state for an empty payload without throwing', async () => {
@@ -354,6 +460,14 @@ describe('CandlestickPanel', () => {
     // A position without a stop still contributes its average price line.
     expect(chart.record.priceLines.filter((line) => line.title === 'Stop')).toEqual([]);
     expect(chart.record.priceLines.at(-1)).toMatchObject({ title: 'Average', lineStyle: 0 });
+  });
+
+  it('gives the section refresh control the pressed state of its ghost variant', () => {
+    renderPanel();
+
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toHaveClass(
+      BUTTON_PRESSED_CLASSES.ghost,
+    );
   });
 
   it('refreshes on demand without waiting for the detail interval', async () => {

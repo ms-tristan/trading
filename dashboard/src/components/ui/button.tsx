@@ -31,11 +31,27 @@ const SIZE_CLASSES: Record<ButtonSize, string> = {
 };
 
 /**
+ * Pressed-state classes of every button variant.
+ *
+ * A press is a background-colour change only, so the control never reflows, and
+ * the `enabled:` modifier is a second, CSS-level guard on top of the runtime
+ * check: a disabled button can never light up under the pointer.
+ */
+export const BUTTON_PRESSED_CLASSES: Record<ButtonVariant, string> = {
+  primary: 'enabled:active:bg-accent-pressed',
+  secondary: 'enabled:active:bg-secondary-pressed',
+  danger: 'enabled:active:bg-destructive-pressed',
+  ghost: 'enabled:active:bg-muted-pressed',
+};
+
+/**
  * Action button of the dashboard.
  *
  * Keyboard operable by construction, always with a visible focus ring and a
- * `cursor-pointer`. `type` defaults to `button` so a button inside a form never
- * submits it by accident.
+ * `cursor-pointer`. A press darkens or lightens the surface (never a scale or a
+ * size change, so nothing reflows) and a disabled button shows no press at all.
+ * `type` defaults to `button` so a button inside a form never submits it by
+ * accident.
  */
 export function Button({
   variant = 'secondary',
@@ -46,6 +62,8 @@ export function Button({
   children,
   ...rest
 }: ButtonProps) {
+  const isDisabled = rest.disabled === true;
+
   return (
     <button
       {...rest}
@@ -56,6 +74,7 @@ export function Button({
         'motion-safe:transition-colors motion-safe:duration-200',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
         'disabled:cursor-not-allowed disabled:opacity-50',
+        isDisabled ? null : BUTTON_PRESSED_CLASSES[variant],
         VARIANT_CLASSES[variant],
         SIZE_CLASSES[size],
         className,

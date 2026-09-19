@@ -308,6 +308,9 @@ export function EquityChart({
         <summary
           className={cn(
             'cursor-pointer font-mono text-xs font-medium text-muted-foreground',
+            // A real click target, like the candle-data disclosure: it
+            // acknowledges the press without moving or resizing anything.
+            'active:bg-muted-pressed active:text-foreground',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
           )}
         >

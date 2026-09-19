@@ -19,6 +19,11 @@ export interface DeleteProfileDialogProps {
   pending: boolean;
   /** Message of the last failed delete, or `null`. */
   error: string | null;
+  /**
+   * Underlying cause of that failure, shown under the message (raw status,
+   * server text, requested path). The message stays the headline.
+   */
+  errorDetail?: string | null;
   /** Send the delete request. Called only by an explicit confirmation. */
   onConfirm: () => void;
   /** Dismiss the dialog without deleting anything. */
@@ -68,14 +73,16 @@ function focusableWithin(container: HTMLElement): HTMLElement[] {
  * * the confirmation is visibly destructive, `disabled` while the request is in
  *   flight, and the dialog announces that state with `aria-busy` — a double
  *   submit is impossible;
- * * the server message of a refused delete is rendered inside the dialog, right
- *   next to the action that failed.
+ * * the failure of a refused delete is rendered inside the dialog, right next to
+ *   the action that failed: the operator-facing headline first, the raw cause
+ *   (status, server text, requested path) as the detail line under it.
  */
 export function DeleteProfileDialog({
   open,
   profileId,
   pending,
   error,
+  errorDetail = null,
   onConfirm,
   onCancel,
 }: DeleteProfileDialogProps) {
@@ -191,7 +198,7 @@ export function DeleteProfileDialog({
           the profile is removed. This cannot be undone.
         </p>
 
-        <ErrorBanner message={error} className="mt-lg" />
+        <ErrorBanner message={error} detail={errorDetail} className="mt-lg" />
 
         <div className="mt-xl flex flex-wrap justify-end gap-sm">
           <Button id={cancelId} variant="ghost" onClick={onCancel}>

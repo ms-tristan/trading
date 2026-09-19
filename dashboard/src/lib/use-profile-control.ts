@@ -17,7 +17,8 @@
  *   been saved in another tab panel), sets `pendingAction` while the request is
  *   in flight and reports the outcome through `notice`/`error`;
  * * `notice` is transient ({@link CONTROL_NOTICE_TIMEOUT_MS}) and `error` is the
- *   server's own message, never a guess;
+ *   server's own message, never a guess; `failure` keeps the value that was
+ *   thrown, so the caller can render the mapped operator-facing copy;
  * * no rejection ever escapes the hook, and unmounting aborts the in-flight poll
  *   and mutation requests and clears their timers.
  */
@@ -87,6 +88,15 @@ export interface UseProfileControlResult {
   pendingAction: ProfileControlAction | null;
   /** Message of the last failure, or `null`. */
   error: string | null;
+  /**
+   * The value the last failure threw — a poll failure or a mutation failure —
+   * or `null`.
+   *
+   * `error` keeps its message, and this keeps the original failure, so a view
+   * can hand it to `failureReport` and show the operator-facing headline plus
+   * the raw underlying detail instead of printing a bare status.
+   */
+  failure: unknown | null;
   /** Transient success message, or `null`. */
   notice: string | null;
   /** Whether pausing is currently possible. */
@@ -170,6 +180,7 @@ export function useProfileControl(
   );
   const [pendingAction, setPendingAction] = useState<ProfileControlAction | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<unknown | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const optionsRef = useRef(options);
@@ -217,6 +228,9 @@ export function useProfileControl(
       });
       if (!mutationErrorRef.current) {
         setError(null);
+        // The last failure is gone with the message that reported it: a view
+        // that renders the mapped report must not keep showing a stale outage.
+        setFailure(null);
       }
     },
     [profileId],
@@ -238,13 +252,14 @@ export function useProfileControl(
         return;
       }
       applyControl(payload);
-    } catch (failure) {
+    } catch (thrown) {
       if (disposedRef.current || controller.signal.aborted) {
         return;
       }
       // The last known state stays on screen; only the message changes.
       mutationErrorRef.current = false;
-      setError(errorMessage(failure));
+      setError(errorMessage(thrown));
+      setFailure(thrown);
     }
   }, [applyControl]);
 
@@ -300,6 +315,8 @@ export function useProfileControl(
       notifyTokenChange();
       if (operatorToken === null) {
         // A local refusal, not a server answer: the poll must not erase it.
+        // Nothing was thrown here, so `failure` is left alone — `error` carries
+        // the message, and no view maps the token hint through `failureReport`.
         mutationErrorRef.current = true;
         setError(NO_OPERATOR_TOKEN_MESSAGE);
         return false;
@@ -313,6 +330,7 @@ export function useProfileControl(
       setNotice(null);
       mutationErrorRef.current = false;
       setError(null);
+      setFailure(null);
       setPendingAction(action);
 
       try {
@@ -322,14 +340,15 @@ export function useProfileControl(
         }
         showNotice(successNotice);
         return true;
-      } catch (failure) {
+      } catch (thrown) {
         if (disposedRef.current || controller.signal.aborted) {
           return false;
         }
         // A refused action must stay readable, so the next successful poll
         // keeps showing it until another action replaces it.
         mutationErrorRef.current = true;
-        setError(errorMessage(failure));
+        setError(errorMessage(thrown));
+        setFailure(thrown);
         return false;
       } finally {
         if (!disposedRef.current) {
@@ -422,6 +441,7 @@ export function useProfileControl(
       known: control.known,
       pendingAction,
       error,
+      failure,
       notice,
       canPause: actionable && !control.paused,
       canResume: actionable && control.paused,
@@ -431,5 +451,5 @@ export function useProfileControl(
       remove,
       refresh,
     };
-  }, [control, error, hasToken, notice, pause, pendingAction, refresh, remove, resume]);
+  }, [control, error, failure, hasToken, notice, pause, pendingAction, refresh, remove, resume]);
 }
