@@ -18,6 +18,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -264,6 +265,10 @@ class FakeStore:
     def load_profiles(self) -> list[ProfileConfig]:
         self._record("load_profiles")
         return [self.profiles[key] for key in sorted(self.profiles)]
+
+    def state_path(self) -> Path | None:
+        """Answer ``None``: an in-memory double has no database file of its own."""
+        return None
 
     # -- orders -------------------------------------------------------------
 

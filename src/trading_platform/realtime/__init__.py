@@ -64,6 +64,15 @@ _LAZY: dict[str, str] = {
     # persistence
     "StateStore": "store",
     "SqliteStateStore": "store",
+    # platform settings (the state store is their single source of truth)
+    "PlatformSettings": "settings",
+    "SETTINGS_META_KEY": "settings",
+    "SETTINGS_VERSION": "settings",
+    "BOOTSTRAP_FIELDS": "settings",
+    "SettingsError": "settings",
+    "settings_from_store": "settings",
+    "save_settings": "settings",
+    "update_settings": "settings",
     # venue adapters
     "Broker": "broker",
     "PaperBroker": "broker",
@@ -100,6 +109,8 @@ _LAZY: dict[str, str] = {
 }
 
 __all__ = [
+    "SETTINGS_META_KEY",
+    "SETTINGS_VERSION",
     "Broker",
     "BrokerAck",
     "BrokerEvent",
@@ -129,6 +140,7 @@ __all__ = [
     "OrderState",
     "OrderType",
     "PaperBroker",
+    "PlatformSettings",
     "PlatformSnapshot",
     "PlatformWallet",
     "PollingMarketStream",
@@ -147,6 +159,7 @@ __all__ = [
     "RiskLimits",
     "RiskManager",
     "RunMode",
+    "SettingsError",
     "SignalAction",
     "SqliteStateStore",
     "StateStore",
@@ -160,6 +173,9 @@ __all__ = [
     "log_event",
     "new_client_order_id",
     "resolve_strategy",
+    "save_settings",
+    "settings_from_store",
+    "update_settings",
 ]
 
 

@@ -15,10 +15,12 @@ import {
   fetchKillSwitch,
   fetchMetrics,
   fetchOrders,
+  fetchOrphans,
   fetchPositions,
   fetchProfile,
   fetchProfiles,
   fetchTrades,
+  isOrphanReport,
   isWalletSnapshot,
   pauseProfile,
   postKillSwitch,
@@ -39,6 +41,7 @@ import type {
   LifecyclePayload,
   MetricsPayload,
   OrdersPayload,
+  OrphanReport,
   PositionsPayload,
   ProfilesPayload,
   ProfileSnapshot,
@@ -146,6 +149,44 @@ function legacyProfile(entry: ProfileSnapshot): Record<string, unknown> {
 function withoutWalletKey<T extends { wallet?: unknown }>(payload: T): Record<string, unknown> {
   const copy: Record<string, unknown> = { ...payload };
   delete copy.wallet;
+  return copy;
+}
+
+/**
+ * The report of the startup safety sweep, as `GET /api/orphans` emits it and as
+ * the `orphaned_positions` key of `GET /api/health` carries it.
+ */
+const orphans: OrphanReport = {
+  found: 2,
+  orphaned: 2,
+  closed_count: 1,
+  failed_count: 1,
+  closed: [
+    {
+      profile_id: 'test1',
+      symbol: 'BTC/USDT',
+      quantity: 0.05,
+      side: 'sell',
+      price: 42123.5,
+    },
+  ],
+  failed: [
+    {
+      profile_id: 'ghost',
+      symbol: 'ETH/USDT',
+      quantity: null,
+      error: 'venue rejected the closing order',
+    },
+  ],
+  swept_at: '2024-06-01T12:00:00+00:00',
+};
+
+/** A health payload of a server that predates the orphan sweep report. */
+function withoutOrphanKey<T extends { orphaned_positions?: unknown }>(
+  payload: T,
+): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...payload };
+  delete copy.orphaned_positions;
   return copy;
 }
 
@@ -316,6 +357,7 @@ const readCases: Array<{
     path: '/api/kill-switch',
     payload: killSwitch,
   },
+  { name: 'fetchOrphans', call: (o) => fetchOrphans(o), path: '/api/orphans', payload: orphans },
 ];
 
 // ---------------------------------------------------------------------------
@@ -547,6 +589,114 @@ describe('the shared platform wallet', () => {
     ).impl;
 
     await expect(fetchHealth({ fetchImpl: healthImpl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/health',
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the startup safety sweep report (additive part of the contract)
+// ---------------------------------------------------------------------------
+
+describe('the orphan sweep report', () => {
+  it('accepts a full report and refuses a half-known one', () => {
+    expect(isOrphanReport(orphans)).toBe(true);
+
+    // Every documented key is required: a report the dashboard cannot read in
+    // full is refused rather than half-rendered.
+    expect(isOrphanReport({ ...orphans, failed: undefined })).toBe(false);
+    expect(isOrphanReport({ ...orphans, closed_count: undefined })).toBe(false);
+    expect(isOrphanReport({ ...orphans, failed_count: '1' })).toBe(false);
+    expect(isOrphanReport({ ...orphans, swept_at: 0 })).toBe(false);
+    // The arrays are validated entry by entry.
+    expect(isOrphanReport({ ...orphans, closed: [{ profile_id: 'test1' }] })).toBe(false);
+    expect(isOrphanReport({ ...orphans, failed: [{ profile_id: 'ghost' }] })).toBe(false);
+    // `null` is a documented quantity/price/error stamp, a string is not.
+    expect(isOrphanReport({ ...orphans, closed: [{ ...orphans.closed[0], price: 'high' }] })).toBe(
+      false,
+    );
+    expect(isOrphanReport(null)).toBe(false);
+    expect(isOrphanReport([])).toBe(false);
+    expect(isOrphanReport('swept')).toBe(false);
+  });
+
+  it('accepts a report of a platform that was never swept', () => {
+    // `swept_at: null` with empty halves is the documented "never swept" state.
+    const neverSwept: OrphanReport = {
+      found: 0,
+      orphaned: 0,
+      closed_count: 0,
+      failed_count: 0,
+      closed: [],
+      failed: [],
+      swept_at: null,
+    };
+
+    expect(isOrphanReport(neverSwept)).toBe(true);
+  });
+
+  it('requests /api/orphans and returns the decoded report', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse(orphans));
+
+    const result = await fetchOrphans({ fetchImpl: impl });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('/api/orphans');
+    expect(calls[0]?.init?.method).toBe('GET');
+    expect(calls[0]?.init?.cache).toBe('no-store');
+    expect(result).toEqual(orphans);
+    expect(result.closed[0]?.symbol).toBe('BTC/USDT');
+    expect(result.failed[0]?.error).toBe('venue rejected the closing order');
+  });
+
+  it('rejects a report missing a field as malformed', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...orphans, failed_count: undefined }));
+
+    await expect(fetchOrphans({ fetchImpl: impl })).rejects.toMatchObject({
+      name: 'ApiError',
+      kind: 'malformed',
+      path: '/api/orphans',
+      message: expect.stringContaining('does not match the expected shape'),
+    });
+  });
+
+  it('rejects a report whose failed entry is not an orphan failure', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...orphans, failed: [{ symbol: 'ETH/USDT' }] }));
+
+    await expect(fetchOrphans({ fetchImpl: impl })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+
+  it('still accepts a health payload without the orphaned_positions key', async () => {
+    const { impl } = recordingFetch(jsonResponse(withoutOrphanKey(health)));
+
+    const result = await fetchHealth({ fetchImpl: impl });
+
+    // An older server stays a valid producer: the absence is not an error.
+    expect(result.orphaned_positions).toBeUndefined();
+    expect(result.version).toBe(health.version);
+  });
+
+  it('now accepts a health payload that carries the orphaned_positions report', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...health, orphaned_positions: orphans }));
+
+    const result = await fetchHealth({ fetchImpl: impl });
+
+    expect(result.orphaned_positions).toEqual(orphans);
+  });
+
+  it('accepts an explicit null orphaned_positions', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...health, orphaned_positions: null }));
+
+    await expect(fetchHealth({ fetchImpl: impl })).resolves.toMatchObject({
+      orphaned_positions: null,
+    });
+  });
+
+  it('refuses a health payload whose orphaned_positions is not a report', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...health, orphaned_positions: { found: 1 } }));
+
+    await expect(fetchHealth({ fetchImpl: impl })).rejects.toMatchObject({
       kind: 'malformed',
       path: '/api/health',
     });

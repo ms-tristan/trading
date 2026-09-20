@@ -18,7 +18,6 @@ from typing import Any
 
 import pytest
 
-from trading_platform.config import load_profiles, load_realtime_config
 from trading_platform.config.models import (
     ProfileConfig,
     RealtimeConfig,
@@ -46,7 +45,81 @@ from trading_platform.realtime.risk import (
 
 LOGGER_NAME = "trading_platform.realtime.risk"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.example.json"
+
+#: The profiles the shipped example used to declare, as an inline literal.  The
+#: JSON document that carried them is deleted -- the profile set is a table of
+#: the SQLite state store, and no importer exists -- so the wallet and platform
+#: cap behaviour it pinned is pinned against the configuration models directly.
+EXAMPLE_PROFILE_PAYLOADS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "btc-paper",
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "strategy": "basic",
+        "mode": "paper",
+        "initial_balance": 10_000.0,
+        "stake_amount": 1_000.0,
+        "exchange": "binance",
+        "warmup_candles": 200,
+        "poll_interval_seconds": 5.0,
+        "allocation": 10_000.0,
+        "forecast": None,
+        "risk": {
+            "max_position_notional": 5_000.0,
+            "max_order_notional": 1_000.0,
+            "max_open_positions": 1,
+            "max_daily_loss": 500.0,
+            "max_drawdown_pct": 0.25,
+            "max_daily_trades": 10,
+        },
+    },
+    {
+        "id": "eth-paper",
+        "symbol": "ETH/USDT",
+        "timeframe": "4h",
+        "strategy": "basic",
+        "mode": "paper",
+        "initial_balance": 5_000.0,
+        "stake_amount": 500.0,
+        "exchange": "binance",
+        "warmup_candles": 300,
+        "poll_interval_seconds": 10.0,
+        "allocation": 5_000.0,
+        "forecast": None,
+        "risk": {
+            "max_position_notional": 2_500.0,
+            "max_order_notional": 500.0,
+            "max_open_positions": 1,
+            "max_daily_loss": 250.0,
+            "max_drawdown_pct": 0.2,
+            "max_daily_trades": 6,
+        },
+    },
+)
+
+#: The engine settings the same example declared, as a plain keyword mapping.
+EXAMPLE_REALTIME_SETTINGS: dict[str, Any] = {
+    "state_db": "data/realtime/state.db",
+    "logs_dir": "data/realtime/logs",
+    "data_dir": "data",
+    "cache_dir": "data/cache",
+    "format": "parquet",
+    "allow_network": True,
+    "csv_dir": None,
+    "start_at": "2024-01-01T00:00:00+00:00",
+    "history_candles": 300,
+    "poll_interval_seconds": 5.0,
+    "stream_poll_timeout_seconds": 10.0,
+    "max_stream_reconnects": 5,
+    "reconnect_backoff_seconds": 1.0,
+    "reconcile_interval_seconds": 60.0,
+    "risk_free_rate": 0.0,
+    "benchmark_variant": "buy_and_hold",
+    "kill_switch_file": "data/realtime/KILL_SWITCH",
+    "platform_initial_balance": 15_000.0,
+    "platform_max_total_notional": 12_000.0,
+    "platform_max_daily_loss": 1_000.0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1295,9 +1368,18 @@ def test_published_figures_drive_the_platform_caps() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_example_profiles_file_declares_the_platform_wallet_and_caps() -> None:
-    profiles = load_profiles(EXAMPLE_PROFILES)
-    realtime = load_realtime_config(EXAMPLE_PROFILES)
+def test_example_profiles_declare_the_platform_wallet_and_caps() -> None:
+    """The shipped example's wallet and platform caps, on the configuration models.
+
+    The document that used to carry them is deleted (the profile set lives in the
+    SQLite state store and nothing reads a profiles file), so the values are
+    pinned against ``ProfileConfig`` and ``RealtimeConfig`` directly.  The
+    *behaviour* these assertions protect is unchanged: the wallet still starts at
+    exactly the sum of the allocations, so every profile keeps the share it
+    declared.
+    """
+    profiles = [ProfileConfig.model_validate(payload) for payload in EXAMPLE_PROFILE_PAYLOADS]
+    realtime = RealtimeConfig.model_validate(EXAMPLE_REALTIME_SETTINGS)
 
     assert [profile.allocation for profile in profiles] == [10_000.0, 5_000.0]
     assert [profile.effective_allocation for profile in profiles] == [10_000.0, 5_000.0]

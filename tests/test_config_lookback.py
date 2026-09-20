@@ -3,11 +3,17 @@
 This module pins REQUIREMENT 9 of the catch-up-entry feature: the configuration
 compatibility trap.  ``tests/test_realtime_models.py`` asserts an exact set
 equality between ``ProfileConfig.model_fields`` and the keys of every profile of
-``config/profiles.example.json``, so adding the field *requires* extending the
-shipped example -- never weakening the assertion.
+the declared profile set, so adding the field *requires* extending that set --
+never weakening the assertion.
+
+The declared profile set is no longer a committed JSON document: the SQLite state
+store is the single source of truth for the profiles.  The declared set pinned
+here is therefore ``DECLARED_PROFILES`` below, written into a real
+:class:`~trading_platform.realtime.store.SqliteStateStore` -- the shipped tree
+declares no profile at all, and a host starts empty on purpose.
 
 Every test here fails as soon as the guard it pins disappears: the field, its
-``ge``/``le`` bounds or the extended example document.
+``ge``/``le`` bounds or the declared profile set.
 
 Deliberate surface update (the optional ``forecast`` profile field)
 -------------------------------------------------------------------
@@ -33,21 +39,72 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from trading_platform.config import load_profiles
 from trading_platform.config.models import (
     MAX_ENTRY_LOOKBACK_CANDLES,
     MonitoringConfig,
     ProfileConfig,
     RealtimeConfig,
 )
+from trading_platform.realtime.settings import BOOTSTRAP_FIELDS, PlatformSettings
+from trading_platform.realtime.store import SqliteStateStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.example.json"
 
-#: Credential-ish keys the shipped example must never carry.
+
+def _declared_profile_payload(**overrides: Any) -> dict[str, Any]:
+    """Return a full profile payload: every model field, plus ``overrides``.
+
+    Built from ``model_dump(mode="json")`` of the model itself, so the declared
+    set can never drift from the field surface: a field added to
+    :class:`ProfileConfig` appears here without anyone editing this module, and
+    ``test_declared_profile_keys_equal_the_model_fields`` then pins it.
+    """
+    payload = ProfileConfig(id="x", symbol="BTC/USDT").model_dump(mode="json")
+    payload.update(overrides)
+    return payload
+
+
+#: The declared profile set this module pins, as it is stored in the state
+#: database.  It is written into a real store (see :func:`declared_profiles`) so
+#: the compatibility trap is exercised against the exact persistence path the
+#: platform uses -- there is no configuration document any more.  The shipped
+#: tree declares no profile at all: a host starts empty on purpose.
+DECLARED_PROFILES: tuple[dict[str, Any], ...] = (
+    _declared_profile_payload(
+        id="btc-paper",
+        symbol="BTC/USDT",
+        entry_lookback_candles=0,
+        forecast=None,
+    ),
+    _declared_profile_payload(
+        id="eth-paper",
+        symbol="ETH/USDT",
+        entry_lookback_candles=3,
+        forecast=None,
+    ),
+)
+
+
+def declared_profiles(tmp_path: Path) -> list[ProfileConfig]:
+    """Return every declared profile, read back from a real state store.
+
+    The store round-trip is the point: a key the persistence layer silently drops
+    would be invisible to a test that kept the payload in memory.
+    """
+    store = SqliteStateStore(tmp_path / "declared.db")
+    store.initialize()
+    try:
+        for payload in DECLARED_PROFILES:
+            store.save_profile(ProfileConfig.model_validate(payload))
+        return list(store.load_profiles())
+    finally:
+        store.close()
+
+
+#: Credential-ish keys the declared profile set must never carry.
 FORBIDDEN_KEYS = ("api_key", "api_secret", "password", "secret", "token")
 
-#: Endpoint schemes the shipped example must never carry either.
+#: Endpoint schemes the declared profile set must never carry either.
 FORBIDDEN_SCHEMES = ("http://", "https://", "wss://")
 
 
@@ -110,28 +167,27 @@ def test_entry_lookback_refuses_a_non_integer(value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. the shipped example declares the key on every profile
+# 4. the declared profile set carries the key on every profile
 # ---------------------------------------------------------------------------
 
 
-def test_example_profiles_declare_entry_lookback() -> None:
-    payload = json.loads(EXAMPLE_PROFILES.read_text(encoding="utf-8"))
+def test_declared_profiles_carry_entry_lookback(tmp_path: Path) -> None:
     declared: list[int] = []
 
-    for profile in payload["profiles"]:
-        assert "entry_lookback_candles" in profile, (
-            f"profile {profile.get('id')!r} does not declare entry_lookback_candles"
+    for payload in DECLARED_PROFILES:
+        assert "entry_lookback_candles" in payload, (
+            f"profile {payload.get('id')!r} does not declare entry_lookback_candles"
         )
-        value = profile["entry_lookback_candles"]
+        value = payload["entry_lookback_candles"]
         assert isinstance(value, int) and not isinstance(value, bool)
         assert 0 <= value <= MAX_ENTRY_LOOKBACK_CANDLES
         declared.append(value)
-        # the optional forecast field is part of the model surface: the shipped
-        # example declares it on every profile, explicitly ``null`` by default
-        assert "forecast" in profile, f"profile {profile.get('id')!r} declares no forecast key"
-        assert profile["forecast"] is None
+        # the optional forecast field is part of the model surface: the declared
+        # set carries it on every profile, explicitly ``null`` by default
+        assert "forecast" in payload, f"profile {payload.get('id')!r} declares no forecast key"
+        assert payload["forecast"] is None
 
-    loaded = load_profiles(EXAMPLE_PROFILES)
+    loaded = declared_profiles(tmp_path)
 
     assert [profile.entry_lookback_candles for profile in loaded] == declared
     assert all(profile.forecast is None for profile in loaded)
@@ -144,8 +200,6 @@ def test_example_profiles_declare_entry_lookback() -> None:
 
 def test_forecast_profile_field_is_last_optional_and_defaults_to_none() -> None:
     """The artifact path is optional, declared last, and ``None`` by default."""
-    payload = json.loads(EXAMPLE_PROFILES.read_text(encoding="utf-8"))
-
     assert list(ProfileConfig.model_fields)[-1] == "forecast"
     assert ProfileConfig.model_fields["forecast"].default is None
 
@@ -154,9 +208,9 @@ def test_forecast_profile_field_is_last_optional_and_defaults_to_none() -> None:
     assert omitted.forecast is None
     assert omitted.forecast_artifact is None
     assert omitted.strategy_params() == {}
-    # a document that omits the key keeps the historical behaviour
+    # a profile that omits the key keeps the historical behaviour
     assert omitted.model_dump()["forecast"] is None
-    assert "forecast" in payload["profiles"][0]
+    assert "forecast" in DECLARED_PROFILES[0]
 
     declared = ProfileConfig(id="x", symbol="BTC/USDT", forecast="a.parquet")
 
@@ -187,16 +241,27 @@ def test_forecast_refuses_an_explicitly_unknown_key() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_example_profile_keys_equal_the_model_fields() -> None:
-    payload = json.loads(EXAMPLE_PROFILES.read_text(encoding="utf-8"))
+def test_declared_profile_keys_equal_the_model_fields(tmp_path: Path) -> None:
     profile_keys = set(ProfileConfig.model_fields)
     risk_keys = set(ProfileConfig.model_fields["risk"].annotation.model_fields)
 
-    for profile in payload["profiles"]:
-        assert set(profile) == profile_keys, f"profile {profile.get('id')!r} drifted"
-        assert set(profile["risk"]) == risk_keys
-    assert set(payload["realtime"]) == set(RealtimeConfig.model_fields)
-    assert set(payload["monitoring"]) == set(MonitoringConfig.model_fields)
+    for payload in DECLARED_PROFILES:
+        assert set(payload) == profile_keys, f"profile {payload.get('id')!r} drifted"
+        assert set(payload["risk"]) == risk_keys
+
+    # the store round-trip preserves the exact key set the model declares
+    for profile in declared_profiles(tmp_path):
+        restored = profile.model_dump(mode="json")
+        assert set(restored) == profile_keys
+        assert set(restored["risk"]) == risk_keys
+
+    # the engine settings live in SQLite too, seeded from the model defaults
+    settings = PlatformSettings.from_defaults()
+
+    assert set(settings.to_dict()["realtime"]) | set(BOOTSTRAP_FIELDS) == set(
+        RealtimeConfig.model_fields
+    )
+    assert set(settings.to_dict()["monitoring"]) == set(MonitoringConfig.model_fields)
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +269,18 @@ def test_example_profile_keys_equal_the_model_fields() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_document_that_omits_the_key_keeps_the_historical_behaviour(tmp_path: Path) -> None:
-    document = {
-        "profiles": [
-            {"id": "legacy-btc", "symbol": "BTC/USDT"},
-            {"id": "legacy-eth", "symbol": "ETH/USDT", "warmup_candles": 300},
-        ]
-    }
-    path = tmp_path / "profiles.json"
-    path.write_text(json.dumps(document), encoding="utf-8")
-
-    profiles = load_profiles(path)
+def test_a_profile_row_that_omits_the_key_keeps_the_historical_behaviour(
+    tmp_path: Path,
+) -> None:
+    """A profile stored without the key behaves exactly as it always did."""
+    store = SqliteStateStore(tmp_path / "state.db")
+    store.initialize()
+    try:
+        store.save_profile(ProfileConfig(id="legacy-btc", symbol="BTC/USDT"))
+        store.save_profile(ProfileConfig(id="legacy-eth", symbol="ETH/USDT", warmup_candles=300))
+        profiles = store.load_profiles()
+    finally:
+        store.close()
 
     assert [profile.entry_lookback_candles for profile in profiles] == [0, 0]
     for profile in profiles:
@@ -227,11 +293,11 @@ def test_a_document_that_omits_the_key_keeps_the_historical_behaviour(tmp_path: 
 
 
 def test_the_new_key_is_not_a_credential_and_adds_no_endpoint() -> None:
-    text = EXAMPLE_PROFILES.read_text(encoding="utf-8")
+    text = json.dumps(DECLARED_PROFILES, sort_keys=True)
     lowered = text.lower()
 
     for key in FORBIDDEN_KEYS:
-        assert key not in lowered, f"the example profiles file contains {key!r}"
+        assert key not in lowered, f"the declared profiles contain {key!r}"
     for scheme in FORBIDDEN_SCHEMES:
-        assert scheme not in lowered, f"the example profiles file contains {scheme!r}"
+        assert scheme not in lowered, f"the declared profiles contain {scheme!r}"
     assert "entry_lookback_candles" in text

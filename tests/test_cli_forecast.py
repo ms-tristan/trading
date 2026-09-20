@@ -24,6 +24,7 @@ import pytest
 from typer.testing import CliRunner
 
 from trading_platform.cli import app, parse_data_file_stem
+from trading_platform.config.models import MonitoringConfig, ProfileConfig, RealtimeConfig
 from trading_platform.core.constants import OHLCV_INDEX_NAME
 from trading_platform.data.synthetic import make_trending_ohlcv
 from trading_platform.forecast.artifact import ForecastStore
@@ -31,6 +32,8 @@ from trading_platform.forecast.backends.naive import NaiveBackend
 from trading_platform.forecast.backends.timesfm import DEFAULT_MODEL_ID
 from trading_platform.forecast.registry import BACKENDS, register_backend
 from trading_platform.forecast.series import TIMEFRAME_SECONDS
+from trading_platform.realtime.settings import PlatformSettings, save_settings
+from trading_platform.realtime.store import SqliteStateStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG = str(REPO_ROOT / "config" / "backtest_default.json")
@@ -178,24 +181,37 @@ def _fresh_now(artifact: Path) -> pd.Timestamp:
     return ForecastStore.load(artifact).origins()[-1]
 
 
-def profile_document(artifact: Path, *, profile_id: str = "btc-timesfm") -> dict[str, Any]:
-    """Return a minimal profiles document (one ``timesfm`` profile) as a mapping."""
-    return {
-        "profiles": [
-            {
-                "id": profile_id,
-                "symbol": "BTC/USDT",
-                "timeframe": "1h",
-                "strategy": "timesfm",
-                "params": {"horizon": HORIZON, "reforecast_every": STRIDE, "min_lead": 2},
-                "mode": "paper",
-                "warmup_candles": CONTEXT,
-                "forecast": str(artifact),
-            }
-        ],
-        "realtime": {"allow_network": False},
-        "monitoring": {"port": 0},
-    }
+def profile_definition(artifact: Path, *, profile_id: str = "btc-timesfm") -> ProfileConfig:
+    """Return the one ``timesfm`` profile of the scenario, as a validated model."""
+    return ProfileConfig(
+        id=profile_id,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        strategy="timesfm",
+        params={"horizon": HORIZON, "reforecast_every": STRIDE, "min_lead": 2},
+        mode="paper",
+        warmup_candles=CONTEXT,
+        forecast=str(artifact),
+    )
+
+
+def seed_store(database: Path, profiles: list[ProfileConfig]) -> Path:
+    """Persist ``profiles`` in a fresh state store and return the database path."""
+    store = SqliteStateStore(database)
+    store.initialize()
+    try:
+        for definition in profiles:
+            store.save_profile(definition)
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig(allow_network=False),
+                monitoring=MonitoringConfig(port=0),
+            ),
+        )
+    finally:
+        store.close()
+    return database
 
 
 # ---------------------------------------------------------------------------
@@ -204,18 +220,16 @@ def profile_document(artifact: Path, *, profile_id: str = "btc-timesfm") -> dict
 
 
 @pytest.fixture
-def profiles_document(tmp_path: Path, synthetic_csv: Path) -> Path:
-    """Write a one-profile ``timesfm`` document pointing at a fresh artifact.
+def profiles_database(tmp_path: Path, synthetic_csv: Path) -> Path:
+    """Seed a one-profile state database pointing at a fresh artifact.
 
     The artifact is built with the offline ``naive`` backend and the profile
-    declares the same symbol and timeframe, so the document is exactly what the
+    declares the same symbol and timeframe, so the store is exactly what the
     realtime startup guard accepts -- which is what lets the tests below assert
     the *refusal* of one deliberately broken variant at a time.
     """
     artifact = build_artifact(tmp_path, synthetic_csv)
-    path = tmp_path / "profiles.json"
-    path.write_text(json.dumps(profile_document(artifact), indent=2), encoding="utf-8")
-    return path
+    return seed_store(tmp_path / "state.db", [profile_definition(artifact)])
 
 
 @pytest.fixture
@@ -329,7 +343,7 @@ def test_forecast_help_lists_the_bootstrap_command() -> None:
     result = invoke("forecast-bootstrap", "--help")
 
     assert result.exit_code == 0, result.output
-    for option in ("--profiles", "--profile", "--config", "--backend", "--json"):
+    for option in ("--state-db", "--profiles", "--profile", "--config", "--backend", "--json"):
         assert option in result.output, f"forecast-bootstrap --help hides {option}"
 
 
@@ -337,7 +351,15 @@ def test_forecast_info_help_lists_the_coverage_options() -> None:
     result = invoke("forecast-info", "--help")
 
     assert result.exit_code == 0, result.output
-    for option in ("--artifact", "--now", "--profiles", "--profile", "--timeframe", "--horizon"):
+    for option in (
+        "--artifact",
+        "--now",
+        "--state-db",
+        "--profiles",
+        "--profile",
+        "--timeframe",
+        "--horizon",
+    ):
         assert option in result.output, f"forecast-info --help hides {option}"
 
 
@@ -965,7 +987,7 @@ def test_forecast_info_honours_the_timeframe_and_horizon_overrides(
 
 
 def test_forecast_info_with_a_profile_reports_the_profile_identity(
-    tmp_path: Path, synthetic_csv: Path, profiles_document: Path
+    tmp_path: Path, synthetic_csv: Path, profiles_database: Path
 ) -> None:
     artifact = build_artifact(tmp_path, synthetic_csv)
 
@@ -973,8 +995,8 @@ def test_forecast_info_with_a_profile_reports_the_profile_identity(
         "forecast-info",
         "--artifact",
         str(artifact),
-        "--profiles",
-        str(profiles_document),
+        "--state-db",
+        str(profiles_database),
         "--now",
         _fresh_now(artifact).isoformat(),
         "--json",
@@ -991,7 +1013,7 @@ def test_forecast_info_with_a_profile_reports_the_profile_identity(
 
 
 def test_forecast_info_refuses_a_symbol_mismatch_with_the_frozen_message(
-    tmp_path: Path, synthetic_csv: Path, profiles_document: Path
+    tmp_path: Path, synthetic_csv: Path, profiles_database: Path
 ) -> None:
     """The pre-flight must read exactly like the realtime startup guard."""
     # a distinct path: the fixture's own artifact must stay intact
@@ -1013,8 +1035,8 @@ def test_forecast_info_refuses_a_symbol_mismatch_with_the_frozen_message(
         "forecast-info",
         "--artifact",
         str(mismatched),
-        "--profiles",
-        str(profiles_document),
+        "--state-db",
+        str(profiles_database),
         "--now",
         _fresh_now(mismatched).isoformat(),
     )
@@ -1025,7 +1047,7 @@ def test_forecast_info_refuses_a_symbol_mismatch_with_the_frozen_message(
 
 
 def test_forecast_info_refuses_a_timeframe_mismatch_with_the_frozen_message(
-    tmp_path: Path, synthetic_csv: Path, profiles_document: Path
+    tmp_path: Path, synthetic_csv: Path, profiles_database: Path
 ) -> None:
     mismatched = tmp_path / "h4.parquet"
     invoke(
@@ -1044,8 +1066,8 @@ def test_forecast_info_refuses_a_timeframe_mismatch_with_the_frozen_message(
         "forecast-info",
         "--artifact",
         str(mismatched),
-        "--profiles",
-        str(profiles_document),
+        "--state-db",
+        str(profiles_database),
         "--now",
         _fresh_now(mismatched).isoformat(),
     )
@@ -1054,7 +1076,7 @@ def test_forecast_info_refuses_a_timeframe_mismatch_with_the_frozen_message(
 
 
 def test_forecast_info_refuses_a_stale_artifact_for_a_profile(
-    tmp_path: Path, synthetic_csv: Path, profiles_document: Path
+    tmp_path: Path, synthetic_csv: Path, profiles_database: Path
 ) -> None:
     artifact = build_artifact(tmp_path, synthetic_csv)
 
@@ -1062,8 +1084,8 @@ def test_forecast_info_refuses_a_stale_artifact_for_a_profile(
         "forecast-info",
         "--artifact",
         str(artifact),
-        "--profiles",
-        str(profiles_document),
+        "--state-db",
+        str(profiles_database),
         "--now",
         "2099-01-01T00:00:00Z",
     )
@@ -1073,7 +1095,7 @@ def test_forecast_info_refuses_a_stale_artifact_for_a_profile(
 
 
 def test_forecast_info_unknown_profile_id_exits_one(
-    tmp_path: Path, synthetic_csv: Path, profiles_document: Path
+    tmp_path: Path, synthetic_csv: Path, profiles_database: Path
 ) -> None:
     artifact = build_artifact(tmp_path, synthetic_csv)
 
@@ -1081,8 +1103,8 @@ def test_forecast_info_unknown_profile_id_exits_one(
         "forecast-info",
         "--artifact",
         str(artifact),
-        "--profiles",
-        str(profiles_document),
+        "--state-db",
+        str(profiles_database),
         "--profile",
         "does-not-exist",
     )
@@ -1097,7 +1119,7 @@ def test_forecast_info_profile_option_requires_a_profiles_file(
 
     result = invoke("forecast-info", "--artifact", str(artifact), "--profile", "btc-timesfm")
 
-    assert_domain_error(result, "--profile requires --profiles")
+    assert_domain_error(result, "--profile requires --state-db")
 
 
 def test_forecast_info_rejects_a_non_iso_now(tmp_path: Path, synthetic_csv: Path) -> None:
@@ -1114,26 +1136,22 @@ def test_forecast_info_rejects_a_non_iso_now(tmp_path: Path, synthetic_csv: Path
 
 
 def bootstrap_profiles(tmp_path: Path, data_file: Path, *extra: str) -> Path:
-    """Write a one-profile document shaped like the shipped timesfm example."""
-    document = {
-        "profiles": [
-            {
-                "id": "btc-timesfm-paper",
-                "symbol": "BTC/USDT",
-                "timeframe": "1h",
-                "strategy": "timesfm",
-                "params": {"horizon": HORIZON, "reforecast_every": STRIDE},
-                "mode": "paper",
-                "warmup_candles": 128,
-                "forecast": "data/forecast/btc-timesfm-paper-1h-seasonal.parquet",
-            }
+    """Seed a one-profile state database shaped like the shipped timesfm example."""
+    return seed_store(
+        tmp_path / "state.db",
+        [
+            ProfileConfig(
+                id="btc-timesfm-paper",
+                symbol="BTC/USDT",
+                timeframe="1h",
+                strategy="timesfm",
+                params={"horizon": HORIZON, "reforecast_every": STRIDE},
+                mode="paper",
+                warmup_candles=128,
+                forecast="data/forecast/btc-timesfm-paper-1h-seasonal.parquet",
+            )
         ],
-        "realtime": {"allow_network": False},
-        "monitoring": {"port": 0},
-    }
-    path = tmp_path / "profiles.json"
-    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return path
+    )
 
 
 def bootstrap_config(tmp_path: Path, data_dir: Path) -> Path:
@@ -1157,7 +1175,7 @@ def test_forecast_bootstrap_writes_the_artifact_the_profile_declares(tmp_path: P
 
     result = invoke(
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         str(profiles),
         "--config",
         str(config),
@@ -1189,38 +1207,30 @@ def test_forecast_bootstrap_honours_the_selected_profile(tmp_path: Path) -> None
     data_dir.mkdir()
     make_trending_ohlcv(700).to_csv(data_dir / "BTC_USDT-1h.csv", index_label=OHLCV_INDEX_NAME)
     make_trending_ohlcv(700).to_csv(data_dir / "ETH_USDT-4h.csv", index_label=OHLCV_INDEX_NAME)
-    profiles = tmp_path / "profiles.json"
-    profiles.write_text(
-        json.dumps(
-            {
-                "profiles": [
-                    {
-                        "id": "btc-timesfm-paper",
-                        "symbol": "BTC/USDT",
-                        "timeframe": "1h",
-                        "strategy": "timesfm",
-                        "params": {},
-                    },
-                    {
-                        "id": "eth-timesfm-paper",
-                        "symbol": "ETH/USDT",
-                        "timeframe": "4h",
-                        "strategy": "timesfm",
-                        "params": {},
-                    },
-                ],
-                "realtime": {"allow_network": False},
-                "monitoring": {"port": 0},
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    profiles = seed_store(
+        tmp_path / "state.db",
+        [
+            ProfileConfig(
+                id="btc-timesfm-paper",
+                symbol="BTC/USDT",
+                timeframe="1h",
+                strategy="timesfm",
+                params={},
+            ),
+            ProfileConfig(
+                id="eth-timesfm-paper",
+                symbol="ETH/USDT",
+                timeframe="4h",
+                strategy="timesfm",
+                params={},
+            ),
+        ],
     )
     config = bootstrap_config(tmp_path, data_dir)
 
     result = invoke(
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         str(profiles),
         "--profile",
         "eth-timesfm-paper",
@@ -1242,7 +1252,6 @@ def test_forecast_bootstrap_artifact_is_accepted_by_the_realtime_guard(
     tmp_path: Path,
 ) -> None:
     """The bootstrap output is what a realtime profile can actually start on."""
-    from trading_platform.config.models import ProfileConfig
     from trading_platform.realtime.features import check_profile_forecast
 
     data_dir = tmp_path / "data"
@@ -1255,7 +1264,7 @@ def test_forecast_bootstrap_artifact_is_accepted_by_the_realtime_guard(
 
     result = invoke(
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         str(profiles),
         "--config",
         str(config),
@@ -1290,7 +1299,7 @@ def test_forecast_bootstrap_rejects_a_non_offline_backend(tmp_path: Path) -> Non
 
     result = invoke(
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         str(profiles),
         "--config",
         str(config),
@@ -1309,7 +1318,7 @@ def test_forecast_bootstrap_missing_candle_file_is_actionable(tmp_path: Path) ->
 
     result = invoke(
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         str(profiles),
         "--config",
         str(config),
@@ -1327,7 +1336,7 @@ def test_forecast_bootstrap_unknown_profile_id_is_actionable(tmp_path: Path) -> 
 
     result = invoke(
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         str(profiles),
         "--profile",
         "nope",
@@ -1346,12 +1355,12 @@ def test_forecast_bootstrap_is_deterministic(tmp_path: Path) -> None:
     profiles = bootstrap_profiles(tmp_path, data_dir / "BTC_USDT-1h.csv")
     config = bootstrap_config(tmp_path, data_dir)
 
-    first = invoke("forecast-bootstrap", "--profiles", str(profiles), "--config", str(config))
+    first = invoke("forecast-bootstrap", "--state-db", str(profiles), "--config", str(config))
     assert first.exit_code == 0, first.output
     artifact = data_dir / "forecast" / "btc-timesfm-paper-1h-seasonal.parquet"
     before = artifact.read_bytes()
 
-    second = invoke("forecast-bootstrap", "--profiles", str(profiles), "--config", str(config))
+    second = invoke("forecast-bootstrap", "--state-db", str(profiles), "--config", str(config))
     assert second.exit_code == 0, second.output
 
     assert artifact.read_bytes() == before

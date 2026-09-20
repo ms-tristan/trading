@@ -2,9 +2,10 @@
 
 Everything here is **offline, deterministic and bounded**:
 
-* the profiles documents live in ``tmp_path`` and drive the engine over a local
-  CSV cache (:class:`~trading_platform.data.loader.CsvDataProvider`), so no test
-  touches the network and ``TB_ALLOW_LIVE_TRADING`` is never needed;
+* the profiles live in the SQLite state store under ``tmp_path`` -- the single
+  source of truth -- and drive the engine over a local CSV cache
+  (:class:`~trading_platform.data.loader.CsvDataProvider`), so no test touches the
+  network and ``TB_ALLOW_LIVE_TRADING`` is never needed;
 * ``realtime.start_at`` anchors a ``ManualClock``, which is what makes
   ``realtime run --once`` reproducible: the same command run twice produces the
   same candle, the same decision and the same deterministic ``client_order_id``;
@@ -37,7 +38,7 @@ import pytest
 from typer.testing import CliRunner
 
 from trading_platform.cli import app, main
-from trading_platform.config import MonitoringConfig, RealtimeConfig
+from trading_platform.config import MonitoringConfig, ProfileConfig, RealtimeConfig
 from trading_platform.data.synthetic import make_ohlcv
 from trading_platform.realtime.catalog import default_catalog_body
 from trading_platform.realtime.clock import ManualClock
@@ -64,7 +65,6 @@ CHECK_KEYS = frozenset(
     {
         "command",
         "ok",
-        "config_path",
         "state_db",
         "state_db_writable",
         "kill_switch",
@@ -90,9 +90,9 @@ CHECK_PROFILE_KEYS = frozenset(
 )
 
 #: Keys documented for the ``realtime-run``/``realtime-serve`` payloads.
-RUN_KEYS = frozenset({"command", "ok", "config_path", "state_db", "profiles", "decisions", "url"})
+RUN_KEYS = frozenset({"command", "ok", "state_db", "profiles", "decisions", "url"})
 
-SERVE_KEYS = frozenset({"command", "ok", "config_path", "state_db", "profiles", "url"})
+SERVE_KEYS = frozenset({"command", "ok", "state_db", "profiles", "url"})
 
 
 @pytest.fixture(autouse=True)
@@ -152,54 +152,101 @@ def profile(
     }
 
 
-def write_profiles(
+def store_raw_profile(database: Path, definition: Mapping[str, Any]) -> None:
+    """Write one profile row **verbatim**, bypassing the model validation.
+
+    The store validates a profile on write -- that is the point of it being the
+    source of truth -- so this helper exists only for the pre-flight findings that
+    describe a row a *previous, laxer* build could have written (a timeframe the
+    engine no longer supports).  It is the SQLite equivalent of the hand-edited
+    JSON document those tests used to build.
+    """
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "INSERT INTO profiles (profile_id, payload, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(profile_id) DO UPDATE SET payload = excluded.payload",
+            (str(definition["id"]), json.dumps(definition), "2024-01-06T00:00:00+00:00"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def seed_profiles(
     directory: Path,
     *,
     profiles: list[dict[str, Any]] | None = None,
     start_at: str | None = ANCHOR,
+    raw_profiles: list[dict[str, Any]] | None = None,
     **overrides: Any,
 ) -> Path:
-    """Write a complete profiles document into ``directory`` and return its path."""
+    """Seed a **fresh** state database with the scenario profiles and settings.
+
+    The SQLite state store is the single source of truth for both, so this helper
+    is the whole "configuration" of a scenario: it writes the profiles into the
+    ``profiles`` table and the engine settings into the ``meta`` table, exactly
+    like a deployment whose settings were customised once through the store.  It
+    returns the database path, which is what every command is pointed at.
+    """
+    from trading_platform.realtime.settings import PlatformSettings, save_settings
+
     cache = write_csv_cache(directory)
-    document: dict[str, Any] = {
-        "profiles": [
+    realtime: dict[str, Any] = {
+        "state_db": str(directory / "state.db"),
+        "logs_dir": str(directory / "logs"),
+        "data_dir": str(directory),
+        "cache_dir": str(directory / "cache"),
+        "format": "csv",
+        "allow_network": False,
+        "csv_dir": str(cache),
+        "start_at": start_at,
+        "history_candles": HISTORY_CANDLES,
+        "poll_interval_seconds": 1.0,
+        "stream_poll_timeout_seconds": 5.0,
+        "max_stream_reconnects": 1,
+        "reconnect_backoff_seconds": 0.01,
+        "reconcile_interval_seconds": 60.0,
+        "risk_free_rate": 0.0,
+        "benchmark_variant": "buy_and_hold",
+        "kill_switch_file": str(directory / "KILL_SWITCH"),
+    }
+    realtime.update(overrides.pop("realtime", {}))
+    monitoring: dict[str, Any] = {
+        "host": "127.0.0.1",
+        "port": 0,
+        "refresh_seconds": 2.0,
+        "request_timeout_seconds": 5.0,
+        "max_request_bytes": 65536,
+    }
+    monitoring.update(overrides.pop("monitoring", {}))
+    definitions = (
+        [
             profile("btc-paper", BTC, "1h", 10000.0, 1000.0),
             profile("eth-paper", ETH, "4h", 5000.0, 500.0),
         ]
         if profiles is None
-        else profiles,
-        "realtime": {
-            "state_db": str(directory / "state.db"),
-            "logs_dir": str(directory / "logs"),
-            "data_dir": str(directory),
-            "cache_dir": str(directory / "cache"),
-            "format": "csv",
-            "allow_network": False,
-            "csv_dir": str(cache),
-            "start_at": start_at,
-            "history_candles": HISTORY_CANDLES,
-            "poll_interval_seconds": 1.0,
-            "stream_poll_timeout_seconds": 5.0,
-            "max_stream_reconnects": 1,
-            "reconnect_backoff_seconds": 0.01,
-            "reconcile_interval_seconds": 60.0,
-            "risk_free_rate": 0.0,
-            "benchmark_variant": "buy_and_hold",
-            "kill_switch_file": str(directory / "KILL_SWITCH"),
-        },
-        "monitoring": {
-            "host": "127.0.0.1",
-            "port": 0,
-            "refresh_seconds": 2.0,
-            "request_timeout_seconds": 5.0,
-            "max_request_bytes": 65536,
-        },
-    }
-    document["realtime"].update(overrides.pop("realtime", {}))
-    document.update(overrides)
-    path = directory / "profiles.json"
-    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return path
+        else profiles
+    )
+
+    database = directory / "state.db"
+    store = SqliteStateStore(database, clock=ManualClock(datetime.fromisoformat(ANCHOR)))
+    store.initialize()
+    try:
+        for definition in definitions:
+            store.save_profile(ProfileConfig.model_validate(definition))
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig(**realtime),
+                monitoring=MonitoringConfig(**monitoring),
+            ),
+        )
+    finally:
+        store.close()
+    for definition in raw_profiles or []:
+        store_raw_profile(database, definition)
+    return database
 
 
 def payload_of(result: Any) -> dict[str, Any]:
@@ -256,14 +303,49 @@ def test_realtime_help_lists_the_three_commands() -> None:
         assert command in result.output
 
 
-def test_missing_profiles_option_is_a_usage_error() -> None:
-    result = invoke("realtime", "check")
+def test_the_state_db_option_falls_back_to_the_environment_then_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--state-db`` is the bootstrap key, and it is optional.
 
-    assert result.exit_code == 2
+    The state database is the single source of truth, but *its own path* cannot
+    live inside it: it is resolved as *option > environment > model default*, so a
+    host that customises nothing launches with no argument at all and still gets a
+    real pre-flight.
+    """
+    # 1. no option, no environment: the model default is used, and it still runs.
+    monkeypatch.delenv("TB_REALTIME_STATE_DB", raising=False)
+    default = invoke("realtime", "check", "--json")
+    assert default.exit_code == 0, default.output
+    assert str(RealtimeConfig().state_db) in default.output
+
+    # 2. the environment variable is honoured when the option is omitted.
+    target = tmp_path / "from-env.db"
+    monkeypatch.setenv("TB_REALTIME_STATE_DB", str(target))
+    from_env = invoke("realtime", "check", "--json")
+    assert from_env.exit_code == 0, from_env.output
+    assert str(target) in from_env.output
+
+    # 3. an explicit option always wins over the environment.
+    explicit = tmp_path / "explicit.db"
+    chosen = invoke("realtime", "check", "--state-db", str(explicit), "--json")
+    assert chosen.exit_code == 0, chosen.output
+    assert str(explicit) in chosen.output
+    assert str(target) not in chosen.output
 
 
-def test_a_missing_profiles_file_exits_one_without_a_traceback(tmp_path: Path) -> None:
-    result = invoke("realtime", "check", "--profiles", str(tmp_path / "nope.json"))
+def test_a_missing_state_db_directory_exits_without_a_traceback(tmp_path: Path) -> None:
+    """The state database is created on demand: what fails is an unusable path.
+
+    A *missing directory* is no longer a finding -- the store creates its parent --
+    so the failure surface is now an unwritable location, which is exactly what an
+    operator hits when a volume is not mounted.
+    """
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("this is a file, not a directory", encoding="utf-8")
+    target = blocker / "state.db"
+
+    result = invoke("realtime", "check", "--state-db", str(target), "--json")
 
     assert result.exit_code == 1
     assert "Traceback" not in result.output
@@ -337,10 +419,9 @@ def test_an_unanchored_run_uses_the_system_clock() -> None:
 
 
 def test_check_accepts_a_valid_paper_document(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path)
-    database = tmp_path / "state.db"
+    database = seed_profiles(tmp_path)
 
-    result = invoke("realtime", "check", "--profiles", str(path), "--json")
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
     payload = payload_of(result)
 
     assert result.exit_code == 0
@@ -362,30 +443,43 @@ def test_check_accepts_a_valid_paper_document(tmp_path: Path) -> None:
         assert entry["risk"]["max_open_positions"] == 1
 
 
-def test_check_never_creates_the_state_database(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path)
+def test_check_on_a_fresh_database_is_ok_with_zero_profiles(tmp_path: Path) -> None:
+    """An empty platform is a legal platform: ``ok`` is ``True`` with no profile.
+
+    The state database is the single source of truth, so a host that never
+    declared anything boots, serves and accepts ``POST /api/profiles``.  The
+    static pre-flight therefore finds nothing to report.
+    """
     database = tmp_path / "state.db"
 
-    assert invoke("realtime", "check", "--profiles", str(path)).exit_code == 0
-
-    assert not database.exists()
-    assert not (tmp_path / "state.db.lock").exists()
-
-
-def test_check_refuses_a_profile_carrying_a_credential_field(tmp_path: Path) -> None:
-    profiles = [profile("btc-paper", BTC, "1h", 10000.0, 1000.0)]
-    profiles[0]["api_key"] = "super-secret-value"
-    path = write_profiles(tmp_path, profiles=profiles)
-
-    result = invoke("realtime", "check", "--profiles", str(path), "--json")
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
     payload = payload_of(result)
 
-    assert result.exit_code == 1
-    assert payload["ok"] is False
+    assert result.exit_code == 0
+    assert set(payload) == CHECK_KEYS
+    assert payload["ok"] is True
     assert payload["profiles"] == []
-    assert any("api_key" in issue for issue in payload["issues"])
-    # ... and the value itself never travels through the payload
-    assert "super-secret-value" not in result.output
+    assert payload["issues"] == []
+    assert payload["state_db"] == str(database)
+    assert "config_path" not in payload
+
+
+def test_check_refuses_a_database_holding_a_profile_with_a_credential_field(
+    tmp_path: Path,
+) -> None:
+    """A credential can never be stored: the model refuses the row, loudly."""
+    from pydantic import ValidationError
+
+    leaked = profile("btc-paper", BTC, "1h", 10000.0, 1000.0)
+    leaked["api_key"] = "super-secret-value"
+
+    with pytest.raises(ValidationError) as excinfo:
+        seed_profiles(tmp_path, profiles=[leaked])
+    assert "api_key" in str(excinfo.value)
+    # the value itself never travelled anywhere
+    stored = tmp_path / "state.db"
+    if stored.exists():
+        assert "super-secret-value" not in stored.read_bytes().decode("utf-8", errors="ignore")
 
 
 def test_check_reports_a_live_profile_that_is_not_armed(
@@ -396,9 +490,9 @@ def test_check_reports_a_live_profile_that_is_not_armed(
     monkeypatch.delenv("TB_LIVE_API_SECRET", raising=False)
     profiles = [profile("btc-live", BTC, "1h", 10000.0, 1000.0)]
     profiles[0]["mode"] = "live"
-    path = write_profiles(tmp_path, profiles=profiles)
+    database = seed_profiles(tmp_path, profiles=profiles)
 
-    result = invoke("realtime", "check", "--profiles", str(path), "--json")
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
     payload = payload_of(result)
 
     assert result.exit_code == 1
@@ -419,9 +513,9 @@ def test_check_accepts_an_armed_live_profile_with_credentials(
     monkeypatch.setenv("TB_PROFILE_BTC_LIVE_API_SECRET", "secret")
     profiles = [profile("btc-live", BTC, "1h", 10000.0, 1000.0)]
     profiles[0]["mode"] = "live"
-    path = write_profiles(tmp_path, profiles=profiles)
+    database = seed_profiles(tmp_path, profiles=profiles)
 
-    result = invoke("realtime", "check", "--profiles", str(path), "--json")
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
     payload = payload_of(result)
 
     assert result.exit_code == 0
@@ -431,25 +525,28 @@ def test_check_accepts_an_armed_live_profile_with_credentials(
     assert entry["issues"] == []
 
 
-def test_check_reports_a_malformed_document(tmp_path: Path) -> None:
-    path = tmp_path / "profiles.json"
-    path.write_text('{"profiles": [', encoding="utf-8")
+def test_check_reports_unusable_state_storage(tmp_path: Path) -> None:
+    """An unusable state database is a pre-flight *finding*, never a traceback."""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("this is a file", encoding="utf-8")
+    target = blocker / "state.db"
 
-    result = invoke("realtime", "check", "--profiles", str(path), "--json")
+    result = invoke("realtime", "check", "--state-db", str(target), "--json")
     payload = payload_of(result)
 
     assert result.exit_code == 1
     assert payload["ok"] is False
     assert payload["profiles"] == []
     assert payload["issues"], "the reason must travel in the payload"
-    assert any(str(path) in issue for issue in payload["issues"])
+    assert "Traceback" not in result.output
 
 
 def test_check_reports_an_unsupported_timeframe(tmp_path: Path) -> None:
-    profiles = [profile("btc-paper", BTC, "7m", 10000.0, 1000.0)]
-    path = write_profiles(tmp_path, profiles=profiles)
+    database = seed_profiles(
+        tmp_path, raw_profiles=[profile("btc-paper", BTC, "7m", 10000.0, 1000.0)]
+    )
 
-    result = invoke("realtime", "check", "--profiles", str(path), "--json")
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
     payload = payload_of(result)
 
     assert result.exit_code == 1
@@ -461,10 +558,10 @@ def test_check_reports_an_unsupported_timeframe(tmp_path: Path) -> None:
 def test_check_reports_an_unwritable_state_directory(tmp_path: Path) -> None:
     directory = tmp_path / "readonly"
     directory.mkdir()
-    path = write_profiles(directory)
+    database = directory / "state.db"
     directory.chmod(0o500)
     try:
-        result = invoke("realtime", "check", "--profiles", str(path), "--json")
+        result = invoke("realtime", "check", "--state-db", str(database), "--json")
         payload = payload_of(result)
     finally:
         directory.chmod(0o700)
@@ -476,16 +573,18 @@ def test_check_reports_an_unwritable_state_directory(tmp_path: Path) -> None:
 
 
 def test_check_prints_a_human_summary_and_exits_one_on_a_finding(tmp_path: Path) -> None:
-    profiles = [profile("btc-paper", BTC, "1h", 10000.0, 1000.0)]
-    profiles[0]["api_secret"] = "leaked"
-    path = write_profiles(tmp_path, profiles=profiles)
+    leaked = profile("btc-paper", BTC, "1h", 10000.0, 1000.0)
+    leaked["api_secret"] = "leaked-secret-value"
+    database = seed_profiles(tmp_path, raw_profiles=[leaked])
 
-    result = invoke("realtime", "check", "--profiles", str(path))
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
 
     assert result.exit_code == 1
-    assert "realtime-check" in result.output
-    assert "issues" in result.output
-    assert "leaked" not in result.output
+    assert payload["ok"] is False
+    assert payload["profiles"] == []
+    # The JSON payload never echoes the offending value.
+    assert "leaked-secret-value" not in stdout_of(result)
 
 
 # ---------------------------------------------------------------------------
@@ -501,16 +600,22 @@ def test_run_installs_the_structured_logs_of_the_layer(tmp_path: Path) -> None:
     last-resort handler -- bare event names at WARNING and above, every INFO event
     dropped, and a ``profile_crashed`` line that did not carry its error.
     """
-    path = write_profiles(tmp_path)
     logs_dir = tmp_path / "logs"
-    document = json.loads(path.read_text(encoding="utf-8"))
-    document["realtime"]["logs_dir"] = str(logs_dir)
-    path.write_text(json.dumps(document), encoding="utf-8")
+    database = seed_profiles(tmp_path)
 
     result = None
     logging.disable(logging.NOTSET)  # this test asserts the log stream itself
     try:
-        result = invoke("realtime", "run", "--profiles", str(path), "--once", "--json")
+        result = invoke(
+            "realtime",
+            "run",
+            "--state-db",
+            str(database),
+            "--logs-dir",
+            str(logs_dir),
+            "--once",
+            "--json",
+        )
     finally:
         logging.disable(logging.CRITICAL)
 
@@ -529,10 +634,9 @@ def test_run_installs_the_structured_logs_of_the_layer(tmp_path: Path) -> None:
 
 def test_run_once_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     """The heart of the contract: one tick writes durable state, twice does not double it."""
-    path = write_profiles(tmp_path)
-    database = tmp_path / "state.db"
+    database = seed_profiles(tmp_path)
 
-    first = invoke("realtime", "run", "--profiles", str(path), "--once", "--json")
+    first = invoke("realtime", "run", "--state-db", str(database), "--once", "--json")
     first_payload = payload_of(first)
     assert first.exit_code == 0
     assert set(first_payload) == RUN_KEYS
@@ -565,7 +669,7 @@ def test_run_once_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     positions_before = table_rows(database, "positions")
     equity_before = table_rows(database, "equity")
 
-    second = invoke("realtime", "run", "--profiles", str(path), "--once", "--json")
+    second = invoke("realtime", "run", "--state-db", str(database), "--once", "--json")
     second_payload = payload_of(second)
 
     assert second.exit_code == 0
@@ -586,9 +690,9 @@ def test_run_once_is_deterministic_and_idempotent(tmp_path: Path) -> None:
 
 
 def test_run_once_prints_a_human_summary(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path)
+    database = seed_profiles(tmp_path)
 
-    result = invoke("realtime", "run", "--profiles", str(path), "--once")
+    result = invoke("realtime", "run", "--state-db", str(database), "--once")
 
     assert result.exit_code == 0
     assert "realtime-run" in result.output
@@ -606,13 +710,13 @@ def test_run_once_turns_a_hanging_stream_into_a_domain_error(
 
     monkeypatch.setattr(stream_module.PollingMarketStream, "next_candle", never)
     profiles = [profile("btc-paper", BTC, "1h", 10000.0, 1000.0)]
-    path = write_profiles(
+    database = seed_profiles(
         tmp_path,
         profiles=profiles,
         realtime={"stream_poll_timeout_seconds": 0.05},
     )
 
-    result = invoke("realtime", "run", "--profiles", str(path), "--once", "--json")
+    result = invoke("realtime", "run", "--state-db", str(database), "--once", "--json")
     payload = payload_of(result)
 
     assert result.exit_code == 1
@@ -631,8 +735,8 @@ def test_serve_is_read_only_over_the_persisted_state(
     """``serve`` reads the SQLite file, binds an ephemeral port and stops cleanly."""
     from trading_platform.web import server as server_module
 
-    path = write_profiles(tmp_path)
-    assert invoke("realtime", "run", "--profiles", str(path), "--once").exit_code == 0
+    database = seed_profiles(tmp_path)
+    assert invoke("realtime", "run", "--state-db", str(database), "--once").exit_code == 0
 
     served: dict[str, Any] = {}
 
@@ -649,7 +753,7 @@ def test_serve_is_read_only_over_the_persisted_state(
         assert not thread.is_alive()
 
     monkeypatch.setattr(server_module, "serve", bounded)
-    result = invoke("realtime", "serve", "--profiles", str(path), "--json", "--port", "0")
+    result = invoke("realtime", "serve", "--state-db", str(database), "--json", "--port", "0")
     payload = payload_of(result)
 
     assert result.exit_code == 0
@@ -677,18 +781,23 @@ def test_serve_publishes_the_persisted_shared_wallet(tmp_path: Path) -> None:
     deployed capital and its own P&L) instead of defaulting to zero.
     """
     from trading_platform.cli import _PersistedSnapshotProvider
-    from trading_platform.config import load_realtime_config
     from trading_platform.realtime.models import RunMode
+    from trading_platform.realtime.settings import PlatformSettings, settings_from_store
 
-    path = write_profiles(tmp_path)
-    database = tmp_path / "state.db"
-    assert invoke("realtime", "run", "--profiles", str(path), "--once").exit_code == 0
+    database = seed_profiles(tmp_path)
+    assert invoke("realtime", "run", "--state-db", str(database), "--once").exit_code == 0
 
-    realtime = load_realtime_config(path)
     clock = ManualClock(datetime.fromisoformat(ANCHOR))
     store = SqliteStateStore(database, clock=clock)
     store.initialize()
     try:
+        realtime = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=RealtimeConfig(state_db=database),
+                monitoring=MonitoringConfig(),
+            ),
+        ).realtime
         provider = _PersistedSnapshotProvider(store, clock=clock, realtime=realtime)
         snapshot = provider.snapshot()
         wallet = snapshot.wallet
@@ -731,7 +840,7 @@ def test_run_starts_the_monitoring_server_and_stops_it(
     """Server mode wires the engine and the dashboard, then shuts both down."""
     from trading_platform.realtime.orchestrator import RealtimeOrchestrator
 
-    path = write_profiles(tmp_path)
+    database = seed_profiles(tmp_path)
     client_order_ids: list[str] = []
 
     async def run_forever(self: RealtimeOrchestrator) -> None:
@@ -741,7 +850,7 @@ def test_run_starts_the_monitoring_server_and_stops_it(
 
     monkeypatch.setattr(RealtimeOrchestrator, "run_forever", run_forever)
 
-    result = invoke("realtime", "run", "--profiles", str(path), "--json", "--port", "0")
+    result = invoke("realtime", "run", "--state-db", str(database), "--json", "--port", "0")
     payload = payload_of(result)
 
     assert result.exit_code == 0
@@ -763,8 +872,8 @@ def test_serve_announces_the_url_on_stderr_in_json_mode(
     """``--json`` keeps stdout to exactly one JSON object."""
     from trading_platform.web import server as server_module
 
-    path = write_profiles(tmp_path)
-    assert invoke("realtime", "run", "--profiles", str(path), "--once").exit_code == 0
+    database = seed_profiles(tmp_path)
+    assert invoke("realtime", "run", "--state-db", str(database), "--once").exit_code == 0
 
     def bounded(server: Any, *, block: bool = True) -> None:
         thread = threading.Thread(
@@ -775,7 +884,7 @@ def test_serve_announces_the_url_on_stderr_in_json_mode(
         thread.join(timeout=5.0)
 
     monkeypatch.setattr(server_module, "serve", bounded)
-    result = invoke("realtime", "serve", "--profiles", str(path), "--json", "--port", "0")
+    result = invoke("realtime", "serve", "--state-db", str(database), "--json", "--port", "0")
 
     assert result.exit_code == 0
     assert stdout_of(result).strip().startswith("{")
@@ -786,14 +895,17 @@ def test_serve_announces_the_url_on_stderr_in_json_mode(
 def test_main_returns_zero_for_a_successful_check(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    path = write_profiles(tmp_path)
+    database = seed_profiles(tmp_path)
 
-    assert main(["realtime", "check", "--profiles", str(path)]) == 0
+    assert main(["realtime", "check", "--state-db", str(database)]) == 0
     capsys.readouterr()
 
 
-def test_main_returns_one_for_a_missing_file(tmp_path: Path) -> None:
-    assert main(["realtime", "check", "--profiles", str(tmp_path / "absent.json")]) == 1
+def test_main_returns_one_for_an_unusable_state_database(tmp_path: Path) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("this is a file", encoding="utf-8")
+
+    assert main(["realtime", "check", "--state-db", str(blocker / "state.db")]) == 1
 
 
 def test_monitoring_config_defaults_are_documented_values() -> None:
@@ -809,21 +921,30 @@ def test_monitoring_config_defaults_are_documented_values() -> None:
 # ---------------------------------------------------------------------------
 
 
-def seed_state_store(database: Path, profiles_path: Path) -> None:
-    """Persist the profiles of ``profiles_path`` into a **fresh** state database.
+def seed_state_store(database: Path, source: Path) -> None:
+    """Copy the profiles of a seeded store into a **fresh** state database.
 
-    The store then knows both profiles and holds **no** candle: it is the exact
-    state ``realtime serve`` reads after a deployment that never ran a tick.
+    The new store then knows both profiles **and the settings** and holds **no**
+    candle: it is the exact state ``realtime serve`` reads after a deployment that
+    never ran a tick.
     """
-    from trading_platform.config import load_profiles
+    from trading_platform.realtime.settings import SETTINGS_META_KEY, PlatformSettings
 
+    source_store = SqliteStateStore(source, clock=ManualClock(datetime.fromisoformat(ANCHOR)))
+    source_store.initialize()
     store = SqliteStateStore(database, clock=ManualClock(datetime.fromisoformat(ANCHOR)))
     store.initialize()
     try:
-        for definition in load_profiles(profiles_path):
+        for definition in source_store.load_profiles():
             store.save_profile(definition)
+        stored = source_store.get_meta(SETTINGS_META_KEY)
+        if stored is not None:
+            store.set_meta(SETTINGS_META_KEY, stored)
+        else:  # pragma: no cover - defensive: seed_profiles always writes them
+            assert PlatformSettings.from_defaults() is not None
     finally:
         store.close()
+        source_store.close()
 
 
 def http_call(
@@ -851,8 +972,9 @@ def test_serve_answers_the_catalog_candles_and_control_routes(
     """``realtime serve`` exposes the whole read surface over persisted state."""
     from trading_platform.web import server as server_module
 
-    path = write_profiles(tmp_path)
-    seed_state_store(tmp_path / "state.db", path)
+    seeded = seed_profiles(tmp_path / "seeded")
+    seed_state_store(tmp_path / "state.db", seeded)
+    database = tmp_path / "state.db"
     observed: dict[str, Any] = {}
 
     def bounded(server: Any, *, block: bool = True) -> None:
@@ -876,7 +998,7 @@ def test_serve_answers_the_catalog_candles_and_control_routes(
             assert not thread.is_alive()
 
     monkeypatch.setattr(server_module, "serve", bounded)
-    result = invoke("realtime", "serve", "--profiles", str(path), "--json", "--port", "0")
+    result = invoke("realtime", "serve", "--state-db", str(database), "--json", "--port", "0")
     payload = payload_of(result)
 
     assert result.exit_code == 0
@@ -919,7 +1041,7 @@ def test_run_wires_the_controller_and_the_catalog(
     from trading_platform.realtime.orchestrator import RealtimeOrchestrator
     from trading_platform.web import server as server_module
 
-    path = write_profiles(tmp_path)
+    database = seed_profiles(tmp_path)
     recorded: dict[str, Any] = {}
     real_create_server = server_module.create_server
 
@@ -935,7 +1057,7 @@ def test_run_wires_the_controller_and_the_catalog(
     monkeypatch.setattr(server_module, "create_server", recording_create_server)
     monkeypatch.setattr(RealtimeOrchestrator, "run_forever", run_forever)
 
-    result = invoke("realtime", "run", "--profiles", str(path), "--json", "--port", "0")
+    result = invoke("realtime", "run", "--state-db", str(database), "--json", "--port", "0")
     payload = payload_of(result)
 
     assert result.exit_code == 0
@@ -946,7 +1068,7 @@ def test_run_wires_the_controller_and_the_catalog(
     catalog = recorded["catalog"]
     assert isinstance(controller, RuntimeProfileController)
     assert isinstance(catalog, MarketCatalog)
-    assert controller.profiles_path == path
+    assert not hasattr(controller, "profiles_path")
     assert controller.bound is True, "the controller must be bound to the engine loop"
     assert catalog.exchange == "binance"
     assert catalog.quote == "USDT"
@@ -962,3 +1084,123 @@ def test_the_catalog_venue_comes_from_the_profiles() -> None:
     assert _realtime_catalog_venue(()) == ("binance", "USDT")
     eth = ProfileConfig(id="eth-eur", symbol="ETH/EUR", timeframe="1h")
     assert _realtime_catalog_venue([eth]) == ("binance", "EUR")
+
+
+# ---------------------------------------------------------------------------
+# 6. SQLite is the source of truth: zero-profile boot and the settings round trip
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_on_an_empty_platform_exits_zero(tmp_path: Path) -> None:
+    """A brand new host runs: no profile is a legal platform, not a failure."""
+    database = tmp_path / "state.db"
+
+    result = invoke("realtime", "run", "--state-db", str(database), "--once", "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert set(payload) == RUN_KEYS
+    assert payload["ok"] is True
+    assert payload["profiles"] == []
+    assert payload["decisions"] == []
+    assert payload["url"] is None
+    assert "Traceback" not in result.output
+
+
+def test_the_historical_profiles_flag_is_an_alias_of_state_db(tmp_path: Path) -> None:
+    """The shipped image CMD and every operator habit keep working."""
+    database = seed_profiles(tmp_path)
+
+    checked = invoke("realtime", "check", "--profiles", str(database), "--json")
+    assert checked.exit_code == 0
+    assert payload_of(checked)["state_db"] == str(database)
+
+    ran = invoke("realtime", "run", "--profiles", str(database), "--once", "--json")
+    assert ran.exit_code == 0
+    assert payload_of(ran)["state_db"] == str(database)
+
+    short = invoke("realtime", "run", "-p", str(database), "--once", "--json")
+    assert short.exit_code == 0
+    assert payload_of(short)["state_db"] == str(database)
+
+
+def test_a_setting_changed_in_the_store_is_seen_by_the_next_run(tmp_path: Path) -> None:
+    """The store is read at every boot, so a runtime update needs no file edit."""
+    from trading_platform.realtime.settings import (
+        PlatformSettings,
+        settings_from_store,
+        update_settings,
+    )
+
+    database = seed_profiles(tmp_path, realtime={"history_candles": 1})
+    assert invoke("realtime", "run", "--state-db", str(database), "--once").exit_code == 0
+
+    clock = ManualClock(datetime.fromisoformat(ANCHOR))
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        current = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=RealtimeConfig(state_db=database),
+                monitoring=MonitoringConfig(),
+            ),
+        )
+        updated = update_settings(store, current=current, realtime={"history_candles": 500})
+        assert updated.realtime.history_candles == 500
+    finally:
+        store.close()
+
+    printed = invoke("realtime", "check", "--state-db", str(database), "--json")
+    assert printed.exit_code == 0
+    assert payload_of(printed)["state_db"] == str(database)
+
+    # and the very next engine boot reads the new value out of the store
+    from trading_platform.cli import _realtime_settings
+
+    resolved = _realtime_settings(
+        database, None, csv_dir=None, allow_network=True, host=None, port=None
+    )
+    assert resolved.realtime.history_candles == 500
+
+
+def test_the_settings_seeded_on_a_fresh_database_are_the_model_defaults(tmp_path: Path) -> None:
+    """A host that never customises anything behaves exactly as it did before."""
+    from trading_platform.realtime.settings import PlatformSettings, settings_from_store
+
+    database = tmp_path / "state.db"
+    clock = ManualClock(datetime.fromisoformat(ANCHOR))
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        resolved = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=RealtimeConfig(state_db=database),
+                monitoring=MonitoringConfig(),
+            ),
+        )
+        defaults = PlatformSettings.from_defaults()
+        assert resolved.realtime.poll_interval_seconds == defaults.realtime.poll_interval_seconds
+        assert resolved.monitoring.refresh_seconds == defaults.monitoring.refresh_seconds
+        assert resolved.realtime.state_db == database
+    finally:
+        store.close()
+
+
+def test_host_and_port_override_the_invocation_only(tmp_path: Path) -> None:
+    """``--host``/``--port`` are a per-invocation decision, never persisted."""
+    from trading_platform.cli import _realtime_settings
+    from trading_platform.realtime.settings import SETTINGS_META_KEY
+
+    database = seed_profiles(tmp_path)
+    before = table_rows(database, "meta")
+
+    resolved = _realtime_settings(
+        database, None, csv_dir=None, allow_network=True, host="0.0.0.0", port=9999
+    )
+    assert resolved.monitoring.host == "0.0.0.0"
+    assert resolved.monitoring.port == 9999
+
+    assert table_rows(database, "meta") == before
+    assert SETTINGS_META_KEY in {row[0] for row in before}

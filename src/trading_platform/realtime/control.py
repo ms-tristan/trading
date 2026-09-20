@@ -33,7 +33,6 @@ import logging
 import re
 from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import ValidationError
@@ -77,9 +76,8 @@ class RuntimeProfileController:
     orchestrator:
         The running platform.  It is injected, never imported by the web layer: a
         test passes a local fake and the router stays importable without an engine.
-    profiles_path:
-        The profiles document -- the on-disk source of truth -- that create and
-        delete rewrite atomically.
+        The profile set it owns is the SQLite state store's, so this controller
+        carries no path: there is no configuration document to rewrite any more.
     timeout_seconds:
         How long a command may block the calling thread before it is abandoned with
         a :class:`~trading_platform.core.errors.MonitoringError`.  The bound is what
@@ -90,11 +88,9 @@ class RuntimeProfileController:
         self,
         *,
         orchestrator: RealtimeOrchestrator,
-        profiles_path: str | Path,
         timeout_seconds: float = 10.0,
     ) -> None:
         self._orchestrator = orchestrator
-        self._profiles_path = Path(profiles_path)
         self._timeout_seconds = float(timeout_seconds)
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -103,17 +99,9 @@ class RuntimeProfileController:
         """Return whether the controller is bound to the engine loop."""
         return self._loop is not None
 
-    @property
-    def profiles_path(self) -> Path:
-        """Return the profiles document this controller rewrites."""
-        return self._profiles_path
-
     def __repr__(self) -> str:
         """Return a short, secret-free representation of the controller."""
-        return (
-            f"RuntimeProfileController(bound={self.bound}, "
-            f"profiles_path={str(self._profiles_path)!r}, timeout={self._timeout_seconds})"
-        )
+        return f"RuntimeProfileController(bound={self.bound}, timeout={self._timeout_seconds})"
 
     def bind(self, loop: asyncio.AbstractEventLoop) -> None:
         """Bind the controller to the engine loop. Idempotent.
@@ -125,7 +113,7 @@ class RuntimeProfileController:
         if self._loop is loop:
             return
         self._loop = loop
-        log_event(_LOGGER, "profile_control_bound", profiles_path=str(self._profiles_path))
+        log_event(_LOGGER, "profile_control_bound", timeout=self._timeout_seconds)
 
     # -- lifecycle commands -------------------------------------------------
 
@@ -139,9 +127,7 @@ class RuntimeProfileController:
 
     def delete_profile(self, profile_id: str) -> str:
         """Delete one profile after flattening it; return the removed identifier."""
-        return self._call(
-            lambda: self._orchestrator.delete_profile(profile_id, profiles_path=self._profiles_path)
-        )
+        return self._call(lambda: self._orchestrator.delete_profile(profile_id))
 
     def create_profile(self, payload: Mapping[str, Any]) -> ProfileSnapshot:
         """Validate one raw create request and start the profile it describes.
@@ -158,8 +144,8 @@ class RuntimeProfileController:
             field :class:`~trading_platform.config.models.ProfileConfig` rejects
             (mode, balance, parameters).
         ProfileError
-            The identifier is already declared by the profiles document or by the
-            running registry.
+            The identifier is already declared by the state store or by the running
+            registry.
         MonitoringError
             The engine is not running, or the command timed out.
         """
@@ -181,9 +167,7 @@ class RuntimeProfileController:
         )
         if self._orchestrator.profile_config(identifier) is not None:
             raise ProfileError(f"profile already exists: {identifier!r}")
-        return self._call(
-            lambda: self._orchestrator.add_profile(profile, profiles_path=self._profiles_path)
-        )
+        return self._call(lambda: self._orchestrator.add_profile(profile))
 
     @staticmethod
     def _build_profile(

@@ -10,14 +10,16 @@ vi.mock('@/lib/api', async (importOriginal) => {
     fetchHealth: vi.fn(),
     fetchProfiles: vi.fn(),
     fetchKillSwitch: vi.fn(),
+    fetchOrphans: vi.fn(),
   };
 });
 
-import { ApiError, fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
+import { ApiError, fetchHealth, fetchKillSwitch, fetchOrphans, fetchProfiles } from '@/lib/api';
 import { EMPTY_PLACEHOLDER } from '@/lib/format';
 import type {
   HealthPayload,
   KillSwitchPayload,
+  OrphanReport,
   ProfilesPayload,
   ProfileSnapshot,
   WalletSnapshot,
@@ -38,6 +40,24 @@ const health: HealthPayload = {
 };
 
 const killSwitch: KillSwitchPayload = { kill_switch: false, reason: '', changed_at: null };
+
+/** The report of the startup safety sweep, as `GET /api/orphans` emits it. */
+const orphans: OrphanReport = {
+  found: 1,
+  orphaned: 1,
+  closed_count: 0,
+  failed_count: 1,
+  closed: [],
+  failed: [
+    {
+      profile_id: 'ghost',
+      symbol: 'ETH/USDT',
+      quantity: 2,
+      error: 'venue rejected the closing order',
+    },
+  ],
+  swept_at: '2024-01-01T00:00:00+00:00',
+};
 
 const profile: ProfileSnapshot = {
   profile_id: 'alpha',
@@ -98,6 +118,7 @@ beforeEach(() => {
   vi.mocked(fetchHealth).mockResolvedValue(health);
   vi.mocked(fetchProfiles).mockResolvedValue(profiles);
   vi.mocked(fetchKillSwitch).mockResolvedValue(killSwitch);
+  vi.mocked(fetchOrphans).mockResolvedValue(orphans);
   // No live server may ever be reached from a test.
   vi.stubGlobal(
     'fetch',
@@ -216,6 +237,8 @@ describe('OverviewPage', () => {
     expect(fetchProfiles).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
     expect(fetchHealth).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
     expect(fetchKillSwitch).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
+    expect(fetchOrphans).toHaveBeenCalledTimes(1);
+    expect(fetchOrphans).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
   });
 
   it('renders the empty state when the platform has no profile', async () => {
@@ -283,5 +306,57 @@ describe('OverviewPage', () => {
     expect(screen.getByText(/No payload was returned by/)).toBeInTheDocument();
     expect(screen.queryByText(/checked at/i)).not.toBeInTheDocument();
     expect(fetchHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it('server-renders the orphan sweep warning of the fetched report', async () => {
+    render(await OverviewPage());
+
+    // The report fetched by the Server Component reaches the live region and is
+    // part of the first paint: the browser issues no request for it.
+    const notice = screen.getByText('Orphaned positions could not all be closed').closest(
+      '[role="status"]',
+    );
+    expect(notice).not.toBeNull();
+    expect(notice).toHaveTextContent('ghost ETH/USDT');
+    expect(notice).toHaveTextContent('venue rejected the closing order');
+    expect(fetchOrphans).toHaveBeenCalledTimes(1);
+  });
+
+  it('still renders the normal page when the orphan route alone fails', async () => {
+    vi.mocked(fetchOrphans).mockRejectedValue(
+      new ApiError('http', 'HTTP 404', { status: 404, path: '/api/orphans' }),
+    );
+
+    render(await OverviewPage());
+
+    // The failing orphan call is normalised to `null`: the page is NOT sent to
+    // the unreachable state and every other payload still renders.
+    expect(screen.queryByText('The monitoring API is unreachable')).not.toBeInTheDocument();
+    expect(screen.queryByText(/No payload was returned by/)).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
+    expect(screen.getByText('$10,450.50')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Platform wallet' })).toBeInTheDocument();
+    expect(screen.getByText(/checked at/i)).toHaveTextContent('2024-01-01 00:00:00 UTC');
+
+    // And there is simply no warning banner to show.
+    expect(screen.queryByText(/Orphaned positions/i)).not.toBeInTheDocument();
+    expect(fetchOrphans).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
+  });
+
+  it('renders no orphan warning when the sweep report carries nothing to warn about', async () => {
+    vi.mocked(fetchOrphans).mockResolvedValue({
+      found: 1,
+      orphaned: 0,
+      closed_count: 0,
+      failed_count: 0,
+      closed: [],
+      failed: [],
+      swept_at: '2024-01-01T00:00:00+00:00',
+    });
+
+    render(await OverviewPage());
+
+    expect(screen.queryByText(/Orphaned positions/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
   });
 });

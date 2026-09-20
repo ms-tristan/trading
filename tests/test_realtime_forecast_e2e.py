@@ -29,15 +29,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import pytest
 
-from trading_platform.config.loader import load_profiles, load_realtime_config
-from trading_platform.config.models import MonitoringConfig
+from trading_platform.config.models import MonitoringConfig, ProfileConfig, RealtimeConfig
 from trading_platform.core.errors import ForecastArtifactError
 from trading_platform.data.synthetic import make_ohlcv
 from trading_platform.forecast.artifact import (
@@ -48,6 +46,11 @@ from trading_platform.forecast.artifact import (
 from trading_platform.realtime import features as features_module
 from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.orchestrator import RealtimeOrchestrator
+from trading_platform.realtime.settings import (
+    PlatformSettings,
+    save_settings,
+    settings_from_store,
+)
 from trading_platform.realtime.store import SqliteStateStore
 from trading_platform.realtime.stream import PollingMarketStream
 from trading_platform.strategy.timesfm_forecast import FORECAST_COLUMNS
@@ -214,13 +217,25 @@ def build_scenario(directory: Path) -> tuple[Path, Path, VenueLikeProvider]:
         },
         "monitoring": {"port": 0},
     }
-    profiles = directory / "profiles.json"
-    profiles.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return profiles, artifact, provider
+    database = directory / "state.db"
+    store = SqliteStateStore(database, clock=ManualClock(LIVE_NOW.to_pydatetime()))
+    store.initialize()
+    try:
+        for definition in document["profiles"]:
+            store.save_profile(ProfileConfig.model_validate(definition))
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig.model_validate(document["realtime"]),
+                monitoring=MonitoringConfig.model_validate(document["monitoring"]),
+            ),
+        )
+    finally:
+        store.close()
+    return database, artifact, provider
 
 
 def make_orchestrator(
-    profiles: Path,
     store: SqliteStateStore,
     clock: ManualClock,
     provider: VenueLikeProvider,
@@ -240,10 +255,13 @@ def make_orchestrator(
         )
 
     return RealtimeOrchestrator(
-        profiles=load_profiles(profiles),
+        profiles=store.load_profiles(),
         store=store,
         clock=clock,
-        realtime=load_realtime_config(profiles),
+        realtime=settings_from_store(
+            store,
+            bootstrap=PlatformSettings(realtime=RealtimeConfig(), monitoring=MonitoringConfig()),
+        ).realtime,
         monitoring=MonitoringConfig(port=0),
         stream_factory=factory,
         version="e2e-forecast",
@@ -264,13 +282,13 @@ def test_a_timesfm_profile_with_an_artifact_actually_trades_end_to_end(
     clock) and the profile must produce at least one trade, observed through the
     **existing** snapshot surface -- no new telemetry, no test-only accessor.
     """
-    profiles, artifact, provider = build_scenario(tmp_path)
+    _database, artifact, provider = build_scenario(tmp_path)
     clock = ManualClock(LIVE_NOW.to_pydatetime())
     store = SqliteStateStore(tmp_path / "state.db", clock=clock)
     store.initialize()
 
     try:
-        orchestrator = make_orchestrator(profiles, store, clock, provider)
+        orchestrator = make_orchestrator(store, clock, provider)
 
         async def scenario() -> tuple[Any, list[Any], list[Any], Any]:
             await orchestrator.run_once()
@@ -313,13 +331,13 @@ def test_the_forecast_columns_of_the_traded_rows_are_really_injected(
     an origin covers the candle, and the artifact is read from disk, never
     recomputed per candle.
     """
-    profiles, artifact, provider = build_scenario(tmp_path)
+    _database, artifact, provider = build_scenario(tmp_path)
     clock = ManualClock(LIVE_NOW.to_pydatetime())
     store = SqliteStateStore(tmp_path / "state.db", clock=clock)
     store.initialize()
 
     try:
-        orchestrator = make_orchestrator(profiles, store, clock, provider)
+        orchestrator = make_orchestrator(store, clock, provider)
         run(orchestrator.run_once())
         runner = orchestrator.runner("btc-timesfm")
         assert runner is not None
@@ -354,7 +372,7 @@ def test_the_artifact_is_read_from_disk_once_and_never_per_candle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The artifact is opened at construction; ticking more candles opens nothing."""
-    profiles, artifact, provider = build_scenario(tmp_path)
+    _database, artifact, provider = build_scenario(tmp_path)
     clock = ManualClock(LIVE_NOW.to_pydatetime())
     store = SqliteStateStore(tmp_path / "state.db", clock=clock)
     store.initialize()
@@ -369,7 +387,7 @@ def test_the_artifact_is_read_from_disk_once_and_never_per_candle(
     monkeypatch.setattr(ForecastStore, "load", classmethod(counting_load))
 
     try:
-        orchestrator = make_orchestrator(profiles, store, clock, provider)
+        orchestrator = make_orchestrator(store, clock, provider)
 
         async def scenario() -> None:
             await orchestrator.run_once()
@@ -397,7 +415,7 @@ def test_a_stale_looking_profile_is_refused_before_the_first_candle(
     The artifact of this scenario is rebuilt far in the past, so the orchestrator
     must refuse the profile instead of starting it and letting it sit inert.
     """
-    profiles, artifact, provider = build_scenario(tmp_path)
+    _database, artifact, provider = build_scenario(tmp_path)
     # rebuild the artifact from a frame that ends far behind the live clock
     stale_frame = make_ohlcv(
         PROVIDER_ROWS,
@@ -423,7 +441,7 @@ def test_a_stale_looking_profile_is_refused_before_the_first_candle(
     store.initialize()
 
     try:
-        orchestrator = make_orchestrator(profiles, store, clock, provider)
+        orchestrator = make_orchestrator(store, clock, provider)
         with pytest.raises(ForecastArtifactError) as caught:
             run(orchestrator.run_once())
         assert "is stale" in str(caught.value)
@@ -444,17 +462,17 @@ def test_the_very_same_profile_without_the_artifact_never_trades(tmp_path: Path)
     difference with the passing scenario is the declared ``forecast`` path, so the
     trade observed above can only come from the injected artifact.
     """
-    profiles, _artifact, provider = build_scenario(tmp_path)
-    document = json.loads(profiles.read_text(encoding="utf-8"))
-    del document["profiles"][0]["forecast"]
-    profiles.write_text(json.dumps(document, indent=2), encoding="utf-8")
-
+    database, _artifact_unused, provider = build_scenario(tmp_path)
     clock = ManualClock(LIVE_NOW.to_pydatetime())
-    store = SqliteStateStore(tmp_path / "state.db", clock=clock)
+    store = SqliteStateStore(database, clock=clock)
     store.initialize()
+    # the only difference with the passing scenario: the stored profile declares
+    # no ``forecast`` path at all
+    stored = store.load_profiles()[0]
+    store.save_profile(stored.model_copy(update={"forecast": None}))
 
     try:
-        orchestrator = make_orchestrator(profiles, store, clock, provider)
+        orchestrator = make_orchestrator(store, clock, provider)
         with pytest.raises(ForecastArtifactError) as caught:
             run(orchestrator.run_once())
 
@@ -468,10 +486,19 @@ def test_the_very_same_profile_without_the_artifact_never_trades(tmp_path: Path)
 
 def test_the_scenario_is_hermetic(tmp_path: Path) -> None:
     """No network is allowed, and no heavy optional dependency is imported."""
-    profiles, _artifact, provider = build_scenario(tmp_path)
-    document = json.loads(profiles.read_text(encoding="utf-8"))
+    database, _artifact, provider = build_scenario(tmp_path)
+    clock = ManualClock(LIVE_NOW.to_pydatetime())
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        settings = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(realtime=RealtimeConfig(), monitoring=MonitoringConfig()),
+        )
+    finally:
+        store.close()
 
-    assert document["realtime"]["allow_network"] is False
+    assert settings.realtime.allow_network is False
     assert provider.frame.index[-1] == LIVE_CLOSED
     assert len(provider.frame) == PROVIDER_ROWS
 

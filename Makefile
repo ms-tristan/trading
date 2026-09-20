@@ -23,11 +23,12 @@ CONFIG ?= config/backtest_default.json
 DATA_FILE ?= data/BTC_USDT-1h.csv
 FORECAST_ARTIFACT ?= data/forecast/forecast.parquet
 FORECAST_BACKEND ?= naive
-PROFILE ?= config/profiles.example.json
 SYMBOL ?= BTC/USDT
 TIMEFRAME ?= 1h
 FORECAST_DIR ?= data/forecast
-TIMESFM_PROFILE ?= config/profiles.timesfm.example.json
+# The SQLite state database is the single source of truth for both the profile
+# set and the engine settings: there is no profiles JSON document any more.
+STATE_DB ?= data/realtime/state.db
 DOCKER_IMAGE ?= trading-platform:latest
 DOCKER_TEST_IMAGE ?= trading-platform:test
 
@@ -64,11 +65,11 @@ help: ## Show this help (every target below is runnable)
 	@echo "  make forecast-build build the offline forecast artifact ($(FORECAST_BACKEND) backend)"
 	@echo "  make forecast-bootstrap          build a naive baseline artifact ($(FORECAST_DIR)/bootstrap-naive.parquet)"
 	@echo "  make forecast-bootstrap-seasonal build the seasonal baseline artifact ($(FORECAST_DIR)/bootstrap-seasonal.parquet)"
-	@echo "  make forecast-profile            build the artifact a timeframed profile needs (TIMESFM_PROFILE=... BACKEND=...)"
-	@echo "  make forecast-info               report whether FORECAST_ARTIFACT is still usable (PROFILE=... to check it against a profile)"
+	@echo "  make forecast-profile            build the artifact a timeframed profile needs (STATE_DB=... BACKEND=...)"
+	@echo "  make forecast-info               report whether FORECAST_ARTIFACT is still usable (STATE_DB=... to check it against a profile)"
 	@echo "  make data-download  download $(SYMBOL) $(TIMEFRAME) candles into the cache (only network-using target)"
-	@echo "  make realtime       run the realtime engine + monitoring JSON API (PROFILES=...)"
-	@echo "  make realtime-forecast run the realtime engine on the forecast profile $(TIMESFM_PROFILE)"
+	@echo "  make realtime       run the realtime engine + monitoring JSON API (STATE_DB=...)"
+	@echo "  make realtime-forecast run the realtime engine on the profiles of $(STATE_DB)"
 	@echo "  make forecast-flow  the documented 3-command flow: data-download, forecast-bootstrap, forecast-info, realtime-forecast"
 	@echo "  make docker-build   build the image $(DOCKER_IMAGE)"
 	@echo "  make docker-test    build the test stage and run the suite with the coverage gate"
@@ -147,14 +148,14 @@ forecast-bootstrap: ## Build the naive-baseline artifact used to bootstrap a for
 forecast-bootstrap-seasonal: ## Build the seasonal-baseline artifact used to bootstrap a forecast profile
 	$(PYTHON) -m trading_platform forecast-build --config $(CONFIG) --data-file $(DATA_FILE) --out $(FORECAST_DIR)/bootstrap-seasonal.parquet --backend seasonal
 
-forecast-profile: ## Build the artifact the profile $(TIMESFM_PROFILE) declares (BACKEND=... to override)
-	$(PYTHON) -m trading_platform forecast-bootstrap --profiles $(TIMESFM_PROFILE) --config $(CONFIG) --backend $${BACKEND:-seasonal}
+forecast-profile: ## Build the artifact a profile of $(STATE_DB) declares (BACKEND=... to override)
+	$(PYTHON) -m trading_platform forecast-bootstrap --state-db $${STATE_DB:-data/realtime/state.db} --config $(CONFIG) --backend $${BACKEND:-seasonal}
 
-forecast-info: ## Report whether $(FORECAST_ARTIFACT) is still usable (PROFILE=... to check it against a profile)
-	$(PYTHON) -m trading_platform forecast-info --artifact $(FORECAST_ARTIFACT) $(if $(PROFILE),--profiles $(PROFILE),) --json
+forecast-info: ## Report whether $(FORECAST_ARTIFACT) is still usable (STATE_DB=... to check it against a profile)
+	$(PYTHON) -m trading_platform forecast-info --artifact $(FORECAST_ARTIFACT) --state-db $${STATE_DB:-data/realtime/state.db} --json
 
-realtime-forecast: ## Run the realtime engine on the forecast profile $(TIMESFM_PROFILE)
-	$(PYTHON) -m trading_platform realtime run --profiles $(TIMESFM_PROFILE)
+realtime-forecast: ## Run the realtime engine on the profiles of $(STATE_DB)
+	$(PYTHON) -m trading_platform realtime run --state-db $${STATE_DB:-data/realtime/state.db}
 
 forecast-flow: data-download forecast-bootstrap forecast-info realtime-forecast ## The documented 3-command flow: download, bootstrap, verify, trade
 
@@ -163,8 +164,8 @@ data-download: ## Fill the on-disk OHLCV cache (only network-using target)
 		--symbol "$${SYMBOL:-$(SYMBOL)}" --timeframe "$${TIMEFRAME:-$(TIMEFRAME)}" \
 		--start "$${START:-2023-01-01T00:00:00Z}" --end "$${END:-2024-01-01T00:00:00Z}"
 
-realtime: ## Run the realtime engine and the monitoring JSON API (PROFILES=... to override)
-	$(PYTHON) -m trading_platform realtime run --profiles $${PROFILES:-config/profiles.example.json}
+realtime: ## Run the realtime engine and the monitoring JSON API (STATE_DB=... to override)
+	$(PYTHON) -m trading_platform realtime run --state-db $${STATE_DB:-data/realtime/state.db}
 
 # ---------------------------------------------------------------------------
 # docker (reproducible environment)

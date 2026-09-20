@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,10 @@ from trading_platform.core.models import (
     TradeRecord,
 )
 from trading_platform.data.synthetic import make_flat_ohlcv, make_ohlcv, make_trending_ohlcv
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module import-cheap
+    from trading_platform.realtime.settings import PlatformSettings
+    from trading_platform.realtime.store import SqliteStateStore
 
 # ---------------------------------------------------------------------------
 # command line / markers
@@ -165,6 +170,45 @@ def app_config(cache_dir: Path) -> AppConfig:
         },
         backtest={"initial_balance": 10_000.0},
     )
+
+
+# ---------------------------------------------------------------------------
+# platform settings fixtures (the state store is their source of truth)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bootstrap_settings(tmp_path: Path) -> PlatformSettings:
+    """The minimal settings known before a state store can be opened.
+
+    ``state_db``/``logs_dir`` point inside the test's ``tmp_path`` and every other
+    field keeps its model default, so a test exercises the bootstrap surface
+    without depending on the developer's working directory.  Imported lazily (see
+    the ``TYPE_CHECKING`` import below) so this module stays importable without
+    pulling in the realtime layer.
+    """
+    from trading_platform.realtime.settings import PlatformSettings
+
+    defaults = PlatformSettings.from_defaults()
+    return PlatformSettings(
+        realtime=defaults.realtime.model_copy(
+            update={"state_db": tmp_path / "realtime" / "state.db", "logs_dir": tmp_path / "logs"}
+        ),
+        monitoring=defaults.monitoring,
+    )
+
+
+@pytest.fixture
+def settings_store(tmp_path: Path) -> Iterator[SqliteStateStore]:
+    """An initialized SQLite state store, always closed at the end of the test."""
+    from trading_platform.realtime.store import SqliteStateStore
+
+    instance = SqliteStateStore(tmp_path / "realtime" / "state.db")
+    instance.initialize()
+    try:
+        yield instance
+    finally:
+        instance.close()
 
 
 # ---------------------------------------------------------------------------

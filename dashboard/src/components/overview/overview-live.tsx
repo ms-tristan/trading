@@ -7,15 +7,21 @@ import Link from 'next/link';
 import { PlusCircle, ShieldAlert } from 'lucide-react';
 
 import { ProfileCard } from '@/components/overview/profile-card';
+import { OrphanWarning } from '@/components/overview/orphan-warning';
 import { WalletPanel } from '@/components/overview/wallet-panel';
 import { BUTTON_SIZE_CLASSES } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/empty-state';
 import { LiveToolbar } from '@/components/ui/live-toolbar';
-import { fetchHealth, fetchKillSwitch, fetchProfiles } from '@/lib/api';
+import { fetchHealth, fetchKillSwitch, fetchOrphans, fetchProfiles } from '@/lib/api';
 import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { EMPTY_PLACEHOLDER, formatInteger, formatTimestamp } from '@/lib/format';
-import type { HealthPayload, KillSwitchPayload, ProfilesPayload } from '@/lib/types';
+import type {
+  HealthPayload,
+  KillSwitchPayload,
+  OrphanReport,
+  ProfilesPayload,
+} from '@/lib/types';
 import { usePolling } from '@/lib/use-polling';
 
 /** Everything one live cycle of the overview refreshes. */
@@ -23,6 +29,11 @@ export interface OverviewBundle {
   health: HealthPayload;
   profiles: ProfilesPayload;
   killSwitch: KillSwitchPayload;
+  /**
+   * Report of the startup safety sweep, `null` when the platform was never
+   * swept or when the orphan route alone could not be read.
+   */
+  orphans: OrphanReport | null;
 }
 
 /** Props of {@link OverviewLive}. */
@@ -33,6 +44,8 @@ export interface OverviewLiveProps {
   initialHealth: HealthPayload;
   /** Kill-switch state rendered by the Server Component. */
   initialKillSwitch: KillSwitchPayload;
+  /** Orphan sweep report rendered by the Server Component, `null` when none. */
+  initialOrphans: OrphanReport | null;
   /** ISO-8601 stamp of the server-rendered payload. */
   initialCheckedAt: string;
   /** Polling cadence, resolved on the server from `monitoring.refresh_seconds`. */
@@ -69,7 +82,8 @@ const NEW_PROFILE_ACTION_CLASSES = cn(
  *
  * The wallet panel is the first block of the live region, seeded with the wallet
  * of the server payload: it is the one instance of the panel on the page, so the
- * overview never shows the shared wallet twice.
+ * overview never shows the shared wallet twice. It is immediately followed by
+ * the orphan sweep warning, whose own absence renders nothing.
  *
  * Robustness: a failed cycle is caught by `usePolling`, shows the non-blocking
  * banner of the toolbar — in the shared operator-facing vocabulary, never as a
@@ -86,23 +100,35 @@ export function OverviewLive({
   initialProfiles,
   initialHealth,
   initialKillSwitch,
+  initialOrphans,
   initialCheckedAt,
   pollIntervalMs,
 }: OverviewLiveProps) {
   // Same-origin on purpose: no base URL, so the request goes to the Next.js
   // rewrite (`/api/*` -> the Python monitoring server) and no CORS applies.
+  //
+  // The orphan sweep report is the one call of the cycle that is allowed to
+  // fail on its own: a dashboard that cannot read `/api/orphans` must never
+  // lose the profile list over it, so its failure is normalised to `null`
+  // (no warning banner) while the rest of the bundle still rejects as before.
   const fetcher = useCallback(async (signal: AbortSignal): Promise<OverviewBundle> => {
-    const [health, profiles, killSwitch] = await Promise.all([
+    const [health, profiles, killSwitch, orphans] = await Promise.all([
       fetchHealth({ signal }),
       fetchProfiles({ signal }),
       fetchKillSwitch({ signal }),
+      fetchOrphans({ signal }).catch(() => null),
     ]);
-    return { health, profiles, killSwitch };
+    return { health, profiles, killSwitch, orphans };
   }, []);
 
   const { data, checkedAt, failure, isPaused, toggle, refreshNow } = usePolling<OverviewBundle>({
     fetcher,
-    initialData: { health: initialHealth, profiles: initialProfiles, killSwitch: initialKillSwitch },
+    initialData: {
+      health: initialHealth,
+      profiles: initialProfiles,
+      killSwitch: initialKillSwitch,
+      orphans: initialOrphans,
+    },
     initialCheckedAt,
     intervalMs: pollIntervalMs,
   });
@@ -121,6 +147,12 @@ export function OverviewLive({
           kept as the last known good value when a cycle fails. `?? null`
           tolerates a payload without the wallet key at all. */}
       <WalletPanel wallet={data.profiles.wallet ?? null} />
+
+      {/* The safety sweep warning is the first block after the wallet, before
+          the kill-switch notice and the profile grid: a position that was
+          flattened — or worse, that could NOT be flattened — at the venue must
+          never be pushed below the fold by the list it belongs to. */}
+      <OrphanWarning report={data.orphans} />
 
       <section aria-labelledby={HEADING_ID} className="flex flex-col gap-lg">
         <header className="flex flex-wrap items-end justify-between gap-md">

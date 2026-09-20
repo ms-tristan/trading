@@ -45,6 +45,17 @@ every pre-existing key keeps its name and its type, and the per-profile payloads
 gain the *attributed* figures (``allocation``, ``deployed``, ``realized_pnl``,
 ``unrealized_pnl`` and ``last_block_reason``) beside the ones they already had.
 
+Orphaned positions (additive)
+-----------------------------
+``GET /api/health`` carries one more extra key, ``orphaned_positions``: the
+report of the last startup safety sweep, which closes at the venue every durable
+position whose profile is no longer loaded.  It is **always present** -- an
+explicit ``null`` until the platform has been swept at least once -- and the very
+same object is served by the dedicated ``GET /api/orphans`` route, so an operator
+or a script can read the warning without parsing the health body.  A closure
+never degrades the health status; a position that could **not** be closed does,
+and is logged at ``ERROR`` as loudly as a success.
+
 Profile lifecycle
 -----------------
 The four lifecycle routes require the operator token and are refused with the
@@ -195,6 +206,16 @@ class SnapshotProvider(Protocol):
 
     def profile_snapshot(self, profile_id: str) -> ProfileSnapshot | None:
         """Return the snapshot of one profile, or ``None`` when unknown."""
+        ...
+
+    def orphan_report(self) -> Mapping[str, Any] | None:
+        """Return the last orphan-position sweep report, or ``None``.
+
+        ``None`` means the platform was **never swept**: the router renders that
+        as an explicit JSON ``null``, never as a missing key, so a consumer can
+        always tell "swept, nothing found" from "never swept".  A provider that
+        cannot answer at all is tolerated through ``getattr``.
+        """
         ...
 
     def engage_kill_switch(self, reason: str) -> Any:
@@ -644,6 +665,8 @@ class Router:
             return self._catalog_response()
         if route == "control":
             return self._control_response()
+        if route == "orphans":
+            return self._orphans_response()
         return self._read(route, argument, query)
 
     def _get_answer(self, route: str, argument: str, query: str = "") -> HttpResponse:
@@ -658,6 +681,8 @@ class Router:
             return self._catalog_response()
         if route == "control":
             return self._control_response()
+        if route == "orphans":
+            return self._orphans_response()
         return self._read(route, argument, query)
 
     def _read(self, route: str, argument: str, query: str = "") -> HttpResponse:
@@ -987,10 +1012,18 @@ class Router:
         provider that reports no wallet answers ``null``: the key is always
         present, so a consumer never has to guess whether the wallet is missing
         or simply empty.
+
+        ``orphaned_positions`` is the report of the last startup orphan sweep
+        (:meth:`_orphan_payload`): ``null`` until the platform has been swept at
+        least once, again always present.  A **closure** never degrades the status
+        -- the sweep did its job -- but a position that could not be closed does,
+        and is logged at ``ERROR`` so a failure is reported as loudly as a success.
         """
         raw = self._provider.health()
         reported: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
         kill_switch = self._kill_switch_engaged()
+        orphans = self._orphan_payload()
+        failed = int(orphans.get("failed_count", 0)) if orphans is not None else 0
 
         profiles_total = reported.get("profiles_total")
         profiles_running = reported.get("profiles_running")
@@ -1006,8 +1039,14 @@ class Router:
             if uptime is None:
                 uptime = snapshot.uptime_seconds
 
+        if failed:
+            _LOGGER.error(
+                "orphan_positions_failed: %d orphaned position(s) could not be closed",
+                failed,
+            )
+
         return {
-            "status": "degraded" if kill_switch else "ok",
+            "status": "degraded" if kill_switch or failed else "ok",
             "version": self._version,
             "uptime_seconds": _finite(uptime),
             "profiles_total": int(profiles_total),
@@ -1015,7 +1054,75 @@ class Router:
             "kill_switch": kill_switch,
             "checked_at": _iso(self._clock.now()),
             "wallet": _snapshot_payload(reported.get("wallet")),
+            "orphaned_positions": orphans,
         }
+
+    # -- orphaned positions -------------------------------------------------
+
+    def _orphan_payload(self) -> dict[str, Any] | None:
+        """Return the last orphan sweep as the documented payload, or ``None``.
+
+        The provider is asked through ``getattr`` so a local test fake written
+        before this route existed keeps working: a provider that cannot answer is
+        simply "never swept", which the API renders as an explicit ``null``.
+
+        The reader is accepted **either as a method or as an attribute**: the two
+        shipped providers of the platform disagree on that detail (the CLI surface
+        declares ``orphan_report()``, the orchestrator publishes the report as a
+        property), and the shape of the payload -- not the calling convention --
+        is what this contract pins.  A callable attribute is called, anything else
+        is read as the value.
+        """
+        reader = getattr(self._provider, "orphan_report", None)
+        if reader is None:
+            return None
+        try:
+            report = reader() if callable(reader) else reader
+        except MonitoringError:
+            raise
+        except Exception as exc:  # a broken report must never break the health route
+            _LOGGER.warning("orphan report unavailable: %s", exc)
+            return None
+        if report is None:
+            return None
+        payload = report if isinstance(report, Mapping) else _snapshot_payload(report)
+        if not isinstance(payload, Mapping):
+            return None
+        return {
+            "found": int(payload.get("found", 0)),
+            "orphaned": int(payload.get("orphaned", 0)),
+            "closed_count": int(payload.get("closed_count", 0)),
+            "failed_count": int(payload.get("failed_count", 0)),
+            "closed": [_json_safe(item) for item in payload.get("closed") or ()],
+            "failed": [_json_safe(item) for item in payload.get("failed") or ()],
+            "swept_at": _iso(payload.get("swept_at")),
+        }
+
+    def _orphans_response(self) -> HttpResponse:
+        """Answer ``GET /api/orphans`` with the last sweep, plus its status.
+
+        The route exists so an operator (or a script) reads the warning without
+        parsing the health body; the object it returns is **exactly** the
+        ``orphaned_positions`` value of ``/api/health``, so the two can never
+        disagree.
+        """
+        orphans = self._orphan_payload()
+        status = (
+            "degraded" if orphans is not None and int(orphans.get("failed_count", 0)) > 0 else "ok"
+        )
+        body: dict[str, Any] = dict(orphans) if orphans is not None else {}
+        if orphans is None:
+            body = {
+                "found": 0,
+                "orphaned": 0,
+                "closed_count": 0,
+                "failed_count": 0,
+                "closed": [],
+                "failed": [],
+                "swept_at": None,
+            }
+        body["status"] = status
+        return _json_response(200, body)
 
     # -- kill switch --------------------------------------------------------
 
@@ -1126,6 +1233,8 @@ class Router:
                 return ("catalog", "")
             if name == "control":
                 return ("control", "")
+            if name == "orphans":
+                return ("orphans", "")
             return ("unknown", "")
         if name != "profiles":
             return ("unknown", "")

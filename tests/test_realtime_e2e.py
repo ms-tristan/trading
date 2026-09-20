@@ -28,6 +28,7 @@ import sqlite3
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,14 +39,18 @@ from typer.testing import CliRunner
 from trading_platform.cli import app
 from trading_platform.config import (
     MonitoringConfig,
+    ProfileConfig,
     RealtimeConfig,
-    load_profiles,
-    load_realtime_config,
 )
 from trading_platform.data.synthetic import make_ohlcv
 from trading_platform.realtime.clock import ManualClock, SystemClock
 from trading_platform.realtime.monitor import Monitor
 from trading_platform.realtime.orchestrator import RealtimeOrchestrator
+from trading_platform.realtime.settings import (
+    PlatformSettings,
+    save_settings,
+    settings_from_store,
+)
 from trading_platform.realtime.store import SqliteStateStore
 from trading_platform.realtime.stream import PollingMarketStream
 from trading_platform.web.server import create_server, start_in_thread
@@ -72,6 +77,7 @@ HEALTH_KEYS = frozenset(
         "kill_switch",
         "checked_at",
         "wallet",
+        "orphaned_positions",
     }
 )
 
@@ -171,14 +177,45 @@ def write_scenario(directory: Path) -> Path:
             "max_request_bytes": 65536,
         },
     }
-    path = directory / "profiles.json"
-    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return path
+    database = directory / "state.db"
+    store = SqliteStateStore(database, clock=ManualClock(datetime.fromisoformat(ANCHOR)))
+    store.initialize()
+    try:
+        for definition in document["profiles"]:
+            store.save_profile(ProfileConfig.model_validate(definition))
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig.model_validate(document["realtime"]),
+                monitoring=MonitoringConfig.model_validate(document["monitoring"]),
+            ),
+        )
+    finally:
+        store.close()
+    return database
 
 
-def tick(path: Path) -> dict[str, Any]:
+def resolved_settings(database: Path) -> PlatformSettings:
+    """Return the settings the state store holds, opened read-only."""
+    clock = SystemClock()
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        return settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=RealtimeConfig(state_db=database), monitoring=MonitoringConfig()
+            ),
+        )
+    finally:
+        store.close()
+
+
+def tick(database: Path) -> dict[str, Any]:
     """Run one deterministic engine tick through the CLI and return its payload."""
-    result = RUNNER.invoke(app, ["realtime", "run", "--profiles", str(path), "--once", "--json"])
+    result = RUNNER.invoke(
+        app, ["realtime", "run", "--state-db", str(database), "--once", "--json"]
+    )
     assert result.exit_code == 0, result.output
     text = getattr(result, "stdout", None) or result.output
     start = text.index("{")
@@ -194,11 +231,23 @@ def write_funding_scenario(directory: Path) -> Path:
     while ``btc-paper`` still declares a 1000 USDT stake: the one shared ledger can
     never fund that entry, which is exactly the refusal this scenario pins.
     """
-    path = write_scenario(directory)
-    document = json.loads(path.read_text(encoding="utf-8"))
-    document["realtime"]["platform_initial_balance"] = 500.0
-    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return path
+    database = write_scenario(directory)
+    from trading_platform.realtime.settings import update_settings
+
+    clock = ManualClock(datetime.fromisoformat(ANCHOR))
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        current = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=RealtimeConfig(state_db=database), monitoring=MonitoringConfig()
+            ),
+        )
+        update_settings(store, current=current, realtime={"platform_initial_balance": 500.0})
+    finally:
+        store.close()
+    return database
 
 
 def rows(database: Path, table: str) -> list[tuple[Any, ...]]:
@@ -231,10 +280,9 @@ def get(port: int, path: str, *, body: bytes | None = None) -> tuple[int, dict[s
 
 
 def test_deterministic_tick_twice_then_the_read_only_monitoring_api(tmp_path: Path) -> None:
-    path = write_scenario(tmp_path)
-    database = tmp_path / "state.db"
+    database = write_scenario(tmp_path)
 
-    first = tick(path)
+    first = tick(database)
     assert [entry["profile_id"] for entry in first["profiles"]] == ["btc-paper", "eth-paper"]
     assert first["url"] is None
     entry_orders = [item for item in first["decisions"] if item["action"] == "enter_long"]
@@ -248,7 +296,7 @@ def test_deterministic_tick_twice_then_the_read_only_monitoring_api(tmp_path: Pa
     assert len(orders_after_first) == 1
     assert len(positions_after_first) == 1
 
-    second = tick(path)
+    second = tick(database)
     assert second["decisions"] == [], "the restart replays no candle"
     assert rows(database, "orders") == orders_after_first, "no order is ever double-submitted"
     assert rows(database, "fills") == fills_after_first
@@ -263,20 +311,21 @@ def test_deterministic_tick_twice_then_the_read_only_monitoring_api(tmp_path: Pa
 
     # ---- the read-only monitoring surface over the persisted state ----------
     clock = SystemClock()
+    settings = resolved_settings(database)  # read before the writer lock is taken
     store = SqliteStateStore(database, clock=clock)
     store.initialize()
     orchestrator = RealtimeOrchestrator(
-        profiles=load_profiles(path),
+        profiles=store.load_profiles(),
         store=store,
         clock=clock,
-        realtime=load_realtime_config(path),
+        realtime=settings.realtime,
         monitoring=MonitoringConfig(port=0),
         stream_factory=lambda profile: None,  # never started: the API only reads
         version="e2e",
     )
     server = create_server(
         orchestrator,
-        monitor=Monitor(store, clock=clock, realtime=load_realtime_config(path)),
+        monitor=Monitor(store, clock=clock, realtime=settings.realtime),
         config=MonitoringConfig(port=0),
         read_only=True,
         version="e2e",
@@ -385,10 +434,9 @@ def test_deterministic_tick_twice_then_the_read_only_monitoring_api(tmp_path: Pa
 
 
 def test_a_restart_in_the_middle_of_a_position_resubmits_nothing(tmp_path: Path) -> None:
-    path = write_scenario(tmp_path)
-    database = tmp_path / "state.db"
+    database = write_scenario(tmp_path)
 
-    tick(path)
+    tick(database)
     orders = rows(database, "orders")
     fills = rows(database, "fills")
     positions = rows(database, "positions")
@@ -399,7 +447,7 @@ def test_a_restart_in_the_middle_of_a_position_resubmits_nothing(tmp_path: Path)
     assert len(equity) == 2
 
     # ---- a second tick over the same file -----------------------------------
-    payload = tick(path)
+    payload = tick(database)
     assert payload["decisions"] == []
     assert rows(database, "orders") == orders
     assert rows(database, "fills") == fills
@@ -418,10 +466,16 @@ def test_a_restart_in_the_middle_of_a_position_resubmits_nothing(tmp_path: Path)
         assert len(store.list_orders("btc-paper")) == 1
 
         orchestrator = RealtimeOrchestrator(
-            profiles=load_profiles(path),
+            profiles=store.load_profiles(),
             store=store,
             clock=clock,
-            realtime=load_realtime_config(path),
+            realtime=settings_from_store(
+                store,
+                bootstrap=PlatformSettings(
+                    realtime=RealtimeConfig(state_db=database),
+                    monitoring=MonitoringConfig(),
+                ),
+            ).realtime,
             monitoring=MonitoringConfig(port=0),
             stream_factory=lambda profile: None,
             version="e2e",
@@ -447,10 +501,9 @@ def test_a_restart_restores_the_shared_platform_wallet_once(tmp_path: Path) -> N
     ledger the restarted platform would count the restored position twice; with it,
     the numbers are identical across the restart, and the durable curve agrees.
     """
-    path = write_scenario(tmp_path)
-    database = tmp_path / "state.db"
+    database = write_scenario(tmp_path)
 
-    first = tick(path)
+    first = tick(database)
     opened = {item["profile_id"]: item for item in first["profiles"]}
     assert opened["btc-paper"]["open_positions"] == 1
     cash = opened["btc-paper"]["cash"]
@@ -472,7 +525,7 @@ def test_a_restart_restores_the_shared_platform_wallet_once(tmp_path: Path) -> N
     assert ledger[0][2] == pytest.approx(15_000.0), "the platform initial balance"
 
     # a brand-new process over the same file: fresh PaperBroker, restored position
-    second = tick(path)
+    second = tick(database)
     restarted = {item["profile_id"]: item for item in second["profiles"]}
     assert restarted["btc-paper"]["open_positions"] == 1
     assert restarted["btc-paper"]["cash"] == pytest.approx(cash)
@@ -515,10 +568,9 @@ def test_an_order_the_shared_wallet_cannot_fund_is_refused_end_to_end(tmp_path: 
     no cash movement.  The refusal is attributed to the profile that asked for it
     and it is readable on the decision *and* on the profile snapshot.
     """
-    path = write_funding_scenario(tmp_path)
-    database = tmp_path / "state.db"
+    database = write_funding_scenario(tmp_path)
 
-    payload = tick(path)
+    payload = tick(database)
     refusals = [item for item in payload["decisions"] if item["blocked"]]
     assert len(refusals) == 1
     refusal = refusals[0]
@@ -558,12 +610,11 @@ def test_the_global_kill_switch_halts_the_whole_platform_end_to_end(tmp_path: Pa
     platform without touching the store: the halt was never persisted, because it
     is a *file* force, not an API engagement.
     """
-    path = write_scenario(tmp_path)
-    database = tmp_path / "state.db"
+    database = write_scenario(tmp_path)
     flag = tmp_path / "KILL_SWITCH"
     flag.write_text("operator halted the desk\n", encoding="utf-8")
 
-    halted = tick(path)
+    halted = tick(database)
     assert [item["profile_id"] for item in halted["profiles"]] == ["btc-paper", "eth-paper"]
     assert len(halted["decisions"]) == 2, "every profile still reports its candle"
     orders_wanted = [item for item in halted["decisions"] if item["action"] != "hold"]
@@ -585,7 +636,7 @@ def test_the_global_kill_switch_halts_the_whole_platform_end_to_end(tmp_path: Pa
     assert published_equity == {"eth-paper"}
 
     # the halt is durable while the file is present: a second tick changes nothing
-    again = tick(path)
+    again = tick(database)
     still_blocked = [item for item in again["decisions"] if item["blocked"]]
     assert len(still_blocked) == 1
     assert still_blocked[0]["client_order_id"] == blocked["client_order_id"], (
@@ -596,7 +647,7 @@ def test_the_global_kill_switch_halts_the_whole_platform_end_to_end(tmp_path: Pa
 
     # lifting the file force releases the platform, and the halted candle is retried
     flag.unlink()
-    released = tick(path)
+    released = tick(database)
     entry = [item for item in released["decisions"] if item["action"] == "enter_long"]
     assert len(entry) == 1, "the candle the halt blocked is processed again, not skipped"
     assert entry[0]["blocked"] is False
@@ -608,9 +659,8 @@ def test_a_second_writer_on_the_same_state_file_is_refused(tmp_path: Path) -> No
     """The documented single-writer rule: one process owns the state database."""
     from trading_platform.core.errors import StateStoreError
 
-    path = write_scenario(tmp_path)
-    database = tmp_path / "state.db"
-    tick(path)
+    database = write_scenario(tmp_path)
+    tick(database)
 
     clock = SystemClock()
     first = SqliteStateStore(database, clock=clock)
@@ -634,15 +684,15 @@ def test_a_second_writer_on_the_same_state_file_is_refused(tmp_path: Path) -> No
 
 def test_the_platform_snapshot_is_json_safe(tmp_path: Path) -> None:
     """No NaN and no Infinity ever reaches the wire (the dashboard contract)."""
-    path = write_scenario(tmp_path)
-    tick(path)
+    database = write_scenario(tmp_path)
+    tick(database)
 
     clock = SystemClock()
     store = SqliteStateStore(tmp_path / "state.db", clock=clock)
     store.initialize()
     try:
         orchestrator = RealtimeOrchestrator(
-            profiles=load_profiles(path),
+            profiles=store.load_profiles(),
             store=store,
             clock=clock,
             realtime=RealtimeConfig(state_db=tmp_path / "state.db", csv_dir=tmp_path / "csv"),
@@ -708,15 +758,16 @@ def test_the_monitoring_surface_ships_json_only(tmp_path: Path) -> None:
         "server.py",
     }
 
-    path = write_scenario(tmp_path)
+    database = write_scenario(tmp_path)
     clock = SystemClock()
+    settings = resolved_settings(database)  # read before the writer lock is taken
     store = SqliteStateStore(tmp_path / "state.db", clock=clock)
     store.initialize()
     orchestrator = RealtimeOrchestrator(
-        profiles=load_profiles(path),
+        profiles=store.load_profiles(),
         store=store,
         clock=clock,
-        realtime=load_realtime_config(path),
+        realtime=settings.realtime,
         monitoring=MonitoringConfig(port=0),
         stream_factory=lambda profile: None,  # never started: the API only reads
         version="e2e",
@@ -782,7 +833,7 @@ class LiveLikeProvider:
 
 
 def write_live_scenario(directory: Path) -> Path:
-    """Write the deployment-shaped profiles document of the live scenario."""
+    """Seed the deployment-shaped store of the live scenario and return its path."""
     document = {
         "profiles": [
             {
@@ -809,17 +860,29 @@ def write_live_scenario(directory: Path) -> Path:
         "realtime": {"start_at": None, "history_candles": 300, "csv_dir": None},
         "monitoring": {"port": 0},
     }
-    path = directory / "profiles-live.json"
-    path.write_text(json.dumps(document), encoding="utf-8")
-    return path
+    database = directory / "state.db"
+    store = SqliteStateStore(database, clock=ManualClock(LIVE_NOW.to_pydatetime()))
+    store.initialize()
+    try:
+        for definition in document["profiles"]:
+            store.save_profile(ProfileConfig.model_validate(definition))
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig.model_validate(document["realtime"]),
+                monitoring=MonitoringConfig.model_validate(document["monitoring"]),
+            ),
+        )
+    finally:
+        store.close()
+    return database
 
 
 def test_a_live_polling_stream_trades_its_first_tick_with_a_full_warmup(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The deployment shape must process the newest closed candle on the first tick."""
-    path = write_live_scenario(tmp_path)
-    database = tmp_path / "state.db"
+    database = write_live_scenario(tmp_path)
     clock = ManualClock(LIVE_NOW.to_pydatetime())
     provider = LiveLikeProvider()
     store = SqliteStateStore(database, clock=clock)
@@ -844,10 +907,16 @@ def test_a_live_polling_stream_trades_its_first_tick_with_a_full_warmup(
         try:
             with caplog.at_level(logging.WARNING):
                 orchestrator = RealtimeOrchestrator(
-                    profiles=load_profiles(path),
+                    profiles=store.load_profiles(),
                     store=store,
                     clock=clock,
-                    realtime=load_realtime_config(path),
+                    realtime=settings_from_store(
+                        store,
+                        bootstrap=PlatformSettings(
+                            realtime=RealtimeConfig(state_db=database),
+                            monitoring=MonitoringConfig(),
+                        ),
+                    ).realtime,
                     monitoring=MonitoringConfig(port=0),
                     stream_factory=factory,
                     version="e2e",

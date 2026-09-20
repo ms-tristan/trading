@@ -69,7 +69,7 @@ The operational flow is three commands, all offline except the download:
 ```bash
 make data-download SYMBOL=BTC/USDT TIMEFRAME=1h    # 1. candles (the only network step)
 make forecast-profile                              # 2. the artifact the profile declares
-make forecast-info PROFILE=config/profiles.timesfm.example.json   # is it still usable?
+make forecast-info STATE_DB=data/realtime/state.db # is it still usable?
 make realtime-forecast                             # 3. the engine, on the forecast profile
 make forecast-flow                                 # the four, in order
 ```

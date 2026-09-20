@@ -56,8 +56,22 @@ product rules, not implementation details: *pausing* only closes the entry gate 
 the static stop of an open position and every exit signal keep being evaluated, so
 nothing is left unmanaged -- and *deleting* flattens the open position through the
 gateway before anything is removed, so a profile is never removed while it is still
-exposed.  Both are persisted (the pause flag in the ``meta`` table, the profile list
-in the profiles document) and survive a restart.
+exposed.  Both are persisted (the pause flag in the ``meta`` table, the profile
+list in the SQLite ``profiles`` table) and survive a restart.
+
+An empty platform is a legal platform
+-------------------------------------
+The SQLite state store is the single source of truth for the profile set, so the
+platform may legitimately hold **zero** profiles: a freshly deployed host starts
+empty and the operator creates profiles from the dashboard.  Constructing the
+orchestrator with an empty ``profiles`` sequence therefore succeeds,
+:meth:`RealtimeOrchestrator.start` and
+:meth:`RealtimeOrchestrator.run_once` complete immediately (``run_once`` answers
+``[]``), :meth:`RealtimeOrchestrator.run_forever` returns instead of blocking, and
+``POST /api/profiles`` still works because the wiring (the stream factory and the
+store) is prepared regardless of how many profiles there are.  The duplicated-id
+check stays: a platform that silently drops a profile is still worse than one that
+refuses to start.
 """
 
 from __future__ import annotations
@@ -70,12 +84,10 @@ import os
 import threading
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
-from trading_platform.config.loader import load_profiles, save_profiles
 from trading_platform.config.models import (
     MonitoringConfig,
     ProfileConfig,
@@ -84,7 +96,6 @@ from trading_platform.config.models import (
 )
 from trading_platform.core.errors import (
     BrokerError,
-    ConfigError,
     GatewayError,
     KillSwitchActiveError,
     MarketStreamError,
@@ -114,6 +125,17 @@ from trading_platform.realtime.models import (
 )
 from trading_platform.realtime.observability import LOGGER_NAME, log_event
 
+# --- ORPHAN SWEEP WIRING (WP3) ---------------------------------------------
+# Everything about the sweep itself lives in ``realtime.orphans``; this module
+# only plugs it into the boot order and publishes its report.
+from trading_platform.realtime.orphans import (
+    OrphanSweepReport,
+    load_orphan_report,
+    sweep_orphaned_positions,
+)
+
+# --- END ORPHAN SWEEP WIRING (WP3) -----------------------------------------
+
 if TYPE_CHECKING:
     from trading_platform.realtime.broker import Broker
     from trading_platform.realtime.risk import (
@@ -125,6 +147,7 @@ if TYPE_CHECKING:
         RiskManager,
     )
     from trading_platform.realtime.runner import ProfileRunner
+    from trading_platform.realtime.settings import PlatformSettings
     from trading_platform.realtime.store import CandleRow, StateStore
     from trading_platform.realtime.stream import MarketStream
     from trading_platform.realtime.wallet import PlatformWallet
@@ -158,6 +181,15 @@ _UNHEALTHY_STATUSES: frozenset[ProfileStatus] = frozenset(
 #: and survives a process restart: :meth:`RealtimeOrchestrator._build_runner` reads
 #: it back and re-pauses the runner it just built.
 _PAUSED_META_PREFIX = "paused:"
+
+#: Smallest positive balance the shared ledger accepts.
+#:
+#: An empty platform resolves its starting cash to ``0.0`` and the ledger refuses a
+#: non-positive balance, but the platform must still exist (it serves its API and
+#: accepts a profile created from the dashboard).  This is the placeholder it is
+#: built with; the operator's configured ``realtime.platform_initial_balance`` --
+#: or the first created profile's allocation -- is what actually funds it.
+_MINIMUM_WALLET_BALANCE = 1e-9
 
 #: Sequence number of the market order that flattens a profile being deleted.
 #:
@@ -297,18 +329,29 @@ class RealtimeOrchestrator:
     Parameters
     ----------
     profiles:
-        The profiles to run.  An empty sequence or a duplicated id raises
-        :class:`~trading_platform.core.errors.ProfileError`: a platform that
+        The profiles to run.  An **empty** sequence is legal -- the platform boots,
+        serves its API and accepts a new profile -- while a duplicated id still
+        raises :class:`~trading_platform.core.errors.ProfileError`: a platform that
         silently drops a profile is worse than one that refuses to start.
     store:
-        Durable state, shared by every profile.
+        Durable state, shared by every profile.  It is also the single source of
+        truth for the profile set **and** for the engine settings.
     clock:
         Time seam; no module of the layer reads the wall clock directly.
     realtime:
         Engine settings shared by the run (poll intervals, timeouts, state paths).
+        Only ``state_db``/``logs_dir`` are authoritative at construction; every
+        other field is replaced from the store at boot (see
+        :meth:`_load_settings_into_configs`).
     monitoring:
         Optional HTTP surface settings; kept here so a caller has a single wiring
         object even though the server itself lives in the web layer.
+    settings:
+        Optional settings already resolved from the store.  When it is ``None`` the
+        orchestrator builds its own bootstrap from the injected ``realtime``/
+        ``monitoring`` and lets :meth:`_load_settings_into_configs` replace them
+        from SQLite; when it is given, the boot reads the store once more anyway, so
+        the resolved objects always describe what the store holds.
     stream_factory:
         Builds the market stream of a profile; **required** to start.
     broker_factory:
@@ -340,10 +383,9 @@ class RealtimeOrchestrator:
         environ: Mapping[str, str] | None = None,
         version: str = "",
         wallet: PlatformWallet | None = None,
+        settings: PlatformSettings | None = None,
     ) -> None:
         self._profiles: tuple[ProfileConfig, ...] = tuple(profiles)
-        if not self._profiles:
-            raise ProfileError("no profile to run: the profile list is empty")
         identifiers = [str(profile.id) for profile in self._profiles]
         duplicates = sorted(
             identifier for identifier, count in Counter(identifiers).items() if count > 1
@@ -354,6 +396,11 @@ class RealtimeOrchestrator:
         self._clock = clock
         self._realtime = realtime
         self._monitoring = monitoring
+        self._settings = settings
+        #: Guards the one-shot adoption of the persisted settings: the boot calls
+        #: :meth:`_load_settings_into_configs` exactly once, and the flag makes that
+        #: "once" a contract rather than an approximation.
+        self._settings_loaded = False
         self._stream_factory = stream_factory
         self._broker_factory = broker_factory
         self._environ: Mapping[str, str] = os.environ if environ is None else environ
@@ -378,6 +425,13 @@ class RealtimeOrchestrator:
         self._monotonic_start: float | None = None
         self._started_at: pd.Timestamp | None = None
         self._prepared = False
+        # --- ORPHAN SWEEP WIRING (WP3) -------------------------------------
+        #: Report of the last startup orphan sweep, or ``None`` before this
+        #: process ever booted.  The engine sets it at boot; a read-only process
+        #: reads the last boot's report back from the store (see
+        #: :meth:`orphan_report`).
+        self._orphan_report: OrphanSweepReport | None = None
+        # --- END ORPHAN SWEEP WIRING (WP3) ---------------------------------
 
     # -- introspection ------------------------------------------------------
 
@@ -402,12 +456,20 @@ class RealtimeOrchestrator:
         configured ``realtime.platform_initial_balance`` when there is one, else the
         sum of the profiles' effective allocations -- which is what keeps a
         configuration written before the shared wallet existed unchanged.
+
+        An **empty** platform resolves that sum to ``0.0``, and the ledger refuses a
+        non-positive starting balance.  The platform still has to exist -- it serves
+        its API and accepts a profile created from the dashboard -- so the wallet is
+        built over the smallest positive balance the model allows and left at zero
+        cash.  As soon as a profile is created, :meth:`add_profile` re-reads it
+        through the very same object.
         """
         if self._wallet is None:
             from trading_platform.realtime.wallet import PlatformWallet
 
+            resolved = float(resolve_platform_initial_balance(self._realtime, self._profiles))
             self._wallet = PlatformWallet(
-                initial_balance=resolve_platform_initial_balance(self._realtime, self._profiles),
+                initial_balance=resolved if resolved > 0.0 else _MINIMUM_WALLET_BALANCE,
                 mode=RunMode.LIVE if self._has_enabled_live_profile() else RunMode.PAPER,
                 store=self._store,
                 clock=self._clock,
@@ -417,13 +479,51 @@ class RealtimeOrchestrator:
 
     @property
     def monitoring(self) -> MonitoringConfig | None:
-        """Return the monitoring settings, when one was configured."""
+        """Return the monitoring settings, read from the store at boot."""
         return self._monitoring
 
     @property
     def realtime(self) -> RealtimeConfig:
-        """Return the engine settings shared by the run."""
+        """Return the engine settings shared by the run, read from the store at boot."""
         return self._realtime
+
+    @property
+    def settings(self) -> PlatformSettings | None:
+        """Return the settings resolved from the store, or ``None`` before boot.
+
+        A reader that wants the *pair* of models -- the realtime and monitoring
+        sections that the state database currently declares -- reads them here
+        instead of reassembling them from :attr:`realtime` and :attr:`monitoring`.
+        """
+        return self._settings
+
+    # --- ORPHAN SWEEP WIRING (WP3) -----------------------------------------
+
+    @property
+    def orphan_report(self) -> OrphanSweepReport | None:
+        """Return the last orphan-position sweep report, or ``None``.
+
+        The report of the boot that ran in **this** process wins.  A process that
+        never booted the engine -- the monitoring server of ``realtime serve`` --
+        reads the report of the last boot back from the store, so an operator
+        always sees whether the platform was swept and what the sweep did.
+
+        ``None`` means "never swept": the API renders it as an explicit ``null``
+        rather than a missing key, so a consumer never has to guess.
+
+        The read path is deliberately **not** gated on the engine having booted:
+        a read-only composition that never opens the engine still has to answer
+        the report the store holds, exactly like :meth:`_ensure_wallet_restored`
+        answers the durable cash.
+        """
+        if self._orphan_report is not None:
+            return self._orphan_report
+        try:
+            return load_orphan_report(self._store)
+        except RealtimeError:
+            return None
+
+    # --- END ORPHAN SWEEP WIRING (WP3) -------------------------------------
 
     def __repr__(self) -> str:
         """Return a short, secret-free representation of the orchestrator."""
@@ -578,7 +678,22 @@ class RealtimeOrchestrator:
             "kill_switch": bool(engaged),
             "checked_at": self._clock.now().isoformat(),
             "wallet": None if wallet is None else wallet.to_dict(),
+            # --- ORPHAN SWEEP WIRING (WP3) ---------------------------------
+            # The last orphan sweep, always present: ``None`` means "never
+            # swept", an explicit ``null`` a consumer can tell apart from "swept
+            # and found nothing" (which carries a ``swept_at`` timestamp).
+            "orphaned_positions": self._orphan_payload(),
+            # --- END ORPHAN SWEEP WIRING (WP3) -----------------------------
         }
+
+    # --- ORPHAN SWEEP WIRING (WP3) -----------------------------------------
+
+    def _orphan_payload(self) -> dict[str, Any] | None:
+        """Return the last orphan sweep as the monitoring payload, or ``None``."""
+        report = self.orphan_report
+        return None if report is None else report.to_dict()
+
+    # --- END ORPHAN SWEEP WIRING (WP3) -------------------------------------
 
     def stats(self) -> dict[str, Any]:
         """Return the in-process counters of every profile of the platform."""
@@ -709,54 +824,57 @@ class RealtimeOrchestrator:
         log_event(_LOGGER, "profile_resume_requested", profile_id=resolved)
         return self._require_snapshot(profile_id)
 
-    async def delete_profile(self, profile_id: str, *, profiles_path: str | Path) -> str:
+    async def delete_profile(self, profile_id: str) -> str:
         """Flatten, stop and forget one profile; return the removed identifier.
 
         The order of the operations is the safety property of this method, not an
         implementation detail:
 
-        1. the profile must exist, and it must not be the last one of the platform
-           (an engine with no profile cannot run);
+        1. the profile must exist;
         2. the open exposure is closed **through the execution gateway**, before
            anything is removed: every working order is cancelled and the open
            position is flattened with one market order.  A failure at this step
            aborts the deletion and changes nothing at all -- a profile is never
            removed while it is still exposed;
-        3. the profiles document is rewritten, so a write failure aborts with the
-           file and the running engine still consistent;
+        3. the profile row is deleted from the state store, so a write failure aborts
+           with the store and the running engine still consistent;
         4. only then is the profile stopped (supervise task, runner and stream) and
            forgotten by the registry, the store flag included.
+
+        Deleting the **last** profile is allowed.  The profile set lives in the
+        SQLite state store, which is the single source of truth, so an empty
+        platform is a legal platform: the API keeps serving and
+        ``POST /api/profiles`` re-creates a profile without a restart.  The
+        flatten-before-remove guarantee is unchanged -- it is still step 2, and a
+        position that cannot be flattened still aborts the whole call and changes
+        nothing.  What replaces the old "cannot delete the last profile" guard is
+        the startup orphan sweep: a profile that disappears **without** going
+        through this method (a manual row removal, a restored older database)
+        leaves an orphaned position, and the sweep closes it at the venue on the
+        next boot.
 
         Parameters
         ----------
         profile_id:
             Profile to delete.
-        profiles_path:
-            The profiles document -- the on-disk source of truth -- rewritten
-            atomically without the deleted profile.
 
         Raises
         ------
         ProfileError
-            Unknown profile, last profile of the platform, or a position that could
-            not be flattened.  In every case nothing else was modified.
-        ConfigError
-            The profiles document could not be rewritten; nothing was removed then
-            either.
+            Unknown profile, or a position that could not be flattened.  In both
+            cases nothing else was modified.
+        StateStoreError
+            The profile row could not be removed; nothing was forgotten then.
         """
         resolved = str(profile_id)
         profile = self._by_id.get(resolved)
         if profile is None:
             raise ProfileError(f"unknown profile: {profile_id!r}")
-        remaining = [item for item in self._profiles if str(item.id) != resolved]
-        if not remaining:
-            raise ProfileError(
-                "cannot delete the last profile: the engine requires at least one profile"
-            )
         runner = self._runners.get(resolved)
         if runner is not None:
             self._flatten_profile(profile, runner)
-        await asyncio.to_thread(save_profiles, profiles_path, remaining)
+        self._ensure_store()
+        self._store.delete_profile(resolved)
         await self._stop_profile(resolved)
         self._runners.pop(resolved, None)
         self._streams.pop(resolved, None)
@@ -773,38 +891,35 @@ class RealtimeOrchestrator:
         log_event(_LOGGER, "profile_deleted", profile_id=resolved, profiles=len(self._profiles))
         return resolved
 
-    async def add_profile(
-        self, profile: ProfileConfig, *, profiles_path: str | Path
-    ) -> ProfileSnapshot:
+    async def add_profile(self, profile: ProfileConfig) -> ProfileSnapshot:
         """Persist, build and start one new profile; return its snapshot.
 
-        The profiles document is written **before** the in-memory registry is
-        touched, so a failed write leaves the platform exactly as it was.  The new
-        profile is then saved in the store, built by the regular wiring
-        (:meth:`_build_runner`, reconciliation included) and started, which is what
-        makes it appear on the dashboard without a restart.
+        The store write happens **before** the in-memory registry is touched, so a
+        failed write leaves the platform exactly as it was.  The new profile is then
+        built by the regular wiring (:meth:`_build_runner`, reconciliation included)
+        and started, which is what makes it appear on the dashboard without a
+        restart.
 
         Parameters
         ----------
         profile:
             The definition to add; its identifier must be free.
-        profiles_path:
-            The profiles document rewritten atomically with the new profile.
 
         Raises
         ------
         ProfileError
             The platform is not running (no prepared wiring, no stream factory), or
-            the identifier is already declared.
+            the identifier is already registered.
+        StateStoreError
+            The profile row could not be written; nothing was registered then.
         """
         resolved = str(profile.id)
         factory = self._stream_factory
         if not self._prepared or factory is None:
             raise ProfileError("the engine is not running")
-        if resolved in self._by_id or resolved in self._declared_ids(profiles_path):
+        if resolved in self._by_id:
             raise ProfileError(f"profile already exists: {profile.id!r}")
         self._ensure_store()
-        await asyncio.to_thread(save_profiles, profiles_path, [*self._profiles, profile])
         self._store.save_profile(profile)
         self._by_id[resolved] = profile
         self._profiles = (*self._profiles, profile)
@@ -817,14 +932,31 @@ class RealtimeOrchestrator:
     # -- wiring -------------------------------------------------------------
 
     def _prepare_runners(self) -> list[str]:
-        """Initialize the store, build every runner and reconcile it, once.
+        """Initialize the store, adopt the settings, sweep orphans, build the runners.
 
-        The boot order is a safety property, not an implementation detail: the
-        store is opened, every profile is persisted, and only then is the shared
-        wallet restored **exactly once** from the durable state -- so a restart
-        never resets the platform's cash, and the restore can never interleave with
-        a profile that is already trading.  A live platform additionally mirrors the
-        venue's balance once, best-effort (see :meth:`_sync_live_wallet`).
+        The boot order is a safety property, not an implementation detail:
+
+        1. the store is opened (it takes the single-writer lock), because it is the
+           source of truth for both the profiles and the settings;
+        2. the engine settings are read from the store **once** (see
+           :meth:`_load_settings_into_configs`), so nothing downstream ever reads
+           the bootstrap placeholder;
+        3. every loaded profile is persisted, which is what makes the registry that
+           the monitor and the API answer from durable;
+        4. the shared wallet is restored **exactly once** from the durable state, so
+           a restart never resets the platform's cash;
+        5. the orphan sweep runs (see :meth:`_sweep_orphaned_positions`): at this
+           point the full durable position set and the full loaded profile set are
+           both visible, and **no runner exists yet**, so nothing can be trading
+           while the sweep closes an orphaned position at the venue;
+        6. only then is every enabled runner built and reconciled, and a live
+           platform mirrors the venue's balance once, best-effort (see
+           :meth:`_sync_live_wallet`).
+
+        Zero profiles is a legal platform: every step above still runs and the
+        method answers ``[]``, which leaves ``_prepared`` set so that
+        :meth:`add_profile` can wire a profile created through the API without a
+        restart.
         """
         if self._prepared:
             return self._enabled_ids()
@@ -832,15 +964,107 @@ class RealtimeOrchestrator:
         if factory is None:
             raise MarketStreamError("no market stream factory: inject one")
         self._ensure_store()
+        self._load_settings_into_configs()
         for profile in self._profiles:
             self._store.save_profile(profile)
+            # --- ORPHAN SWEEP WIRING (WP3) -----------------------------
+            # The exchange of every loaded profile is durable *before* any
+            # sweep can need it: an orphan has no ProfileConfig left, so this
+            # ``meta`` entry is the only way to learn which venue it was
+            # trading on.
+            self._store.set_meta("profile_exchange:" + str(profile.id), str(profile.exchange))
+            # --- END ORPHAN SWEEP WIRING (WP3) -------------------------
         self._ensure_wallet_restored()
+        self._sweep_orphaned_positions()
         for profile_id in self._enabled_ids():
             profile = self._by_id[profile_id]
             self._build_runner(profile, factory)
         self._sync_live_wallet()
         self._prepared = True
         return self._enabled_ids()
+
+    def _load_settings_into_configs(self) -> None:
+        """Adopt the settings the state store holds, exactly once per orchestrator.
+
+        The SQLite state store is the single source of truth for the engine
+        settings: whatever the caller injected is a **bootstrap** -- the minimal
+        surface (``state_db``, ``logs_dir``) that had to be known before the store
+        could be opened -- and this method replaces it with what the store
+        remembers, seeding it from the injected values on the very first boot.
+
+        The flag makes "once" exact: the settings are read before the first profile
+        is persisted and before any runner exists, so no component ever observes a
+        half-adopted configuration.
+        """
+        if self._settings_loaded:
+            return
+        self._settings_loaded = True
+        from trading_platform.realtime.settings import (
+            PlatformSettings,
+            settings_from_store,
+        )
+
+        bootstrap = self._settings
+        if bootstrap is None:
+            bootstrap = PlatformSettings(
+                realtime=self._realtime,
+                monitoring=(
+                    self._monitoring if self._monitoring is not None else MonitoringConfig()
+                ),
+            )
+        resolved = settings_from_store(self._store, bootstrap=bootstrap)
+        self._settings = resolved
+        self._realtime = resolved.realtime
+        self._monitoring = resolved.monitoring
+        log_event(
+            _LOGGER,
+            "platform_settings_loaded",
+            state_db=str(self._realtime.state_db),
+            source="store",
+        )
+
+    # --- ORPHAN SWEEP WIRING (WP3) -----------------------------------------
+
+    def _sweep_orphaned_positions(self) -> None:
+        """Flatten every durable position whose profile is no longer loaded.
+
+        This is the boot step that closes the gap left by a profile that
+        disappears **without** going through :meth:`delete_profile`: such a
+        position is tracked by nobody -- no stop loss, no exit management, no
+        reconciliation -- so it is closed at the venue here, before any runner
+        exists.
+
+        The sweep is called exactly once, at the point where the full durable
+        position set and the full loaded profile set are both visible, and it is
+        given the same factory and the same environment the engine uses, so a
+        ``paper`` orphan closes on the simulated venue and a ``live`` orphan
+        closes through the real one.
+
+        A sweep that cannot even read the store must never stop the boot:
+        :class:`~trading_platform.core.errors.RealtimeError` is caught, logged as
+        ``orphan_sweep_failed`` at ``ERROR`` and turned into an empty report.  The
+        sweep itself never raises for an individual position either -- that is
+        carried by the entries of the report.
+        """
+        try:
+            report = sweep_orphaned_positions(
+                store=self._store,
+                profiles=self._profiles,
+                clock=self._clock,
+                broker_factory=self._broker_factory,
+                environ=self._environ,
+            )
+        except RealtimeError as exc:
+            log_event(
+                _LOGGER,
+                "orphan_sweep_failed",
+                level=logging.ERROR,
+                error=str(exc),
+            )
+            report = OrphanSweepReport.empty(swept_at=pd.Timestamp(self._clock.now()).isoformat())
+        self._orphan_report = report
+
+    # --- END ORPHAN SWEEP WIRING (WP3) -------------------------------------
 
     def _ensure_wallet_restored(self) -> None:
         """Adopt the persisted ledger, exactly once, before anything reports it.
@@ -1086,18 +1310,9 @@ class RealtimeOrchestrator:
             return False
 
     @staticmethod
-    def _declared_ids(profiles_path: str | Path) -> set[str]:
-        """Return the identifiers the profiles document declares (empty when unreadable).
-
-        The file is the source of truth, so it is consulted before adding a profile:
-        an identifier that a concurrent editor added on disk must be refused too.  An
-        unreadable document is not reported here -- the write that follows owns that
-        failure and reports it with the document in hand.
-        """
-        try:
-            return {str(item.id) for item in load_profiles(profiles_path)}
-        except ConfigError:
-            return set()
+    def _declared_ids(profile_ids: Sequence[str]) -> set[str]:
+        """Return the identifiers a sequence of profile ids declares, as a set."""
+        return {str(item) for item in profile_ids}
 
     def _flatten_profile(self, profile: ProfileConfig, runner: ProfileRunner) -> None:
         """Cancel the working orders and flatten the open position, before any removal.

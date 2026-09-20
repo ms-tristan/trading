@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -22,7 +21,6 @@ from trading_platform.config import (
     load_config,
     override_params,
 )
-from trading_platform.config.loader import load_profiles, save_profiles
 from trading_platform.config.models import (
     ProfileConfig,
     RealtimeConfig,
@@ -373,181 +371,79 @@ def test_override_params_on_an_empty_mapping_returns_an_equal_copy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# save_profiles: the on-disk source of truth of a running platform
+# profiles live in the SQLite state store, not in a JSON document
 # ---------------------------------------------------------------------------
 
 
-def profiles_document(tmp_path: Path, identifiers: list[str]) -> Path:
-    """Write a profiles document carrying profiles, realtime and monitoring keys."""
-    path = tmp_path / "profiles.json"
-    path.write_text(
-        json.dumps(
-            {
-                "profiles": [
-                    {
-                        "id": identifier,
-                        "symbol": "BTC/USDT",
-                        "timeframe": "1h",
-                        "strategy": "basic",
-                        "mode": "paper",
-                        "initial_balance": 1000.0,
-                    }
-                    for identifier in identifiers
-                ],
-                "realtime": {"state_db": str(tmp_path / "state.db"), "history_candles": 42},
-                "monitoring": {"host": "127.0.0.1", "port": 8099},
-            },
-            indent=2,
-            sort_keys=True,
+def seed_profiles(tmp_path: Path, identifiers: list[str]) -> Any:
+    """Persist one profile per identifier in a fresh state store, and return it."""
+    from trading_platform.realtime.store import SqliteStateStore
+
+    store = SqliteStateStore(tmp_path / "state.db")
+    store.initialize()
+    for identifier in identifiers:
+        store.save_profile(
+            ProfileConfig(
+                id=identifier,
+                symbol="BTC/USDT",
+                timeframe="1h",
+                strategy="basic",
+                mode="paper",
+                initial_balance=1000.0,
+            )
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    return path
+    return store
 
 
-def test_save_profiles_round_trips_the_rewritten_list(tmp_path: Path) -> None:
-    """Two profiles out, the very same two models in."""
-    path = profiles_document(tmp_path, ["aaa-paper", "bbb-paper"])
-    rewritten = [
-        ProfileConfig(id="ccc-paper", symbol="ETH/USDT", mode="paper"),
-        ProfileConfig(id="ddd-paper", symbol="SOL/USDT", timeframe="4h", initial_balance=250.0),
-    ]
-    assert save_profiles(path, rewritten) == path
-    assert save_profiles(str(path), rewritten) == path
-    assert load_profiles(path) == rewritten
-
-
-def test_save_profiles_preserves_every_other_root_key_verbatim(tmp_path: Path) -> None:
-    """The engine and the server must not lose their settings to a profile edit."""
-    path = profiles_document(tmp_path, ["aaa-paper"])
-    before = json.loads(path.read_text(encoding="utf-8"))
-    save_profiles(path, [ProfileConfig(id="aaa-paper", symbol="BTC/USDT")])
-    text = path.read_text(encoding="utf-8")
-    after = json.loads(text)
-    assert after["realtime"] == before["realtime"]
-    assert after["monitoring"] == before["monitoring"]
-    assert sorted(after) == ["monitoring", "profiles", "realtime"]
-    assert text.startswith("{\n")
-    assert text.endswith("\n")
-    assert list(after) == sorted(after)  # pretty, sorted keys, like dump_config
-
-
-def test_save_profiles_preserves_the_file_mode(tmp_path: Path) -> None:
-    """``os.replace`` swaps the inode, so the mode has to be carried over.
-
-    The temporary file is created 0o600 by default; without carrying the target's
-    mode over, the rewritten document would silently become owner-only. In the
-    deployed container the bind mount maps the owner to another uid, so an
-    owner-only file is unreadable by the very process that wrote it -- the create
-    route worked once and every later read failed.
-    """
-    path = profiles_document(tmp_path, ["aaa-paper"])
-    path.chmod(0o644)
-
-    save_profiles(path, [ProfileConfig(id="bbb-paper", symbol="ETH/USDT")])
-
-    assert stat.S_IMODE(path.stat().st_mode) == 0o644
-
-    # A deliberately private document stays private.
-    path.chmod(0o600)
-    save_profiles(path, [ProfileConfig(id="ccc-paper", symbol="SOL/USDT")])
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-
-
-def test_save_profiles_sets_the_mode_at_creation_not_by_chmod(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A filesystem that refuses ``chmod`` still gets the right mode.
-
-    Docker Desktop's virtiofs bind mount answers ``EPERM`` to every chmod, and
-    the temporary file is created 0o600 by default: the document then came out
-    owner-only and the container -- whose mount maps the owner to another uid --
-    could no longer read the config it had just written. The mode therefore has
-    to reach ``os.open``, not be restored afterwards.
-    """
-    path = profiles_document(tmp_path, ["aaa-paper"])
-    path.chmod(0o644)
-
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise PermissionError(1, "Operation not permitted")
-
-    monkeypatch.setattr(Path, "chmod", refuse)
-    monkeypatch.setattr(os, "chmod", refuse)
-
-    save_profiles(path, [ProfileConfig(id="bbb-paper", symbol="ETH/USDT")])
-
-    assert stat.S_IMODE(path.stat().st_mode) == 0o644
-    assert load_profiles(path) == [ProfileConfig(id="bbb-paper", symbol="ETH/USDT")]
-
-
-def test_save_profiles_adds_then_removes_a_profile(tmp_path: Path) -> None:
-    """The exact sequence the create and delete routes perform."""
-    path = profiles_document(tmp_path, ["aaa-paper"])
-    first = load_profiles(path)
-    created = ProfileConfig(id="bbb-paper", symbol="ETH/USDT")
-    save_profiles(path, [*first, created])
-    assert [item.id for item in load_profiles(path)] == ["aaa-paper", "bbb-paper"]
-    save_profiles(path, load_profiles(path)[:1])
-    assert [item.id for item in load_profiles(path)] == ["aaa-paper"]
-
-
-def test_save_profiles_never_validates_the_empty_list(tmp_path: Path) -> None:
-    """Writing an empty list is allowed; reading it back is still refused."""
-    path = profiles_document(tmp_path, ["aaa-paper"])
-    save_profiles(path, [])
-    assert json.loads(path.read_text(encoding="utf-8"))["profiles"] == []
-    with pytest.raises(ConfigError, match="declares no profile"):
-        load_profiles(path)
-
-
-def test_save_profiles_is_atomic_when_the_rename_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A failing rename leaves the original file byte-identical, and no temporary."""
-    path = profiles_document(tmp_path, ["aaa-paper", "bbb-paper"])
-    original = path.read_bytes()
-    real_replace = os.replace
-
-    def failing_replace(source: object, target: object, *args: object, **kwargs: object) -> None:
-        if Path(str(target)) == path:
-            raise OSError("read-only file system")
-        real_replace(source, target, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(os, "replace", failing_replace)
-    with pytest.raises(ConfigError) as excinfo:
-        save_profiles(path, [ProfileConfig(id="aaa-paper", symbol="BTC/USDT")])
-    assert f"cannot write profiles file {path}" in str(excinfo.value)
-    assert path.read_bytes() == original
-    assert sorted(item.name for item in tmp_path.iterdir()) == ["profiles.json"]
-
-
-@pytest.mark.skipif(
-    hasattr(os, "geteuid") and os.geteuid() == 0,
-    reason="a root process ignores the directory permissions",
-)
-def test_save_profiles_reports_an_unwritable_directory(tmp_path: Path) -> None:
-    """A directory that refuses the temporary file aborts without touching the file."""
-    directory = tmp_path / "readonly"
-    directory.mkdir()
-    path = directory / "profiles.json"
-    path.write_text(json.dumps({"profiles": []}), encoding="utf-8")
-    original = path.read_bytes()
-    directory.chmod(0o500)
+def test_profiles_round_trip_through_the_state_store(tmp_path: Path) -> None:
+    """Two profiles out, the very same two models in -- no document involved."""
+    store = seed_profiles(tmp_path, ["aaa-paper", "bbb-paper"])
     try:
-        with pytest.raises(ConfigError) as excinfo:
-            save_profiles(path, [ProfileConfig(id="aaa-paper", symbol="BTC/USDT")])
-        assert f"cannot write profiles file {path}" in str(excinfo.value)
-        assert path.read_bytes() == original
-        assert sorted(item.name for item in directory.iterdir()) == ["profiles.json"]
+        rewritten = store.load_profiles()
+        assert [item.id for item in rewritten] == ["aaa-paper", "bbb-paper"]
+        assert all(isinstance(item, ProfileConfig) for item in rewritten)
     finally:
-        directory.chmod(0o700)
+        store.close()
 
 
-def test_save_profiles_refuses_a_document_it_cannot_read(tmp_path: Path) -> None:
-    """Saving updates a document; it never invents one."""
-    with pytest.raises(ConfigError, match="not found"):
-        save_profiles(tmp_path / "missing.json", [ProfileConfig(id="aaa", symbol="BTC/USDT")])
+def test_a_saved_profile_is_updated_in_place(tmp_path: Path) -> None:
+    """The identifier is the natural key: re-saving never duplicates a row."""
+    store = seed_profiles(tmp_path, ["aaa-paper"])
+    try:
+        store.save_profile(ProfileConfig(id="aaa-paper", symbol="ETH/USDT"))
+        profiles = store.load_profiles()
+        assert len(profiles) == 1
+        assert str(profiles[0].symbol) == "ETH/USDT"
+    finally:
+        store.close()
+
+
+def test_a_deleted_profile_disappears_from_the_store(tmp_path: Path) -> None:
+    """Deleting a profile is a store write, and an empty set is legal."""
+    store = seed_profiles(tmp_path, ["aaa-paper", "bbb-paper"])
+    try:
+        assert store.load_profiles()
+        assert store.delete_profile("aaa-paper") is True
+        assert [item.id for item in store.load_profiles()] == ["bbb-paper"]
+        # deleting what is gone is an idempotent no-op
+        assert store.delete_profile("aaa-paper") is False
+        store.delete_profile("bbb-paper")
+        assert store.load_profiles() == []
+    finally:
+        store.close()
+
+
+def test_the_store_refuses_a_profile_carrying_a_credential(tmp_path: Path) -> None:
+    """The model is the write-side validation: a credential never reaches the row."""
+    store = seed_profiles(tmp_path, ["aaa-paper"])
+    try:
+        with pytest.raises(ValidationError) as excinfo:
+            ProfileConfig.model_validate(
+                {"id": "bad", "symbol": "BTC/USDT", "api_key": "super-secret"}
+            )
+        assert "api_key" in str(excinfo.value)
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -588,20 +484,20 @@ def test_profile_allocation_must_be_positive(tmp_path: Path, allocation: float) 
     with pytest.raises(ValidationError):
         ProfileConfig(id="btc-paper", symbol="BTC/USDT", allocation=allocation)
 
-    path = profiles_document(tmp_path, ["aaa-paper"])
-    document = json.loads(path.read_text(encoding="utf-8"))
-    document["profiles"][0]["allocation"] = allocation
-    path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ConfigError) as excinfo:
-        load_profiles(path)
+    with pytest.raises(ValidationError) as excinfo:
+        ProfileConfig(id="aaa-paper", symbol="BTC/USDT", allocation=allocation)
     assert "allocation" in str(excinfo.value)
 
 
-def test_a_profiles_document_written_before_the_wallet_still_loads(tmp_path: Path) -> None:
+def test_a_profile_stored_before_the_wallet_still_loads(tmp_path: Path) -> None:
     """Backward compatibility: no ``allocation`` key, no platform key, no change."""
-    profiles = load_profiles(profiles_document(tmp_path, ["aaa-paper", "bbb-paper"]))
-    assert [profile.allocation for profile in profiles] == [None, None]
-    assert [profile.effective_allocation for profile in profiles] == [1000.0, 1000.0]
+    store = seed_profiles(tmp_path, ["aaa-paper", "bbb-paper"])
+    try:
+        profiles = store.load_profiles()
+        assert [profile.allocation for profile in profiles] == [None, None]
+        assert [profile.effective_allocation for profile in profiles] == [1000.0, 1000.0]
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
 import type {
   HealthPayload,
   KillSwitchPayload,
+  OrphanReport,
   ProfilesPayload,
   ProfileSnapshot,
   WalletSnapshot,
@@ -70,6 +71,41 @@ const health: HealthPayload = {
 const killSwitch: KillSwitchPayload = { kill_switch: false, reason: '', changed_at: null };
 
 /**
+ * The report of the startup safety sweep: one position closed at the venue, one
+ * that could not be closed and is still open. The loud state, on purpose — a
+ * failure must never be softened by the success line next to it.
+ */
+const orphans: OrphanReport = {
+  found: 2,
+  orphaned: 2,
+  closed_count: 1,
+  failed_count: 1,
+  closed: [
+    { profile_id: 'test1', symbol: 'BTC/USDT', quantity: 0.05, side: 'sell', price: 42123.5 },
+  ],
+  failed: [
+    {
+      profile_id: 'ghost',
+      symbol: 'ETH/USDT',
+      quantity: null,
+      error: 'venue rejected the closing order',
+    },
+  ],
+  swept_at: '2024-06-01T12:00:00+00:00',
+};
+
+/** A sweep that found nothing: the banner stays away. */
+const noOrphans: OrphanReport = {
+  found: 2,
+  orphaned: 0,
+  closed_count: 0,
+  failed_count: 0,
+  closed: [],
+  failed: [],
+  swept_at: '2024-06-01T12:00:00+00:00',
+};
+
+/**
  * The shared platform wallet of the fixtures.
  *
  * `cash = initial_balance - deployed + realized_pnl`
@@ -116,6 +152,10 @@ interface StubServer {
   health: HealthPayload;
   profiles: ProfilesPayload;
   killSwitch: KillSwitchPayload;
+  /** Report answered by `GET /api/orphans`. */
+  orphans: OrphanReport;
+  /** When `true`, `GET /api/orphans` fails while every other route answers. */
+  orphansFailing: boolean;
   /** When `true`, every request fails (no response ever arrives). */
   failing: boolean;
   /** Requested paths of the page cycle, in call order. */
@@ -141,6 +181,8 @@ function startServer(): StubServer {
       wallet: { ...wallet },
     },
     killSwitch: { ...killSwitch },
+    orphans: { ...orphans },
+    orphansFailing: false,
     failing: false,
     calls: [],
     fetchMock: vi.fn(),
@@ -172,6 +214,14 @@ function startServer(): StubServer {
     if (target.endsWith('/api/kill-switch')) {
       return jsonResponse(server.killSwitch);
     }
+    if (target.endsWith('/api/orphans')) {
+      // Only this route can be made to fail on its own: a dashboard that
+      // cannot read it must never lose the profile list over it.
+      if (server.orphansFailing) {
+        throw new TypeError('Failed to fetch');
+      }
+      return jsonResponse(server.orphans);
+    }
     return jsonResponse({ error: 'not found' }, 404);
   });
 
@@ -179,12 +229,13 @@ function startServer(): StubServer {
   return server;
 }
 
-function renderLive(server: StubServer) {
+function renderLive(server: StubServer, initialOrphans: OrphanReport | null = null) {
   return render(
     <OverviewLive
       initialProfiles={server.profiles}
       initialHealth={server.health}
       initialKillSwitch={server.killSwitch}
+      initialOrphans={initialOrphans}
       initialCheckedAt="2024-01-01T00:00:00+00:00"
       pollIntervalMs={2000}
     />,
@@ -234,10 +285,15 @@ describe('OverviewLive', () => {
     expect(server.calls).toEqual([]);
 
     await advance(1);
-    expect(server.calls).toEqual(['/api/health', '/api/profiles', '/api/kill-switch']);
+    expect(server.calls).toEqual([
+      '/api/health',
+      '/api/profiles',
+      '/api/kill-switch',
+      '/api/orphans',
+    ]);
 
     await advance(2000);
-    expect(server.calls).toHaveLength(6);
+    expect(server.calls).toHaveLength(8);
   });
 
   it('renders the action island of every card, fed by the control route', async () => {
@@ -279,7 +335,10 @@ describe('OverviewLive', () => {
     server.failing = true;
     await advance(2000);
 
-    const banner = screen.getByRole('status');
+    // Scoped on purpose: the page carries more than one `role="status"` now
+    // that the sweep warning is a notice of its own; this test is about the
+    // polling failure of the toolbar.
+    const banner = within(screen.getByRole('region', { name: 'Profiles' })).getByRole('status');
     // The operator reads the mapped headline, never the bare transport message.
     expect(within(banner).getByText('The monitoring API is unreachable')).toBeInTheDocument();
     // The raw cause stays visible, verbatim, as the detail line.
@@ -296,20 +355,20 @@ describe('OverviewLive', () => {
     const server = startServer();
     renderLive(server);
     await advance(2000);
-    expect(server.calls).toHaveLength(3);
+    expect(server.calls).toHaveLength(4);
 
     fireEvent.click(screen.getByRole('button', { name: 'Pause live updates' }));
     expect(screen.getByText('Live updates paused')).toBeInTheDocument();
 
     await advance(6000);
-    expect(server.calls).toHaveLength(3);
+    expect(server.calls).toHaveLength(4);
 
     fireEvent.click(screen.getByRole('button', { name: 'Resume live updates' }));
     await settle();
-    expect(server.calls).toHaveLength(6);
+    expect(server.calls).toHaveLength(8);
 
     await advance(2000);
-    expect(server.calls).toHaveLength(9);
+    expect(server.calls).toHaveLength(12);
   });
 
   it('exposes the checked-at stamp and the paused state as a polite live region', async () => {
@@ -409,7 +468,12 @@ describe('OverviewLive', () => {
     server.health = { ...server.health, wallet: { ...refreshedWallet } };
     await advance(2000);
 
-    expect(server.calls).toEqual(['/api/health', '/api/profiles', '/api/kill-switch']);
+    expect(server.calls).toEqual([
+      '/api/health',
+      '/api/profiles',
+      '/api/kill-switch',
+      '/api/orphans',
+    ]);
     expect(within(tiles).getByText('$23,800.25')).toBeInTheDocument();
     expect(within(tiles).getByText('$26,951.00')).toBeInTheDocument();
     // The panel is updated in place, never remounted.
@@ -427,7 +491,9 @@ describe('OverviewLive', () => {
 
     // The failure is announced by the toolbar, and the wallet of the last good
     // payload stays on screen instead of collapsing to em dashes.
-    expect(screen.getByRole('status')).toHaveTextContent('The monitoring API is unreachable');
+    expect(
+      within(screen.getByRole('region', { name: 'Profiles' })).getByRole('status'),
+    ).toHaveTextContent('The monitoring API is unreachable');
     expect(within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00')).toBeInTheDocument();
     expect(screen.getByText('Local ledger')).toBeInTheDocument();
   });
@@ -469,5 +535,82 @@ describe('OverviewLive', () => {
     expect(notice).toHaveTextContent('manual stop');
     expect(notice).toHaveTextContent('2024-06-01 11:00:00 UTC');
     expect(notice).toHaveAttribute('aria-live', 'polite');
+  });
+
+  // -------------------------------------------------------------------------
+  // the startup safety sweep warning
+  // -------------------------------------------------------------------------
+
+  it('renders no orphan warning when the platform was never swept', () => {
+    const server = startServer();
+    renderLive(server, null);
+
+    expect(screen.queryByText(/Orphaned positions/i)).not.toBeInTheDocument();
+    // The rest of the overview is untouched by the absence of a report.
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+  });
+
+  it('renders the orphan warning of the server-rendered report without a request', () => {
+    const server = startServer();
+    renderLive(server, orphans);
+
+    // The first paint already carries the report: mounting issues no request.
+    expect(server.calls).toEqual([]);
+
+    const banner = screen.getByText(/Orphaned positions could not all be closed/i);
+    const notice = banner.closest('[role="status"]');
+    expect(notice).toHaveTextContent('test1 BTC/USDT');
+    expect(notice).toHaveTextContent('venue rejected the closing order');
+
+    // Placement: the warning is rendered above the profiles section, so a
+    // safety notice is never pushed below the fold by the list it is about.
+    const section = screen.getByRole('region', { name: 'Profiles' });
+    expect(notice).not.toBeNull();
+    expect(
+      (notice as HTMLElement).compareDocumentPosition(section) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('surfaces an orphan report found by a polling cycle', async () => {
+    const server = startServer();
+    server.orphans = { ...noOrphans };
+    const view = renderLive(server, noOrphans);
+    expect(screen.queryByText(/Orphaned positions/i)).not.toBeInTheDocument();
+
+    server.orphans = { ...orphans };
+    await advance(2000);
+
+    expect(screen.getByText(/Orphaned positions could not all be closed/i)).toBeInTheDocument();
+
+    // And a later clean sweep takes the warning away again.
+    server.orphans = { ...noOrphans };
+    await advance(2000);
+    expect(screen.queryByText(/Orphaned positions/i)).not.toBeInTheDocument();
+
+    view.unmount();
+  });
+
+  it('keeps the profile cards when the orphan route alone cannot be read', async () => {
+    const server = startServer();
+    const view = renderLive(server, orphans);
+
+    server.orphansFailing = true;
+    await advance(2000);
+
+    // The failing call of the cycle is normalised to `null`: the cards, the
+    // wallet and the toolbar all keep the last known good bundle.
+    expect(server.calls).toContain('/api/orphans');
+    expect(screen.queryByText(/checked at/i)).toHaveTextContent('2024-06-01 12:00:02 UTC');
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+    expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00')).toBeInTheDocument();
+
+    // No warning survives a report the dashboard could not read, and the
+    // operator is not told the monitoring API is unreachable either.
+    expect(screen.queryByText(/Orphaned positions/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('The monitoring API is unreachable')).not.toBeInTheDocument();
+
+    view.unmount();
   });
 });
