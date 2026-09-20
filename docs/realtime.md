@@ -492,6 +492,7 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 | `GET /api/catalog` | `{symbols: [{symbol, base, quote}…], strategies: [...], timeframes: [...], modes: [...]}` | — |
 | `GET /api/control` | `{engine_running, read_only, mutable, profiles: [{profile_id, paused, running}…]}` | — |
 | `GET /api/orphans` | the `orphaned_positions` report of the startup safety sweep (§4.1), on its own route | — |
+| `GET /api/operator-token` | `{valid: bool, reason: str, read_only?: bool}` — answers whether the `X-Operator-Token` header of the request authorises mutations | never 403 (see below) |
 | `POST /api/profiles/{id}/pause` | `{profile: ProfileSnapshot, paused: true}` | 400, 403, 404, 409, 503 |
 | `POST /api/profiles/{id}/resume` | `{profile: ProfileSnapshot, paused: false}` | 400, 403, 404, 409, 503 |
 | `DELETE /api/profiles/{id}` | `{profile_id, deleted: true}` | 400, 403, 404, 409, 503 |
@@ -562,6 +563,28 @@ empty, non-numeric, zero or negative value answers
 any other query parameter is ignored. The route reads the same seam in both
 modes -- the live engine in `realtime run`, the persisted state in
 `realtime serve` -- so a chart keeps its history when the engine is stopped.
+
+`GET /api/operator-token` answers one question: **does the token in this
+request's `X-Operator-Token` header authorise mutations?** It exists because
+every mutating route answers the same `403 missing or invalid operator token`
+whether the header was absent, wrong, or the server simply disables mutations,
+and an operator who pasted a token has no way to tell those apart. The route
+therefore never answers `403` -- a wrong token is a successful answer to the
+question, so it is a `200` carrying `valid: false` and one of four fixed
+reasons:
+
+| `reason` | Meaning |
+| --- | --- |
+| `valid operator token` | `valid: true`; the header matches the configured token |
+| `no operator token was supplied` | the request carried no `X-Operator-Token` header |
+| `the supplied operator token does not match this server` | a token was sent and it is wrong |
+| `no operator token is configured on this server` | `TB_OPERATOR_TOKEN` is unset, or the server runs read-only; `read_only` is also reported |
+
+The answer is a boolean and a fixed reason string only: the configured token is
+never echoed, and the comparison stays constant-time. The route is `GET` only --
+its answer depends on a request header, which a header-free `HEAD` could not
+supply without misreporting the caller's credentials -- so `HEAD` and every
+other verb answer `405`.
 
 `GET /api/catalog` is the vocabulary of the dashboard pickers: the tradable
 **spot** pairs of the exchange for the configured quote currency (fetched through

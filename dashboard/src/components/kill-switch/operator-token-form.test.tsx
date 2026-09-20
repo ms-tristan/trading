@@ -7,8 +7,11 @@ import { OPERATOR_TOKEN_STORAGE_KEY } from '@/lib/operator-token';
 
 import {
   OperatorTokenForm,
+  TOKEN_DISABLED_MESSAGE,
   TOKEN_MISSING_MESSAGE,
+  TOKEN_REJECTED_MESSAGE,
   TOKEN_SAVED_MESSAGE,
+  TOKEN_VERIFIED_MESSAGE,
 } from './operator-token-form';
 
 const TOKEN = 'super-secret-token';
@@ -185,5 +188,127 @@ describe('OperatorTokenForm without a usable storage', () => {
     await saveToken(user, TOKEN);
 
     expect(screen.getByRole('status')).toHaveTextContent(TOKEN_MISSING_MESSAGE);
+  });
+});
+
+describe('OperatorTokenForm verification', () => {
+  /** A fetch double answering `GET /api/operator-token` with `body`. */
+  function stubVerify(body: unknown, init: { status?: number; reject?: Error } = {}) {
+    const fetchMock = vi.fn(async () => {
+      if (init.reject !== undefined) {
+        throw init.reject;
+      }
+      return new Response(JSON.stringify(body), {
+        status: init.status ?? 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('offers Verify only once a token is stored', async () => {
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+
+    expect(screen.queryByRole('button', { name: 'Verify token' })).not.toBeInTheDocument();
+
+    await saveToken(user, TOKEN);
+
+    expect(screen.getByRole('button', { name: 'Verify token' })).toBeInTheDocument();
+  });
+
+  it('reports that the server accepts the stored token', async () => {
+    const fetchMock = stubVerify({ valid: true, reason: 'valid operator token' });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+
+    expect(await screen.findByText(TOKEN_VERIFIED_MESSAGE)).toBeInTheDocument();
+    // The token travels as a header, never in the URL of the request.
+    const [url] = fetchMock.mock.calls[0] as unknown as [string];
+    expect(String(url)).not.toContain(TOKEN);
+  });
+
+  it('tells the operator the stored token is wrong when the server refuses it', async () => {
+    stubVerify({ valid: false, reason: 'the supplied operator token does not match this server' });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+
+    // A refused token is the whole point of the action: it must be unmistakable
+    // and must differ from the "nothing stored" sentence.
+    const message = await screen.findByText(TOKEN_REJECTED_MESSAGE);
+    expect(message).toBeInTheDocument();
+    expect(TOKEN_REJECTED_MESSAGE).not.toBe(TOKEN_MISSING_MESSAGE);
+  });
+
+  it('reports a server that accepts no token at all distinctly', async () => {
+    stubVerify({ valid: false, reason: 'no operator token is configured on this server', read_only: true });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+
+    expect(await screen.findByText(TOKEN_DISABLED_MESSAGE)).toBeInTheDocument();
+  });
+
+  it('never claims a token is wrong when the API is unreachable', async () => {
+    stubVerify(null, { reject: new TypeError('Failed to fetch') });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+
+    // A transport failure is not a verdict on the token.
+    expect(await screen.findByText(/unreachable/i)).toBeInTheDocument();
+    expect(screen.queryByText(TOKEN_REJECTED_MESSAGE)).not.toBeInTheDocument();
+  });
+
+  it('drops a stale verdict when a different token is saved', async () => {
+    stubVerify({ valid: false, reason: 'the supplied operator token does not match this server' });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+    expect(await screen.findByText(TOKEN_REJECTED_MESSAGE)).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText(/operator token/i), 'another-token');
+    await user.click(screen.getByRole('button', { name: 'Save token' }));
+
+    // The new token has not been checked, so the old verdict must not stand.
+    expect(screen.queryByText(TOKEN_REJECTED_MESSAGE)).not.toBeInTheDocument();
+  });
+
+  it('clears the verdict when the token is removed', async () => {
+    stubVerify({ valid: true, reason: 'valid operator token' });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+    expect(await screen.findByText(TOKEN_VERIFIED_MESSAGE)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Clear token' }));
+
+    expect(screen.queryByText(TOKEN_VERIFIED_MESSAGE)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Verify token' })).not.toBeInTheDocument();
+  });
+
+  it('never renders the stored token, on success or on failure', async () => {
+    stubVerify({ valid: true, reason: 'valid operator token' });
+    const user = userEvent.setup();
+    render(<OperatorTokenForm />);
+    await saveToken(user, TOKEN);
+    await user.click(screen.getByRole('button', { name: 'Verify token' }));
+    await screen.findByText(TOKEN_VERIFIED_MESSAGE);
+
+    expect(document.body.textContent ?? '').not.toContain(TOKEN);
+    expect(document.body.innerHTML).not.toContain(TOKEN);
   });
 });

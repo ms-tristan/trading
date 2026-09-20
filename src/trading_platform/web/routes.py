@@ -134,6 +134,19 @@ MISSING_TOKEN_ERROR = "missing or invalid operator token"
 #: Documented 400 body of a malformed ``limit`` query parameter.
 MALFORMED_LIMIT_ERROR = "malformed query parameter: 'limit' must be a positive integer"
 
+#: Reason returned by ``GET /api/operator-token`` when the supplied token matches.
+TOKEN_REASON_VALID = "valid operator token"
+
+#: Reason returned when the request carries no token at all.
+TOKEN_REASON_MISSING = "no operator token was supplied"
+
+#: Reason returned when the supplied token does not match the configured one.
+TOKEN_REASON_INVALID = "the supplied operator token does not match this server"
+
+#: Reason returned when the server has no usable token configured (read-only, or
+#: no token at all), so no token could ever authorise a mutation.
+TOKEN_REASON_DISABLED = "no operator token is configured on this server"
+
 #: Candles returned by ``GET /api/profiles/{id}/candles`` when ``limit`` is absent.
 CANDLE_ROUTE_DEFAULT_LIMIT: int = 500
 
@@ -170,6 +183,10 @@ _SCALARS: tuple[type, ...] = (str, int, float, bool, type(None))
 
 #: Methods answering a read-only route.
 _READ_METHODS: tuple[str, ...] = ("GET", "HEAD")
+
+#: Methods answering a read route whose answer depends on the request headers.
+#: Such a route cannot answer a header-free ``HEAD`` honestly, so it is GET only.
+_GET_ONLY_METHODS: tuple[str, ...] = ("GET",)
 
 #: Methods answering a platform route that both reads and mutates.
 _MUTATING_METHODS: tuple[str, ...] = ("GET", "HEAD", "POST")
@@ -574,6 +591,10 @@ class Router:
             return _PROFILE_METHODS
         if route in _PROFILE_ACTIONS:
             return _ACTION_METHODS
+        if route == "operator_token":
+            # GET only: the answer depends on the request's token header, which a
+            # header-free HEAD could not supply without lying (see `_get_answer`).
+            return _GET_ONLY_METHODS
         return _READ_METHODS
 
     # -- entry point --------------------------------------------------------
@@ -667,6 +688,8 @@ class Router:
             return self._control_response()
         if route == "orphans":
             return self._orphans_response()
+        if route == "operator_token":
+            return self._operator_token_response(headers)
         return self._read(route, argument, query)
 
     def _get_answer(self, route: str, argument: str, query: str = "") -> HttpResponse:
@@ -683,6 +706,17 @@ class Router:
             return self._control_response()
         if route == "orphans":
             return self._orphans_response()
+        if route == "operator_token":
+            # A HEAD carries no request headers to verify in this path (the
+            # helper is header-free by design), and answering "invalid" for a
+            # HEAD would be a lie about the caller's token. The route therefore
+            # advertises GET only (see `_methods_of`), and reaching here is a
+            # 405 -- never a 404, which would claim the route does not exist.
+            return _json_response(
+                405,
+                {"error": "method not allowed"},
+                headers=(("Allow", "GET"),),
+            )
         return self._read(route, argument, query)
 
     def _read(self, route: str, argument: str, query: str = "") -> HttpResponse:
@@ -1179,6 +1213,44 @@ class Router:
             return False
         return hmac.compare_digest(supplied, self._operator_token)
 
+    def _operator_token_response(self, headers: Mapping[str, str] | None) -> HttpResponse:
+        """Answer ``GET /api/operator-token``: does this token actually work?
+
+        The operator otherwise learns that a token is wrong only by attempting a
+        mutation and reading a 403 whose text ("missing or invalid operator
+        token") does not say WHICH of the two it was.  This route answers that
+        question directly, so the dashboard can validate what the operator
+        pasted before relying on it.
+
+        It is a **read**: it changes no state, which is why it is answered on
+        ``GET`` without the mutating-request treatment, and it is deliberately
+        *not* a 403 -- a wrong token is a successful answer to the question
+        "is this token valid?", so it is reported as ``200`` with
+        ``valid: false`` and a machine-readable ``reason``.  That keeps the
+        distinction the operator needs, between a wrong token and a server that
+        disables mutations altogether.
+
+        Nothing about the configured token is ever echoed: the answer is a
+        boolean plus one of four fixed reason strings, and the comparison stays
+        constant-time (:func:`hmac.compare_digest`), exactly like
+        :meth:`_authorised`.
+        """
+        if self._read_only or self._operator_token is None:
+            return _json_response(
+                200,
+                {
+                    "valid": False,
+                    "reason": TOKEN_REASON_DISABLED,
+                    "read_only": bool(self._read_only),
+                },
+            )
+        supplied = _header_value(headers, OPERATOR_TOKEN_HEADER)
+        if supplied is None:
+            return _json_response(200, {"valid": False, "reason": TOKEN_REASON_MISSING})
+        if hmac.compare_digest(supplied, self._operator_token):
+            return _json_response(200, {"valid": True, "reason": TOKEN_REASON_VALID})
+        return _json_response(200, {"valid": False, "reason": TOKEN_REASON_INVALID})
+
     @staticmethod
     def _parse_kill_switch_body(body: bytes) -> dict[str, Any] | HttpResponse:
         """Decode the kill-switch body, or return the documented 400 response.
@@ -1235,6 +1307,8 @@ class Router:
                 return ("control", "")
             if name == "orphans":
                 return ("orphans", "")
+            if name == "operator-token":
+                return ("operator_token", "")
             return ("unknown", "")
         if name != "profiles":
             return ("unknown", "")

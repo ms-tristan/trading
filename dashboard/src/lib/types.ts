@@ -438,6 +438,23 @@ export interface LifecyclePayload {
 }
 
 /**
+ * Body of `GET /api/operator-token`: whether the token a request carried
+ * actually authorises mutations.
+ *
+ * The route never answers `403` — that is the point of it: a wrong token is a
+ * successful answer to the question "is this token valid?". `reason` is one of
+ * the four documented strings and exists so the two failures an operator must
+ * tell apart ("nothing was saved" vs "what was saved is wrong") never read the
+ * same. `read_only` is present only when the server cannot authorise anything
+ * at all.
+ */
+export interface OperatorTokenCheckPayload {
+  valid: boolean;
+  reason: string;
+  read_only?: boolean;
+}
+
+/**
  * Body of a successful `POST /api/profiles`.
  *
  * Creation answers the started profile only: a brand new profile is never
