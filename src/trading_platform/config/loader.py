@@ -5,24 +5,30 @@ dicts and/or dotted keys) and validates the result through
 :class:`~trading_platform.config.models.AppConfig`.  Every failure is normalised
 to :class:`~trading_platform.core.errors.ConfigError`.
 
-The same module owns the realtime documents: a *profiles file* is a single JSON
-object whose three allowed root keys are ``profiles`` (a required, non-empty list
-of :class:`~trading_platform.config.models.ProfileConfig`), ``realtime`` and
-``monitoring``.  :func:`load_profiles`, :func:`load_realtime_config` and
-:func:`load_monitoring_config` read that one file; each of them ignores the keys
-it does not own, so a run, a monitoring-only server and a pre-flight check all
-consume the same document.  :func:`save_profiles` owns the write side: it replaces
-the ``profiles`` key and preserves every other root key, atomically.
+The realtime platform has **no configuration document any more**.  Its profiles
+and its engine settings live in the SQLite state store, which is their single
+source of truth (see :mod:`trading_platform.realtime.settings`): a JSON document
+rebuilt from git on every deployment silently destroyed every change an operator
+made through the dashboard, so the document was removed rather than patched.
+
+What remains here is the **bootstrap surface**, and it is deliberately tiny: the
+path of the state database cannot live inside the database it locates, so
+:func:`load_bootstrap_realtime_config` resolves the two storage keys that must be
+known *before* the store can be opened -- ``state_db`` and ``logs_dir`` -- from
+the environment variables ``TB_REALTIME_STATE_DB``/``TB_REALTIME_LOGS_DIR`` and
+from explicit keyword arguments.  Every other field of the returned
+:class:`~trading_platform.config.models.RealtimeConfig` is a placeholder that the
+store overwrites at boot.
+
+:func:`load_realtime_config` and :func:`load_monitoring_config` are kept for call
+compatibility and now return the built-in defaults plus optional overrides: they
+never read a document, whatever ``path`` they are handed.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
-import secrets
-import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -31,7 +37,6 @@ from pydantic import BaseModel, ValidationError
 from trading_platform.config.models import (
     AppConfig,
     MonitoringConfig,
-    ProfileConfig,
     RealtimeConfig,
 )
 from trading_platform.core.errors import ConfigError
@@ -41,23 +46,30 @@ __all__ = [
     "default_monitoring_config",
     "default_realtime_config",
     "dump_config",
+    "load_bootstrap_realtime_config",
     "load_config",
     "load_monitoring_config",
-    "load_profiles",
     "load_realtime_config",
     "override_params",
-    "save_profiles",
 ]
 
 _JSON_SUFFIXES = (".json",)
 
-#: The only keys accepted at the root of a profiles document.
-_PROFILES_ROOT_KEYS: frozenset[str] = frozenset({"profiles", "realtime", "monitoring"})
-
-#: How many names :func:`_open_temporary` tries before giving up.
-_TEMPORARY_ATTEMPTS: int = 100
-
 _SectionModel = TypeVar("_SectionModel", bound=BaseModel)
+
+#: Environment variable carrying the bootstrap state-database path.
+STATE_DB_ENV = "TB_REALTIME_STATE_DB"
+
+#: Environment variable carrying the bootstrap log-directory path.
+LOGS_DIR_ENV = "TB_REALTIME_LOGS_DIR"
+
+#: The storage keys that must be known *before* the state store can be opened.
+#:
+#: They are the only fields of :class:`RealtimeConfig` that keep a
+#: file/environment surface: the database path cannot be stored in the database
+#: it locates.  Everything else is seeded into SQLite on first initialisation and
+#: read back from SQLite on every later boot.
+BOOTSTRAP_FIELDS: tuple[str, ...] = ("state_db", "logs_dir")
 
 
 def default_config() -> AppConfig:
@@ -216,173 +228,143 @@ def override_params(cfg: AppConfig, params: Mapping[str, Any]) -> AppConfig:
 
 
 # ---------------------------------------------------------------------------
-# profiles document: profiles + realtime + monitoring
+# realtime: the bootstrap surface, and the store as the source of truth
 # ---------------------------------------------------------------------------
 
 
-def load_profiles(path: str | Path) -> list[ProfileConfig]:
-    """Load every profile declared by the profiles document ``path``.
+def _bootstrap_value(
+    name: str,
+    explicit: str | Path | bool | None,
+    environ: Mapping[str, str],
+    env_name: str,
+) -> str | Path | bool | None:
+    """Resolve one bootstrap key, applying "argument > environment > default".
 
-    The document is a JSON object whose root keys are limited to ``profiles``,
-    ``realtime`` and ``monitoring``.  This function owns the ``profiles`` key and
-    ignores the two others.
+    ``None`` is the explicit "not set" marker, so a caller that passes nothing
+    never overrides the environment, and the model default applies last.  A
+    boolean is passed through untouched: ``allow_network=False`` is a decision,
+    not a missing value.
+    """
+    if explicit is None:
+        raw = environ.get(env_name)
+        return None if raw is None else raw
+    return explicit
+
+
+def _python_literal(raw: str) -> Any:
+    """Return ``raw`` as a boolean when it spells one, else the string itself.
+
+    ``TB_REALTIME_*`` variables are read through the same ``bool`` fields as the
+    CLI options, so ``TB_REALTIME_ALLOW_NETWORK=false`` has to mean ``False``
+    rather than the truthy string ``"false"``.  Anything else stays a string and
+    is validated by the model (a path, a number).
+    """
+    lowered = raw.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return raw
+
+
+def load_bootstrap_realtime_config(
+    *,
+    state_db: str | Path | None = None,
+    logs_dir: str | Path | None = None,
+    data_dir: str | Path | None = None,
+    csv_dir: str | Path | None = None,
+    allow_network: bool | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> RealtimeConfig:
+    """Resolve the **bootstrap** realtime configuration, before any store exists.
+
+    Precedence is *explicit argument > environment variable > model default*::
+
+        state_db  <- argument, else TB_REALTIME_STATE_DB,  else data/realtime/state.db
+        logs_dir  <- argument, else TB_REALTIME_LOGS_DIR,  else data/realtime/logs
+
+    The returned object is a **bootstrap**, not the platform configuration.  Only
+    :data:`BOOTSTRAP_FIELDS` (``state_db`` and ``logs_dir``) are authoritative:
+    the path of the database cannot live inside the database it locates, so those
+    two keys are resolved here and inherited verbatim on every later read.  Every
+    other field carried by the returned object is a *placeholder* that the SQLite
+    settings overwrite at boot -- the store is the single source of truth for the
+    engine settings, exactly as it already is for the profiles.
 
     Parameters
     ----------
-    path:
-        JSON profiles file (``.json`` only, like :func:`load_config`).
+    state_db:
+        Path of the SQLite state database.  The historical ``--profiles`` option
+        of the realtime commands is an alias of the option that lands here.
+    logs_dir:
+        Directory of the durable JSON logs.
+    data_dir:
+        Offline data directory, when the caller wants it bootstrapped rather than
+        stored.
+    csv_dir:
+        Offline candle directory polled instead of the venue.
+    allow_network:
+        ``False`` refuses every network call of the market-stream factory.
+    environ:
+        Environment mapping to read; defaults to the process environment.
 
     Returns
     -------
-    list[ProfileConfig]
-        The declared profiles, in file order.  Profiles whose ``enabled`` flag is
-        ``False`` are returned too: filtering is the caller's decision.
+    RealtimeConfig
+        Validated by the configuration model itself, so the same bounds,
+        literals and ``extra="forbid"`` rules apply as everywhere else.
 
     Raises
     ------
     ConfigError
-        Wrong extension, missing file, invalid JSON, non-object root, unknown root
-        key, missing or empty ``profiles`` list, invalid profile entry or a
-        duplicated profile id.
+        The resolved payload does not validate against
+        :class:`~trading_platform.config.models.RealtimeConfig`.
     """
-    target = Path(path)
-    payload = _read_payload(target)
-    for key in payload:
-        if key not in _PROFILES_ROOT_KEYS:
-            allowed = ", ".join(sorted(_PROFILES_ROOT_KEYS))
-            raise ConfigError(
-                f"unknown key at the root of the profiles file {target}: {key!r} "
-                f"(allowed: {allowed})"
-            )
-    if "profiles" not in payload:
-        raise ConfigError(f"the profiles file {target} declares no 'profiles' key")
-    raw_profiles = payload["profiles"]
-    if not isinstance(raw_profiles, list):
-        raise ConfigError(
-            f"the 'profiles' key of {target} must be a JSON list, got {type(raw_profiles).__name__}"
-        )
-    if not raw_profiles:
-        raise ConfigError("the profiles file declares no profile")
+    import os
 
-    profiles: list[ProfileConfig] = []
-    seen: set[str] = set()
-    for index, entry in enumerate(raw_profiles):
-        if not isinstance(entry, Mapping):
-            raise ConfigError(
-                f"invalid profile at index {index}: expected a JSON object, "
-                f"got {type(entry).__name__}"
-            )
-        try:
-            profile = ProfileConfig.model_validate(dict(entry))
-        except ValidationError as exc:
-            raise ConfigError(
-                f"invalid profile at index {index}: {_format_validation_error(exc)}"
-            ) from exc
-        if profile.id in seen:
-            raise ConfigError(f"duplicate profile id: {profile.id!r}")
-        seen.add(profile.id)
-        profiles.append(profile)
-    return profiles
-
-
-def _open_temporary(directory: Path, name: str, mode: int) -> tuple[int, str]:
-    """Create a unique temporary file next to ``name``, with ``mode``.
-
-    ``tempfile.mkstemp`` cannot be used here: it hard-codes 0o600, and the mode
-    of the file that gets renamed onto the target is the one the target ends up
-    with. ``O_EXCL`` keeps the creation atomic, so two concurrent callers can
-    never pick the same name.
-    """
-    for _ in range(_TEMPORARY_ATTEMPTS):
-        candidate = directory / f".{name}.{secrets.token_hex(6)}.tmp"
-        try:
-            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
-        except FileExistsError:
+    source = os.environ if environ is None else environ
+    payload: dict[str, Any] = {}
+    candidates: tuple[tuple[str, str | Path | bool | None, str], ...] = (
+        ("state_db", state_db, STATE_DB_ENV),
+        ("logs_dir", logs_dir, LOGS_DIR_ENV),
+        ("data_dir", data_dir, "TB_REALTIME_DATA_DIR"),
+        ("csv_dir", csv_dir, "TB_REALTIME_CSV_DIR"),
+        ("allow_network", allow_network, "TB_REALTIME_ALLOW_NETWORK"),
+    )
+    for name, explicit, env_name in candidates:
+        value = _bootstrap_value(name, explicit, source, env_name)
+        if value is None:
             continue
-        return descriptor, str(candidate)
-    raise ConfigError(f"cannot create a temporary file next to {directory / name}")
-
-
-def save_profiles(path: str | Path, profiles: Sequence[ProfileConfig]) -> Path:
-    """Rewrite the ``profiles`` key of the profiles document ``path``, atomically.
-
-    The profiles file is the on-disk **source of truth** of the running platform, so
-    the create/delete routes rewrite it while the engine keeps running.  The document
-    is therefore never truncated in place: the existing payload is read first, only
-    its ``profiles`` key is replaced, and the result is written to a temporary file
-    of the same directory which is then moved onto the target with :func:`os.replace`
-    -- an atomic rename on every supported platform.  A crash between the two steps
-    leaves the original file untouched, and a reader never observes a half-written
-    document.
-
-    Every other root key (``realtime``, ``monitoring``) is preserved **verbatim**: a
-    caller that owns only the profile list must not silently drop the engine
-    settings that share the document.
-
-    Parameters
-    ----------
-    path:
-        JSON profiles file (``.json`` only, like :func:`load_profiles`).  It must
-        already exist: this function updates a document, it never invents one.
-    profiles:
-        The profiles to declare, in the order they must appear.  An empty sequence
-        is written as an empty list; whether that is a legal platform is the
-        caller's rule and :func:`load_profiles` still refuses to read it.
-
-    Returns
-    -------
-    Path
-        The written path.
-
-    Raises
-    ------
-    ConfigError
-        The document cannot be read (missing file, wrong extension, invalid JSON),
-        or it cannot be written (unwritable directory, failing rename).  The
-        original file is left untouched and the temporary file is removed.
-    """
-    target = Path(path)
-    payload = _read_payload(target)
-    payload["profiles"] = [profile.model_dump(mode="json") for profile in profiles]
-    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    # The mode has to be right at CREATION time. Some bind mounts -- Docker
-    # Desktop's virtiofs on macOS, for one -- refuse chmod outright with EPERM,
-    # and ``tempfile.mkstemp`` hard-codes 0o600: the rename would then hand the
-    # target a mode that makes it unreadable to the uid the mount maps the owner
-    # to, which is exactly how the container lost access to the config it had
-    # just written.
+        payload[name] = _python_literal(value) if isinstance(value, str) else value
     try:
-        mode = stat.S_IMODE(target.stat().st_mode)
-    except OSError:
-        mode = 0o644
-    temporary: Path | None = None
+        return RealtimeConfig.model_validate(payload)
+    except ValidationError as exc:
+        raise ConfigError(
+            f"invalid realtime bootstrap configuration: {_format_validation_error(exc)}"
+        ) from exc
+
+
+def _load_defaults(
+    model: type[_SectionModel],
+    key: str,
+    overrides: Mapping[str, Any] | None,
+) -> _SectionModel:
+    """Build one section over its own built-in defaults (never reads a document)."""
+    merged = model().model_dump()
+    if overrides is not None:
+        merged = _apply_overrides(merged, _strip_section_prefix(overrides, key))
     try:
-        handle, name = _open_temporary(target.parent, target.name, mode)
-        temporary = Path(name)
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        # Best effort, for platforms where the umask stripped bits at creation.
-        with contextlib.suppress(OSError):
-            temporary.chmod(mode)
-        # ``Path.replace`` *is* ``os.replace``: an atomic rename on every supported
-        # platform, which is what makes the rewrite all-or-nothing for a reader.
-        temporary.replace(target)
-    except OSError as exc:
-        if temporary is not None:
-            with contextlib.suppress(OSError):
-                temporary.unlink(missing_ok=True)
-        raise ConfigError(f"cannot write profiles file {target}: {exc}") from exc
-    return target
+        return model.model_validate(merged)
+    except ValidationError as exc:
+        raise ConfigError(f"invalid {key} configuration: {_format_validation_error(exc)}") from exc
 
 
 def _strip_section_prefix(overrides: Mapping[str, Any], key: str) -> dict[str, Any]:
     """Drop the ``"<section>."`` prefix of dotted override keys.
 
-    ``load_realtime_config(path, {"realtime.poll_interval_seconds": 1})`` and
-    ``load_realtime_config(path, {"poll_interval_seconds": 1})`` therefore mean
-    the same thing.  A key that does not start with the section name is left
+    ``load_realtime_config({"realtime.poll_interval_seconds": 1})`` and
+    ``load_realtime_config({"poll_interval_seconds": 1})`` therefore mean the
+    same thing.  A key that does not start with the section name is left
     untouched, so an override targeting another section is still rejected loudly
     by ``extra="forbid"`` instead of being silently swallowed.
     """
@@ -393,53 +375,35 @@ def _strip_section_prefix(overrides: Mapping[str, Any], key: str) -> dict[str, A
     }
 
 
-def _load_section(
-    model: type[_SectionModel],
-    key: str,
-    path: str | Path | None,
-    overrides: Mapping[str, Any] | None,
-) -> _SectionModel:
-    """Load one ``realtime``/``monitoring`` section over the built-in defaults."""
-    payload: dict[str, Any] = {}
-    if path is not None:
-        document = _read_payload(Path(path))
-        section = document.get(key)
-        if section is not None and not isinstance(section, Mapping):
-            raise ConfigError(
-                f"the {key!r} key of {path} must be a JSON object, got {type(section).__name__}"
-            )
-        payload = dict(section or {})
-    merged = _deep_merge(model().model_dump(), payload)
-    if overrides is not None:
-        merged = _apply_overrides(merged, _strip_section_prefix(overrides, key))
-    try:
-        return model.model_validate(merged)
-    except ValidationError as exc:
-        raise ConfigError(f"invalid {key} configuration: {_format_validation_error(exc)}") from exc
-
-
 def load_realtime_config(
     path: str | Path | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> RealtimeConfig:
-    """Build a :class:`RealtimeConfig` from the ``realtime`` key of a profiles file.
+    """Build a :class:`RealtimeConfig` from the built-in defaults and ``overrides``.
 
-    ``path=None`` means "defaults only".  ``overrides`` accepts nested mappings and
-    dotted keys: the section name prefix is optional, so both
-    ``{"poll_interval_seconds": 1.0}`` and ``{"realtime.poll_interval_seconds": 1.0}``
-    override the same field, and an unknown key is rejected with a
+    ``path`` is **ignored** and kept only for call compatibility: there is no
+    profiles document any more, and this function never reads a file.  The engine
+    settings live in the SQLite state store, and the bootstrap fields
+    (``state_db``/``logs_dir``) are resolved by
+    :func:`load_bootstrap_realtime_config`.
+
+    ``overrides`` accepts nested mappings and dotted keys: the section name
+    prefix is optional, so both ``{"poll_interval_seconds": 1.0}`` and
+    ``{"realtime.poll_interval_seconds": 1.0}`` override the same field, and an
+    unknown key is rejected with a
     :class:`~trading_platform.core.errors.ConfigError` (``extra="forbid"``).
     """
-    return _load_section(RealtimeConfig, "realtime", path, overrides)
+    return _load_defaults(RealtimeConfig, "realtime", overrides)
 
 
 def load_monitoring_config(
     path: str | Path | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> MonitoringConfig:
-    """Build a :class:`MonitoringConfig` from the ``monitoring`` key of a profiles file.
+    """Build a :class:`MonitoringConfig` from the built-in defaults and ``overrides``.
 
-    ``path=None`` means "defaults only"; ``overrides`` follows the same nested /
-    dotted semantics as :func:`load_config`.
+    ``path`` is **ignored** and kept only for call compatibility: this function
+    never reads a file.  The monitoring settings live in the SQLite state store;
+    ``--host``/``--port`` are per-invocation overrides that are never persisted.
     """
-    return _load_section(MonitoringConfig, "monitoring", path, overrides)
+    return _load_defaults(MonitoringConfig, "monitoring", overrides)

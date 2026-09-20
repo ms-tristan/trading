@@ -41,8 +41,12 @@ import pytest
 from typer.testing import CliRunner
 
 from trading_platform.cli import app
+from trading_platform.config.models import MonitoringConfig, ProfileConfig, RealtimeConfig
 from trading_platform.core.constants import OHLCV_INDEX_NAME
 from trading_platform.data.synthetic import make_ohlcv
+from trading_platform.realtime.clock import ManualClock
+from trading_platform.realtime.settings import PlatformSettings, save_settings
+from trading_platform.realtime.store import SqliteStateStore
 
 RUNNER = CliRunner()
 
@@ -143,8 +147,8 @@ def anchor_start(*, rows: int = PROVIDER_ROWS) -> str:
     return (last_origin - (rows - 1) * pd.Timedelta(hours=1)).isoformat()
 
 
-def write_profiles(directory: Path, *, forecast: str | None) -> Path:
-    """Write the one-profile document of the flow (plus the realtime/monitoring keys)."""
+def seed_profiles(directory: Path, *, forecast: str | None) -> Path:
+    """Seed the state store of the flow with its one profile and its settings."""
     profile: dict[str, Any] = {
         "id": "btc-timesfm-paper",
         "symbol": SYMBOL,
@@ -182,9 +186,33 @@ def write_profiles(directory: Path, *, forecast: str | None) -> Path:
         },
         "monitoring": {"host": "127.0.0.1", "port": 0},
     }
-    path = directory / "profiles.json"
-    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
-    return path
+    database = directory / "state.db"
+    store = SqliteStateStore(database, clock=ManualClock(LIVE_NOW.to_pydatetime()))
+    store.initialize()
+    try:
+        for definition in document["profiles"]:
+            store.save_profile(ProfileConfig.model_validate(definition))
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig.model_validate(document["realtime"]),
+                monitoring=MonitoringConfig.model_validate(document["monitoring"]),
+            ),
+        )
+    finally:
+        store.close()
+    return database
+
+
+def write_profile(database: Path, *, forecast: str | None) -> None:
+    """Update the stored profile of the scenario in place (the store is truth)."""
+    store = SqliteStateStore(database, clock=ManualClock(LIVE_NOW.to_pydatetime()))
+    store.initialize()
+    try:
+        stored = store.load_profiles()[0]
+        store.save_profile(stored.model_copy(update={"forecast": forecast}))
+    finally:
+        store.close()
 
 
 def write_config(path: Path, data_dir: Path) -> Path:
@@ -206,10 +234,10 @@ def single_json_object(text: str) -> dict[str, Any]:
 
 
 def run_flow(directory: Path, *, backend: str = "seasonal") -> tuple[Path, dict[str, Any]]:
-    """Run ``forecast-bootstrap`` over the scenario and return (profiles, payload)."""
+    """Run ``forecast-bootstrap`` over the scenario and return (database, payload)."""
     data_dir = directory / "data"
     config = write_config(directory / "config.json", data_dir)
-    profiles = write_profiles(
+    database = seed_profiles(
         directory,
         forecast=str(data_dir / "forecast" / "btc-timesfm-paper-1h-seasonal.parquet"),
     )
@@ -217,8 +245,8 @@ def run_flow(directory: Path, *, backend: str = "seasonal") -> tuple[Path, dict[
         app,
         [
             "forecast-bootstrap",
-            "--profiles",
-            str(profiles),
+            "--state-db",
+            str(database),
             "--config",
             str(config),
             "--backend",
@@ -227,7 +255,7 @@ def run_flow(directory: Path, *, backend: str = "seasonal") -> tuple[Path, dict[
         ],
     )
     assert result.exit_code == 0, result.output
-    return profiles, single_json_object(result.stdout)
+    return database, single_json_object(result.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +271,7 @@ def test_the_documented_operational_flow_produces_a_trading_profile(tmp_path: Pa
     frame = make_ohlcv(PROVIDER_ROWS, start=anchor_start(), timeframe=TIMEFRAME, seed=SCENARIO_SEED)
     frame.to_csv(csv_dir / f"BTC_USDT-{TIMEFRAME}.csv", index_label=OHLCV_INDEX_NAME)
 
-    profiles, bootstrap_payload = run_flow(tmp_path)
+    database, bootstrap_payload = run_flow(tmp_path)
     artifact = Path(bootstrap_payload["reports"][0])
     assert artifact.is_file()
 
@@ -277,7 +305,7 @@ def test_the_documented_operational_flow_produces_a_trading_profile(tmp_path: Pa
 
     # 4. the live runner accepts the profile and actually trades
     result = RUNNER.invoke(
-        app, ["realtime", "run", "--profiles", str(profiles), "--once", "--json"]
+        app, ["realtime", "run", "--state-db", str(database), "--once", "--json"]
     )
     assert result.exit_code == 0, result.output
     payload = single_json_object(result.stdout)
@@ -311,7 +339,7 @@ def test_the_documented_operational_flow_produces_a_trading_profile(tmp_path: Pa
 def test_the_three_command_flow_is_repeatable(tmp_path: Path) -> None:
     """Re-running the flow on the same candles rewrites the same artifact."""
     write_candles(tmp_path / "data", start=anchor_start())
-    profiles, first = run_flow(tmp_path)
+    database, first = run_flow(tmp_path)
     artifact = Path(first["reports"][0])
     before = artifact.read_bytes()
 
@@ -319,8 +347,8 @@ def test_the_three_command_flow_is_repeatable(tmp_path: Path) -> None:
         app,
         [
             "forecast-bootstrap",
-            "--profiles",
-            str(profiles),
+            "--state-db",
+            str(database),
             "--config",
             str(tmp_path / "config.json"),
             "--backend",
@@ -345,7 +373,7 @@ def test_a_stale_artifact_is_refused_with_an_actionable_message(tmp_path: Path) 
         rows=400,
         start=(LIVE_NOW - pd.Timedelta(hours=4000)).isoformat(),
     )
-    profiles, payload = run_flow(tmp_path)
+    database, payload = run_flow(tmp_path)
     artifact = Path(payload["reports"][0])
 
     # the artifact names the very command that rebuilds it
@@ -354,7 +382,7 @@ def test_a_stale_artifact_is_refused_with_an_actionable_message(tmp_path: Path) 
     assert single_json_object(info.stdout)["run"]["coverage"]["usable"] is False
 
     result = RUNNER.invoke(
-        app, ["realtime", "run", "--profiles", str(profiles), "--once", "--json"]
+        app, ["realtime", "run", "--state-db", str(database), "--once", "--json"]
     )
 
     assert result.exit_code == 1, result.output
@@ -372,7 +400,7 @@ def test_an_artifact_of_another_symbol_is_refused_before_any_candle(tmp_path: Pa
         csv_dir / f"BTC_USDT-{TIMEFRAME}.csv", index_label=OHLCV_INDEX_NAME
     )
 
-    profiles, payload = run_flow(tmp_path)
+    database, payload = run_flow(tmp_path)
     artifact = Path(payload["reports"][0])
 
     # rebuild the artifact for another symbol, then point the BTC profile at it
@@ -402,12 +430,10 @@ def test_an_artifact_of_another_symbol_is_refused_before_any_candle(tmp_path: Pa
     )
     assert result.exit_code == 0, result.output
 
-    document = json.loads(profiles.read_text(encoding="utf-8"))
-    document["profiles"][0]["forecast"] = str(other)
-    profiles.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    write_profile(database, forecast=str(other))
 
     refused = RUNNER.invoke(
-        app, ["realtime", "run", "--profiles", str(profiles), "--once", "--json"]
+        app, ["realtime", "run", "--state-db", str(database), "--once", "--json"]
     )
 
     assert refused.exit_code == 1, refused.output
@@ -424,7 +450,7 @@ def test_an_artifact_of_another_timeframe_is_refused_before_any_candle(tmp_path:
         csv_dir / f"BTC_USDT-{TIMEFRAME}.csv", index_label=OHLCV_INDEX_NAME
     )
 
-    profiles, _payload = run_flow(tmp_path)
+    database, _payload = run_flow(tmp_path)
     other = tmp_path / "data" / "forecast" / "h4.parquet"
     frame = make_ohlcv(400, start=anchor_start(rows=400), timeframe="4h", seed=SCENARIO_SEED)
     frame.to_csv(tmp_path / "data" / "BTC_USDT-4h.csv", index_label=OHLCV_INDEX_NAME)
@@ -451,12 +477,10 @@ def test_an_artifact_of_another_timeframe_is_refused_before_any_candle(tmp_path:
     )
     assert result.exit_code == 0, result.output
 
-    document = json.loads(profiles.read_text(encoding="utf-8"))
-    document["profiles"][0]["forecast"] = str(other)
-    profiles.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    write_profile(database, forecast=str(other))
 
     refused = RUNNER.invoke(
-        app, ["realtime", "run", "--profiles", str(profiles), "--once", "--json"]
+        app, ["realtime", "run", "--state-db", str(database), "--once", "--json"]
     )
 
     assert refused.exit_code == 1, refused.output

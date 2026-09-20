@@ -56,6 +56,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -309,6 +310,21 @@ def _trade_key(profile_id: str, trade: TradeRecord) -> str:
     )
 
 
+#: Matches the ``input_value=...`` fragment of a pydantic error message.
+_INPUT_VALUE_PATTERN = re.compile(r"input_value=.*?(?=,\s*input_type=|\]|$)", re.DOTALL)
+
+
+def _redact_profile_error(exc: BaseException) -> str:
+    """Return ``exc`` rendered with every echoed *value* removed.
+
+    A profile row is the one place a credential could have been hand-written, and
+    pydantic echoes the offending value in its message (``input_value='s3cr3t'``).
+    The rule and the field path are what an operator needs; the value is not, and a
+    message carrying it ends up in the monitoring payload and in the logs.
+    """
+    return _INPUT_VALUE_PATTERN.sub("input_value=<redacted>", str(exc))
+
+
 def _rollback(conn: sqlite3.Connection) -> None:
     """Roll a transaction back, ignoring a transaction that is already gone."""
     try:
@@ -361,12 +377,34 @@ class StateStore(Protocol):
         """Release every resource held by the store. Idempotent."""
         ...
 
+    def state_path(self) -> Path | None:
+        """Return the path of the backing store's database file, or ``None``.
+
+        The path of the file is what the bootstrap surface of the platform
+        settings is resolved against (see :mod:`trading_platform.realtime.settings`),
+        so a caller never has to know which concrete store it was handed.  A store
+        with no file of its own -- an in-memory double, a test fake -- answers
+        ``None``.
+        """
+        ...
+
     def save_profile(self, spec: ProfileConfig) -> None:
         """Persist (or update) the configuration of one profile."""
         ...
 
     def load_profiles(self) -> list[ProfileConfig]:
         """Return every persisted profile, ordered by ``profile_id``."""
+        ...
+
+    def delete_profile(self, profile_id: str) -> bool:
+        """Remove one persisted profile; answer whether a row was actually removed.
+
+        The profile set lives in the store, so removing one is a store write and
+        not a document rewrite.  Deleting an unknown identifier is a no-op that
+        answers ``False`` rather than an error: the caller has already resolved
+        the profile it passes, and a concurrent deletion must not turn a
+        successful call into a failure.
+        """
         ...
 
     def save_wallet(self, *, cash: float, initial_balance: float) -> None:
@@ -407,6 +445,17 @@ class StateStore(Protocol):
 
     def list_positions(self, profile_id: str) -> list[Position]:
         """Return every open position of a profile, ordered by symbol."""
+        ...
+
+    def position_profile_ids(self) -> list[str]:
+        """Return, sorted, every profile id the ``positions`` table mentions.
+
+        The read exists for the startup orphan sweep: a position is durable state
+        completely independent of the ``profiles`` table, so the only way to find
+        one whose profile was never loaded is to ask the table itself.  An empty
+        table answers ``[]``; no ordering, no filtering, no decoding -- the
+        identifiers are exactly the ``profile_id`` column, distinct and sorted.
+        """
         ...
 
     def append_equity(self, point: EquityPoint) -> bool:
@@ -512,6 +561,16 @@ class SqliteStateStore:
     @property
     def path(self) -> Path:
         """Location of the SQLite file backing this store."""
+        return self._path
+
+    def state_path(self) -> Path | None:
+        """Return the location of the SQLite file backing this store.
+
+        The file *is* the store, so this never answers ``None`` -- it is the
+        member of the :class:`StateStore` seam that lets a caller resolve the
+        bootstrap surface of the platform settings without knowing which
+        implementation it was handed.
+        """
         return self._path
 
     @property
@@ -787,11 +846,28 @@ class SqliteStateStore:
             try:
                 profiles.append(ProfileConfig.model_validate(json.loads(str(row["payload"]))))
             except (KeyError, TypeError, ValueError) as exc:
+                # The payload is echoed *sanitised*: pydantic reports the offending
+                # value in its message, and a profile row is exactly where an
+                # operator might have hand-written a credential.  The reason is kept
+                # (field path and rule), the value never is.
                 raise StateStoreError(
                     f"state store read failed (load_profiles): corrupted payload for "
-                    f"{profile_id}: {exc}"
+                    f"{profile_id}: {_redact_profile_error(exc)}"
                 ) from exc
         return profiles
+
+    def delete_profile(self, profile_id: str) -> bool:
+        """Remove the row of ``profile_id``; answer whether one was removed.
+
+        The delete is idempotent: replaying it deletes nothing the second time and
+        answers ``False``.  Only the ``profiles`` table is touched -- the durable
+        positions of a profile are deliberately left alone, because a position is
+        state of its own and is closed (or swept) through the execution path, never
+        by deleting a row.
+        """
+        with self._write("delete_profile") as conn:
+            cursor = conn.execute("DELETE FROM profiles WHERE profile_id = ?", (str(profile_id),))
+            return bool(cursor.rowcount)
 
     # -- shared platform wallet ---------------------------------------------
 
@@ -973,6 +1049,19 @@ class SqliteStateStore:
             )
             for row in rows
         ]
+
+    def position_profile_ids(self) -> list[str]:
+        """Return, sorted, every profile id the ``positions`` table mentions.
+
+        See the protocol member: this is the orphan sweep's raw scan of the
+        durable positions, which is the only way to find a row whose profile is
+        not loaded any more.
+        """
+        rows = self._fetchall(
+            "position_profile_ids",
+            "SELECT DISTINCT profile_id FROM positions ORDER BY profile_id ASC",
+        )
+        return [str(row["profile_id"]) for row in rows]
 
     # -- equity -------------------------------------------------------------
 

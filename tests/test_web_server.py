@@ -77,6 +77,10 @@ class FakeStore:
     def load_profiles(self) -> list[ProfileConfig]:
         return list(self._specs)
 
+    def state_path(self) -> Path | None:
+        """Answer ``None``: an in-memory double has no database file of its own."""
+        return None
+
     def equity_curve(self, profile_id: str) -> list[EquityPoint]:
         if profile_id != PROFILE_A:
             return []
@@ -353,6 +357,7 @@ def test_real_round_trip_on_health_and_profiles(server: MonitoringServer) -> Non
     assert sorted(body) == [
         "checked_at",
         "kill_switch",
+        "orphaned_positions",
         "profiles_running",
         "profiles_total",
         "status",

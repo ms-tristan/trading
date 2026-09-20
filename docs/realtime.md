@@ -26,9 +26,11 @@ One thing **is** shared: the USDT cash. Every profile funds its orders from
 **one** platform wallet, and the `allocation` of a profile is the part of that
 wallet attributed to it (§9). Nothing else is pooled.
 
-A profile is described by one JSON object of the profiles file (see
-`config/profiles.example.json`) and validated by `config.models.ProfileConfig`,
-which rejects any unknown key (`extra="forbid"`):
+A profile is **one row of the `profiles` table** of the SQLite state store
+(§1.1), loaded from there at every boot and validated by
+`config.models.ProfileConfig`, which rejects any unknown key
+(`extra="forbid"`). There is no profiles JSON document any more: the field table
+below is the schema of that row, not of a file.
 
 | `ProfileConfig` field | Role |
 | --- | --- |
@@ -49,12 +51,65 @@ which rejects any unknown key (`extra="forbid"`):
 | `entry_lookback_candles` | live-only catch-up window: the entry decision may act on a crossover that occurred within the last N candles (0, the default, keeps the historical behaviour: only the last row decides); ignored by the backtest, which already reads every row; 0 <= N <= 200 |
 | `forecast` | path of the **offline forecast artifact** the profile consumes (built by `trading forecast-build`, see [`forecasting.md`](forecasting.md)); `null` by default. It is **required** by a `timesfm` profile and refused loudly at startup when it is missing, corrupt, stale or built for another symbol/timeframe; a `basic` profile never reads it, and `"forecast": null` is exactly the historical behaviour |
 
-The complete document carries three root keys: `profiles`, `realtime`
-(`RealtimeConfig`: state base, directories, CSV or cache provider, `start_at`
-anchor, delays, reconnections, benchmark) and `monitoring`
-(`MonitoringConfig`: `host`, `port`, `refresh_seconds`,
-`request_timeout_seconds`, `max_request_bytes`). Any other root key is
-rejected.
+The complete profile set is the `profiles` table of the state store. The two
+other sections of the retired document are settings, and they are rows of the
+`meta` table as well: `realtime` (`RealtimeConfig`: state base, directories, CSV
+or cache provider, `start_at` anchor, delays, reconnections, benchmark) and
+`monitoring` (`MonitoringConfig`: `host`, `port`, `refresh_seconds`,
+`request_timeout_seconds`, `max_request_bytes`). An unknown key is rejected
+everywhere, because the models forbid extra fields.
+
+### 1.1 Where the configuration lives
+
+**SQLite is the single source of truth**, for the profile set *and* for the
+engine settings:
+
+| Surface | Storage |
+| --- | --- |
+| the profile set | the `profiles` table of `realtime.state_db` |
+| the engine and monitoring settings | the `meta` key `platform_settings` of the same database |
+| positions, orders, fills, equity, candles, wallet | the tables of the same schema |
+
+`POST /api/profiles` and `DELETE /api/profiles/{id}` write that table, not a
+file: a profile created through the dashboard is durable, survives a restart, and
+is **not** rebuilt from git by the next deployment. This is deliberate — the
+platform used to keep the profile set in a committed JSON document that the
+monitoring API rewrote, so every deploy silently dropped the profiles that existed
+only on the deployed host.
+
+**The bootstrap surface is exactly two keys.** The path of the state database
+**cannot live inside the database it locates**, so `realtime.state_db` (default
+`data/realtime/state.db`) and `realtime.logs_dir` (default `data/realtime/logs`)
+are resolved *before* the store can be opened:
+
+```
+state_db  <-  --state-db,  else TB_REALTIME_STATE_DB,  else data/realtime/state.db
+logs_dir  <-  --logs-dir,  else TB_REALTIME_LOGS_DIR,  else data/realtime/logs
+```
+
+**Every other setting is seeded into SQLite on first initialisation and read
+from SQLite on every later boot**: `poll_interval_seconds`,
+`stream_poll_timeout_seconds`, `max_stream_reconnects`,
+`reconnect_backoff_seconds`, `reconcile_interval_seconds`, `data_dir`,
+`cache_dir`, `csv_dir`, `format`, `allow_network`, `history_candles`,
+`start_at`, `risk_free_rate`, `benchmark_variant`, `kill_switch_file`,
+`platform_initial_balance`, `platform_max_total_notional`,
+`platform_max_daily_loss`, and the whole `monitoring` section (`host`, `port`,
+`refresh_seconds`, `request_timeout_seconds`, `max_request_bytes`) — no
+exception. Deleting the state database and restarting re-seeds the built-in
+defaults, which is why a host that never customises anything behaves exactly as
+it did before this storage change: the seed *is* the model default.
+
+The settings are updatable at runtime through the store (`set_meta` writes the
+document, and the next read observes the new value); nothing needs to be edited
+on disk, and there is no file to edit. `--host` and `--port` stay per-invocation
+options: they are never persisted, so `realtime serve --port 0` cannot re-point
+the engine.
+
+**No migration is performed.** A previously declared profile is *not* imported
+from any document, and no importer exists: the host starts with an **empty
+profile set** and the operator re-creates the profiles through the dashboard
+(§4, §8). The engine boots cleanly with zero profiles.
 
 ## 2. One execution path for paper and live
 
@@ -243,18 +298,21 @@ profile — `ProfileRunner.start`, `ProfileRunner.run` / `run_once`,
 goes through it, the refusal happens **before the first candle**. The error is a
 `TradingBacktestError`, so the CLI error surface already renders it; it is never
 wrapped and never swallowed. A profile that declares no forecast (every `basic`
-profile of the platform, including the two shipped examples) keeps the exact
-previous behaviour: its bundle is empty, nothing is loaded, nothing is checked.
+profile of the platform) keeps the exact previous behaviour: its bundle is empty,
+nothing is loaded, nothing is checked.
 
 Ask the same question **before** starting the engine with
-`trading forecast-info --profiles <file> [--profile <id>]`, which reuses this very
-guard and prints the same message (§6).
+`trading forecast-info --state-db <database> [--profile <id>]`, which reuses this
+very guard and prints the same message (§6).
 
 ## 4. Persistence, restart and reconciliation
 
 - The state lives in **a single SQLite file** (`realtime.state_db`, default
   `data/realtime/state.db`, ignored by git), in WAL mode, one connection per
-  calling thread, **every write inside a transaction**.
+  calling thread, **every write inside a transaction**. That one file is the
+  whole durable state of the platform: the profile set, the engine settings
+  (§1.1), the positions, the orders, the fills, the equity curve, the candle
+  history and the shared wallet.
 - Every write is **idempotent**: UPSERT on the natural key, and the order
   identifier is **deterministic** — `new_client_order_id(profile_id, symbol,
   candle_timestamp, sequence)` — so the same decision always produces the same
@@ -319,6 +377,96 @@ guard and prints the same message (§6).
   persisted truth. A **real** venue is never reseeded locally either: the wallet
   *mirrors* the account the venue publishes (`CcxtBroker.fetch_balance`,
   best-effort, once at startup) and stays read-only (§9).
+- **An empty platform is a legal platform.** With the profile set living in the
+  state store, the engine boots with **zero** profiles: it opens the store, seeds
+  or adopts the settings, restores the wallet, opens the monitoring API and idles.
+  `GET /api/profiles` answers `[]`, `GET /api/health` reports
+  `profiles_total: 0`, `realtime check` exits `0`, and `POST /api/profiles`
+  creates the first profile and **starts it immediately**, without a restart. The
+  retired loader used to refuse an empty profile set with the error
+  `the profiles file declares no profile`, which would now mean a platform that
+  cannot be brought up at all from an empty database — so that refusal is gone
+  with the file that produced it.
+- **The "cannot delete the last profile" guard is removed** — a *recorded
+  decision*, not an oversight. It existed because an engine was believed to need
+  at least one profile; it does not: with the state store as the source of truth,
+  deleting the last profile simply leaves the same legal empty platform described
+  above, and re-creating a profile from the dashboard takes one request. The
+  **flatten-before-remove safety of `DELETE /api/profiles/{id}` is untouched**:
+  the open exposure is still closed through the execution gateway *before*
+  anything is removed, and a position that cannot be flattened still aborts the
+  whole call and changes nothing (§8). What the removed guard leaves behind is
+  the path that does **not** go through the delete route at all — a row removed
+  with `sqlite3`, a database restored from a backup taken before the profile
+  existed — and that path is covered by the next paragraph.
+
+### 4.1 Orphaned positions are flattened at startup
+
+A position is **durable state independent of the `profiles` table**: its row
+carries the `profile_id` it belongs to, but nothing ties the two tables together.
+When a profile disappears **without** going through `Orchestrator.delete_profile`,
+nothing ever tracks its open position again — no stop-loss, no exit management, no
+reconciliation — and the exposure stays open at the venue with no owner. That is
+an **orphan**, and the platform sweeps it.
+
+**The sweep.** It runs at engine boot, from `_prepare_runners`, at the one point
+where the whole durable position set and the whole loaded profile set are visible
+together — after the store is opened, the settings adopted and the profiles
+loaded, and after the shared wallet is restored, but **before any runner exists**.
+That ordering is the safety property: nothing can be trading while the sweep
+closes a position.
+
+**What it does.** Every position whose `profile_id` matches **no** loaded profile
+is orphaned, and is **closed at the venue through the execution gateway**, in
+**both** `paper` and `live` mode. Closing means routing a real closing order
+through the injected broker, never deleting the SQLite row: removing the row would
+leave the exchange position open, which is exactly the hazard being fixed.
+
+The mode and the exchange of an orphan are recovered from the `meta` table of
+the state store, under `profile_state:<id>` and `profile_exchange:<id>` — the durable
+evidence of how that profile traded — because the profile itself is gone. A
+`profile_state:<id>` of `live` therefore closes through the real broker, subject
+to the same live gate as any live profile (§3); an absent or unreadable
+`profile_state:<id>` closes in the **safer** direction, at the venue the position
+was opened on.
+
+**Every closure is logged** with `profile_id`, `symbol`, `quantity`, `side` and
+`price` (the structured event `orphaned_position_closed`), and the sweep itself is
+logged as `orphaned_positions_swept` with the counts.
+
+**A position that cannot be closed is NOT deleted.** The row stays, the failure is
+logged at `ERROR` (`orphaned_position_close_failed`, carrying the verbatim venue
+error) and it is **surfaced** — in the report below and on the dashboard — because
+an unclosable exposure must stay visible rather than be silently forgotten.
+
+**Idempotent across restarts.** The sweep only ever acts on positions, and a
+position that was closed is closed: a restart finds no open position for that
+profile and does nothing. A failure is retried on the next boot rather than
+hidden, and a successful closure is never repeated. `closed_count` counts
+closures, never rows inspected.
+
+**Where the operator sees it.** The result is published through the monitoring
+JSON API, on `GET /api/health` (the additive `orphaned_positions` key) and on the
+dedicated read route `GET /api/orphans` (§5). Both carry the same object:
+
+```
+{"found": 3, "orphaned": 2, "closed_count": 1, "failed_count": 1,
+ "closed": [{"profile_id": "test1", "symbol": "BTC/USDT", "quantity": 0.5,
+             "side": "sell", "price": 61234.5}],
+ "failed": [{"profile_id": "eth-scratch", "symbol": "ETH/USDT",
+             "quantity": 1.25, "error": "BrokerUnavailableError: ..."}],
+ "swept_at": "2024-05-01T12:00:00+00:00"}
+```
+
+`found` counts the durable positions the sweep inspected, `orphaned` those that
+matched no loaded profile, `closed_count`/`failed_count` the two outcomes,
+`closed` and `failed` the per-position detail, and `swept_at` the ISO-8601 stamp
+of the sweep — `null` when the platform was never swept, which is how a consumer
+tells "no orphan found" from "never looked". A `failed_count > 0` makes
+`GET /api/health` answer `status: degraded`, exactly like an engaged kill switch:
+a failure to close is reported as loudly as a success. The dashboard renders the
+same object as an operator-facing warning banner. `GET /api/orphans` is
+read-only and requires no operator token.
 
 ## 5. Web API reference
 
@@ -330,7 +478,7 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 
 | Method and route | 200 response | Errors |
 | --- | --- | --- |
-| `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at, wallet}` | — |
+| `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at, wallet, orphaned_positions}` | — |
 | `GET /api/profiles` | `{profiles: [ProfileSnapshot…], generated_at, wallet}` | — |
 | `GET /api/profiles/{id}` | `ProfileSnapshot` | 404 `{error}` |
 | `GET /api/profiles/{id}/equity` | `{points: [{timestamp, equity, cash, position_value}…]}` | 404 |
@@ -343,6 +491,7 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 | `GET /api/profiles/{id}/candles?limit=N` | `{candles: [{profile_id, timestamp, open, high, low, close, volume, closed}…], count}` (oldest first) | 404 unknown profile, 400 malformed `limit` |
 | `GET /api/catalog` | `{symbols: [{symbol, base, quote}…], strategies: [...], timeframes: [...], modes: [...]}` | — |
 | `GET /api/control` | `{engine_running, read_only, mutable, profiles: [{profile_id, paused, running}…]}` | — |
+| `GET /api/orphans` | the `orphaned_positions` report of the startup safety sweep (§4.1), on its own route | — |
 | `POST /api/profiles/{id}/pause` | `{profile: ProfileSnapshot, paused: true}` | 400, 403, 404, 409, 503 |
 | `POST /api/profiles/{id}/resume` | `{profile: ProfileSnapshot, paused: false}` | 400, 403, 404, 409, 503 |
 | `DELETE /api/profiles/{id}` | `{profile_id, deleted: true}` | 400, 403, 404, 409, 503 |
@@ -367,6 +516,31 @@ wallet row yet answers `"wallet": null`: the key is
 always present, so a consumer never has to guess whether the wallet is missing or
 simply empty, and no payload ever carries `NaN` or `Infinity` — a non-finite
 number is rendered `null`.
+
+`orphaned_positions` is the **additive** report of the startup safety sweep of
+§4.1, present on `GET /api/health` and served on its own by `GET /api/orphans`:
+
+```
+{"found": int, "orphaned": int, "closed_count": int, "failed_count": int,
+ "closed": [{"profile_id": str, "symbol": str, "quantity": num|null,
+             "side": "buy"|"sell", "price": num|null}],
+ "failed": [{"profile_id": str, "symbol": str, "quantity": num|null,
+             "error": str}],
+ "swept_at": str|null}
+```
+
+`found` is how many durable positions the sweep looked at and `orphaned` how many
+of them matched no loaded profile. `closed_count` and `failed_count` are the two
+outcomes; `closed` and `failed` carry one entry per position, and a `quantity` or
+a `price` the venue did not report as a finite number is rendered `null` rather
+than dropped — the closing order still happened. `swept_at` is `null` when the
+platform was never swept, which is how a consumer distinguishes "no orphan found"
+from "never looked" (the dashboard then renders no warning at all). A
+`failed_count > 0` makes `status` **`degraded`**, exactly like an engaged kill
+switch, so an unclosable position is as loud as a closed one. `GET /api/orphans`
+is read-only, needs no operator token, and answers the same object — a platform
+that was never swept answers `swept_at: null` with empty lists rather than a
+`404`.
 
 A `ProfileSnapshot` carries every key it always carried — `profile_id`, `symbol`,
 `timeframe`, `strategy`, `mode`, `status`, `initial_balance`, `equity`, `cash`,
@@ -432,33 +606,46 @@ trace on the network. The single operator token comes from `TB_OPERATOR_TOKEN`
 
 ```bash
 # static pre-flight: passes NO order and does NOT touch the network
-trading realtime check --profiles config/profiles.example.json --json
+trading realtime check --state-db data/realtime/state.db --json
 
 # engine + JSON monitoring API
-trading realtime run --profiles config/profiles.example.json
-trading realtime run --profiles config/profiles.example.json --host 127.0.0.1 --port 8080
+trading realtime run --state-db data/realtime/state.db
+trading realtime run --state-db data/realtime/state.db --host 127.0.0.1 --port 8080
 
 # a single deterministic tick (realtime.start_at anchor), then exit 0
-trading realtime run --profiles config/profiles.example.json --once --json
+trading realtime run --state-db data/realtime/state.db --once --json
 
 # monitoring only, read-only, on the persisted state
-trading realtime serve --profiles config/profiles.example.json --port 8080
+trading realtime serve --state-db data/realtime/state.db --port 8080
 ```
+
+The three commands take the same storage option: `--state-db` is the path of the
+SQLite state database, and it is the **only** thing the command needs to know
+before the store exists (§1.1). `--profiles` / `-p` is kept as an **alias** of
+`--state-db`, so a script written against the previous name keeps working while
+pointing at a database instead of a document; the primary spelling is
+`--state-db`. `--logs-dir` sets the durable log directory, and both options fall
+back on `TB_REALTIME_STATE_DB` / `TB_REALTIME_LOGS_DIR` and then on the model
+defaults.
 
 Payloads (exact keys):
 
-- `realtime check` → `{command: "realtime-check", ok, config_path, state_db,
+- `realtime check` → `{command: "realtime-check", ok, state_db,
   state_db_writable, kill_switch, profiles: [{id, symbol, timeframe, strategy,
   mode, ok, issues, credentials_present, live_gate_allowed, risk}], issues}`.
-  The **top-level `issues` key** carries the *platform* problems (unreadable
-  document, non-writable state directory); the `issues` of each profile carry the
-  *profile's* problems. Exit `1` as soon as one profile cannot start.
-- `realtime run` / `run --once` → `{command: "realtime-run", ok, config_path,
-  state_db, profiles: [ProfileSnapshot…], decisions: [TradeSignalDecision…],
-  url}`. `url` is `null` with `--once` and `http://host:port/` otherwise; `--once`
-  starts **no** server.
-- `realtime serve` → `{command: "realtime-serve", ok, config_path, state_db,
+  The **top-level `issues` key** carries the *platform* problems (a non-writable
+  state directory, an unusable store); the `issues` of each profile carry the
+  *profile's* problems. Exit `1` as soon as one profile cannot start. Zero
+  profiles is a legal platform, so an empty `profiles` list answers `ok: true`.
+- `realtime run` / `run --once` → `{command: "realtime-run", ok, state_db,
+  profiles: [ProfileSnapshot…], decisions: [TradeSignalDecision…], url}`. `url` is
+  `null` with `--once` and `http://host:port/` otherwise; `--once` starts **no**
+  server.
+- `realtime serve` → `{command: "realtime-serve", ok, state_db,
   profiles: [ProfileSnapshot…], url}`.
+
+There is no `config_path` key any more: no command reads a configuration
+document, and `state_db` is the storage the payload reports.
 
 In `--json` mode, the startup URL is announced on **stderr**: stdout contains
 only a single JSON object. `SIGINT` stops the server and the engine cleanly, then
@@ -489,23 +676,27 @@ it rather than letting it run silently (§3.1). The operational path is therefor
 automatable:
 
 ```bash
+# 0. create the profile from the dashboard (POST /api/profiles) or with the CLI:
+#    the profile set lives in the SQLite state database, not in a file (§1.1)
+trading realtime check --state-db data/realtime/state.db --json
+
 # 1. download the candles of the symbol/timeframe the profile declares
 #    (the ONLY network-using step; any symbol, any supported timeframe)
 make data-download SYMBOL=BTC/USDT TIMEFRAME=1h
 
 # 2. build the artifact the profile declares, offline and deterministically
 #    (the seasonal/naive backends only: no torch, no checkpoint download)
-make forecast-profile TIMESFM_PROFILE=config/profiles.timesfm.example.json BACKEND=seasonal
+make forecast-profile STATE_DB=data/realtime/state.db BACKEND=seasonal
 #    ... or the equivalent CLI call, which is what the target runs
-trading forecast-bootstrap --profiles config/profiles.timesfm.example.json --backend seasonal
+trading forecast-bootstrap --state-db data/realtime/state.db --backend seasonal
 
 # 2b. ask the guard itself whether what was just built is usable right now
-make forecast-info PROFILE=config/profiles.timesfm.example.json
+make forecast-info STATE_DB=data/realtime/state.db
 trading forecast-info --artifact data/forecast/btc-timesfm-paper-1h-seasonal.parquet \
-    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+    --state-db data/realtime/state.db --profile btc-timesfm-paper
 
 # 3. start the engine; the profile now really trades
-make realtime-forecast          # == trading realtime run --profiles config/profiles.timesfm.example.json
+make realtime-forecast          # == trading realtime run --state-db data/realtime/state.db
 ```
 
 The whole chain is also wired end to end as `make forecast-flow`, which runs
@@ -516,7 +707,9 @@ that order. The artifact path is the profile's `forecast` key; keep the default
 
 **Declare the profile.** The forecast profile is a normal `ProfileConfig` (§1),
 so the only thing that distinguishes it is the `strategy` name, its `params` and
-the `forecast` key:
+the `forecast` key. It is declared as a row of the `profiles` table — through the
+dashboard, or through `POST /api/profiles` — and its payload is exactly the object
+below:
 
 ```json
 {
@@ -529,17 +722,16 @@ the `forecast` key:
 }
 ```
 
-The shipped example is `config/profiles.timesfm.example.json`. The `symbol`, the
-`timeframe` and the `forecast` path must agree with the artifact's own metadata:
-the guard refuses a mismatch at startup rather than trading another instrument's
-forecast.
+The `symbol`, the `timeframe` and the `forecast` path must agree with the
+artifact's own metadata: the guard refuses a mismatch at startup rather than
+trading another instrument's forecast.
 
 **Confirm it is trading.** "Started" is not "trading", and this is the whole
 point of the delivery, so check the observable surface rather than the log line:
 
 ```bash
 # a single deterministic tick, then exit 0 (no server)
-trading realtime run --profiles config/profiles.timesfm.example.json --once --json
+trading realtime run --state-db data/realtime/state.db --once --json
 
 # or, against the running engine, the per-profile snapshot of the JSON API
 curl -s http://127.0.0.1:8080/api/profiles | python -m json.tool
@@ -558,8 +750,8 @@ conclusion from a profitable one.
 **When the guard refuses.** The message is the operational instruction: it names
 the profile, the artifact, the covered window and the exact
 `trading forecast-build --symbol … --timeframe …` rebuild command. Run
-`trading forecast-info --profiles …` to reproduce it without touching the engine,
-and `make forecast-info` for the same answer through the profiles file.
+`trading forecast-info --state-db …` to reproduce it without touching the engine,
+and `make forecast-info` for the same answer through the state database.
 
 ## 7. What is NOT proven
 
@@ -615,24 +807,36 @@ candles: pause is not stop.
 open order and flattens the open position **at market** through the existing
 execution gateway **before** anything is removed. When flattening fails, the
 delete fails with an explicit error (`409`) and the profile stays exactly where
-it was: nothing is orphaned and no profile that is still exposed is removed. The
-delete also refuses to remove the **last** profile of the platform (an engine
-with no profile cannot run). Once flat, the profile is stopped, removed from the
-running engine **and** removed from the profiles configuration file; a file that
-cannot be rewritten aborts with `400`, with the engine still consistent.
+it was: nothing is orphaned and no profile that is still exposed is removed. Once
+flat, the profile is stopped, removed from the running engine **and** deleted from
+the `profiles` table; a store that cannot be written aborts with `400`, with the
+engine still consistent.
+
+**Deleting the last profile is allowed.** The old "refuse to remove the **last**
+profile" guard is **gone** (§4, where the decision and its motivation are
+recorded): with the state store as the source of truth an empty platform is a
+legal one, the API keeps serving, and `POST /api/profiles` re-creates a profile
+without a restart. The flatten-before-remove guarantee above is untouched: a
+position that cannot be flattened still aborts the whole call. The path the guard
+was never able to cover — a profile that disappears **without** going through
+this route — is the one that leaves an orphan, and the next boot flattens it
+(§4.1).
 
 **Create validates against the catalog.** `POST /api/profiles` accepts
 `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?}`,
 refuses an unknown field, a field of the wrong type, an unknown strategy (the
 message names the available ones), an unsupported timeframe and a malformed
 identifier with `400`, and a duplicate identifier with `409`. On success the
-profile is persisted to the profiles configuration file and **started
-immediately** in the running engine, and the `201` body carries its
-`ProfileSnapshot`, so the dashboard refreshes without guessing.
+profile is written to the `profiles` table and **started immediately** in the
+running engine, and the `201` body carries its `ProfileSnapshot`, so the dashboard
+refreshes without guessing. It is the supported way to create the profiles of a
+freshly deployed, empty host.
 
-**The profiles configuration file is the source of truth.** Adding or removing a
-profile rewrites it **atomically** (temporary file + `os.replace`), so an
-interrupted rewrite can never leave a truncated document behind.
+**The `profiles` table is the source of truth.** Adding or removing a profile is
+one transaction of the state store (an UPSERT on the natural key, or a `DELETE`),
+so a failed write leaves the table untouched and the running engine consistent:
+there is no document left half-rewritten, and nothing for a deployment to
+overwrite.
 
 **Candle history.** The engine persists every candle it processes in a bounded
 `candles` table (one row per profile and timestamp, the 1000 most recent rows per
@@ -646,10 +850,9 @@ replayed (§2.2).
 
 **Error mapping of the four mutations.** `MonitoringError` (`503`: no engine, or
 a command that timed out), `ProfileError` (`409`: a duplicate, a profile that is
-not running, a refused flattening, the last profile), `ConfigError` (`400`: an
-unknown strategy, an unsupported timeframe, an unsupported value, a profiles file
-that cannot be rewritten) and -- for anything else -- the existing `500`
-boundary.
+not running, a refused flattening), `ConfigError` (`400`: an unknown strategy, an
+unsupported timeframe, an unsupported value, a profile the store refuses) and --
+for anything else -- the existing `500` boundary.
 
 ## 9. The shared platform wallet
 

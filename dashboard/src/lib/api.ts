@@ -34,6 +34,7 @@ import type {
   LifecyclePayload,
   MetricsPayload,
   OrdersPayload,
+  OrphanReport,
   PositionsPayload,
   ProfileControl,
   ProfilesPayload,
@@ -326,6 +327,60 @@ function withWallet<T extends { wallet?: WalletSnapshot | null }>(payload: T): T
   return { ...payload, wallet: null };
 }
 
+/** One closure entry of the startup safety sweep report. */
+function isOrphanClosure(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    isString(value.profile_id) &&
+    isString(value.symbol) &&
+    isNumberOrNull(value.quantity) &&
+    isString(value.side) &&
+    isNumberOrNull(value.price)
+  );
+}
+
+/** One unclosable orphan entry of the startup safety sweep report. */
+function isOrphanFailure(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    isString(value.profile_id) &&
+    isString(value.symbol) &&
+    isNumberOrNull(value.quantity) &&
+    isString(value.error)
+  );
+}
+
+/**
+ * Report of the startup safety sweep (`GET /api/orphans` and the
+ * `orphaned_positions` key of `GET /api/health`).
+ *
+ * Every field is required and both arrays are validated entry by entry: a
+ * report the dashboard cannot read in full is refused as `'malformed'` rather
+ * than half-rendered, because the operator must never read a truncated list of
+ * what was — or was not — flattened at the venue.
+ */
+export function isOrphanReport(value: unknown): value is OrphanReport {
+  return (
+    isRecord(value) &&
+    isNumber(value.found) &&
+    isNumber(value.orphaned) &&
+    isNumber(value.closed_count) &&
+    isNumber(value.failed_count) &&
+    isArrayOf(value.closed, isOrphanClosure) &&
+    isArrayOf(value.failed, isOrphanFailure) &&
+    isStringOrNull(value.swept_at)
+  );
+}
+
+/**
+ * The optional `orphaned_positions` key of a health payload: absent
+ * (`undefined`) and explicit `null` both mean "never swept", anything else must
+ * be a full report.
+ */
+function isOptionalOrphanReport(value: unknown): boolean {
+  return value === undefined || value === null || isOrphanReport(value);
+}
+
 function isHealthPayload(value: unknown): boolean {
   return (
     isRecord(value) &&
@@ -336,7 +391,8 @@ function isHealthPayload(value: unknown): boolean {
     isNumber(value.profiles_running) &&
     isBoolean(value.kill_switch) &&
     isStringOrNull(value.checked_at) &&
-    isOptionalWallet(value.wallet)
+    isOptionalWallet(value.wallet) &&
+    isOptionalOrphanReport(value.orphaned_positions)
   );
 }
 
@@ -629,6 +685,20 @@ export async function fetchHealth(options: RequestOptions = {}): Promise<HealthP
   const path = '/api/health';
   const payload = await requestJson<unknown>(path, options);
   return withWallet(expectShape<HealthPayload>(payload, isHealthPayload, path));
+}
+
+/**
+ * `GET /api/orphans` — the report of the startup safety sweep.
+ *
+ * `swept_at === null` means the platform was never swept; the caller then
+ * renders no warning at all. The route is read-only and, like every other read
+ * route, validates the full body: a report the dashboard cannot read in full is
+ * refused instead of being shown truncated.
+ */
+export async function fetchOrphans(options: RequestOptions = {}): Promise<OrphanReport> {
+  const path = '/api/orphans';
+  const payload = await requestJson<unknown>(path, options);
+  return expectShape<OrphanReport>(payload, isOrphanReport, path);
 }
 
 /** `GET /api/profiles` — the shared wallet and every configured profile. */

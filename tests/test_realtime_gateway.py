@@ -105,6 +105,10 @@ class FakeStore:
     def load_profiles(self) -> list[ProfileConfig]:
         return []
 
+    def state_path(self) -> Path | None:
+        """Answer ``None``: an in-memory double has no database file of its own."""
+        return None
+
     # -- orders ------------------------------------------------------------
     def upsert_order(self, order: Order) -> None:
         self.orders[order.client_order_id] = order

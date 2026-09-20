@@ -23,7 +23,7 @@ deploy/
 ├── Dockerfile.realtime    # python:3.11-slim + the package + the `exchange` extra (ccxt)
 ├── Dockerfile.dashboard   # node:24-alpine, multi-stage, Next.js standalone output
 ├── docker-compose.yml     # both services, their volumes and their healthchecks
-├── profiles.json          # the deployed profiles (paper only)
+├── README.md              # this document
 └── .env                   # TB_OPERATOR_TOKEN — git-ignored, never in an image
 ```
 
@@ -36,19 +36,22 @@ docker compose -f deploy/docker-compose.yml down -v         # stop AND wipe stat
 
 ### `trading-realtime` — the engine and its JSON API
 
-The container runs `python -m trading_platform realtime run`: the engine **and**
-the monitoring server. It runs as an unprivileged user (`appuser`), with
-`restart: unless-stopped` and a healthcheck that queries `GET /api/health` on
-port 8080. Since the standalone dashboard landed, the Python server is a **pure
-JSON API**: it serves no HTML page and no static asset any more (`GET /` answers
-the same JSON 404 as any unknown route). Its port is published on the loopback
-interface **for debugging only** — nothing in the browser ever reaches it
-directly.
+The container runs
+`python -m trading_platform realtime run --state-db /app/data/realtime/state.db`
+(that is the image's `CMD`): the engine **and** the monitoring server. It runs as
+an unprivileged user (`appuser`), with `restart: unless-stopped` and a healthcheck
+that queries `GET /api/health` on port 8080. Since the standalone dashboard
+landed, the Python server is a **pure JSON API**: it serves no HTML page and no
+static asset any more (`GET /` answers the same JSON 404 as any unknown route).
+Its port is published on the loopback interface **for debugging only** — nothing
+in the browser ever reaches it directly.
 
-Two **paper** profiles run on real market data (Binance via ccxt):
-`btc-paper` (BTC/USDT 1h) and `eth-paper` (ETH/USDT 15m).
-`realtime.start_at` is `null`: the engine follows the wall clock, it does
-**not** replay history.
+The container starts with an **empty profile set**: the profile set and the engine
+settings are read from the SQLite state database, and a fresh `trading-state`
+volume holds no profile yet. The operator creates the profiles from the dashboard
+(`POST /api/profiles`) and they take effect immediately, without a restart.
+`realtime.start_at` is `null`: the engine follows the wall clock, it does **not**
+replay history.
 
 ### `trading-dashboard` — the Next.js UI
 
@@ -87,27 +90,41 @@ The dashboard is **stateless**: it owns no volume, no database and no durable
 file. Restarting or rebuilding it loses nothing, and its operator token lives
 only in the browser's `sessionStorage` (never on disk, never rendered back).
 
-### The profiles file is written by the API
+### The SQLite state database is the source of truth
 
-`deploy/` itself is bind-mounted **read-write** at `/app/deploy`, because
-`POST /api/profiles` and `DELETE /api/profiles/{id}` rewrite `profiles.json`
-(the on-disk source of truth). Two host-side details matter:
+The profile set and the engine settings live in **one SQLite database**:
+`/app/data/realtime/state.db`, inside the `trading-state` volume.
 
-1. **The directory must be writable by the container user** (`appuser`, uid
-   1000), which is not the uid that owns the checkout:
+| What | Where |
+| --- | --- |
+| Profiles | the `profiles` table, one row per profile |
+| Engine and monitoring settings | the `meta` key/value table, under the `platform_settings` key |
+| Positions, orders, fills, equity, candles, wallet | the tables of the same schema |
 
-   ```bash
-   chmod o+w deploy
-   ```
+Consequences an operator must know:
 
-   The rewrite is atomic — a temp file in the same directory, then
-   `os.replace` — and that rename fails with `EBUSY` when the target is a
-   bind-mounted **file**, which is why the whole directory is mounted rather
-   than `profiles.json` alone. The image still ships its own copy at
-   `/app/deploy/profiles.json`; the mount shadows it at runtime.
-2. **`deploy/.env` keeps mode 600**, so it stays readable by its owner only and
-   the unprivileged container user cannot read it — granting the directory
-   write access does not expose the operator token.
+* **the operator creates profiles through the dashboard** (`POST /api/profiles`)
+  and they are written to that database, not to a file in this repository;
+* **deleting the state volume is the only way to lose them**
+  (`docker compose -f deploy/docker-compose.yml down -v`), and a rebuild of the
+  images (`up -d --build`) keeps them, because a named volume survives a rebuild;
+* **no file of the checkout is written by any container any more**. There is no
+  bind mount of `deploy/`: with the committed JSON profile document gone, nothing
+  the runtime does needs to write on the host, and the image therefore never
+  needs `chmod` on a host directory.
+
+The settings are seeded from the built-in configuration defaults the first time
+the database is opened, and read back from the database on every later boot. The
+only thing that stays outside the database is the **path** of the database
+itself, which cannot live inside the database it locates: it comes from
+`--state-db` (the image passes `/app/data/realtime/state.db`), from
+`TB_REALTIME_STATE_DB`, or from the model default. A host that never customises
+anything behaves exactly as it did before.
+
+Since the profile set is no longer versioned in git, a deployment **cannot**
+overwrite it: the old failure mode — a profile created through the UI and
+silently destroyed by the next deploy, because the deploy rebuilt a committed
+file — is gone with the file.
 
 ### Secrets
 
@@ -286,22 +303,27 @@ must run on the host itself:
    running profile, and the dashboard must answer on `127.0.0.1:3031` both on
    `/` and through its `/api/*` proxy.
 
-### Profiles created through the UI are not versioned
+### Profiles created through the UI survive a deploy
 
-`deploy/profiles.json` is the source of truth the engine reads **and** the file
-the monitoring API rewrites when a profile is created or deleted from the
-dashboard. Those edits happen on disk only: they are never committed, so they
-are not part of the deployment revision.
+A profile created from the dashboard is written to the `profiles` table of
+`/app/data/realtime/state.db`, inside the `trading-state` volume. That volume is
+**never** touched by a deployment: the build rebuilds the images, and
+`docker compose up -d --build` keeps the named volumes, so a profile created
+through the UI is still running after the next deploy.
 
-A deploy rebuilds from the merged commit, which means the **committed**
-`profiles.json` wins: a profile that exists only because it was created through
-the UI disappears from the running engine (its rows stay in `state.db`, but
-nothing loads it). The `test1` scratch profile behaved exactly this way — it was
-never in git, so the first deploy dropped it.
+This is what changed. The superseded design kept the profile set in a committed
+JSON document that the monitoring API rewrote on disk: a deploy rebuilt that file
+from the merged commit and silently dropped every UI-created profile — the
+`test1` scratch profile was destroyed exactly that way. The document is gone, and
+with it the failure mode: the database is now the only source of truth the engine
+reads, and a deployment cannot overwrite it.
 
-To make a UI-created profile survive deploys, commit it to
-`deploy/profiles.json`. To keep a scratch profile out of a deploy, delete it
-before merging.
+The consequence to accept is the other side of the same coin: the profile set is
+no longer versioned in git, so it is no longer reproduced on another machine. A
+fresh host starts with an **empty** platform — the API answers, `GET
+/api/profiles` returns `[]` — and the operator re-creates the profiles from the
+dashboard. A backup of the platform's configuration is a copy of the
+`trading-state` volume.
 
 Pull requests never touch the runner: the job is gated on
 `github.event_name == 'push'`. `ci.yml` already runs the full Python and
@@ -345,8 +367,8 @@ Operational notes:
   published on a public interface;
 - **no shared state between the containers**: the dashboard holds no database
   and no volume; everything it shows comes from the JSON API at request time;
-- **no live trading**: both profiles are `paper`; `live` mode would require
-  `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK`, exchange keys in the
+- **no live trading**: every profile this stack runs is `paper`; `live` mode would
+  require `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK`, exchange keys in the
   environment and a `mode: live` profile — none of which is configured here;
 - **no high availability**: two long-lived containers and a single-writer
   SQLite database;

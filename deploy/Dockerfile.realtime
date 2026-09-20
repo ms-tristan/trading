@@ -4,8 +4,12 @@
 #
 #   build  -> python:3.11-slim + the package + the optional `exchange` extra
 #             (ccxt) so the polling market stream can reach a real exchange.
-#   run    -> `python -m trading_platform realtime run --profiles ...`
-#             engine + monitoring dashboard on 0.0.0.0:8080 (HTTP, plain).
+#   run    -> `python -m trading_platform realtime run --state-db
+#             /app/data/realtime/state.db --host 0.0.0.0 --port 8080`
+#             engine + monitoring API on 0.0.0.0:8080 (HTTP, plain). The profile
+#             set and the engine settings come from that SQLite state database,
+#             which is the single source of truth: the image ships no profile
+#             document and nothing is read from `/app/deploy` at run time.
 #
 # TLS, authentication, rate limiting and fail2ban live in the host nginx
 # (see deploy/README.md): the container NEVER terminates TLS and is only
@@ -29,9 +33,12 @@ WORKDIR /app
 # 1. runtime dependencies (requirements.txt mirrors [project].dependencies)
 COPY requirements.txt ./
 
-# 2. the package and its deployment profiles; the `exchange` extra pulls ccxt
-#    (lazy-imported by trading_platform.data / trading_platform.realtime, so the
-#    test-suite never needs it but the deployed engine does)
+# 2. the package; the `exchange` extra pulls ccxt (lazy-imported by
+#    trading_platform.data / trading_platform.realtime, so the test-suite never
+#    needs it but the deployed engine does). `deploy/` is copied for
+#    documentation only -- it ships the compose file and its README, and the
+#    runtime needs none of it, since the durable state is the SQLite database on
+#    the /app/data volumes and no profile document exists any more.
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY config ./config
@@ -52,4 +59,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).status == 200 else 1)"]
 
 ENTRYPOINT ["python", "-m", "trading_platform"]
-CMD ["realtime", "run", "--profiles", "/app/deploy/profiles.json", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["realtime", "run", "--state-db", "/app/data/realtime/state.db", "--host", "0.0.0.0", "--port", "8080"]

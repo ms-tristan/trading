@@ -158,10 +158,77 @@ export interface ProfilesPayload {
 }
 
 /**
+ * One position the startup safety sweep found without any loaded profile and
+ * closed at the venue.
+ *
+ * `quantity` and `price` are `null` when the venue did not report a finite
+ * value: the closing order still happened, so the entry is never dropped for a
+ * missing number.
+ */
+export interface OrphanClosure {
+  /** Profile the position belonged to; it is not loaded anymore. */
+  profile_id: string;
+  /** Instrument that was flattened. */
+  symbol: string;
+  /** Size that was closed, `null` when the venue reported none. */
+  quantity: number | null;
+  /** Side of the closing order (`buy`/`sell`). */
+  side: string;
+  /** Price the position was closed at, `null` when the venue reported none. */
+  price: number | null;
+}
+
+/**
+ * One position the startup safety sweep could **not** close.
+ *
+ * It is the loud half of the report: the row is deliberately left in place
+ * rather than deleted, so an unclosable exposure stays visible.
+ */
+export interface OrphanFailure {
+  /** Profile the position belonged to; it is not loaded anymore. */
+  profile_id: string;
+  /** Instrument that is still open at the venue. */
+  symbol: string;
+  /** Size that could not be closed, `null` when it is unknown. */
+  quantity: number | null;
+  /** Why the closing order did not go through, verbatim. */
+  error: string;
+}
+
+/**
+ * Body of `orphaned_positions` in `GET /api/health` and of `GET /api/orphans`.
+ *
+ * The report of the startup safety sweep: `found` is how many durable positions
+ * the sweep looked at, `orphaned` how many of them matched no loaded profile.
+ * A `swept_at` of `null` means the platform was never swept — the dashboard
+ * then renders no warning at all, because there is nothing to warn about yet.
+ */
+export interface OrphanReport {
+  /** Durable positions the sweep looked at. */
+  found: number;
+  /** Positions whose `profile_id` matched no loaded profile. */
+  orphaned: number;
+  /** Orphans that were closed at the venue. */
+  closed_count: number;
+  /** Orphans that could not be closed and are still open. */
+  failed_count: number;
+  /** The closures, one entry per flattened position. */
+  closed: OrphanClosure[];
+  /** The failures, one entry per position that stayed open. */
+  failed: OrphanFailure[];
+  /** ISO-8601 stamp of the sweep, `null` when the platform was never swept. */
+  swept_at: string | null;
+}
+
+/**
  * Body of `GET /api/health`.
  *
  * `wallet` is the shared platform wallet (same value as the one of
  * `GET /api/profiles`), optional for the same backward-compatible reason.
+ *
+ * `orphaned_positions` is the report of the startup safety sweep, optional for
+ * that same reason: a server that does not emit the key stays a valid producer,
+ * and the dashboard then renders no warning.
  */
 export interface HealthPayload {
   status: 'ok' | 'degraded';
@@ -172,6 +239,7 @@ export interface HealthPayload {
   kill_switch: boolean;
   checked_at: string | null;
   wallet?: WalletSnapshot | null;
+  orphaned_positions?: OrphanReport | null;
 }
 
 /** One point of a profile equity curve. */

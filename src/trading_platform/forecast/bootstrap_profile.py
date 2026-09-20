@@ -9,10 +9,13 @@ timeframe and the candle file -- and any typo produces a profile that starts and
 then never trades, which is exactly the failure the startup guard exists to
 prevent.
 
-:func:`bootstrap_profile_forecast` is the repeatable answer: point it at a
-profiles file, name a profile, and it reads that profile, finds the candle file
-the profile's own declarations imply, builds the artifact and writes it where
-``docs/realtime.md`` documents it.
+The set of profiles no longer lives in a configuration document (a JSON file
+rebuilt from git on every deployment silently destroyed every change an operator
+made through the dashboard): it lives in the SQLite state store, which is its
+single source of truth.  :func:`bootstrap_profile_forecast` therefore takes the
+**resolved** :class:`~trading_platform.config.models.ProfileConfig` the caller
+read from the store, finds the candle file the profile's own declarations imply,
+builds the artifact and writes it where ``docs/realtime.md`` documents it.
 
 Design rules, all of them deliberate:
 
@@ -23,9 +26,9 @@ Design rules, all of them deliberate:
   ``timesfm``.  The model-backed backend stays reachable through
   ``trading forecast-build --backend timesfm``, which is the command that owns
   the optional extra.
-* **Deterministic.**  Nothing here reads the wall clock: the same profiles file
-  and the same candle file always produce the same artifact, which is what makes
-  the flow reproducible in CI and in a test.
+* **Deterministic.**  Nothing here reads the wall clock: the same profile and the
+  same candle file always produce the same artifact, which is what makes the flow
+  reproducible in CI and in a test.
 * **Cheap to import.**  This module imports :mod:`trading_platform.core.errors`
   and :mod:`trading_platform.forecast.artifact` at module level and everything
   that knows about profiles, candle files or the backend registry **inside** the
@@ -49,6 +52,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from trading_platform.config.models import ProfileConfig
 from trading_platform.core.errors import ForecastError
 from trading_platform.forecast.artifact import (
     ForecastBuildConfig,
@@ -109,16 +113,16 @@ def _candle_path(data_dir: Path, symbol: str, timeframe: str) -> Path:
 
 
 def bootstrap_profile_forecast(
-    profiles_path: str | Path,
-    profile_id: str | None,
+    profile: ProfileConfig,
     *,
     config: AppConfig,
     backend: str = "seasonal",
 ) -> tuple[Path, ArtifactMetadata]:
     """Build the offline artifact of one profile and write it under the data dir.
 
-    The profile is read from ``profiles_path`` and the artifact is built from the
-    candle file the profile's own declarations imply, through
+    The profile is handed in already resolved -- the caller reads it from the
+    SQLite state store, which is its single source of truth -- and the artifact is
+    built from the candle file the profile's own declarations imply, through
     :func:`trading_platform.forecast.artifact.build_forecast_artifact` -- the one
     artifact builder of the project.  The symbol and the timeframe recorded in
     the metadata are the profile's, and they are cross-checked against the file
@@ -127,12 +131,8 @@ def bootstrap_profile_forecast(
 
     Parameters
     ----------
-    profiles_path:
-        JSON profiles document, read through
-        :func:`trading_platform.config.loader.load_profiles`.
-    profile_id:
-        Id of the profile to bootstrap, or ``None`` to take the first declared
-        profile.  An unknown id is refused and the message lists the known ones.
+    profile:
+        The profile to bootstrap, as stored in the state database.
     config:
         Application configuration; ``config.data.data_dir`` locates both the
         candle file and the ``forecast/`` output directory.
@@ -149,31 +149,17 @@ def bootstrap_profile_forecast(
     Raises
     ------
     ForecastError
-        If the profiles file declares no such profile, if the backend is not one
-        of :data:`OFFLINE_BACKENDS`, if the candle file is missing or empty, if
-        the profile's declarations disagree with the candle file name, or if the
-        build itself is invalid (raised unchanged by
+        If the backend is not one of :data:`OFFLINE_BACKENDS`, if the candle file
+        is missing or empty, if the profile's declarations disagree with the candle
+        file name, or if the build itself is invalid (raised unchanged by
         ``build_forecast_artifact``).
     """
     # Local imports: this module must stay cheap to import, and neither the
-    # profiles loader nor the backend registry belongs to its import graph.
+    # candle-file reader nor the backend registry belongs to its import graph.
     from trading_platform.cli import _read_data_file, parse_data_file_stem
-    from trading_platform.config.loader import load_profiles
     from trading_platform.forecast.registry import get_backend
     from trading_platform.forecast.series import resolve_seasonal_period
     from trading_platform.forecast.types import DEFAULT_QUANTILE_LEVELS
-
-    declared = load_profiles(profiles_path)
-    if profile_id is None:
-        profile = declared[0]
-    else:
-        matches = [entry for entry in declared if entry.id == profile_id]
-        if not matches:
-            known = ", ".join(sorted(entry.id for entry in declared))
-            raise ForecastError(
-                f"profile {profile_id!r} is not declared by {profiles_path} (known ids: {known})"
-            )
-        profile = matches[0]
 
     backend_name = _resolve_backend_name(backend)
 

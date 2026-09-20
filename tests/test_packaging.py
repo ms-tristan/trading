@@ -6,9 +6,10 @@ Pure file-content assertions -- no network, no exchange, no market data:
   script and the coverage gate;
 * ``requirements*.txt`` mirror the dependency floors declared there;
 * ``Makefile`` / ``Dockerfile`` / ``.dockerignore`` expose the documented tasks;
-* the bootstrap assets of the forecast flow (``config/profiles.example.json``,
-  the two committed Freqtrade documents and the ``forecast-bootstrap*`` targets
-  that build their artifacts) ship with the checkout;
+* the bootstrap assets of the forecast flow (the two committed Freqtrade
+  documents and the ``forecast-bootstrap*`` targets that build their artifacts)
+  ship with the checkout, while the retired JSON profile documents do **not**
+  (the profile set is a table of the SQLite state store);
 * ``docs/testing-policy.md`` pins the full coverage command and the 85 % gate.
 """
 
@@ -244,13 +245,21 @@ def test_makefile_pipeline_targets_use_the_cli() -> None:
         assert f"$(PYTHON) -m trading_platform {command} --config $(CONFIG)" in text
 
 
-#: The bootstrap assets the wheel and the documented flow depend on: the shipped
-#: profile documents (read by ``make realtime`` and by the config tests) and the
-#: offline prediction artifact a forecast profile consumes.
+#: The bootstrap assets the wheel and the documented flow depend on: the two
+#: committed Freqtrade documents.  The profile documents were **removed**: the
+#: profile set lives in the SQLite state store (``realtime.state_db``), so a
+#: JSON profile file would be read by no one.
 BOOTSTRAP_CONFIG_ASSETS = (
-    "config/profiles.example.json",
     "config/freqtrade_config.json",
     "config/freqtrade_dryrun.json",
+)
+
+#: The JSON profile documents the platform used to read, and no longer ships
+#: under any name: no importer, no migration, no replacement.
+DELETED_CONFIG_ASSETS = (
+    "config/profiles.example.json",
+    "config/profiles.timesfm.example.json",
+    "deploy/profiles.json",
 )
 
 
@@ -261,6 +270,26 @@ def test_the_shipped_configuration_assets_are_present_and_parsable() -> None:
 
         assert path.is_file(), f"{relative} is missing from the checkout"
         assert json.loads(read(path)), f"{relative} is empty"
+
+
+def test_the_bootstrap_assets_carry_no_profile_document() -> None:
+    """The shipped configuration assets are Freqtrade documents and nothing else.
+
+    A profile document back in this list would re-introduce the failure the
+    state store removed: a committed file that looks authoritative, is rebuilt
+    from git on every deployment, and silently disagrees with the running
+    platform.
+    """
+    profiled = [relative for relative in BOOTSTRAP_CONFIG_ASSETS if "profiles" in relative]
+
+    assert not profiled, f"the bootstrap assets still list profile documents: {profiled}"
+
+
+def test_the_json_profile_documents_are_deleted() -> None:
+    """Every retired profile document is gone from the checkout."""
+    surviving = [relative for relative in DELETED_CONFIG_ASSETS if (REPO_ROOT / relative).exists()]
+
+    assert not surviving, f"these JSON profile documents were not deleted: {surviving}"
 
 
 def test_the_makefile_bootstraps_a_forecast_profile() -> None:

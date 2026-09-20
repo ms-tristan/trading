@@ -641,7 +641,7 @@ python -m trading_platform.cli forecast-build \
 
 # build the artifact a PROFILE declares, from its own candle file (offline only)
 python -m trading_platform.cli forecast-bootstrap \
-    --profiles config/profiles.timesfm.example.json --backend seasonal
+    --state-db data/realtime/state.db --backend seasonal
 
 # measure the artifact's forecast skill against the random walk
 python -m trading_platform.cli forecast-skill \
@@ -654,15 +654,15 @@ python -m trading_platform.cli forecast-info \
 # ... and ask whether it is STILL USABLE right now, against the profile it feeds
 python -m trading_platform.cli forecast-info \
     --artifact data/forecast/btc-timesfm-paper-1h-seasonal.parquet \
-    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+    --state-db data/realtime/state.db --profile btc-timesfm-paper
 ```
 
 | Command | Options | Output |
 | --- | --- | --- |
 | `trading forecast-build` | `--config/-c` (required), `--data-file`, `--out`, `--backend naive\|seasonal\|timesfm`, `--context N`, `--horizon H`, `--reforecast-every S`, `--seasonal-period N`, `--seasonal-window N`, `--model-id`, `--symbol`, `--timeframe` | writes the parquet artifact and its `<artifact>.meta.json` sidecar; prints the path, the number of origins and the covered window |
-| `trading forecast-bootstrap` | `--profiles` (required), `--profile` (default: the first declared), `--config/-c`, `--backend naive\|seasonal` (default `seasonal`) | builds what the profile declares from the candle file its `symbol`/`timeframe` imply, writes it under `data/forecast/<profile-id>-<timeframe>-<backend>.parquet`, and prints the same `coverage` block as `forecast-info` |
+| `trading forecast-bootstrap` | `--state-db` (required), `--profile` (default: the first profile of the database), `--config/-c`, `--backend naive\|seasonal` (default `seasonal`) | builds what the profile declares from the candle file its `symbol`/`timeframe` imply, writes it under `data/forecast/<profile-id>-<timeframe>-<backend>.parquet`, and prints the same `coverage` block as `forecast-info` |
 | `trading forecast-skill` | `--artifact`, `--data-file` | RMSE / MAE / MASE against the random-walk baseline, decile coverage and directional accuracy at the horizon, on the modelled target **and** on the real price |
-| `trading forecast-info` | `--artifact`, `--now ISO-8601`, `--profiles`, `--profile`, `--timeframe`, `--horizon` | metadata of the artifact (no candle file needed) plus `run['coverage']`: `first_origin`, `last_origin`, `usable_until`, `usable`, `seasonal_period`, `checked_at` |
+| `trading forecast-info` | `--artifact`, `--now ISO-8601`, `--state-db`, `--profile`, `--timeframe`, `--horizon` | metadata of the artifact (no candle file needed) plus `run['coverage']`: `first_origin`, `last_origin`, `usable_until`, `usable`, `seasonal_period`, `checked_at` |
 
 Each origin uses **only candles `<= origin`**, `--context` is the number of
 candles fed to the backend, `--horizon` the number of stored steps and
@@ -680,9 +680,9 @@ hourly candles. An explicit `--seasonal-period N` overrides the derivation, and
 the resolved value is recorded in the artifact metadata.
 
 **Is this artifact still usable right now?** `forecast-info` answers it through
-`run['coverage']`. Without `--profiles` the command only **reports** and never
-fails on staleness. Pointed at a real profile
-(`--profiles <file> [--profile <id>]`) it becomes a pre-flight of that profile:
+`run['coverage']`. Without `--state-db` the command only **reports** and never
+fails on staleness. Pointed at a real profile of the state database
+(`--state-db <db> [--profile <id>]`) it becomes a pre-flight of that profile:
 it reuses the realtime startup guard verbatim, so a symbol, timeframe or coverage
 failure raises the **same** message the engine raises at startup, and `coverage`
 gains `profile_id`, `symbol_ok` and `timeframe_ok`. `--now` makes the answer
@@ -830,10 +830,10 @@ exactement les mêmes commandes que `make check` en local.
 | `make forecast-build` | `python -m trading_platform forecast-build --config $(CONFIG) --data-file $(DATA_FILE) --out $(FORECAST_ARTIFACT) --backend $(FORECAST_BACKEND)` | build the offline forecast artifact (`DATA_FILE`, `FORECAST_ARTIFACT`, `FORECAST_BACKEND` override the defaults) |
 | `make forecast-bootstrap` | same command with `--out $(FORECAST_DIR)/bootstrap-naive.parquet --backend naive` | build the naive-baseline artifact used to bootstrap a forecast profile |
 | `make forecast-bootstrap-seasonal` | same command with `--out $(FORECAST_DIR)/bootstrap-seasonal.parquet --backend seasonal` | build the seasonal-baseline artifact used to bootstrap a forecast profile |
-| `make forecast-profile` | `python -m trading_platform forecast-bootstrap --profiles $(TIMESFM_PROFILE) --config $(CONFIG) --backend $${BACKEND:-seasonal}` | build the artifact the forecast profile **declares**, from its own candle file (`BACKEND=…`, `TIMESFM_PROFILE=…` override the defaults) |
-| `make forecast-info` | `python -m trading_platform forecast-info --artifact $(FORECAST_ARTIFACT) [--profiles $(PROFILE)] --json` | report whether `$(FORECAST_ARTIFACT)` is still usable; `PROFILE=…` checks it against a profile through the same startup guard |
-| `make realtime` | `realtime run --profiles $${PROFILES:-config/profiles.example.json}` | moteur temps réel + API JSON (§11) ; dashboard : `make dashboard-dev` (§11.6) |
-| `make realtime-forecast` | `realtime run --profiles $(TIMESFM_PROFILE)` | run the realtime engine on the forecast profile, which therefore really trades (§11.7) |
+| `make forecast-profile` | `python -m trading_platform forecast-bootstrap --state-db $${STATE_DB:-data/realtime/state.db} --config $(CONFIG) --backend $${BACKEND:-seasonal}` | build the artifact the profile **declares**, from its own candle file (`BACKEND=…`, `STATE_DB=…` override the defaults) |
+| `make forecast-info` | `python -m trading_platform forecast-info --artifact $(FORECAST_ARTIFACT) --state-db $${STATE_DB:-data/realtime/state.db} --json` | report whether `$(FORECAST_ARTIFACT)` is still usable; `STATE_DB=…` checks it against a profile through the same startup guard |
+| `make realtime` | `realtime run --state-db $${STATE_DB:-data/realtime/state.db}` | moteur temps réel + API JSON (§11) ; dashboard : `make dashboard-dev` (§11.6) |
+| `make realtime-forecast` | `realtime run --state-db $${STATE_DB:-data/realtime/state.db}` | run the realtime engine on the forecast profile, which therefore really trades (§11.7) |
 | `make forecast-flow` | `data-download forecast-bootstrap forecast-info realtime-forecast` | the documented three-command operational flow, end to end: download the candles, build the artifact, verify it, trade |
 | `make docker-build` | `docker build` | construction de l'image |
 | `make docker-test` | `docker build --target test` puis `docker run … pytest tests --cov-fail-under=85` | suite complète dans le conteneur |
@@ -861,16 +861,15 @@ FORECAST_BACKEND=timesfm FORECAST_ARTIFACT=data/forecast/tfm.parquet make foreca
 ```
 
 The forecast **profile** targets carry their own variables —
-`FORECAST_DIR` (`data/forecast`), `TIMESFM_PROFILE`
-(`config/profiles.timesfm.example.json`), `PROFILE`
-(`config/profiles.example.json`, the file `forecast-info` checks against) and
-`SYMBOL`/`TIMEFRAME` (`BTC/USDT`, `1h`, used by `data-download`) — and they are
-the operational flow of §11.7:
+`FORECAST_DIR` (`data/forecast`), `STATE_DB` (`data/realtime/state.db`, the
+database whose profiles `forecast-info` checks against) and `SYMBOL`/`TIMEFRAME`
+(`BTC/USDT`, `1h`, used by `data-download`) — and they are the operational flow
+of §11.7:
 
 ```bash
 make data-download SYMBOL=BTC/USDT TIMEFRAME=1h           # candles (only network step)
-make forecast-profile TIMESFM_PROFILE=… BACKEND=seasonal  # the artifact the profile declares
-make forecast-info PROFILE=…                              # is it still usable right now?
+make forecast-profile STATE_DB=… BACKEND=seasonal         # the artifact the profile declares
+make forecast-info STATE_DB=…                             # is it still usable right now?
 make realtime-forecast                                    # the engine, on the forecast profile
 make forecast-flow                                        # the four, in order
 ```
@@ -1032,24 +1031,32 @@ Le contrat complet (interfaces, API, limites assumées) est dans
 
 ```bash
 # pré-vol statique : ne passe AUCUN ordre, ne touche PAS au réseau
-python -m trading_platform realtime check --profiles config/profiles.example.json
+python -m trading_platform realtime check --state-db data/realtime/state.db
 
 # un seul tick déterministe (ancre realtime.start_at), puis sortie 0
-python -m trading_platform realtime run --profiles config/profiles.example.json --once --json
+python -m trading_platform realtime run --state-db data/realtime/state.db --once --json
 
 # moteur + API JSON (port 0 = port éphémère choisi par l'OS)
-python -m trading_platform realtime run --profiles config/profiles.example.json \
+python -m trading_platform realtime run --state-db data/realtime/state.db \
     --host 127.0.0.1 --port 8080
 
 # surveillance seule, LECTURE SEULE, sur l'état déjà persisté
-python -m trading_platform realtime serve --profiles config/profiles.example.json --port 8080
+python -m trading_platform realtime serve --state-db data/realtime/state.db --port 8080
 ```
+
+The profile set and the engine settings live in that SQLite state database, which
+is the single source of truth: `--state-db` is the path of the database and the
+only thing a command must know before the store exists. `--profiles` / `-p` is
+kept as an **alias** of `--state-db` for scripts written against the previous
+name. A legacy JSON profiles document is no longer read by anything, and the host
+starts with an empty profile set — create the profiles from the dashboard
+(`POST /api/profiles`).
 
 | Commande | Options | Rôle |
 | --- | --- | --- |
-| `realtime run` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--once`, `--json` | moteur **et** serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
-| `realtime serve` | `--profiles/-p` (obligatoire), `--host`, `--port`, `--json` | surveillance **lecture seule** sur l'état persisté, sans moteur : `POST /api/kill-switch` répond **403** |
-| `realtime check` | `--profiles/-p` (obligatoire), `--json` | pré-vol statique : validité de la configuration, **présence** des credentials (jamais leur valeur), porte live, limites de risque, inscriptibilité de la base d'état ; sortie `1` dès qu'un **un** profil ne peut pas démarrer ; ne crée **pas** la base d'état |
+| `realtime run` | `--state-db/-p` (facultatif : `TB_REALTIME_STATE_DB`, sinon `data/realtime/state.db`), `--logs-dir`, `--host`, `--port`, `--once`, `--json` | moteur **et** serveur de surveillance ; `--once` exécute **un** tick déterministe, écrit l'état et sort (aucun serveur) |
+| `realtime serve` | `--state-db/-p` (facultatif : `TB_REALTIME_STATE_DB`, sinon `data/realtime/state.db`), `--logs-dir`, `--host`, `--port`, `--json` | surveillance **lecture seule** sur l'état persisté, sans moteur : `POST /api/kill-switch` répond **403** |
+| `realtime check` | `--state-db/-p` (facultatif : `TB_REALTIME_STATE_DB`, sinon `data/realtime/state.db`), `--logs-dir`, `--json` | pré-vol statique : validité de la base d'état et des profils qu'elle contient, **présence** des credentials (jamais leur valeur), porte live, limites de risque, inscriptibilité de la base d'état ; sortie `1` dès qu'un **un** profil ne peut pas démarrer ; ne crée **pas** la base d'état |
 
 `SIGINT` arrête proprement le serveur et le moteur, puis la commande sort avec le
 code `0`. En mode `--json`, l'URL de démarrage est annoncée sur **stderr** :
@@ -1063,7 +1070,6 @@ stdout ne contient qu'**un seul** objet JSON.
 {
   "command": "realtime-check",
   "ok": true,
-  "config_path": "config/profiles.example.json",
   "state_db": "data/realtime/state.db",
   "state_db_writable": true,
   "kill_switch": false,
@@ -1093,7 +1099,7 @@ stdout ne contient qu'**un seul** objet JSON.
 ```
 
 La clé **`issues` de premier niveau** porte les problèmes *de plateforme*
-(document illisible, répertoire d'état non inscriptible) ; les `issues` de
+(base d'état inutilisable, répertoire d'état non inscriptible) ; les `issues` de
 chaque profil portent les problèmes *du profil* (porte live non armée,
 credentials absents, profil désactivé…).
 
@@ -1103,7 +1109,6 @@ credentials absents, profil désactivé…).
 {
   "command": "realtime-run",
   "ok": true,
-  "config_path": "config/profiles.example.json",
   "state_db": "data/realtime/state.db",
   "profiles": [ "« ProfileSnapshot.to_dict() » pour chaque profil" ],
   "decisions": [ "« TradeSignalDecision.to_dict() » — vide en mode serveur, vide aussi si le tick n'a rien de neuf à traiter" ],
@@ -1115,11 +1120,11 @@ credentials absents, profil désactivé…).
 `http://host:port/` sinon. `realtime serve` renvoie le même objet avec
 `"command": "realtime-serve"` et **sans** clé `decisions`.
 
-### 11.3 Anatomie du fichier de profils
-
-`config/profiles.example.json` porte **trois** clés racine — `profiles`,
-`realtime`, `monitoring` — et **aucune** credential : les secrets viennent
-uniquement de l'environnement (§11.4).
+The configuration is a set of rows, not a file: the **profile set is the
+`profiles` table** of the SQLite state database and the engine and monitoring
+settings are the `meta` key `platform_settings` of the same database
+([`docs/realtime.md`](realtime.md) §1.1). Neither carries a credential: the
+secrets come only from the environment (§11.4).
 
 Chaque entrée de `profiles` est un `ProfileConfig` (`extra="forbid"` : toute clé
 inconnue, dont `api_key`, est refusée bruyamment) :
@@ -1144,9 +1149,8 @@ inconnue, dont `api_key`, est refusée bruyamment) :
 
 The `forecast` key is documented in depth in
 [`docs/realtime.md`](realtime.md) §1 and §3.1 and in
-[`docs/forecasting.md`](forecasting.md); `config/profiles.example.json` keeps
-`"forecast": null` on both of its `basic` profiles, and the shipped forecast
-profile is `config/profiles.timesfm.example.json`.
+[`docs/forecasting.md`](forecasting.md); `"forecast": null` is the default every
+`basic` profile gets, and a `timesfm` profile declares its artifact path.
 
 `risk` (`RiskLimitsConfig`) — toutes les limites sont optionnelles, `null`
 signifie « non appliquée », et `0` est une valeur **valide** pour les limites de
@@ -1276,7 +1280,7 @@ même fichier échoue avec `StateStoreError` (verrou de fichier), et une base
 
 ```bash
 # un tick, puis inspection directe de l'état persisté
-python -m trading_platform realtime run --profiles config/profiles.example.json --once
+python -m trading_platform realtime run --state-db data/realtime/state.db --once
 sqlite3 data/realtime/state.db "select profile_id, timestamp, equity from equity;"
 sqlite3 data/realtime/state.db "select key, value from meta where key like 'last_candle%';"
 ```
@@ -1328,11 +1332,11 @@ curl -s http://127.0.0.1:8080/api/profiles/btc-paper/metrics
 
 ```bash
 make realtime                                   # moteur + API JSON
-PROFILES=config/profiles.example.json make realtime
+STATE_DB=data/realtime/state.db make realtime
 ```
 
-La cible `realtime` appelle `realtime run --profiles
-${PROFILES:-config/profiles.example.json}` et laisse `make check` intact.
+La cible `realtime` appelle `realtime run --state-db
+${STATE_DB:-data/realtime/state.db}` et laisse `make check` intact.
 
 ### 11.7.1 Operating a forecast profile: three commands
 
@@ -1346,19 +1350,19 @@ first three steps are wired as `make` targets:
 make data-download SYMBOL=BTC/USDT TIMEFRAME=1h
 
 # 2. the artifact the profile declares, built offline and deterministically
-make forecast-profile TIMESFM_PROFILE=config/profiles.timesfm.example.json BACKEND=seasonal
+make forecast-profile STATE_DB=data/realtime/state.db BACKEND=seasonal
 #    ... the equivalent CLI call, which is what the target runs:
 python -m trading_platform forecast-bootstrap \
-    --profiles config/profiles.timesfm.example.json --backend seasonal
+    --state-db data/realtime/state.db --backend seasonal
 
 # 2b. is it still usable right now? (the very same guard the engine runs)
-make forecast-info PROFILE=config/profiles.timesfm.example.json
+make forecast-info STATE_DB=data/realtime/state.db
 python -m trading_platform forecast-info \
     --artifact data/forecast/btc-timesfm-paper-1h-seasonal.parquet \
-    --profiles config/profiles.timesfm.example.json --profile btc-timesfm-paper
+    --state-db data/realtime/state.db --profile btc-timesfm-paper
 
 # 3. start the engine: the profile now really trades
-make realtime-forecast       # == realtime run --profiles $(TIMESFM_PROFILE)
+make realtime-forecast       # == realtime run --state-db $(STATE_DB)
 
 # the four, in order
 make forecast-flow
@@ -1368,9 +1372,9 @@ make forecast-flow
 | --- | --- | --- |
 | `make forecast-bootstrap` | `forecast-build … --backend naive --out $(FORECAST_DIR)/bootstrap-naive.parquet` | the *naive* baseline artifact |
 | `make forecast-bootstrap-seasonal` | `forecast-build … --backend seasonal --out $(FORECAST_DIR)/bootstrap-seasonal.parquet` | the *seasonal* baseline artifact |
-| `make forecast-profile` | `forecast-bootstrap --profiles $(TIMESFM_PROFILE) --backend $${BACKEND:-seasonal}` | the artifact the **profile declares**, from its own candle file |
-| `make forecast-info` | `forecast-info --artifact $(FORECAST_ARTIFACT) [--profiles $(PROFILE)] --json` | is the artifact still usable? `PROFILE=…` evaluates it against a profile |
-| `make realtime-forecast` | `realtime run --profiles $(TIMESFM_PROFILE)` | the engine, on the forecast profile |
+| `make forecast-profile` | `forecast-bootstrap --state-db $${STATE_DB:-data/realtime/state.db} --backend $${BACKEND:-seasonal}` | the artifact the **profile declares**, from its own candle file |
+| `make forecast-info` | `forecast-info --artifact $(FORECAST_ARTIFACT) --state-db $${STATE_DB:-data/realtime/state.db} --json` | is the artifact still usable? `STATE_DB=…` evaluates it against a profile |
+| `make realtime-forecast` | `realtime run --state-db $${STATE_DB:-data/realtime/state.db}` | the engine, on the profiles of the state database |
 | `make forecast-flow` | `data-download forecast-bootstrap forecast-info realtime-forecast` | the whole chain, in order |
 
 **Declare the profile.** The forecast profile is a normal `ProfileConfig`: the only
@@ -1398,7 +1402,7 @@ surface, not the log line:
 ```bash
 # one deterministic tick, then exit 0 (no server)
 python -m trading_platform.cli realtime run \
-    --profiles config/profiles.timesfm.example.json --once --json
+    --state-db data/realtime/state.db --once --json
 
 # or, with the engine running, the per-profile snapshot of the JSON API
 curl -s http://127.0.0.1:8080/api/profiles

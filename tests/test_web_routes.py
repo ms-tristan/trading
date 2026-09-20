@@ -16,6 +16,7 @@ pinned here as the documented JSON ``404``.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -81,6 +82,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HEALTH_KEYS = [
     "checked_at",
     "kill_switch",
+    "orphaned_positions",
     "profiles_running",
     "profiles_total",
     "status",
@@ -88,6 +90,49 @@ HEALTH_KEYS = [
     "version",
     "wallet",
 ]
+
+#: Exact keys of the orphan-sweep payload carried by ``/api/health`` and
+#: ``/api/orphans`` (the dedicated route adds exactly one more: ``status``).
+ORPHAN_KEYS = [
+    "closed",
+    "closed_count",
+    "failed",
+    "failed_count",
+    "found",
+    "orphaned",
+    "swept_at",
+]
+ORPHANS_ROUTE_KEYS = sorted([*ORPHAN_KEYS, "status"])
+
+#: Exact keys of one entry of the two orphan lists.
+ORPHAN_CLOSURE_KEYS = ["price", "profile_id", "quantity", "side", "symbol"]
+ORPHAN_FAILURE_KEYS = ["error", "profile_id", "quantity", "symbol"]
+
+#: A deterministic sweep report: one closure and one failure, both surfaced.
+ORPHAN_PAYLOAD: dict[str, Any] = {
+    "found": 2,
+    "orphaned": 2,
+    "closed_count": 1,
+    "failed_count": 1,
+    "closed": [
+        {
+            "profile_id": "ghost-paper",
+            "symbol": "BTC/USDT",
+            "quantity": 2.0,
+            "side": "sell",
+            "price": 100.0,
+        }
+    ],
+    "failed": [
+        {
+            "profile_id": "ghost-live",
+            "symbol": "ETH/USDT",
+            "quantity": 1.0,
+            "error": "venue unreachable",
+        }
+    ],
+    "swept_at": "2024-01-01T06:00:00+00:00",
+}
 
 #: Exact keys of the shared-platform-wallet object (additive, §5 of the docs).
 WALLET_KEYS = sorted(
@@ -217,6 +262,10 @@ class FakeStore:
         self._maybe_fail()
         return list(self._specs)
 
+    def state_path(self) -> Path | None:
+        """Answer ``None``: an in-memory double has no database file of its own."""
+        return None
+
     def equity_curve(self, profile_id: str) -> list[EquityPoint]:
         self._maybe_fail()
         return list(self._equity.get(profile_id, ()))
@@ -312,6 +361,8 @@ class FakeProvider:
     candles: Mapping[str, Sequence[Any]] = field(default_factory=dict)
     candle_error: Exception | None = None
     candle_calls: list[tuple[str, int]] = field(default_factory=list)
+    orphans: Any = None
+    orphan_error: Exception | None = None
 
     def snapshot(self) -> PlatformSnapshot:
         if self.snapshot_error is not None:
@@ -345,6 +396,12 @@ class FakeProvider:
         if self.candle_error is not None:
             raise self.candle_error
         return list(self.candles.get(profile_id, ()))[:limit]
+
+    def orphan_report(self) -> Any:
+        """Return the last orphan sweep (``None`` means "never swept")."""
+        if self.orphan_error is not None:
+            raise self.orphan_error
+        return self.orphans
 
     def engage_kill_switch(self, reason: str) -> Any:
         self.engaged_calls.append(reason)
@@ -399,6 +456,22 @@ class LegacyProvider(FakeProvider):
             generated_at=pd.Timestamp(START + timedelta(seconds=10)),
             uptime_seconds=self.uptime_seconds,
         )
+
+
+class UncensusedProvider(FakeProvider):
+    """Provider written **before** the orphan sweep existed.
+
+    It answers none of the new surface: the router must tolerate it through
+    ``getattr`` and render the orphan block as an explicit ``null`` instead of
+    crashing the health route or dropping the key.
+    """
+
+    orphan_report = None  # type: ignore[assignment]
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "orphan_report":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
 
 
 @dataclass
@@ -983,6 +1056,221 @@ def test_a_legacy_snapshot_without_the_wallet_attribute_answers_null(
     assert health["profiles_total"] == 2
     assert health["profiles_running"] == 1
     assert health["uptime_seconds"] == 42.5
+
+
+# ---------------------------------------------------------------------------
+# orphaned positions: the startup sweep warning, additive and never missing
+# ---------------------------------------------------------------------------
+
+
+def test_health_always_carries_the_orphan_block(router: Router) -> None:
+    """The key is always present, and ``null`` until the platform was swept."""
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert "orphaned_positions" in health
+    assert health["orphaned_positions"] is None
+    assert health["status"] == "ok"
+
+
+def test_health_carries_the_sweep_report_verbatim(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A swept platform publishes the whole report on the health body."""
+    provider.orphans = dict(ORPHAN_PAYLOAD)
+    router = build_router(provider, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(health) == HEALTH_KEYS
+    orphans = health["orphaned_positions"]
+    assert sorted(orphans) == ORPHAN_KEYS
+    assert sorted(orphans["closed"][0]) == ORPHAN_CLOSURE_KEYS
+    assert sorted(orphans["failed"][0]) == ORPHAN_FAILURE_KEYS
+    assert orphans["found"] == 2
+    assert orphans["orphaned"] == 2
+    assert orphans["closed_count"] == 1
+    assert orphans["failed_count"] == 1
+    assert orphans["swept_at"] == ORPHAN_PAYLOAD["swept_at"]
+
+
+def test_health_is_degraded_when_an_orphan_could_not_be_closed(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A failure degrades health; a successful closure alone never does."""
+    provider.orphans = dict(ORPHAN_PAYLOAD)
+    router = build_router(provider, monitor, manual_clock)
+    assert payload_of(router.handle("GET", "/api/health"))["status"] == "degraded"
+
+    clean = dict(ORPHAN_PAYLOAD)
+    clean["failed"] = []
+    clean["failed_count"] = 0
+    clean["orphaned"] = 1
+    provider.orphans = clean
+    health = payload_of(router.handle("GET", "/api/health"))
+    assert health["status"] == "ok"
+    assert health["orphaned_positions"]["closed_count"] == 1
+    assert health["orphaned_positions"]["failed_count"] == 0
+
+
+def test_health_logs_the_unclosable_orphans_at_error(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure to close is reported as loudly as a success."""
+    provider.orphans = dict(ORPHAN_PAYLOAD)
+    router = build_router(provider, monitor, manual_clock)
+
+    with caplog.at_level(logging.ERROR, logger=web_routes.LOGGER_NAME):
+        router.handle("GET", "/api/health")
+
+    assert any("orphan_positions_failed" in record.message for record in caplog.records)
+    assert all(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_a_clean_sweep_logs_nothing_at_error(
+    monitor: Monitor,
+    manual_clock: ManualClock,
+    provider: FakeProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A closure is informational: it raises no error record."""
+    clean = dict(ORPHAN_PAYLOAD)
+    clean["failed"] = []
+    clean["failed_count"] = 0
+    provider.orphans = clean
+    router = build_router(provider, monitor, manual_clock)
+
+    with caplog.at_level(logging.ERROR, logger=web_routes.LOGGER_NAME):
+        router.handle("GET", "/api/health")
+
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+
+
+def test_orphans_route_answers_the_same_object_as_health(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """``GET /api/orphans`` is the dedicated read of the very same warning."""
+    provider.orphans = dict(ORPHAN_PAYLOAD)
+    router = build_router(provider, monitor, manual_clock)
+
+    response = router.handle("GET", "/api/orphans")
+
+    assert response.status == 200
+    body = payload_of(response)
+    assert sorted(body) == ORPHANS_ROUTE_KEYS
+    assert body["status"] == "degraded"
+    health = payload_of(router.handle("GET", "/api/health"))["orphaned_positions"]
+    assert {key: value for key, value in body.items() if key != "status"} == health
+
+
+def test_orphans_route_is_never_a_404_and_answers_head(router: Router) -> None:
+    """The route exists on every server, swept or not, and advertises GET/HEAD."""
+    assert router.allowed_methods("/api/orphans") == ("GET", "HEAD")
+
+    for method in ("GET", "HEAD"):
+        response = router.handle(method, "/api/orphans")
+        assert response.status == 200, method
+
+
+def test_orphans_route_on_a_never_swept_platform_is_an_explicit_null_set(
+    router: Router,
+) -> None:
+    """An unswept platform answers a fully typed, empty report -- never a 404."""
+    body = payload_of(router.handle("GET", "/api/orphans"))
+
+    assert sorted(body) == ORPHANS_ROUTE_KEYS
+    assert body["status"] == "ok"
+    assert body["found"] == 0
+    assert body["orphaned"] == 0
+    assert body["closed_count"] == 0
+    assert body["failed_count"] == 0
+    assert body["closed"] == []
+    assert body["failed"] == []
+    assert body["swept_at"] is None
+
+
+def test_orphans_route_is_read_only_even_with_a_token(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A mutating method on the read-only route is refused like every other read."""
+    router = build_router(provider, monitor, manual_clock, operator_token="secret")
+    assert router.handle("POST", "/api/orphans").status == 405
+
+
+def test_a_provider_without_the_orphan_member_answers_null(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A provider written before the sweep existed is tolerated through getattr."""
+    legacy = UncensusedProvider(profiles=provider.profiles, health_body={"status": "ok"})
+    router = build_router(legacy, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert health["orphaned_positions"] is None
+    assert health["status"] == "ok"
+    assert payload_of(router.handle("GET", "/api/orphans"))["status"] == "ok"
+
+
+def test_a_broken_orphan_read_never_breaks_the_health_route(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A report that cannot be read is "never swept", not a ``500``."""
+    provider.orphan_error = StateStoreError("cannot read the sweep report")
+    router = build_router(provider, monitor, manual_clock)
+
+    response = router.handle("GET", "/api/health")
+
+    assert response.status == 200
+    assert payload_of(response)["orphaned_positions"] is None
+
+
+def test_a_report_object_is_rendered_through_its_to_dict(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The provider may hand back the report object itself, not its payload."""
+
+    class Report:
+        """Local stand-in of ``OrphanSweepReport`` (duck-typed by the route)."""
+
+        def to_dict(self) -> dict[str, Any]:
+            return dict(ORPHAN_PAYLOAD)
+
+    provider.orphans = Report()
+    router = build_router(provider, monitor, manual_clock)
+
+    orphans = payload_of(router.handle("GET", "/api/health"))["orphaned_positions"]
+
+    assert sorted(orphans) == ORPHAN_KEYS
+    assert orphans["closed_count"] == 1
+
+
+def test_the_orphan_block_is_additive_on_every_payload_it_touches(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """Every pre-existing key keeps its name and its type."""
+    provider.orphans = dict(ORPHAN_PAYLOAD)
+    router = build_router(provider, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+    profiles = payload_of(router.handle("GET", "/api/profiles"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert sorted(profiles) == PROFILES_KEYS
+    assert isinstance(health["status"], str)
+    assert isinstance(health["version"], str)
+    assert isinstance(health["uptime_seconds"], float)
+    assert isinstance(health["profiles_total"], int)
+    assert isinstance(health["profiles_running"], int)
+    assert isinstance(health["kill_switch"], bool)
+    assert isinstance(health["checked_at"], str)
+    assert isinstance(health["orphaned_positions"], dict)
+    assert isinstance(profiles["profiles"], list)
+    assert isinstance(profiles["generated_at"], str)
+    assert profiles["wallet"] is None
 
 
 def test_profiles_payload_has_exactly_the_documented_keys(router: Router) -> None:

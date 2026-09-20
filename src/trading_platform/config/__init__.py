@@ -12,12 +12,11 @@ from trading_platform.config.loader import (
     default_monitoring_config,
     default_realtime_config,
     dump_config,
+    load_bootstrap_realtime_config,
     load_config,
     load_monitoring_config,
-    load_profiles,
     load_realtime_config,
     override_params,
-    save_profiles,
 )
 from trading_platform.config.models import (
     AppConfig,
@@ -53,10 +52,9 @@ __all__ = [
     "default_monitoring_config",
     "default_realtime_config",
     "dump_config",
+    "load_bootstrap_realtime_config",
     "load_config",
     "load_monitoring_config",
-    "load_profiles",
     "load_realtime_config",
     "override_params",
-    "save_profiles",
 ]

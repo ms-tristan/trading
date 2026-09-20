@@ -23,8 +23,18 @@ USAGE = REPO_ROOT / "docs" / "usage.md"
 REALTIME = REPO_ROOT / "docs" / "realtime.md"
 README = REPO_ROOT / "README.md"
 MAKEFILE = REPO_ROOT / "Makefile"
-EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.example.json"
-TIMESFM_EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.timesfm.example.json"
+COMPOSE = REPO_ROOT / "deploy" / "docker-compose.yml"
+DOCKERFILE_REALTIME = REPO_ROOT / "deploy" / "Dockerfile.realtime"
+
+#: The JSON profile documents the platform used to read.  They are **deleted**
+#: and nothing replaces them: the profile set is a table of the SQLite state
+#: store (``docs/realtime.md`` section 1.1), so a surviving copy of either file
+#: would be read by no one and would silently drift from the running platform.
+DELETED_PROFILE_DOCUMENTS = (
+    REPO_ROOT / "deploy" / "profiles.json",
+    REPO_ROOT / "config" / "profiles.example.json",
+    REPO_ROOT / "config" / "profiles.timesfm.example.json",
+)
 
 #: The three-command operational flow of a forecast profile, frozen by name:
 #: download the candles, build the artifact, ask the guard, then start the engine.
@@ -112,6 +122,7 @@ REALTIME_ROUTES = (
     "GET /api/profiles/{id}/candles",
     "GET /api/catalog",
     "GET /api/control",
+    "GET /api/orphans",
     "GET /api/kill-switch",
     "POST /api/kill-switch",
     "POST /api/profiles",
@@ -122,8 +133,161 @@ REALTIME_ROUTES = (
 
 _MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
 
-#: Substrings that must never appear in the shipped example profiles file.
+#: Substrings that must never appear in a shipped profile payload.
 FORBIDDEN_PROFILE_KEYS = ("api_key", "api_secret", "password", "secret", "token")
+
+#: The two storage keys the platform must resolve *before* the state store can be
+#: opened: the path of the database cannot live inside the database it locates.
+BOOTSTRAP_FIELDS = ("--state-db", "--logs-dir")
+
+#: Every field of ``RealtimeConfig`` that must be seeded into SQLite on the first
+#: initialisation and read back from SQLite on every later boot.
+PERSISTED_SETTINGS = (
+    "poll_interval_seconds",
+    "stream_poll_timeout_seconds",
+    "max_stream_reconnects",
+    "reconnect_backoff_seconds",
+    "reconcile_interval_seconds",
+    "data_dir",
+    "cache_dir",
+    "csv_dir",
+    "format",
+    "allow_network",
+    "history_candles",
+    "start_at",
+    "risk_free_rate",
+    "benchmark_variant",
+    "kill_switch_file",
+    "platform_initial_balance",
+    "platform_max_total_notional",
+    "platform_max_daily_loss",
+    "refresh_seconds",
+    "request_timeout_seconds",
+    "max_request_bytes",
+)
+
+#: The inline profile literal the contract tests validate.  The shipped JSON
+#: example was removed with the document that carried it; the *payload* is what
+#: the platform still has to accept, so it is pinned here as a Python literal and
+#: round-tripped through the configuration model and through the state store.
+EXAMPLE_PROFILE_PAYLOAD: dict[str, Any] = {
+    "id": "btc-paper",
+    "symbol": "BTC/USDT",
+    "timeframe": "1h",
+    "strategy": "basic",
+    "params": {
+        "ema_fast": 9,
+        "ema_slow": 21,
+        "rsi_period": 14,
+        "rsi_min": 30.0,
+        "rsi_max": 70.0,
+        "atr_period": 14,
+        "atr_stop_multiplier": 2.0,
+        "allow_short": False,
+    },
+    "mode": "paper",
+    "initial_balance": 10_000.0,
+    "stake_amount": 1_000.0,
+    "exchange": "binance",
+    "enabled": True,
+    "warmup_candles": 200,
+    "poll_interval_seconds": 5.0,
+    "risk": {
+        "max_position_notional": 5_000.0,
+        "max_order_notional": 1_000.0,
+        "max_open_positions": 1,
+        "max_daily_loss": 500.0,
+        "max_drawdown_pct": 0.25,
+        "max_daily_trades": 10,
+    },
+    "allocation": 10_000.0,
+    "forecast": None,
+    "entry_lookback_candles": 3,
+}
+
+#: The forecast profile of the documented operational flow, as an inline literal.
+#: It is a real, loadable ``ProfileConfig``: the flow's commands start it, so a
+#: ``timesfm`` profile without an artifact would start an inert profile -- the
+#: exact failure the forecast guard exists to refuse.
+TIMESFM_EXAMPLE_PAYLOAD: dict[str, Any] = {
+    "id": "btc-timesfm-paper",
+    "symbol": "BTC/USDT",
+    "timeframe": "1h",
+    "strategy": "timesfm",
+    "params": {
+        "context_length": 512,
+        "horizon": 24,
+        "reforecast_every": 24,
+        "min_lead": 2,
+        "forecast_age": 24,
+        "entry_lookahead": 4,
+        "rsi_period": 14,
+        "atr_period": 14,
+        "ema_fast_period": 9,
+        "ema_slow_period": 21,
+        "vol_window": 24,
+        "atr_percentile_window": 100,
+        "min_alpha": 0.001,
+        "alpha_vs_atr": 0.5,
+        "min_reliability": 0.5,
+        "min_agreement": 0.6,
+        "min_path_efficiency": 0.2,
+        "max_vol_ratio": 3.0,
+        "min_atr_percentile": 0.1,
+        "max_atr_percentile": 0.95,
+        "rsi_min": 0.0,
+        "rsi_max": 100.0,
+        "exit_alpha": 0.0005,
+        "exit_confirm": 2,
+        "target_capture": 0.8,
+        "min_path_efficiency_exit": 0.05,
+        "min_reliability_exit": 0.1,
+        "max_hold": 24,
+        "min_progress": 0.3,
+        "exit_vol_ratio": 6.0,
+        "atr_stop_multiplier": 2.0,
+        "cooldown": 4,
+        "allow_short": False,
+    },
+    "mode": "paper",
+    "initial_balance": 10_000.0,
+    "stake_amount": 1_000.0,
+    "exchange": "binance",
+    "enabled": True,
+    "warmup_candles": 512,
+    "poll_interval_seconds": 5.0,
+    "risk": {
+        "max_position_notional": 5_000.0,
+        "max_order_notional": 1_000.0,
+        "max_open_positions": 1,
+        "max_daily_loss": 500.0,
+        "max_drawdown_pct": 0.25,
+        "max_daily_trades": 10,
+    },
+    "entry_lookback_candles": 12,
+    "forecast": "data/forecast/btc-timesfm-paper-1h-seasonal.parquet",
+}
+
+
+def load_example_profile(payload: dict[str, Any]) -> Any:
+    """Validate one inline profile literal through the project's own model."""
+    from trading_platform.config.models import ProfileConfig
+
+    return ProfileConfig.model_validate(payload)
+
+
+def round_trip_through_the_store(tmp_path: Any, profile: Any) -> Any:
+    """Write ``profile`` to a real SQLite store and read the profile set back."""
+    from trading_platform.realtime.store import SqliteStateStore
+
+    store = SqliteStateStore(tmp_path / "state.db")
+    store.initialize()
+    try:
+        store.save_profile(profile)
+        loaded = store.load_profiles()
+    finally:
+        store.close()
+    return loaded
 
 
 def read(path: Path) -> str:
@@ -329,6 +493,120 @@ def test_realtime_page_documents_the_three_commands_and_payloads() -> None:
     assert "client_order_id" in text
 
 
+def test_realtime_page_documents_the_configuration_storage() -> None:
+    """§1.1 states where the configuration lives, key by key.
+
+    The page has to answer the three questions an operator actually asks: what
+    is authoritative, what may still be read from outside the database, and what
+    happens to a previously declared profile.  Each answer is pinned below.
+    """
+    text = read(REALTIME)
+
+    assert "### 1.1 Where the configuration lives" in text
+    section = text.split("### 1.1 Where the configuration lives", 1)[1].split("\n## 2.", 1)[0]
+
+    # authoritative surfaces
+    assert "SQLite is the single source of truth" in section
+    assert "`profiles` table" in section
+    assert "platform_settings" in section
+    assert "state_db" in section
+
+    # the bootstrap surface, and why it cannot be anything else
+    for token in BOOTSTRAP_FIELDS:
+        assert token in section, f"§1.1 does not document {token!r}"
+    assert "cannot live inside the database it locates" in section
+    assert "TB_REALTIME_STATE_DB" in section
+    assert "TB_REALTIME_LOGS_DIR" in section
+    assert "data/realtime/state.db" in section
+
+    # every other setting is seeded once and read from the database afterwards
+    flattened = " ".join(section.split())
+    assert "seeded into SQLite on first initialisation" in flattened
+    assert "read from SQLite on every later boot" in flattened
+    for field in PERSISTED_SETTINGS:
+        assert field in section, f"§1.1 does not name the persisted setting {field!r}"
+
+    # no migration is wanted, and the host starts empty
+    assert "No migration" in section
+    assert "empty" in section
+
+    # the retired document is not advertised anywhere on the page
+    assert "profiles.example.json" not in text
+    assert "--profiles config/" not in text
+
+
+def test_realtime_page_documents_the_empty_platform_and_the_removed_guard() -> None:
+    """§4 records the empty start and the removal of the last-profile guard."""
+    text = read(REALTIME)
+    section = text.split("## 4. Persistence, restart and reconciliation", 1)[1].split("## 5.", 1)[0]
+
+    assert "An empty platform is a legal platform" in section
+    assert "zero" in section
+    assert "POST /api/profiles" in section
+    flattened = " ".join(section.split())
+    assert "the profiles file declares no profile" in flattened
+    assert "cannot delete the last profile" in flattened
+    assert "recorded decision" in flattened
+    assert "flatten-before-remove" in section
+
+
+def test_realtime_page_documents_the_orphan_sweep() -> None:
+    """§4.1 documents the startup safety sweep and its observable report."""
+    text = read(REALTIME)
+    assert "### 4.1 Orphaned positions are flattened at startup" in text
+    section = text.split("### 4.1 Orphaned positions are flattened at startup", 1)[1]
+    section = section.split("\n## 5.", 1)[0]
+
+    # what an orphan is, and why the sweep exists
+    assert "profile_id" in section
+    assert "orphan" in section.lower()
+    # where it runs, and the ordering that makes it safe
+    assert "before any runner exists" in section
+    assert "wallet" in section
+    # how it closes: at the venue, through the gateway, in BOTH modes
+    assert "execution gateway" in section
+    assert "paper" in section and "live" in section
+    assert "at the venue" in section
+    # a failure is loud and deletes nothing
+    assert "NOT deleted" in section
+    assert "ERROR" in section
+    # idempotency across restarts
+    assert "Idempotent across restarts" in section
+    # where the mode and the exchange of an orphan come from
+    assert "profile_state:<id>" in section
+    assert "profile_exchange:<id>" in section
+    assert "`meta` table" in section
+
+    # the exact JSON shape, field by field
+    for key in (
+        "found",
+        "orphaned",
+        "closed_count",
+        "failed_count",
+        "closed",
+        "failed",
+        "swept_at",
+    ):
+        assert key in section, f"§4.1 does not document the {key!r} field"
+    assert "GET /api/health" in section
+    assert "GET /api/orphans" in section
+
+
+def test_realtime_page_documents_the_orphan_key_and_the_read_route() -> None:
+    """§5 documents the additive key and the new read route, field by field."""
+    text = read(REALTIME)
+    section = text.split("## 5. Web API reference", 1)[1].split("## 6.", 1)[0]
+
+    assert "orphaned_positions" in section
+    for key in ("closed_count", "failed_count", "swept_at", "profile_id", "symbol", "error"):
+        assert key in section, f"§5 does not document the {key!r} field of the report"
+    assert "status: degraded" in section or "`degraded`" in section
+    assert "failed_count > 0" in section
+    assert "`null`" in section
+    # the key is additive: the previous key set did not move
+    assert "additive" in section
+
+
 def test_realtime_page_states_what_is_not_proven() -> None:
     text = read(REALTIME)
     section = text.split("## 7. What is NOT proven", 1)[1]
@@ -363,45 +641,175 @@ def test_readme_links_the_realtime_page() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. the shipped example file carries no credential and no endpoint
+# 9. the JSON profile documents are gone, and the payload they carried is not
 # ---------------------------------------------------------------------------
 
 
-def test_example_profiles_file_has_no_credential_and_no_endpoint() -> None:
-    assert EXAMPLE_PROFILES.is_file(), "config/profiles.example.json is missing"
-    text = read(EXAMPLE_PROFILES)
-    lowered = text.lower()
+@pytest.mark.parametrize(
+    "document", DELETED_PROFILE_DOCUMENTS, ids=lambda path: str(path.relative_to(REPO_ROOT))
+)
+def test_the_json_profile_documents_do_not_exist(document: Path) -> None:
+    """No JSON profile document survives anywhere in the checkout.
+
+    The profile set is a table of the SQLite state store (``docs/realtime.md``
+    section 1.1), and a document that no code reads is worse than no document at
+    all: it looks authoritative, it is committed, and it drifts silently from
+    what the platform actually runs.  No importer and no migration exist either,
+    so a resurrected copy would simply be dead weight.
+    """
+    assert not document.exists(), (
+        f"{document.relative_to(REPO_ROOT)} is back: the profile set lives in the SQLite "
+        "state store and no JSON profile document may be read or shipped"
+    )
+
+
+def test_no_json_profile_document_is_shipped_anywhere() -> None:
+    """The deletion is exhaustive, not a per-file exception.
+
+    ``.scratch/`` holds operator-local experiments and is excluded from the build
+    context (``.dockerignore``), so only the tracked tree is inspected here: what
+    must not come back is a *shipped* profile document, under any name.
+    """
+    leftovers = sorted(
+        str(path.relative_to(REPO_ROOT))
+        for path in REPO_ROOT.rglob("profiles*.json")
+        if not {".venv", "node_modules", ".scratch"} & set(path.parts)
+    )
+
+    assert not leftovers, f"JSON profile documents are still shipped: {leftovers}"
+
+
+def test_the_example_profile_payload_carries_no_credential_and_no_endpoint() -> None:
+    """The shipped payload is credential-free, exactly as the deleted file was."""
+    text = json.dumps(EXAMPLE_PROFILE_PAYLOAD).lower()
 
     for key in FORBIDDEN_PROFILE_KEYS:
-        assert key not in lowered, f"the example profiles file contains {key!r}"
-    assert "http://" not in lowered
-    assert "https://" not in lowered
-    assert "wss://" not in lowered
+        assert key not in text, f"the example profile payload contains {key!r}"
+    assert "http://" not in text
+    assert "https://" not in text
+    assert "wss://" not in text
 
 
-def test_example_profiles_file_is_a_valid_profiles_document() -> None:
-    document: dict[str, Any] = json.loads(read(EXAMPLE_PROFILES))
+def test_the_example_profile_payload_is_a_valid_profile() -> None:
+    profile = load_example_profile(EXAMPLE_PROFILE_PAYLOAD)
 
-    assert set(document) == {"profiles", "realtime", "monitoring"}
-    assert document["profiles"], "the example must declare at least one profile"
-    for entry in document["profiles"]:
-        assert entry["mode"] == "paper", "the shipped example never ships a live profile"
-        assert "risk" in entry
-    assert document["realtime"]["state_db"].startswith("data/")
+    assert profile.id == "btc-paper"
+    assert profile.mode == "paper", "the example never declares a live profile"
+    assert profile.risk is not None
+    assert profile.forecast_artifact is None
+    assert profile.strategy != "timesfm"
 
 
-def test_example_profiles_file_is_accepted_by_the_loader() -> None:
-    from trading_platform.config import load_profiles
+def test_the_example_profile_payload_round_trips_through_the_state_store(tmp_path: Path) -> None:
+    """The payload is persisted the way the platform persists it, and read back.
 
-    profiles = load_profiles(EXAMPLE_PROFILES)
+    ``save_profile`` / ``load_profiles`` are the only persistence of a profile
+    set that exists any more, so the inline literal is pinned by a real
+    round-trip through a real database rather than by a model validation alone.
+    """
+    profile = load_example_profile(EXAMPLE_PROFILE_PAYLOAD)
 
-    assert [profile.id for profile in profiles] == ["btc-paper", "eth-paper"]
-    assert all(profile.mode == "paper" for profile in profiles)
+    loaded = round_trip_through_the_store(tmp_path, profile)
+
+    assert [item.id for item in loaded] == ["btc-paper"]
+    assert loaded[0] == profile
+    assert loaded[0].params["ema_fast"] == 9
+    assert loaded[0].risk is not None
+    assert loaded[0].risk.max_position_notional == 5_000.0
+
+
+def test_the_store_boots_with_zero_profiles(tmp_path: Path) -> None:
+    """An empty platform is a legal platform: the store answers an empty set."""
+    from trading_platform.realtime.store import SqliteStateStore
+
+    store = SqliteStateStore(tmp_path / "empty.db")
+    store.initialize()
+    try:
+        assert store.load_profiles() == []
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------------------
-# the Makefile target and the README bullet stay additive
+# the Makefile targets reference the state database, never a deleted document
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# the deploy stack carries no JSON profile document and no bind mount of it
+# ---------------------------------------------------------------------------
+
+
+def test_compose_does_not_bind_mount_the_deploy_directory() -> None:
+    """The bind mount existed only so the API could rewrite the JSON document.
+
+    With the document gone, nothing the runtime does writes on the host: the two
+    named volumes below are the only durable state the realtime container needs,
+    and a container that cannot write into the checkout is one less way for a
+    deployment to corrupt it.
+    """
+    text = read(COMPOSE)
+
+    assert ":/app/deploy" not in text, (
+        "docker-compose.yml still bind-mounts the deploy directory; it existed only so "
+        "the monitoring API could rewrite the profiles JSON document"
+    )
+    assert "./:/app/deploy" not in text
+
+
+def test_compose_keeps_the_two_named_volumes_and_says_they_are_the_durable_state() -> None:
+    text = read(COMPOSE)
+
+    assert "- trading-state:/app/data/realtime" in text
+    assert "- trading-cache:/app/data/cache" in text
+    assert "trading-state:" in text.split("volumes:", 1)[-1]
+    assert "trading-cache:" in text.split("volumes:", 1)[-1]
+    # the header states the source of truth and the durability consequence
+    # comments are folded, so strip the leading '#' markers of every line first
+    header = " ".join(
+        line.lstrip("# ").strip() for line in text.split("services:", 1)[0].splitlines()
+    )
+    assert "SQLite state database" in header
+    assert "single source of truth" in header
+    assert "deleting the volume is the only way to lose them" in header
+
+
+def test_compose_command_line_of_the_readme_still_works() -> None:
+    """The documented orchestration command is the one the compose file serves."""
+    text = read(COMPOSE)
+
+    assert "docker compose -f deploy/docker-compose.yml up -d --build" in text
+
+
+def test_realtime_dockerfile_runs_against_the_state_database() -> None:
+    """The image's CMD names the database, never a deleted profile document."""
+    text = read(DOCKERFILE_REALTIME)
+
+    assert '"--state-db", "/app/data/realtime/state.db"' in text
+    assert "/app/deploy/profiles.json" not in text
+    assert "--profiles" not in text
+    # the COPY of deploy/ stays -- it ships the compose file and this README --
+    # but the header must not claim it ships deployment profiles any more
+    assert "COPY deploy ./deploy" in text
+    header = text.split("FROM ", 1)[0]
+    assert "ships no profile" in header or "no profile document" in header
+
+
+def test_deploy_readme_describes_the_state_database() -> None:
+    """The deployment README is rewritten around the SQLite source of truth."""
+    text = read(REPO_ROOT / "deploy" / "README.md")
+
+    assert "The SQLite state database is the source of truth" in text
+    assert "`profiles` table" in text
+    assert "platform_settings" in text
+    assert "/app/data/realtime/state.db" in text
+    assert "trading-state" in text
+    assert "deleting the state volume is the only way to lose them" in text
+
+    # every mention of the retired design is gone
+    assert "profiles.json" not in text
+    assert "chmod o+w deploy" not in text
+    assert "/app/deploy" not in text
 
 
 def test_makefile_declares_the_realtime_target() -> None:
@@ -410,7 +818,27 @@ def test_makefile_declares_the_realtime_target() -> None:
     assert re.search(r"^realtime:", text, flags=re.MULTILINE)
     assert "make realtime" in text
     assert "realtime" in text.split(".PHONY:", 1)[1].split("\n\n", 1)[0]
-    assert "config/profiles.example.json" in text
+    assert "STATE_DB ?=" in text
+    assert "data/realtime/state.db" in text
+
+
+@pytest.mark.parametrize("target", ("realtime", "realtime-forecast", "forecast-profile"))
+def test_makefile_realtime_targets_use_the_state_database(target: str) -> None:
+    """Every realtime target names ``--state-db``, and none names a JSON document."""
+    text = read(MAKEFILE)
+    body = text.split(f"\n{target}:", 1)[1].split("\n\n", 1)[0]
+
+    assert "--state-db" in body, f"the {target!r} target does not use --state-db"
+    assert "$${STATE_DB:-data/realtime/state.db}" in body
+
+
+def test_the_makefile_never_references_a_deleted_profile_document() -> None:
+    text = read(MAKEFILE)
+    offenders = [
+        name for name in ("config/profiles.example.json", "deploy/profiles.json") if name in text
+    ]
+
+    assert not offenders, f"the Makefile still references deleted documents: {offenders}"
 
 
 def test_makefile_check_target_is_untouched() -> None:
@@ -428,7 +856,7 @@ def test_usage_documents_the_realtime_commands() -> None:
         "realtime run",
         "realtime serve",
         "realtime check",
-        "profiles.example.json",
+        "--state-db",
         "TB_ALLOW_LIVE_TRADING",
         "TB_OPERATOR_TOKEN",
         "state_db",
@@ -436,6 +864,10 @@ def test_usage_documents_the_realtime_commands() -> None:
         "make realtime",
     ):
         assert token in text, f"usage.md does not document {token!r}"
+    # The retired document is not advertised any more, and the command examples
+    # point at the state database instead of at a file.
+    assert "profiles.example.json" not in text
+    assert "--profiles config/" not in text
     # the payloads are spelled out with their exact keys
     assert "realtime-check" in text
     assert "realtime-run" in text
@@ -509,9 +941,10 @@ def test_realtime_page_documents_the_lifecycle_and_candle_rules() -> None:
     # delete: flatten at market first, rewrite the file atomically, refuse the last
     assert "at market" in section
     assert "execution gateway" in section
-    assert "last** profile" in section
-    assert "atomically" in section
-    assert "os.replace" in section
+    # delete: the last-profile guard is gone, and the store write is transactional
+    flattened = " ".join(section.split())
+    assert "the **last** profile" in flattened
+    assert "profiles` table is the source of truth" in flattened
     # create: validated against the catalog, started immediately
     assert "catalog" in section
     assert "started" in section
@@ -606,7 +1039,7 @@ def test_realtime_page_documents_the_forecast_profile_field() -> None:
     # ... and the page really explains the mechanism behind the row.
     for token in (
         "forecast-bootstrap",
-        "forecast-info --profiles",
+        "forecast-info --state-db",
         "realtime.features.resolve_profile_features",
         "check_profile_forecast",
         "resolve_features",
@@ -721,7 +1154,7 @@ def test_usage_documents_the_forecast_operational_flow() -> None:
 
     for token in (
         "forecast-bootstrap",
-        "--profiles",
+        "--state-db",
         "--profile",
         "make forecast-flow",
         "make realtime-forecast",
@@ -787,55 +1220,43 @@ def test_makefile_declares_the_forecast_flow() -> None:
     assert not offenders, f"these Makefile targets reach the network: {offenders}"
 
 
-def test_example_profiles_opt_into_no_forecast() -> None:
-    """The shipped example declares the key on every profile, and uses none of it.
+def test_the_example_profile_opts_into_no_forecast() -> None:
+    """The example declares the key, and uses none of it.
 
-    ``"forecast": null`` is the load-bearing detail: the field exists (so its
-    absence from the file would fail the exact-key-set contract of
-    ``tests/test_realtime_models.py``), and every profile leaves it at ``None``,
-    so the example still describes two plain ``basic`` profiles whose behaviour
-    is byte-for-byte the one they had before forecasting existed.
+    ``"forecast": None`` is the load-bearing detail: the field exists (the
+    exact-key-set contract of ``tests/test_realtime_models.py`` keeps it), and
+    the profile leaves it unset, so it stays a plain ``basic`` profile whose
+    behaviour is byte-for-byte the one it had before forecasting existed.
     """
-    document: dict[str, Any] = json.loads(read(EXAMPLE_PROFILES))
-
-    assert document["profiles"], "the example must declare at least one profile"
-    for entry in document["profiles"]:
-        assert "forecast" in entry, f"profile {entry['id']!r} does not carry the `forecast` key"
-        assert entry["forecast"] is None, (
-            f"profile {entry['id']!r} opts into a forecast; the shipped example opts into nothing"
-        )
-        assert entry["strategy"] != "timesfm", (
-            f"profile {entry['id']!r} uses `timesfm` without an artifact and would be refused"
-        )
+    assert "forecast" in EXAMPLE_PROFILE_PAYLOAD
+    assert EXAMPLE_PROFILE_PAYLOAD["forecast"] is None
+    assert EXAMPLE_PROFILE_PAYLOAD["strategy"] != "timesfm", (
+        "a `timesfm` profile without an artifact would be refused at startup"
+    )
 
 
 def test_timesfm_example_profile_is_valid_and_declares_its_artifact() -> None:
-    """The forecast example is a real, loadable profile -- not an illustration.
+    """The forecast profile is a real, loadable profile -- not an illustration.
 
-    It is the profile the operational flow points at, so it must parse through
-    the project's own loader, declare the ``timesfm`` strategy and carry a
+    It is the profile the operational flow points at, so it must validate through
+    the project's own model, declare the ``timesfm`` strategy and carry a
     non-null ``forecast`` path; anything less and the documented three commands
     would start an inert profile, which is the exact failure this delivery fixes.
+    The payload is an inline literal because the JSON document that used to carry
+    it is deleted, like every other profile document.
     """
-    assert TIMESFM_EXAMPLE_PROFILES.is_file(), "config/profiles.timesfm.example.json is missing"
-    document: dict[str, Any] = json.loads(read(TIMESFM_EXAMPLE_PROFILES))
-    assert set(document) == {"profiles", "realtime", "monitoring"}
+    profile = load_example_profile(TIMESFM_EXAMPLE_PAYLOAD)
 
-    from trading_platform.config import load_profiles
-
-    profiles = load_profiles(TIMESFM_EXAMPLE_PROFILES)
-
-    assert profiles, "the forecast example declares no profile"
-    for profile in profiles:
-        assert profile.strategy == "timesfm", (
-            f"profile {profile.id!r} of the forecast example is not a `timesfm` profile"
-        )
-        assert profile.forecast_artifact is not None, (
-            f"profile {profile.id!r} declares no forecast artifact"
-        )
-        assert profile.mode == "paper", "the shipped example never ships a live profile"
-        assert profile.timeframe in {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
-    # the shipped example still carries no credential-ish key
-    lowered = read(TIMESFM_EXAMPLE_PROFILES).lower()
+    assert profile.id == "btc-timesfm-paper"
+    assert profile.strategy == "timesfm", (
+        f"profile {profile.id!r} of the forecast example is not a `timesfm` profile"
+    )
+    assert profile.forecast_artifact is not None, (
+        f"profile {profile.id!r} declares no forecast artifact"
+    )
+    assert profile.mode == "paper", "the shipped example never ships a live profile"
+    assert profile.timeframe in {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+    # the shipped payload still carries no credential-ish key
+    lowered = json.dumps(TIMESFM_EXAMPLE_PAYLOAD).lower()
     for key in FORBIDDEN_PROFILE_KEYS:
         assert key not in lowered, f"the forecast example contains {key!r}"

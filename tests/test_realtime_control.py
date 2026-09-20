@@ -129,17 +129,13 @@ class FakeOrchestrator:
         """Record a resume and return the snapshot of the resumed profile."""
         return await self._mutate("resume_profile", snapshot(profile_id), profile_id)
 
-    async def delete_profile(self, profile_id: str, *, profiles_path: str | Path) -> str:
+    async def delete_profile(self, profile_id: str) -> str:
         """Record a delete and return the removed identifier."""
-        return await self._mutate(
-            "delete_profile", str(profile_id), profile_id, profiles_path=profiles_path
-        )
+        return await self._mutate("delete_profile", str(profile_id), profile_id)
 
-    async def add_profile(self, profile: ProfileConfig, *, profiles_path: str | Path) -> Any:
+    async def add_profile(self, profile: ProfileConfig) -> Any:
         """Record a create and return the snapshot of the created profile."""
-        return await self._mutate(
-            "add_profile", snapshot(str(profile.id)), profile, profiles_path=profiles_path
-        )
+        return await self._mutate("add_profile", snapshot(str(profile.id)), profile)
 
     def profile_config(self, profile_id: str) -> ProfileConfig | None:
         """Return a declared profile, if the test declared one."""
@@ -165,7 +161,6 @@ def controller_for(
     """Build a controller over one local fake platform."""
     return RuntimeProfileController(
         orchestrator=fake,  # type: ignore[arg-type]
-        profiles_path=tmp_path / "profiles.json",
         timeout_seconds=timeout_seconds,
     )
 
@@ -216,7 +211,7 @@ def test_every_mutating_command_runs_on_the_engine_loop(tmp_path: Path) -> None:
     assert fake.threads == [engine.thread_id] * 4
     assert all(identifier != threading.get_ident() for identifier in fake.threads)
     assert fake.calls[0][1] == ("btc-paper",)
-    assert fake.calls[2][2]["profiles_path"] == tmp_path / "profiles.json"
+    assert fake.calls[2][1] == ("btc-paper",)
     created_profile = fake.calls[4][1][0]
     assert isinstance(created_profile, ProfileConfig)
     assert created_profile.id == "sol-paper"
@@ -232,7 +227,10 @@ def test_control_state_is_a_synchronous_read_of_the_platform(tmp_path: Path) -> 
     assert controller.bound is False
     assert controller.control_state() == {"profiles": [{"profile_id": "btc-paper"}]}
     assert fake.names() == ["control_state"]
-    assert controller.profiles_path == tmp_path / "profiles.json"
+    # There is no configuration document any more: the profile set lives in the
+    # SQLite state store, so the controller carries no path at all.
+    assert not hasattr(controller, "profiles_path")
+    assert "profiles_path" not in repr(controller)
     assert "RuntimeProfileController" in repr(controller)
 
 
@@ -283,7 +281,7 @@ def test_a_command_on_an_unbound_controller_is_refused(tmp_path: Path) -> None:
     "failure",
     [
         ProfileError("unknown profile: 'nope'"),
-        ConfigError("cannot write profiles file /tmp/profiles.json: read-only"),
+        ConfigError("the state store refused the write: read-only"),
         MonitoringError("the read model is unavailable"),
     ],
 )

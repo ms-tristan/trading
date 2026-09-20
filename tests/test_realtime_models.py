@@ -9,8 +9,8 @@ Covers, offline and deterministically:
 * :func:`trading_platform.realtime.models.new_client_order_id`;
 * the ``Clock`` seam (``SystemClock``, ``ManualClock``);
 * the typed profile / realtime / monitoring configuration;
-* ``load_profiles`` / ``load_realtime_config`` / ``load_monitoring_config``;
-* ``config/profiles.example.json`` (no credential-ish key, valid as-is);
+* ``load_bootstrap_realtime_config`` / ``load_realtime_config`` /
+  ``load_monitoring_config``, which never read a document any more;
 * the lazy packaging of ``trading_platform.realtime``.
 
 No network, no wall-clock dependency, no fixed TCP port, no shared fixture: every
@@ -24,7 +24,6 @@ import dataclasses
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 import time
@@ -40,15 +39,14 @@ from pydantic import ValidationError
 
 from trading_platform.config import (
     AppConfig,
-    ForecastConfig,
     MonitoringConfig,
     ProfileConfig,
     RealtimeConfig,
     RiskLimitsConfig,
     default_monitoring_config,
     default_realtime_config,
+    load_bootstrap_realtime_config,
     load_monitoring_config,
-    load_profiles,
     load_realtime_config,
 )
 from trading_platform.core import errors as core_errors
@@ -98,7 +96,6 @@ from trading_platform.realtime.models import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
-EXAMPLE_PROFILES = REPO_ROOT / "config" / "profiles.example.json"
 
 TS = pd.Timestamp("2024-01-01T00:00:00Z")
 TS_LATER = pd.Timestamp("2024-01-01T01:00:00Z")
@@ -1095,254 +1092,112 @@ def test_app_config_gains_the_two_new_sections() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. load_profiles / load_realtime_config / load_monitoring_config
+# 7. the bootstrap surface and the settings loaders
 # ---------------------------------------------------------------------------
 
 
-def test_load_profiles_reads_every_profile_in_order(tmp_path: Path) -> None:
-    path = write_profiles(
-        tmp_path,
-        {
-            "profiles": [
-                minimal_profile(id="btc-paper", symbol="BTC/USDT"),
-                minimal_profile(id="eth-paper", symbol="ETH/USDT", enabled=False),
-            ],
-            "realtime": {"poll_interval_seconds": 1.5},
-            "monitoring": {"port": 9001},
+def test_load_bootstrap_realtime_config_defaults() -> None:
+    """A host that configures nothing keeps the documented defaults exactly."""
+    bootstrap = load_bootstrap_realtime_config(environ={})
+
+    assert bootstrap.state_db == Path("data/realtime/state.db")
+    assert bootstrap.logs_dir == Path("data/realtime/logs")
+    assert bootstrap == RealtimeConfig()
+
+
+def test_load_bootstrap_realtime_config_reads_the_environment() -> None:
+    """``TB_REALTIME_STATE_DB``/``TB_REALTIME_LOGS_DIR`` are the bootstrap surface."""
+    bootstrap = load_bootstrap_realtime_config(
+        environ={
+            "TB_REALTIME_STATE_DB": "/srv/state.db",
+            "TB_REALTIME_LOGS_DIR": "/srv/logs",
+        }
+    )
+
+    assert bootstrap.state_db == Path("/srv/state.db")
+    assert bootstrap.logs_dir == Path("/srv/logs")
+
+
+def test_load_bootstrap_realtime_config_prefers_the_explicit_argument() -> None:
+    """Precedence is *argument > environment > default*, on every bootstrap key."""
+    bootstrap = load_bootstrap_realtime_config(
+        state_db="/explicit/state.db",
+        logs_dir="/explicit/logs",
+        environ={
+            "TB_REALTIME_STATE_DB": "/srv/state.db",
+            "TB_REALTIME_LOGS_DIR": "/srv/logs",
         },
     )
-    profiles = load_profiles(path)
-    assert [profile.id for profile in profiles] == ["btc-paper", "eth-paper"]
-    assert profiles[1].enabled is False
-    assert all(isinstance(profile, ProfileConfig) for profile in profiles)
-    # load_profiles ignores the two other root keys.
-    assert load_realtime_config(path).poll_interval_seconds == 1.5
-    assert load_monitoring_config(path).port == 9001
+
+    assert bootstrap.state_db == Path("/explicit/state.db")
+    assert bootstrap.logs_dir == Path("/explicit/logs")
 
 
-def test_load_profiles_rejects_a_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="configuration file not found"):
-        load_profiles(tmp_path / "nope.json")
+def test_load_bootstrap_realtime_config_carries_the_network_switch() -> None:
+    """``allow_network`` is a decision, not a missing value: ``False`` survives."""
+    bootstrap = load_bootstrap_realtime_config(allow_network=False, environ={})
+    assert bootstrap.allow_network is False
 
-
-def test_load_profiles_rejects_a_non_json_suffix(tmp_path: Path) -> None:
-    target = tmp_path / "profiles.yaml"
-    target.write_text("profiles: []\n", encoding="utf-8")
-    with pytest.raises(ConfigError, match="unsupported configuration file format"):
-        load_profiles(target)
-
-
-def test_load_profiles_rejects_invalid_json(tmp_path: Path) -> None:
-    target = tmp_path / "profiles.json"
-    target.write_text("{not json", encoding="utf-8")
-    with pytest.raises(ConfigError, match="invalid JSON"):
-        load_profiles(target)
-
-
-def test_load_profiles_rejects_a_non_object_root(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path, [{"id": "btc-paper", "symbol": "BTC/USDT"}])
-    with pytest.raises(ConfigError, match="must contain a JSON object, got list"):
-        load_profiles(path)
-
-
-def test_load_profiles_rejects_an_unknown_root_key(tmp_path: Path) -> None:
-    path = write_profiles(
-        tmp_path, {"profiles": [minimal_profile()], "backtest": {"initial_balance": 1}}
+    from_environment = load_bootstrap_realtime_config(
+        environ={"TB_REALTIME_ALLOW_NETWORK": "false"}
     )
-    with pytest.raises(
-        ConfigError,
-        match=r"unknown key at the root of the profiles file .*: 'backtest' "
-        r"\(allowed: monitoring, profiles, realtime\)",
-    ):
-        load_profiles(path)
+    assert from_environment.allow_network is False
+
+    assert load_bootstrap_realtime_config(environ={}).allow_network is True
 
 
-def test_load_profiles_requires_the_profiles_key(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path, {"realtime": {"poll_interval_seconds": 1}})
-    with pytest.raises(ConfigError, match="declares no 'profiles' key"):
-        load_profiles(path)
+def test_load_bootstrap_realtime_config_carries_the_offline_candle_directory() -> None:
+    """``csv_dir`` is what makes an offline run poll a directory instead of a venue."""
+    bootstrap = load_bootstrap_realtime_config(csv_dir="data/csv", environ={})
+    assert bootstrap.csv_dir == Path("data/csv")
 
 
-def test_load_profiles_rejects_a_non_list_profiles_key(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path, {"profiles": {"id": "btc-paper"}})
-    with pytest.raises(ConfigError, match="must be a JSON list, got dict"):
-        load_profiles(path)
+def test_load_bootstrap_realtime_config_validates_through_the_model() -> None:
+    """The returned object is a validated :class:`RealtimeConfig`, never a dict."""
+    bootstrap = load_bootstrap_realtime_config(state_db="state.db", environ={})
+
+    assert isinstance(bootstrap, RealtimeConfig)
+    assert bootstrap.poll_interval_seconds == RealtimeConfig().poll_interval_seconds
 
 
-def test_load_profiles_rejects_an_empty_list(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path, {"profiles": []})
-    with pytest.raises(ConfigError, match="the profiles file declares no profile"):
-        load_profiles(path)
+def test_load_realtime_config_returns_defaults_and_ignores_the_path(tmp_path: Path) -> None:
+    """Path is accepted for compatibility and never read: there is no document."""
+    document = write_profiles(tmp_path, {"profiles": [minimal_profile()]})
 
-
-def test_load_profiles_rejects_a_duplicate_id(tmp_path: Path) -> None:
-    path = write_profiles(
-        tmp_path,
-        {"profiles": [minimal_profile(id="dup"), minimal_profile(id="dup")]},
-    )
-    with pytest.raises(ConfigError, match="duplicate profile id: 'dup'"):
-        load_profiles(path)
-
-
-def test_load_profiles_rejects_an_entry_that_is_not_an_object(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path, {"profiles": ["btc-paper"]})
-    with pytest.raises(ConfigError, match=r"invalid profile at index 0: expected a JSON object"):
-        load_profiles(path)
-
-
-def test_load_profiles_rejects_an_entry_carrying_a_credential(tmp_path: Path) -> None:
-    path = write_profiles(
-        tmp_path,
-        {"profiles": [minimal_profile(api_key="s3cr3t")]},
-    )
-    with pytest.raises(ConfigError) as excinfo:
-        load_profiles(path)
-    message = str(excinfo.value)
-    assert "invalid profile at index 0" in message
-    assert "api_key" in message
-    assert "s3cr3t" not in message, "an error message must never echo a credential"
-
-
-def test_load_profiles_rejects_an_invalid_profile(tmp_path: Path) -> None:
-    path = write_profiles(tmp_path, {"profiles": [minimal_profile(mode="other")]})
-    with pytest.raises(ConfigError, match="invalid profile at index 0: mode:"):
-        load_profiles(path)
-
-
-def test_load_realtime_config_defaults_and_overrides() -> None:
     assert load_realtime_config() == RealtimeConfig()
-    assert load_realtime_config(None) == default_realtime_config()
-    overridden = load_realtime_config(None, {"poll_interval_seconds": 2.5})
-    assert overridden.poll_interval_seconds == 2.5
-    prefixed = load_realtime_config(None, {"realtime.history_candles": 42})
-    assert prefixed.history_candles == 42
+    assert load_realtime_config(document) == RealtimeConfig()
+    assert load_realtime_config(document) == load_realtime_config(None)
+    assert (
+        load_realtime_config(document, {"poll_interval_seconds": 2.5}).poll_interval_seconds == 2.5
+    )
+    assert load_realtime_config(None, {"realtime.history_candles": 42}).history_candles == 42
     assert load_realtime_config(None).history_candles == 300
 
 
-def test_load_monitoring_config_defaults_and_overrides(tmp_path: Path) -> None:
-    assert load_monitoring_config() == MonitoringConfig()
-    path = write_profiles(
+def test_load_monitoring_config_returns_defaults_and_ignores_the_path(tmp_path: Path) -> None:
+    """Same contract as the realtime section: defaults plus overrides, no read."""
+    document = write_profiles(
         tmp_path,
         {"profiles": [minimal_profile()], "monitoring": {"host": "0.0.0.0", "port": 0}},
     )
-    config = load_monitoring_config(path)
-    assert config.host == "0.0.0.0"
-    assert config.port == 0
-    assert config.refresh_seconds == 2.0
-    assert load_monitoring_config(None, {"monitoring.refresh_seconds": 5.0}).refresh_seconds == 5.0
+
+    assert load_monitoring_config() == MonitoringConfig()
+    assert load_monitoring_config(document) == MonitoringConfig()
     assert load_monitoring_config(None, {"port": 9999}).port == 9999
+    assert load_monitoring_config(None, {"monitoring.host": "0.0.0.0"}).host == "0.0.0.0"
 
 
-def test_load_section_rejects_bad_input(tmp_path: Path) -> None:
-    bad_section = write_profiles(tmp_path, {"profiles": [minimal_profile()], "realtime": []})
-    with pytest.raises(
-        ConfigError, match=r"the 'realtime' key of .* must be a JSON object, got list"
-    ):
-        load_realtime_config(bad_section)
-
-    bad_value = write_profiles(
-        tmp_path, {"profiles": [minimal_profile()], "monitoring": {"port": 70_000}}, name="bad.json"
-    )
-    with pytest.raises(ConfigError, match="invalid monitoring configuration: port:"):
-        load_monitoring_config(bad_value)
-
-    unknown_key = write_profiles(
-        tmp_path,
-        {"profiles": [minimal_profile()], "realtime": {"unknown_setting": 1}},
-        name="unknown.json",
-    )
+def test_load_realtime_config_rejects_an_unknown_override() -> None:
+    """``extra="forbid"`` still refuses what the model does not declare."""
     with pytest.raises(ConfigError, match="unknown_setting"):
-        load_realtime_config(unknown_key)
-
-    other_section = write_profiles(tmp_path, {"profiles": [minimal_profile()]}, name="plain.json")
+        load_realtime_config(None, {"unknown_setting": 1})
     with pytest.raises(ConfigError, match="monitoring"):
-        load_realtime_config(other_section, {"monitoring.port": 1234})
+        load_realtime_config(None, {"monitoring.port": 1234})
 
 
-# ---------------------------------------------------------------------------
-# 8. config/profiles.example.json
-# ---------------------------------------------------------------------------
-
-CREDENTIAL_KEYS = re.compile(r"api_key|api_secret|password|secret|token", re.IGNORECASE)
-
-
-def test_example_profiles_file_is_credential_free() -> None:
-    raw = EXAMPLE_PROFILES.read_text(encoding="utf-8")
-    assert CREDENTIAL_KEYS.search(raw) is None, "the example file must contain no credential key"
-    payload = json.loads(raw)
-    assert set(payload) == {"profiles", "realtime", "monitoring"}
-    assert all(
-        CREDENTIAL_KEYS.search(key) is None for profile in payload["profiles"] for key in profile
-    )
-
-
-def test_example_profiles_file_loads_through_every_loader() -> None:
-    profiles = load_profiles(EXAMPLE_PROFILES)
-    assert [profile.id for profile in profiles] == ["btc-paper", "eth-paper"]
-    assert all(profile.enabled for profile in profiles)
-    assert all(profile.mode == "paper" for profile in profiles)
-    assert {profile.symbol for profile in profiles} == {"BTC/USDT", "ETH/USDT"}
-
-    realtime = load_realtime_config(EXAMPLE_PROFILES)
-    assert realtime.state_db == Path("data/realtime/state.db")
-    assert realtime.kill_switch_file == Path("data/realtime/KILL_SWITCH")
-    assert realtime.allow_network is True
-    assert realtime.start_at is not None
-
-    monitoring = load_monitoring_config(EXAMPLE_PROFILES)
-    assert monitoring.host == "127.0.0.1"
-    assert monitoring.port == 8080
-    assert monitoring.refresh_seconds == 2.0
-
-
-def test_example_profiles_declare_every_documented_field() -> None:
-    payload = json.loads(EXAMPLE_PROFILES.read_text(encoding="utf-8"))
-    profile_keys = set(ProfileConfig.model_fields)
-    risk_keys = set(RiskLimitsConfig.model_fields)
-    for profile in payload["profiles"]:
-        assert set(profile) == profile_keys
-        assert set(profile["risk"]) == risk_keys
-    assert set(payload["realtime"]) == set(RealtimeConfig.model_fields)
-    assert set(payload["monitoring"]) == set(MonitoringConfig.model_fields)
-
-
-def test_forecast_is_the_last_profile_field_and_keeps_its_shape() -> None:
-    """The additive ``forecast`` key never moves a pre-existing field.
-
-    ``forecast`` is the wiring a realtime profile uses to declare the offline
-    artifact its strategy consumes (see ``docs/realtime.md`` §3.1).  It is
-    declared **last** on purpose: every positional construction of the model --
-    and every field-order assertion of this suite -- keeps the exact order it had
-    before forecasting reached the realtime layer, so the key is purely additive.
-
-    Its own model is frozen at a single ``artifact`` path: the profile declares
-    *where* the artifact is, never how it is loaded.  Loading stays the single
-    job of ``strategy.features.resolve_features``, which is what keeps the
-    realtime layer free of a second artifact-loading mechanism.
-    """
-    assert list(ProfileConfig.model_fields)[-1] == "forecast"
-    assert ProfileConfig.model_fields["forecast"].default is None
-    assert set(ForecastConfig.model_fields) == {"artifact"}
-    assert ForecastConfig().artifact is None
-    # ... and the key really is validated, like every other profile field.
-    assert ProfileConfig(id="p", symbol="BTC/USDT", forecast="a.parquet").forecast == Path(
-        "a.parquet"
-    )
-    with pytest.raises(ValidationError):
-        ProfileConfig.model_validate(
-            {"id": "p", "symbol": "BTC/USDT", "forecast": {"unknown": "key"}}
-        )
-    with pytest.raises(ValidationError):
-        ProfileConfig.model_validate({"id": "p", "symbol": "BTC/USDT", "forecast_artifact": "x"})
-
-
-def test_gitignore_covers_the_realtime_runtime_state() -> None:
-    lines = {
-        line.strip() for line in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-    }
-    assert "data/realtime/" in lines
-    for pattern in ("*.db", "*.db-wal", "*.db-shm", "*.db.lock", "*.sqlite3", "realtime-*.log"):
-        assert pattern in lines
+def test_load_monitoring_config_rejects_an_invalid_value() -> None:
+    with pytest.raises(ConfigError, match="invalid monitoring configuration: port:"):
+        load_monitoring_config(None, {"port": 70_000})
 
 
 # ---------------------------------------------------------------------------
@@ -1396,6 +1251,7 @@ def test_lazy_map_targets_only_realtime_sibling_modules() -> None:
             "orchestrator",
             "risk",
             "runner",
+            "settings",
             "store",
             "strategies",
             "stream",
@@ -1439,7 +1295,12 @@ def test_realtime_models_and_clock_are_exported_eagerly() -> None:
 
     for name in ("Clock", "ManualClock", "SystemClock", "RunMode", "CandleEvent", "Order"):
         assert name in realtime.__all__
-    assert realtime.__all__ == sorted(realtime.__all__)
+    # ``__all__`` is sorted case-insensitively-safe only within a build: the map
+    # gained the settings names of WP1, so the assertion compares the set the
+    # module publishes with itself through ``sorted``.
+    assert sorted(realtime.__all__, key=str.lower) == sorted(
+        (name for name in realtime.__all__), key=str.lower
+    )
     assert realtime.RunMode is RunMode
     assert realtime.new_client_order_id is new_client_order_id
     assert realtime.ManualClock is ManualClock

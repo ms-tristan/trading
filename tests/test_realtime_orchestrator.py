@@ -16,6 +16,7 @@ depend on the shape of a real indicator series.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from datetime import UTC, datetime
@@ -25,7 +26,6 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from trading_platform.config.loader import load_profiles
 from trading_platform.config.models import (
     MonitoringConfig,
     ProfileConfig,
@@ -33,7 +33,11 @@ from trading_platform.config.models import (
     RiskLimitsConfig,
     resolve_platform_initial_balance,
 )
-from trading_platform.core.errors import ConfigError, MarketStreamError, ProfileError
+from trading_platform.core.errors import (
+    MarketStreamError,
+    ProfileError,
+    StateStoreError,
+)
 from trading_platform.core.models import Direction
 from trading_platform.realtime import runner as runner_module
 from trading_platform.realtime.broker import PaperBroker
@@ -93,7 +97,8 @@ START = pd.Timestamp("2024-01-01T00:00:00Z")
 SYMBOL_BTC = "BTC/USDT"
 SYMBOL_ETH = "ETH/USDT"
 
-#: The exact key set of the ``/api/health`` body (the shared wallet view included).
+#: The exact key set of the ``/api/health`` body (the shared wallet view and the
+#: orphan-sweep report included).
 HEALTH_KEYS = frozenset(
     {
         "status",
@@ -104,6 +109,7 @@ HEALTH_KEYS = frozenset(
         "kill_switch",
         "checked_at",
         "wallet",
+        "orphaned_positions",
     }
 )
 
@@ -317,8 +323,14 @@ def build_orchestrator(
     shared = wallet
     if shared is None:
         live = any(str(item.mode) == RunMode.LIVE.value for item in profiles if item.enabled)
+        # A platform with no profile has nothing to fund, and the shared ledger
+        # refuses a non-positive starting balance: the empty-platform tests hand
+        # in a positive one explicitly, exactly like an operator who configured
+        # ``realtime.platform_initial_balance`` on a fresh host.
         shared = PlatformWallet(
-            initial_balance=resolve_platform_initial_balance(resolved_realtime, profiles),
+            initial_balance=(
+                resolve_platform_initial_balance(resolved_realtime, profiles) or 1000.0
+            ),
             mode=RunMode.LIVE if live else RunMode.PAPER,
             store=resolved_store,
             clock=resolved_clock,
@@ -1042,11 +1054,10 @@ def test_a_deleted_profile_is_forgotten_by_the_platform_risk_state(
     orchestrator, store, _clock, _streams = build_orchestrator(
         tmp_path, profiles, realtime=realtime_config(tmp_path, platform_max_total_notional=300.0)
     )
-    path = write_profiles(tmp_path / "profiles.json", profiles)
 
     async def scenario() -> Any:
         first = await orchestrator.run_once()
-        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        removed = await orchestrator.delete_profile("btc-paper")
         after = await orchestrator.run_once()
         return first, removed, after
 
@@ -1122,15 +1133,41 @@ def test_a_live_wallet_sync_failure_is_logged_and_never_fatal(
 # ---------------------------------------------------------------------------
 
 
-def test_an_empty_profile_list_is_refused(tmp_path: Path) -> None:
-    """A platform with no profile is a configuration mistake."""
-    with pytest.raises(ProfileError, match="empty"):
-        RealtimeOrchestrator(
-            profiles=[],
-            store=SqliteStateStore(tmp_path / "state.db"),
-            clock=ManualClock(),
-            realtime=RealtimeConfig(),
-        )
+def test_an_empty_profile_list_is_a_legal_platform(tmp_path: Path, logs: Any) -> None:
+    """A fresh host starts empty: it boots, serves and accepts a new profile.
+
+    The SQLite state store is the single source of truth for the profile set, so
+    zero profiles is a legal platform -- the loader used to refuse it and the
+    delete path used to guard against it, and both guards are gone.
+    """
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, [])
+
+    async def scenario() -> Any:
+        await orchestrator.start()
+        return await orchestrator.run_once()
+
+    assert orchestrator.profiles == ()
+    decisions = run(scenario())
+    assert decisions == []
+    assert orchestrator.profile_ids() == []
+    assert orchestrator.snapshot().profiles == ()
+    started = [
+        record
+        for record in logs
+        if str(getattr(record, "event", record.getMessage())) == "platform_started"
+    ]
+    assert len(started) == 1
+    assert started[0].context["profiles"] == 0
+    assert started[0].context["running"] == 0
+    store.close()
+
+
+def test_run_forever_returns_immediately_with_zero_profiles(tmp_path: Path) -> None:
+    """Nothing to supervise means nothing to wait for -- and no exception."""
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, [])
+    assert run(orchestrator.run_forever()) is None
+    assert orchestrator._prepared is True
+    store.close()
 
 
 def test_a_duplicate_profile_id_is_refused(tmp_path: Path) -> None:
@@ -1320,24 +1357,6 @@ def test_the_hold_mode_of_the_scripted_strategy_never_opens(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 # 14. runtime profile control: pause, resume, delete and create
 # ---------------------------------------------------------------------------
-
-
-def write_profiles(path: Path, profiles: list[ProfileConfig]) -> Path:
-    """Write a minimal profiles document (``profiles`` + the two section keys)."""
-    path.write_text(
-        json.dumps(
-            {
-                "profiles": [item.model_dump(mode="json") for item in profiles],
-                "realtime": {"state_db": str(path.parent / "state.db")},
-                "monitoring": {"port": 0},
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return path
 
 
 class RefusingFlattenBroker(PaperBroker):
@@ -1570,12 +1589,11 @@ def test_delete_profile_flattens_before_it_removes_anything(
     scripted(monkeypatch, flag)
     profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
     orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
-    path = write_profiles(tmp_path / "profiles.json", profiles)
 
     async def scenario() -> Any:
         await orchestrator.run_once()
         positions = store.list_positions("btc-paper")
-        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        removed = await orchestrator.delete_profile("btc-paper")
         return positions, removed
 
     positions, removed = run(scenario())
@@ -1602,7 +1620,8 @@ def test_delete_profile_flattens_before_it_removes_anything(
     assert orchestrator.profile_snapshot("btc-paper") is None
     assert orchestrator.profile_config("btc-paper") is None
     assert [item.id for item in orchestrator.profiles] == ["eth-paper"]
-    assert [item.id for item in load_profiles(path)] == ["eth-paper"]
+    # The store IS the source of truth: the removal is visible to the very next read.
+    assert [item.id for item in store.load_profiles()] == ["eth-paper"]
     assert orchestrator.control_state()["profiles"] == [
         {"profile_id": "eth-paper", "paused": False, "running": True}
     ]
@@ -1613,33 +1632,45 @@ def test_delete_profile_refuses_an_unknown_profile(tmp_path: Path) -> None:
     """Deleting what does not exist changes nothing."""
     profiles = [profile("btc-paper", SYMBOL_BTC)]
     orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
-    path = write_profiles(tmp_path / "profiles.json", profiles)
-    before = path.read_bytes()
     run(orchestrator.run_once())
     with pytest.raises(ProfileError) as excinfo:
-        run(orchestrator.delete_profile("nope", profiles_path=path))
+        run(orchestrator.delete_profile("nope"))
     assert str(excinfo.value) == "unknown profile: 'nope'"
-    assert path.read_bytes() == before
     assert orchestrator.profile_ids() == ["btc-paper"]
+    assert [item.id for item in store.load_profiles()] == ["btc-paper"]
     store.close()
 
 
-def test_delete_profile_refuses_the_last_profile(tmp_path: Path) -> None:
-    """An engine requires at least one profile, so the last one is not deletable."""
+def test_delete_profile_removes_the_last_profile_of_the_platform(tmp_path: Path) -> None:
+    """Deleting the last profile leaves a legal empty platform.
+
+    The store is the source of truth, so an empty profile set is a platform the
+    API keeps serving and ``POST /api/profiles`` re-creates from.  What survives
+    the removal of the guard is the flatten-before-remove property, pinned by the
+    two tests below.
+    """
     profiles = [profile("btc-paper", SYMBOL_BTC)]
     orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
-    path = write_profiles(tmp_path / "profiles.json", profiles)
-    before = path.read_bytes()
     run(orchestrator.run_once())
-    with pytest.raises(ProfileError) as excinfo:
-        run(orchestrator.delete_profile("btc-paper", profiles_path=path))
-    assert str(excinfo.value) == (
-        "cannot delete the last profile: the engine requires at least one profile"
-    )
-    assert path.read_bytes() == before
-    assert orchestrator.profile_ids() == ["btc-paper"]
-    assert orchestrator.profile_config("btc-paper") is not None
+    removed = run(orchestrator.delete_profile("btc-paper"))
+    assert removed == "btc-paper"
+    assert orchestrator.profiles == ()
+    assert orchestrator.profile_ids() == []
+    assert orchestrator.profile_config("btc-paper") is None
+    assert store.load_profiles() == []
+    assert orchestrator.control_state()["profiles"] == []
     store.close()
+
+
+def test_delete_profile_has_no_profiles_path_parameter() -> None:
+    """There is no configuration document to rewrite any more."""
+    parameters = inspect.signature(RealtimeOrchestrator.delete_profile).parameters
+    assert list(parameters) == ["self", "profile_id"]
+    assert "profiles_path" not in parameters
+    assert list(inspect.signature(RealtimeOrchestrator.add_profile).parameters) == [
+        "self",
+        "profile",
+    ]
 
 
 def test_delete_profile_keeps_everything_when_the_venue_refuses_the_flatten(
@@ -1663,14 +1694,11 @@ def test_delete_profile_keeps_everything_when_the_venue_refuses_the_flatten(
         tmp_path, profiles, broker_factory=venues
     )
     wallets["platform"] = orchestrator.wallet
-    path = write_profiles(tmp_path / "profiles.json", profiles)
     run(orchestrator.run_once())
-    before = path.read_bytes()
     with pytest.raises(ProfileError, match="could not be flattened"):
-        run(orchestrator.delete_profile("btc-paper", profiles_path=path))
-    assert path.read_bytes() == before
+        run(orchestrator.delete_profile("btc-paper"))
     assert orchestrator.profile_ids() == ["btc-paper", "eth-paper"]
-    assert [item.id for item in load_profiles(path)] == ["btc-paper", "eth-paper"]
+    assert [item.id for item in store.load_profiles()] == ["btc-paper", "eth-paper"]
     assert len(store.list_positions("btc-paper")) == 1
     store.close()
 
@@ -1696,25 +1724,22 @@ def test_delete_profile_keeps_everything_when_the_position_stays_open(
         tmp_path, profiles, broker_factory=venues
     )
     wallets["platform"] = orchestrator.wallet
-    path = write_profiles(tmp_path / "profiles.json", profiles)
     run(orchestrator.run_once())
-    before = path.read_bytes()
     with pytest.raises(ProfileError) as excinfo:
-        run(orchestrator.delete_profile("btc-paper", profiles_path=path))
+        run(orchestrator.delete_profile("btc-paper"))
     assert str(excinfo.value) == (
         "cannot delete profile 'btc-paper': the open position could not be flattened"
     )
-    assert path.read_bytes() == before
     assert orchestrator.profile_ids() == ["btc-paper", "eth-paper"]
+    assert [item.id for item in store.load_profiles()] == ["btc-paper", "eth-paper"]
     assert len(store.list_positions("btc-paper")) == 1
     store.close()
 
 
-def test_add_profile_starts_it_and_rewrites_the_document(tmp_path: Path) -> None:
+def test_add_profile_starts_it_and_persists_it_in_the_store(tmp_path: Path) -> None:
     """A created profile is persisted, built, started and visible immediately."""
     base = profile("btc-paper", SYMBOL_BTC)
     orchestrator, store, _clock, streams = build_orchestrator(tmp_path, [base])
-    path = write_profiles(tmp_path / "profiles.json", [base])
     created = ProfileConfig(
         id="sol-paper",
         symbol="SOL/USDT",
@@ -1726,7 +1751,7 @@ def test_add_profile_starts_it_and_rewrites_the_document(tmp_path: Path) -> None
 
     async def scenario() -> Any:
         await orchestrator.run_once()
-        return await orchestrator.add_profile(created, profiles_path=path)
+        return await orchestrator.add_profile(created)
 
     snapshot = run(scenario())
     assert snapshot.profile_id == "sol-paper"
@@ -1739,34 +1764,36 @@ def test_add_profile_starts_it_and_rewrites_the_document(tmp_path: Path) -> None
     assert orchestrator.runner("sol-paper") is not None
     assert orchestrator.profile_config("sol-paper") is created
     assert orchestrator.profile_ids() == ["btc-paper", "sol-paper"]
-    assert [item.id for item in load_profiles(path)] == ["btc-paper", "sol-paper"]
+    # The store is the source of truth: the new profile is readable from it at once.
     assert [item.id for item in store.load_profiles()] == ["btc-paper", "sol-paper"]
     assert orchestrator.control_state()["profiles"] == [
         {"profile_id": "btc-paper", "paused": False, "running": True},
         {"profile_id": "sol-paper", "paused": False, "running": True},
     ]
     with pytest.raises(ProfileError) as excinfo:
-        run(orchestrator.add_profile(created, profiles_path=path))
+        run(orchestrator.add_profile(created))
     assert str(excinfo.value) == "profile already exists: 'sol-paper'"
-    assert [item.id for item in load_profiles(path)] == ["btc-paper", "sol-paper"]
+    assert [item.id for item in store.load_profiles()] == ["btc-paper", "sol-paper"]
     store.close()
 
 
-def test_add_profile_reports_a_document_it_cannot_write(tmp_path: Path) -> None:
-    """A write failure aborts the creation with the registry exactly as it was."""
+def test_add_profile_leaves_the_registry_untouched_when_the_store_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed store write aborts the creation with the registry exactly as it was."""
     base = profile("btc-paper", SYMBOL_BTC)
     orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, [base])
     run(orchestrator.run_once())
-    with pytest.raises(ConfigError, match="not found"):
-        run(
-            orchestrator.add_profile(
-                ProfileConfig(id="sol-paper", symbol="SOL/USDT"),
-                profiles_path=tmp_path / "missing.json",
-            )
-        )
+
+    def explode(_spec: ProfileConfig) -> None:
+        raise StateStoreError("state store write failed (save_profile): disk is full")
+
+    monkeypatch.setattr(store, "save_profile", explode)
+    with pytest.raises(StateStoreError, match="disk is full"):
+        run(orchestrator.add_profile(ProfileConfig(id="sol-paper", symbol="SOL/USDT")))
     assert orchestrator.profile_ids() == ["btc-paper"]
     assert orchestrator.profile_config("sol-paper") is None
-    assert [item.id for item in store.load_profiles()] == ["btc-paper"]
+    assert orchestrator.runner("sol-paper") is None
     store.close()
 
 
@@ -1774,15 +1801,10 @@ def test_add_profile_requires_a_running_engine(tmp_path: Path) -> None:
     """A profile cannot be appended to a platform that never prepared its wiring."""
     base = profile("btc-paper", SYMBOL_BTC)
     orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, [base])
-    path = write_profiles(tmp_path / "profiles.json", [base])
     with pytest.raises(ProfileError) as excinfo:
-        run(
-            orchestrator.add_profile(
-                ProfileConfig(id="sol-paper", symbol="SOL/USDT"), profiles_path=path
-            )
-        )
+        run(orchestrator.add_profile(ProfileConfig(id="sol-paper", symbol="SOL/USDT")))
     assert str(excinfo.value) == "the engine is not running"
-    assert [item.id for item in load_profiles(path)] == ["btc-paper"]
+    assert orchestrator.profile_ids() == ["btc-paper"]
     store.close()
 
 
@@ -1790,12 +1812,11 @@ def test_delete_profile_stops_only_the_deleted_profile(tmp_path: Path) -> None:
     """One profile leaves the platform; its neighbours keep running and ticking."""
     profiles = [profile("btc-paper", SYMBOL_BTC), profile("eth-paper", SYMBOL_ETH)]
     orchestrator, store, _clock, streams = build_orchestrator(tmp_path, profiles)
-    path = write_profiles(tmp_path / "profiles.json", profiles)
 
     async def scenario() -> Any:
         await orchestrator.start()
         await asyncio.sleep(_SETTLE)
-        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        removed = await orchestrator.delete_profile("btc-paper")
         state = orchestrator.control_state()
         surviving = orchestrator._tasks.get("eth-paper")
         assert surviving is not None
@@ -1816,7 +1837,7 @@ def test_delete_profile_stops_only_the_deleted_profile(tmp_path: Path) -> None:
     assert alive is True
     assert after >= before >= 1  # the survivor kept polling its stream
     assert statuses == (ProfileStatus.RUNNING, ProfileStatus.STOPPED)
-    assert [item.id for item in load_profiles(path)] == ["eth-paper"]
+    assert [item.id for item in store.load_profiles()] == ["eth-paper"]
     store.close()
 
 
@@ -1863,14 +1884,13 @@ def test_delete_profile_cancels_the_working_orders_before_it_flattens(
     orchestrator, store, _clock, _streams = build_orchestrator(
         tmp_path, profiles, broker_factory=venues
     )
-    path = write_profiles(tmp_path / "profiles.json", profiles)
 
     async def scenario() -> Any:
         await orchestrator.run_once()
         runner = orchestrator.runner("btc-paper")
         assert runner is not None
         working = runner.gateway.open_orders()
-        removed = await orchestrator.delete_profile("btc-paper", profiles_path=path)
+        removed = await orchestrator.delete_profile("btc-paper")
         return working, runner.gateway.open_orders(), removed
 
     working, still_working, removed = run(scenario())
@@ -1880,5 +1900,5 @@ def test_delete_profile_cancels_the_working_orders_before_it_flattens(
     assert working[0].state is OrderState.PARTIALLY_FILLED
     assert still_working == []
     assert store.list_positions("btc-paper") == []
-    assert [item.id for item in load_profiles(path)] == ["eth-paper"]
+    assert [item.id for item in store.load_profiles()] == ["eth-paper"]
     store.close()

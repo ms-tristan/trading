@@ -110,10 +110,9 @@ from trading_platform.config import (
     ProfileConfig,
     RealtimeConfig,
     default_realtime_config,
+    load_bootstrap_realtime_config,
     load_config,
     load_monitoring_config,
-    load_profiles,
-    load_realtime_config,
 )
 from trading_platform.core.constants import OHLCV_INDEX_NAME, SUPPORTED_TIMEFRAMES, UTC
 from trading_platform.core.errors import (
@@ -1453,7 +1452,11 @@ _SEASONAL_WINDOW_HELP = (
 )
 _MODEL_ID_HELP = "Checkpoint of a model-backed backend, e.g. google/timesfm-2.5-200m-pytorch."
 _ARTIFACT_HELP = "Forecast artifact parquet written by 'trading forecast-build'."
-_PROFILES_PATH_HELP = "Path to the JSON profiles file (profiles + realtime + monitoring)."
+_PROFILES_PATH_HELP = (
+    "Path to the SQLite state database the profile is read from; "
+    "the state store is the single source of truth for the profiles "
+    "(default: TB_REALTIME_STATE_DB or data/realtime/state.db)."
+)
 
 
 def _backend_extra_hint(name: str) -> str:
@@ -1631,9 +1634,11 @@ def forecast_build(
 
 @app.command("forecast-bootstrap")
 def forecast_bootstrap(
-    profiles: Path = typer.Option(..., "--profiles", help=_PROFILES_PATH_HELP),
+    state_db: Path | None = typer.Option(
+        None, "--state-db", "--profiles", help=_PROFILES_PATH_HELP
+    ),
     profile: str | None = typer.Option(
-        None, "--profile", help="Profile id to bootstrap (default: the first declared profile)."
+        None, "--profile", help="Profile id to bootstrap (default: the first stored profile)."
     ),
     config: Path = typer.Option(
         "config/backtest_default.json", "--config", "-c", help=_CONFIG_HELP
@@ -1666,8 +1671,9 @@ def forecast_bootstrap(
 
         ensure_forecast_backends()
         cfg = load_config(config)
+        resolved_profile = _profile_from_store(_resolve_state_db(state_db), profile)
         artifact, metadata = bootstrap_profile_forecast(
-            Path(profiles), profile, config=cfg, backend=backend
+            resolved_profile, config=cfg, backend=backend
         )
         store = ForecastStore.load(artifact)
         origins = store.origins()
@@ -1757,13 +1763,14 @@ def forecast_info(
             "makes the answer deterministic."
         ),
     ),
-    profiles: Path | None = typer.Option(
+    state_db: Path | None = typer.Option(
         None,
+        "--state-db",
         "--profiles",
-        help="Profiles file the artifact must feed (enables the per-profile guard).",
+        help="State database the artifact must feed (enables the per-profile guard).",
     ),
     profile: str | None = typer.Option(
-        None, "--profile", help="Profile id inside --profiles (default: the first one)."
+        None, "--profile", help="Profile id inside --state-db (default: the first one)."
     ),
     timeframe: str | None = typer.Option(
         None, "--timeframe", help="Override the timeframe the coverage is measured on."
@@ -1778,7 +1785,7 @@ def forecast_info(
     The metadata is still printed verbatim in ``run``, and ``run['coverage']``
     adds the operational verdict: the covered window (``first_origin``,
     ``last_origin``, ``usable_until``), the seasonal period actually in force and
-    the ``usable`` flag.  Without ``--profiles`` the command only *reports*, it
+    the ``usable`` flag.  Without ``--state-db`` the command only *reports*, it
     never fails on staleness; pointing it at a real profile turns it into a
     pre-flight of that profile, and a symbol/timeframe/coverage failure then
     raises the very same refusal message the realtime startup guard raises, so
@@ -1807,18 +1814,23 @@ def forecast_info(
             checked_at = pd.Timestamp.now(tz=UTC)
 
         resolved_profile: ProfileConfig | None = None
-        if profiles is not None or profile is not None:
-            if profiles is None:
-                raise ConfigError("--profile requires --profiles")
-            declared = load_profiles(Path(profiles))
+        if state_db is not None or profile is not None:
+            if state_db is None:
+                raise ConfigError("--profile requires --state-db")
+            declared = _read_profile_store(_resolve_state_db(state_db))
             if profile is None:
+                if not declared:
+                    raise ConfigError(
+                        f"the state database {state_db} declares no profile: "
+                        "create one through the dashboard"
+                    )
                 resolved_profile = declared[0]
             else:
                 matches = [entry for entry in declared if entry.id == profile]
                 if not matches:
-                    known = ", ".join(sorted(entry.id for entry in declared))
+                    known = ", ".join(sorted(entry.id for entry in declared)) or "<none>"
                     raise ConfigError(
-                        f"profile {profile!r} is not declared by {profiles} (known ids: {known})"
+                        f"profile {profile!r} is not declared by {state_db} (known ids: {known})"
                     )
                 resolved_profile = matches[0]
 
@@ -1886,10 +1898,42 @@ LIVE_TRADING_ENV = "TB_ALLOW_LIVE_TRADING"
 #: The exact value :data:`LIVE_TRADING_ENV` must carry to arm live trading.
 LIVE_TRADING_VALUE = "I_UNDERSTAND_THE_RISK"
 
-_PROFILES_HELP = "Path to the JSON profiles file (profiles + realtime + monitoring)."
+_STATE_DB_HELP = (
+    "Path to the SQLite state database, holding the profiles and the engine settings "
+    "and therefore the single source of truth (the historical --profiles name is kept "
+    "as an alias; default: TB_REALTIME_STATE_DB or data/realtime/state.db)."
+)
+_LOGS_DIR_HELP = (
+    "Directory of the durable JSON logs (default: TB_REALTIME_LOGS_DIR or data/realtime/logs)."
+)
+_CSV_DIR_HELP = "Offline candle directory polled instead of the venue (default: none)."
+_NO_NETWORK_HELP = "Refuse every network call of the market-stream factory."
 _HOST_HELP = "Monitoring bind host (default: monitoring.host)."
 _PORT_HELP = "Monitoring port; 0 binds an ephemeral port (default: monitoring.port)."
 _ONCE_HELP = "Run ONE deterministic engine tick over the polled candles and exit."
+
+
+def _resolve_state_db(state_db: Path | None) -> Path:
+    """Resolve the state-database bootstrap key: option, else environment, else default.
+
+    ``--state-db`` (historical alias ``--profiles``/``-p``) is the *bootstrap* key
+    that locates the SQLite state database, which is the single source of truth for
+    the profiles and the engine settings.  The path of the database cannot live
+    inside the database it locates, so it keeps a small outside surface, and that
+    surface is entirely optional: an omitted option falls back to
+    ``TB_REALTIME_STATE_DB`` and then to the model default
+    (``data/realtime/state.db``), so a host that customises nothing launches with no
+    argument at all.
+    """
+    from trading_platform.config.loader import STATE_DB_ENV
+
+    if state_db is not None:
+        return Path(state_db)
+    from_env = os.environ.get(STATE_DB_ENV)
+    if from_env:
+        return Path(from_env)
+    return Path(RealtimeConfig().state_db)
+
 
 #: Credential variable names quoted by the pre-flight messages (never their values).
 _CREDENTIAL_HELP = "set TB_LIVE_API_KEY/TB_LIVE_API_SECRET or TB_PROFILE_<ID>_API_KEY/_API_SECRET"
@@ -1902,7 +1946,7 @@ def _print_realtime_human(payload: Mapping[str, Any]) -> None:
     """Print the rich summary of a realtime payload (``realtime run|serve|check``)."""
     command = str(payload.get("command") or "")
     console.print(f"[bold]{command}[/bold]", highlight=False)
-    for key in ("config_path", "state_db", "state_db_writable", "kill_switch", "url"):
+    for key in ("state_db", "state_db_writable", "kill_switch", "url"):
         if key in payload and payload[key] is not None:
             console.print(f"  {key}: {_format_value(payload[key])}", highlight=False)
 
@@ -2019,6 +2063,153 @@ def _realtime_store(realtime: RealtimeConfig, clock: Any) -> Any:
     from trading_platform.realtime.store import SqliteStateStore
 
     return SqliteStateStore(Path(realtime.state_db), clock=clock)
+
+
+def _open_state_store(state_db: Path) -> Any:
+    """Open an initialized state store over ``state_db`` (its single writer lock taken).
+
+    The profile set lives in the state store, so every command that needs a profile
+    -- not only the realtime ones -- opens it the same way: build the clock from the
+    bootstrap, build the store, initialize it.  The caller owns the store and must
+    close it.
+    """
+    from trading_platform.realtime.clock import SystemClock
+    from trading_platform.realtime.store import SqliteStateStore
+
+    store = SqliteStateStore(Path(state_db), clock=SystemClock())
+    store.initialize()
+    return store
+
+
+def _read_profile_store(state_db: Path) -> list[ProfileConfig]:
+    """Return every profile the state database holds, and close the store.
+
+    A database path that does not exist yet is a legal empty platform, not an
+    error: the store creates it, finds nothing and answers ``[]``.  Only a real
+    storage failure (an unusable path, a database written by a newer build)
+    propagates, as a :class:`~trading_platform.core.errors.StateStoreError`.
+    """
+    store = _open_state_store(state_db)
+    try:
+        return list(store.load_profiles())
+    finally:
+        store.close()
+
+
+def _profile_from_store(state_db: Path, profile_id: str | None) -> ProfileConfig:
+    """Return one profile of the state database, or the first stored one.
+
+    Parameters
+    ----------
+    state_db:
+        Path of the SQLite state database.
+    profile_id:
+        Identifier to look for, or ``None`` for the first stored profile.
+
+    Raises
+    ------
+    ForecastError
+        The store holds no profile at all, or none carries ``profile_id``.
+    """
+    declared = _read_profile_store(state_db)
+    if profile_id is None:
+        if not declared:
+            raise ForecastError(
+                f"the state database {state_db} declares no profile: "
+                "create one through the dashboard"
+            )
+        return declared[0]
+    matches = [entry for entry in declared if str(entry.id) == profile_id]
+    if not matches:
+        known = ", ".join(sorted(str(entry.id) for entry in declared)) or "<none>"
+        raise ForecastError(
+            f"profile {profile_id!r} is not declared by {state_db} (known ids: {known})"
+        )
+    return matches[0]
+
+
+def _realtime_settings(
+    state_db: Path,
+    logs_dir: Path | None,
+    *,
+    csv_dir: Path | None,
+    allow_network: bool,
+    host: str | None,
+    port: int | None,
+) -> Any:
+    """Resolve the engine settings of one realtime invocation, from SQLite.
+
+    This is the whole settings flow of every realtime command, in one place:
+
+    1. :func:`load_bootstrap_realtime_config` resolves the *bootstrap* surface --
+       only ``state_db``/``logs_dir`` are authoritative there, because the path of
+       the database cannot live inside the database it locates;
+    2. the state store is opened (which takes the single-writer lock);
+    3. the settings are **seeded on the first boot, read on every later one**
+       (:func:`~trading_platform.realtime.settings.settings_from_store`);
+    4. the remaining bootstrap fields are rebuilt from the store's answer, the
+       bootstrap winning only for ``state_db``/``logs_dir`` -- so an explicit
+       ``--state-db``/``--logs-dir`` (or their environment variable) always wins,
+       as it must;
+    5. the store is closed again; the boot opens it once more, as its owner.
+
+    ``--host``/``--port`` override ``monitoring.host``/``monitoring.port`` for that
+    invocation **only**, and are never written back to the store: they are a
+    per-invocation decision, exactly like the documented behaviour they replace.
+    """
+    from trading_platform.realtime.settings import (
+        PlatformSettings,
+        settings_from_store,
+    )
+
+    bootstrap = load_bootstrap_realtime_config(
+        state_db=state_db,
+        logs_dir=logs_dir,
+        csv_dir=csv_dir,
+        allow_network=False if not allow_network else None,
+    )
+    # Only the options the operator actually passed override the monitoring
+    # section: an absent ``--host``/``--port`` must keep the model default (or the
+    # stored value) instead of writing an explicit ``None`` into the payload.
+    monitoring_overrides: dict[str, Any] = {}
+    if host is not None:
+        monitoring_overrides["host"] = host
+    if port is not None:
+        monitoring_overrides["port"] = port
+    monitoring = load_monitoring_config(None, monitoring_overrides or None)
+    clock = _realtime_clock(bootstrap)
+    store = _realtime_store(bootstrap, clock)
+    try:
+        store.initialize()
+        seed = PlatformSettings.from_defaults()
+        seed = PlatformSettings(
+            realtime=_merge_bootstrap(seed.realtime, bootstrap),
+            monitoring=monitoring,
+        )
+        resolved = settings_from_store(store, bootstrap=seed)
+    finally:
+        store.close()
+    if monitoring_overrides:
+        # ``--host``/``--port`` are the documented per-invocation overrides: they
+        # apply to *this* command and are never written back, so they are re-applied
+        # over what the store answered rather than merged into the seed.
+        resolved = PlatformSettings(
+            realtime=resolved.realtime,
+            monitoring=resolved.monitoring.model_copy(update=monitoring_overrides),
+        )
+    return resolved
+
+
+def _merge_bootstrap(defaults: RealtimeConfig, bootstrap: RealtimeConfig) -> RealtimeConfig:
+    """Return the bootstrap surface applied over the model defaults.
+
+    Only the keys the bootstrap *explicitly* carries are taken from it: a keyword
+    the caller did not pass keeps the model default, so seeding a brand-new state
+    database reproduces exactly what a host that customises nothing runs with.
+    """
+    return RealtimeConfig.model_validate(
+        {**defaults.model_dump(mode="json"), **bootstrap.model_dump(mode="json")}
+    )
 
 
 def _realtime_monitor(store: Any, *, clock: Any, realtime: RealtimeConfig) -> Any:
@@ -2171,10 +2362,10 @@ async def _engine_until_stopped(
 def _realtime_catalog_venue(profiles: Sequence[ProfileConfig]) -> tuple[str, str]:
     """Return the ``(exchange, quote)`` pair the catalog must describe.
 
-    The profiles document is the only configuration a realtime command loads, so
-    the venue is read from the profiles themselves: the exchange of the first
-    profile whose symbol carries a quote currency, and that quote.  A document
-    with no such profile falls back on the platform-wide defaults of
+    The profile set of a realtime command comes from the state store, so the venue
+    is read from the profiles themselves: the exchange of the first profile whose
+    symbol carries a quote currency, and that quote.  A platform with no such
+    profile falls back on the platform-wide defaults of
     :class:`~trading_platform.config.models.ExchangeConfig`.
     """
     from trading_platform.config.models import ExchangeConfig
@@ -2213,7 +2404,6 @@ def _realtime_engine(
     *,
     clock: Any,
     store: Any,
-    profiles_path: Path,
     host: str | None,
     port: int | None,
     json_output: bool,
@@ -2225,16 +2415,16 @@ def _realtime_engine(
     payload is emitted, and the exit code stays ``0``.
 
     Two seams travel to the web layer: the market catalog (the pickers) and the
-    runtime controller (pause/resume/delete/create).  The controller rewrites
-    ``profiles_path`` -- the on-disk source of truth -- and is bound to the engine
-    loop by :func:`_engine_until_stopped`.
+    runtime controller (pause/resume/delete/create).  The controller mutates the
+    SQLite state store -- the source of truth -- through the orchestrator and is
+    bound to the engine loop by :func:`_engine_until_stopped`.
     """
     from trading_platform.realtime.control import RuntimeProfileController
     from trading_platform.web.server import create_server, start_in_thread
 
     orchestrator = _realtime_orchestrator(profiles, realtime, monitoring, clock=clock, store=store)
     catalog = _realtime_catalog(profiles, realtime)
-    controller = RuntimeProfileController(orchestrator=orchestrator, profiles_path=profiles_path)
+    controller = RuntimeProfileController(orchestrator=orchestrator)
     server = create_server(
         orchestrator,
         monitor=_realtime_monitor(store, clock=clock, realtime=realtime),
@@ -2333,9 +2523,8 @@ def _realtime_profile_entry(
 
 
 def _realtime_check_payload(
-    path: Path,
+    state_db: str | Path,
     *,
-    realtime: RealtimeConfig,
     entries: Sequence[Mapping[str, Any]],
     issues: Sequence[str],
     writable: bool,
@@ -2344,21 +2533,21 @@ def _realtime_check_payload(
     """Assemble the documented ``realtime-check`` payload.
 
     ``issues`` is the **platform-level** counterpart of the per-profile ``issues``
-    list (an unreadable document, an unwritable state directory): the documented
-    keys are always present, and that eighth key never carries a profile finding.
+    list (an unwritable state directory, a profile that cannot start): the
+    documented keys are always present, and that key never carries a profile
+    finding.
+
+    ``ok`` is ``False`` **only on a real finding**.  A platform with zero profiles
+    is a legal platform -- the state store is the source of truth and the operator
+    creates profiles from the dashboard -- so an empty ``profiles`` list answers
+    ``ok: true``.
     """
     profile_entries = [dict(entry) for entry in entries]
-    ok = (
-        bool(profile_entries)
-        and not issues
-        and writable
-        and all(bool(entry["ok"]) for entry in profile_entries)
-    )
+    ok = not issues and writable and all(bool(entry["ok"]) for entry in profile_entries)
     return {
         "command": "realtime-check",
         "ok": ok,
-        "config_path": str(path),
-        "state_db": str(realtime.state_db),
+        "state_db": str(state_db),
         "state_db_writable": bool(writable),
         "kill_switch": bool(kill_switch),
         "profiles": profile_entries,
@@ -2366,32 +2555,75 @@ def _realtime_check_payload(
     }
 
 
-def _realtime_preflight(path: Path) -> dict[str, Any]:
-    """Run the static pre-flight of a profiles document (offline, order-free)."""
+def _realtime_preflight(
+    state_db: Path,
+    logs_dir: Path | None,
+    *,
+    csv_dir: Path | None,
+    allow_network: bool,
+) -> dict[str, Any]:
+    """Run the static pre-flight of a platform (offline, order-free).
+
+    The profile set and the engine settings come from the SQLite state store; the
+    documented ``--state-db``/``--logs-dir`` (and their environment variables) are
+    the bootstrap surface, since the path of the database cannot live inside the
+    database it locates.
+    """
     from trading_platform.realtime.risk import KillSwitch, LiveTradingGate
 
-    profiles = load_profiles(path)
-    realtime = load_realtime_config(path)
-    load_monitoring_config(path)
+    issues: list[str] = []
+    profiles: list[ProfileConfig] = []
+    settings: Any = None
+
+    # The writability of the state directory is probed FIRST and without ever
+    # touching the database: an unwritable location is the finding an operator on a
+    # container with a missing volume actually hits, and it must be reported even
+    # when the store itself cannot be opened there.
+    writable, problem = _state_db_writable(state_db)
+    if not writable:
+        issues.append(problem)
+    else:
+        try:
+            settings = _realtime_settings(
+                state_db,
+                logs_dir,
+                csv_dir=csv_dir,
+                allow_network=allow_network,
+                host=None,
+                port=None,
+            )
+        except TradingBacktestError as exc:
+            # An unusable state store is a pre-flight *finding*, not a crash: the
+            # operator gets the documented payload and the reason in `issues`.
+            issues.append(str(exc))
+
+    realtime = default_realtime_config() if settings is None else settings.realtime
+    clock = _realtime_clock(realtime)
+    if settings is not None:
+        store = _realtime_store(realtime, clock)
+        try:
+            store.initialize()
+            profiles = store.load_profiles()
+        except TradingBacktestError as exc:  # pragma: no cover - probed just above
+            issues.append(str(exc))
+        finally:
+            store.close()
 
     gate = LiveTradingGate(os.environ)
     entries = [
         _realtime_profile_entry(profile, environ=os.environ, gate=gate) for profile in profiles
     ]
 
-    issues: list[str] = []
-    writable, problem = _state_db_writable(Path(realtime.state_db))
-    if not writable:
-        issues.append(problem)
-
     kill_switch = KillSwitch(
-        clock=_realtime_clock(realtime),
+        clock=clock,
         flag_path=realtime.kill_switch_file,
         environ=os.environ,
     ).engaged()
     return _realtime_check_payload(
-        path,
-        realtime=realtime,
+        # The RESOLVED state database: when the store could not be opened, the
+        # option (or its environment variable) is still what the operator asked
+        # for, and reporting the built-in default instead would be a lie.
+        settings.realtime.state_db if settings is not None else state_db,
         entries=entries,
         issues=issues,
         writable=writable,
@@ -2399,11 +2631,10 @@ def _realtime_preflight(path: Path) -> dict[str, Any]:
     )
 
 
-def _realtime_check_failure(path: Path, message: str) -> dict[str, Any]:
-    """Build the documented ``realtime-check`` payload of an unreadable document."""
+def _realtime_check_failure(state_db: Path, message: str) -> dict[str, Any]:
+    """Build the documented ``realtime-check`` payload of an unusable state store."""
     return _realtime_check_payload(
-        path,
-        realtime=default_realtime_config(),
+        state_db,
         entries=(),
         issues=[message],
         writable=False,
@@ -2413,31 +2644,56 @@ def _realtime_check_failure(path: Path, message: str) -> dict[str, Any]:
 
 @realtime_app.command("check")
 def realtime_check(
-    profiles: Path = typer.Option(..., "--profiles", "-p", help=_PROFILES_HELP),
+    state_db: Path | None = typer.Option(
+        None, "--state-db", "--profiles", "-p", help=_STATE_DB_HELP
+    ),
+    logs_dir: Path | None = typer.Option(None, "--logs-dir", help=_LOGS_DIR_HELP),
+    csv_dir: Path | None = typer.Option(None, "--csv-dir", help=_CSV_DIR_HELP),
+    no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
-    """Static pre-flight of a profiles file; exit 1 when a profile cannot start."""
+    """Static pre-flight of the platform; exit 1 when a profile cannot start.
+
+    Zero profiles is a legal platform: the command exits ``0`` with an empty
+    ``profiles`` list and no issue, because the SQLite state store is the source of
+    truth and the operator creates profiles from the dashboard.
+    """
     with _error_surface("realtime-check", json_output=json_output):
-        path = Path(profiles)
+        resolved = _resolve_state_db(state_db)
         try:
-            payload = _realtime_preflight(path)
-        except ConfigError as exc:
-            # An unreadable/invalid document is a pre-flight *finding*, not a crash:
-            # it is reported through the documented check payload and its `issues`
-            # list, and the reason is echoed on stderr exactly like `_error_surface`
-            # would (there is no per-profile entry to carry it).
-            payload = _realtime_check_failure(path, str(exc))
+            payload = _realtime_preflight(
+                resolved,
+                logs_dir,
+                csv_dir=csv_dir,
+                allow_network=not no_network,
+            )
+        except TradingBacktestError as exc:
+            # An unusable state store is a pre-flight *finding*, not a crash: it is
+            # reported through the documented check payload and its `issues` list,
+            # and the reason is echoed on stderr exactly like `_error_surface` would
+            # (there is no per-profile entry to carry it).
+            payload = _realtime_check_failure(resolved, str(exc))
             _emit_realtime(payload, json_output=json_output)
             err_console.print(f"error: {exc}", style="red", markup=False, highlight=False)
             raise typer.Exit(code=1) from exc
         _emit_realtime(payload, json_output=json_output)
+        for issue in payload["issues"]:
+            # Every platform-level finding is echoed on stderr, exactly like
+            # `_error_surface` would: an operator reading the terminal must not
+            # have to parse the JSON to learn what went wrong.
+            err_console.print(f"error: {issue}", style="red", markup=False, highlight=False)
         if not payload["ok"]:
             raise typer.Exit(code=1)
 
 
 @realtime_app.command("run")
 def realtime_run(
-    profiles: Path = typer.Option(..., "--profiles", "-p", help=_PROFILES_HELP),
+    state_db: Path | None = typer.Option(
+        None, "--state-db", "--profiles", "-p", help=_STATE_DB_HELP
+    ),
+    logs_dir: Path | None = typer.Option(None, "--logs-dir", help=_LOGS_DIR_HELP),
+    csv_dir: Path | None = typer.Option(None, "--csv-dir", help=_CSV_DIR_HELP),
+    no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
     host: str | None = typer.Option(None, "--host", help=_HOST_HELP),
     port: int | None = typer.Option(None, "--port", help=_PORT_HELP),
     once: bool = typer.Option(False, "--once", help=_ONCE_HELP),
@@ -2446,16 +2702,25 @@ def realtime_run(
     """Run N concurrent profiles in real time, with the monitoring dashboard.
 
     ``--once`` executes a single deterministic tick over the polled candles,
-    persists the state and exits without starting any HTTP server.
+    persists the state and exits without starting any HTTP server.  Zero profiles
+    is a legal platform: ``--once`` then exits ``0`` with ``decisions: []``.
     """
     with _error_surface("realtime-run", json_output=json_output):
-        path = Path(profiles)
-        engine_profiles = load_profiles(path)
-        realtime = load_realtime_config(path)
-        monitoring = load_monitoring_config(path)
+        settings = _realtime_settings(
+            _resolve_state_db(state_db),
+            logs_dir,
+            csv_dir=csv_dir,
+            allow_network=not no_network,
+            host=host,
+            port=port,
+        )
+        realtime = settings.realtime
+        monitoring = settings.monitoring
         _realtime_logging(realtime)
         clock = _realtime_clock(realtime)
         store = _realtime_store(realtime, clock)
+        store.initialize()
+        engine_profiles = store.load_profiles()
 
         url: str | None = None
         if once:
@@ -2470,7 +2735,6 @@ def realtime_run(
                 monitoring,
                 clock=clock,
                 store=store,
-                profiles_path=path,
                 host=host,
                 port=port,
                 json_output=json_output,
@@ -2479,7 +2743,6 @@ def realtime_run(
             {
                 "command": "realtime-run",
                 "ok": True,
-                "config_path": str(path),
                 "state_db": str(realtime.state_db),
                 "profiles": snapshots,
                 "decisions": decisions,
@@ -2491,24 +2754,41 @@ def realtime_run(
 
 @realtime_app.command("serve")
 def realtime_serve(
-    profiles: Path = typer.Option(..., "--profiles", "-p", help=_PROFILES_HELP),
+    state_db: Path | None = typer.Option(
+        None, "--state-db", "--profiles", "-p", help=_STATE_DB_HELP
+    ),
+    logs_dir: Path | None = typer.Option(None, "--logs-dir", help=_LOGS_DIR_HELP),
+    csv_dir: Path | None = typer.Option(None, "--csv-dir", help=_CSV_DIR_HELP),
+    no_network: bool = typer.Option(False, "--no-network", help=_NO_NETWORK_HELP),
     host: str | None = typer.Option(None, "--host", help=_HOST_HELP),
     port: int | None = typer.Option(None, "--port", help=_PORT_HELP),
     json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
-    """Serve the monitoring JSON API read-only over the persisted state; no engine runs."""
+    """Serve the monitoring JSON API read-only over the persisted state; no engine runs.
+
+    Zero profiles is a legal platform: ``GET /api/profiles`` answers ``[]`` and
+    ``POST /api/profiles`` is refused only because this server is read-only -- run
+    ``realtime run`` to create one.
+    """
     from trading_platform.realtime.clock import SystemClock
     from trading_platform.web.server import create_server, serve
 
     with _error_surface("realtime-serve", json_output=json_output):
-        path = Path(profiles)
-        engine_profiles = load_profiles(path)
-        realtime = load_realtime_config(path)
-        monitoring = load_monitoring_config(path)
+        settings = _realtime_settings(
+            _resolve_state_db(state_db),
+            logs_dir,
+            csv_dir=csv_dir,
+            allow_network=not no_network,
+            host=host,
+            port=port,
+        )
+        realtime = settings.realtime
+        monitoring = settings.monitoring
         _realtime_logging(realtime)
         clock = SystemClock()
         store = _realtime_store(realtime, clock)
         store.initialize()
+        engine_profiles = store.load_profiles()
         snapshots: list[dict[str, Any]] = []
         url = ""
         try:
@@ -2539,7 +2819,6 @@ def realtime_serve(
             {
                 "command": "realtime-serve",
                 "ok": True,
-                "config_path": str(path),
                 "state_db": str(realtime.state_db),
                 "profiles": snapshots,
                 "url": url,
@@ -2563,14 +2842,31 @@ class _PersistedSnapshotProvider:
 
     def __init__(self, store: Any, *, clock: Any, realtime: RealtimeConfig) -> None:
         from trading_platform.realtime.risk import KillSwitch
+        from trading_platform.realtime.settings import (
+            PlatformSettings,
+            settings_from_store,
+        )
 
         self._store = store
         self._clock = clock
-        self.monitor = _realtime_monitor(store, clock=clock, realtime=realtime)
+        # ``realtime serve`` must report the settings the state store *holds*, not
+        # the bootstrap the command was launched with: the store is the single
+        # source of truth for the engine settings, exactly as it is for the
+        # profiles.  The read is idempotent -- the command already seeded the store
+        # -- so it simply adopts what is persisted.
+        resolved = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=realtime,
+                monitoring=MonitoringConfig(),
+            ),
+        )
+        self.settings = resolved
+        self.monitor = _realtime_monitor(store, clock=clock, realtime=resolved.realtime)
         self._kill_switch = KillSwitch(
             store,
             clock=clock,
-            flag_path=realtime.kill_switch_file,
+            flag_path=resolved.realtime.kill_switch_file,
             environ=os.environ,
         )
 
@@ -2709,6 +3005,18 @@ class _PersistedSnapshotProvider:
             "checked_at": self._clock.now().isoformat(),
             "wallet": None if wallet is None else wallet.to_dict(),
         }
+
+    def orphan_report(self) -> Any:
+        """Return the report of the last orphan sweep, or ``None``.
+
+        ``realtime serve`` runs no engine, so the warning comes from the store:
+        the report the **last boot** persisted is what the operator sees.  ``None``
+        means the platform was never swept, which the API renders as an explicit
+        ``null``.
+        """
+        from trading_platform.realtime.orphans import load_orphan_report
+
+        return load_orphan_report(self._store)
 
     def candle_series(self, profile_id: str, limit: int) -> list[CandleRow]:
         """Return the persisted candles of one profile, oldest first.

@@ -266,6 +266,7 @@ def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
         "candle_series",
         "close",
         "delete_position",
+        "delete_profile",
         "equity_curve",
         "get_meta",
         "get_order",
@@ -281,11 +282,13 @@ def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
         "load_wallet",
         "mark_acted_entry_crossing",
         "mark_candle_processed",
+        "position_profile_ids",
         "profile_state",
         "save_profile",
         "save_status",
         "save_wallet",
         "set_meta",
+        "state_path",
         "upsert_order",
         "upsert_position",
     }
@@ -1736,3 +1739,93 @@ def test_two_threads_can_write_the_wallet_through_one_store(
     row = store.load_wallet()
     assert row is not None
     assert row.cash in written
+
+
+# ---------------------------------------------------------------------------
+# 12. the store seam: the backing file, and the frozen schema version
+# ---------------------------------------------------------------------------
+
+
+def test_state_path_answers_the_database_file(store: SqliteStateStore, db_path: Path) -> None:
+    """The store names the file it persists into, before and after ``initialize``."""
+    assert store.state_path() == db_path
+    assert store.state_path() == store.path
+
+
+def test_state_path_is_part_of_the_protocol() -> None:
+    """``StateStore`` declares ``state_path``: a caller never has to guess the type."""
+    assert hasattr(StateStore, "state_path")
+    assert "state_path" in dir(StateStore)
+
+
+def test_state_path_is_available_on_an_uninitialized_store(db_path: Path) -> None:
+    """Resolving the bootstrap surface must not require opening the store first."""
+    unopened = SqliteStateStore(db_path)
+    assert unopened.state_path() == db_path
+    assert unopened.is_initialized() is False
+
+
+def test_a_store_without_a_file_answers_none() -> None:
+    """The protocol's documented answer for a store that has no file of its own."""
+
+    class InMemoryStore:
+        """The smallest possible ``StateStore`` double: it has no backing file."""
+
+        def state_path(self) -> Path | None:
+            return None
+
+    assert InMemoryStore().state_path() is None
+
+
+def test_the_schema_version_is_still_three() -> None:
+    """The settings work added no table and no column: the schema did not move."""
+    assert SCHEMA_VERSION == 3
+
+
+def test_a_version_three_database_opens_with_no_migration(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """A database written before the settings change reopens untouched.
+
+    The settings live in the existing ``meta`` table, so a version-3 database
+    written by the previous build must gain no object, lose no row and keep its
+    stored version: the regression pinned here is that this change is *additive to
+    nothing at all*.
+    """
+    first = SqliteStateStore(db_path, clock=clock)
+    first.initialize()
+    first.save_profile(make_profile("btc-paper"))
+    first.upsert_position(make_position())
+    first.save_wallet(cash=9_000.0, initial_balance=10_000.0)
+    first.set_meta("entry_crossing:btc-paper", stamp(4).isoformat())
+    first.close()
+
+    before = table_snapshot(db_path)
+    tables_before = _table_names(db_path)
+    with raw_connection(db_path) as conn:
+        versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
+    assert versions == [3]
+
+    reopened = SqliteStateStore(db_path, clock=clock)
+    reopened.initialize()
+    try:
+        # nothing gained, nothing lost
+        assert _table_names(db_path) == tables_before
+        assert table_snapshot(db_path) == before
+        with raw_connection(db_path) as conn:
+            versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
+        assert versions == [3]
+        # and every row still decodes with the meaning it had before
+        assert [item.id for item in reopened.load_profiles()] == ["btc-paper"]
+        assert reopened.get_position("btc-paper", "BTC/USDT") is not None
+        wallet = reopened.load_wallet()
+        assert wallet is not None
+        assert wallet.cash == pytest.approx(9_000.0)
+        assert reopened.get_meta("entry_crossing:btc-paper") == stamp(4).isoformat()
+    finally:
+        reopened.close()
+
+
+def test_the_meta_table_is_the_only_settings_storage(store: SqliteStateStore) -> None:
+    """No dedicated settings table exists: the free-form ``meta`` table is reused."""
+    assert "settings" not in _table_names(store.state_path())  # type: ignore[arg-type]

@@ -231,6 +231,10 @@ class FakeStore:
     def load_profiles(self) -> list[ProfileConfig]:
         return list(self.profiles)
 
+    def state_path(self) -> Path | None:
+        """Answer ``None``: an in-memory double has no database file of its own."""
+        return None
+
     def profile_state(self, profile_id: str) -> ProfileState:
         if self.state is not None:
             return self.state
