@@ -59,6 +59,10 @@ from trading_platform.web import routes as web_routes
 from trading_platform.web.routes import (
     CANDLE_ROUTE_DEFAULT_LIMIT,
     CANDLE_ROUTE_MAX_LIMIT,
+    TOKEN_REASON_DISABLED,
+    TOKEN_REASON_INVALID,
+    TOKEN_REASON_MISSING,
+    TOKEN_REASON_VALID,
     CatalogProvider,
     HttpResponse,
     ProfileController,
@@ -2935,3 +2939,73 @@ def test_a_controller_returning_a_plain_mapping_is_rendered_as_is(
     )["profile"]
     assert isinstance(rendered, str)
     assert rendered.startswith("<object object at")
+
+
+# ---------------------------------------------------------------------------
+# operator token verification (GET /api/operator-token)
+# ---------------------------------------------------------------------------
+
+
+def test_the_token_route_confirms_a_matching_token(writable: Router) -> None:
+    """A correct token is answered 200 with an explicit ``valid: true``."""
+    response = writable.handle("GET", "/api/operator-token", headers=AUTH)
+
+    assert response.status == 200
+    assert payload_of(response) == {"valid": True, "reason": TOKEN_REASON_VALID}
+
+
+def test_the_token_route_refuses_a_mismatching_token_without_a_403(
+    writable: Router,
+) -> None:
+    """A wrong token is a successful *answer*, not a refused request.
+
+    The route exists to tell the operator which of the two failure modes they
+    are in, so it never answers ``403``: a wrong token is ``200`` with
+    ``valid: false`` and a distinct reason.
+    """
+    response = writable.handle("GET", "/api/operator-token", headers={"X-Operator-Token": "nope"})
+
+    assert response.status == 200
+    body = payload_of(response)
+    assert body["valid"] is False
+    assert body["reason"] == TOKEN_REASON_INVALID
+
+
+def test_the_token_route_reports_a_missing_token_distinctly(writable: Router) -> None:
+    """ "No token supplied" and "wrong token" must not read the same."""
+    body = payload_of(writable.handle("GET", "/api/operator-token"))
+
+    assert body["valid"] is False
+    assert body["reason"] == TOKEN_REASON_MISSING
+    assert body["reason"] != TOKEN_REASON_INVALID
+
+
+def test_the_token_route_reports_a_server_without_a_token(
+    read_only_with_controller: Router,
+) -> None:
+    """A server that cannot authorise anything says so, and flags ``read_only``."""
+    body = payload_of(read_only_with_controller.handle("GET", "/api/operator-token", headers=AUTH))
+
+    assert body["valid"] is False
+    assert body["reason"] == TOKEN_REASON_DISABLED
+    assert body["read_only"] is True
+
+
+def test_the_token_route_never_echoes_the_configured_token(writable: Router) -> None:
+    """The answer is a boolean and a fixed reason: the secret is never returned."""
+    for headers in (AUTH, {"X-Operator-Token": "nope"}, None):
+        raw = writable.handle("GET", "/api/operator-token", headers=headers).body.decode("utf-8")
+        assert TOKEN not in raw
+
+
+def test_the_token_route_answers_get_only(writable: Router) -> None:
+    """The answer depends on a request header, so a header-free HEAD is a 405."""
+    for verb in ("HEAD", "POST", "PUT", "DELETE"):
+        response = writable.handle(verb, "/api/operator-token", body=b"{}")
+        assert response.status == 405, verb
+
+
+def test_the_token_route_is_not_a_profile_route(writable: Router) -> None:
+    """A typo in the path stays a 404: the new route matches exactly."""
+    assert writable.handle("GET", "/api/operator-tokens").status == 404
+    assert writable.handle("GET", "/api/operator-token/extra").status == 404

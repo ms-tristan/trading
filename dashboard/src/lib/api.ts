@@ -32,6 +32,7 @@ import type {
   HealthPayload,
   KillSwitchPayload,
   LifecyclePayload,
+  OperatorTokenCheckPayload,
   MetricsPayload,
   OrdersPayload,
   OrphanReport,
@@ -645,6 +646,16 @@ export function isControlPayload(value: unknown): value is ControlPayload {
   );
 }
 
+/** Body of `GET /api/operator-token`. `read_only` is optional by contract. */
+export function isOperatorTokenCheckPayload(value: unknown): value is OperatorTokenCheckPayload {
+  return (
+    isRecord(value) &&
+    isBoolean(value.valid) &&
+    typeof value.reason === 'string' &&
+    (value.read_only === undefined || isBoolean(value.read_only))
+  );
+}
+
 /** Body of a successful pause or resume call. */
 export function isLifecyclePayload(value: unknown): value is LifecyclePayload {
   return isRecord(value) && isProfileSnapshot(value.profile) && isBoolean(value.paused);
@@ -816,6 +827,34 @@ export async function fetchControl(options: RequestOptions = {}): Promise<Contro
   const path = '/api/control';
   const payload = await requestJson<unknown>(path, options);
   return expectShape<ControlPayload>(payload, isControlPayload, path);
+}
+
+/**
+ * Check whether the token in `options.operatorToken` authorises mutations.
+ *
+ * `GET /api/operator-token` answers `200` whether the token is right or wrong —
+ * the payload's `valid` flag and `reason` carry the verdict — so this call
+ * resolves for a wrong token instead of throwing. That is deliberate: the
+ * caller is asking a question, and "no, it is wrong" is an answer, not an
+ * error. Only a transport failure or an unexpected shape rejects.
+ *
+ * The token is sent as the `X-Operator-Token` header, registered as the secret
+ * to scrub from any message this call may raise, and never placed in the URL.
+ */
+export async function verifyOperatorToken(
+  options: MutatingRequestOptions,
+): Promise<OperatorTokenCheckPayload> {
+  const path = '/api/operator-token';
+  const payload = await performRequest<unknown>(path, {
+    method: 'GET',
+    baseUrl: options.baseUrl,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    headers: { [OPERATOR_TOKEN_HEADER]: options.operatorToken },
+    validate: isOperatorTokenCheckPayload,
+    secret: options.operatorToken,
+  });
+  return payload as OperatorTokenCheckPayload;
 }
 
 // ---------------------------------------------------------------------------
