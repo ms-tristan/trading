@@ -845,18 +845,11 @@ class ProfileRunner:
     def _prepare(self) -> None:
         """Resolve the strategy exactly once (the single construction path).
 
-        The resolution also **injects the profile's forecast bundle**: every
-        caller of this method -- :meth:`start`, :meth:`run` and :meth:`run_once`,
-        and therefore ``realtime run``, ``realtime run --once`` and the
-        orchestrator's ``_build_runner`` -- goes through it, so a profile whose
-        artifact is missing, corrupt, built for another symbol/timeframe or too
-        stale to cover its decision horizon fails **here, at startup**, long
-        before the first candle, instead of starting and silently never trading.
-
-        Nothing else is resolved per candle: the artifact is loaded once per
-        profile, at construction, exactly like the backtest engine loads it once
-        per run.  A profile that declares no forecast keeps the exact previous
-        behaviour.
+        Every caller of this method -- :meth:`start`, :meth:`run` and
+        :meth:`run_once`, and therefore ``realtime run``, ``realtime run --once``
+        and the orchestrator's ``_build_runner`` -- goes through it, so an unknown
+        strategy name or a rejected parameter set fails **here, at startup**,
+        before the first candle, instead of starting inert.
         """
         if self._strategy is None:
             self._strategy = resolve_strategy(self._profile)

@@ -37,7 +37,6 @@
     "use_order_book": true
   },
   "fiat_display_currency": "USD",
-  "forecast": null,
   "max_open_trades": 1,
   "pairlists": [
     {

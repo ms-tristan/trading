@@ -17,8 +17,6 @@ __all__ = [
     "DataDownloadError",
     "DataError",
     "DataValidationError",
-    "ForecastArtifactError",
-    "ForecastError",
     "FreqtradeConfigError",
     "GatewayError",
     "InsufficientDataError",
@@ -78,22 +76,6 @@ class DataError(TradingBacktestError):
 
 class DataValidationError(DataError):
     """Market data violates the OHLCV contract."""
-
-
-# ---------------------------------------------------------------------------
-# Forecast layer: the offline forecasting pipeline (backend registry, the
-# trajectory contract and the versioned parquet artifacts).  ``ForecastError``
-# is the root so that ``except ForecastError`` also catches every artifact
-# problem.
-# ---------------------------------------------------------------------------
-
-
-class ForecastError(TradingBacktestError):
-    """A forecast request, backend or prediction target is invalid."""
-
-
-class ForecastArtifactError(ForecastError):
-    """A forecast artifact is missing, corrupt or incompatible."""
 
 
 class InsufficientDataError(DataError):

@@ -17,7 +17,6 @@ DOCS_DIR = REPO_ROOT / "docs"
 
 ARCHITECTURE = DOCS_DIR / "architecture.md"
 METHODOLOGY = DOCS_DIR / "backtesting-methodology.md"
-FORECASTING = DOCS_DIR / "forecasting.md"
 USAGE = DOCS_DIR / "usage.md"
 TESTING_POLICY = DOCS_DIR / "testing-policy.md"
 README = REPO_ROOT / "README.md"
@@ -31,7 +30,6 @@ FULL_PYTEST_COMMAND = (
 DOCUMENTED_PAGES = {
     "architecture": ARCHITECTURE,
     "backtesting-methodology": METHODOLOGY,
-    "forecasting": FORECASTING,
     "usage": USAGE,
     "testing-policy": TESTING_POLICY,
 }
@@ -39,7 +37,6 @@ DOCUMENTED_PAGES = {
 FROZEN_MODULES = (
     "trading_platform.config",
     "trading_platform.data",
-    "trading_platform.forecast",
     "trading_platform.strategy",
     "trading_platform.validation",
     "trading_platform.metrics",
@@ -52,9 +49,6 @@ CLI_COMMANDS = (
     "walk-forward",
     "robustness",
     "monte-carlo",
-    "forecast-build",
-    "forecast-skill",
-    "forecast-info",
 )
 
 _MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
@@ -606,93 +600,3 @@ def test_usage_documents_the_freqtrade_exposure_section() -> None:
     assert "freqtrade trade" in text
     assert "freqtrade_dryrun.json" in text
     assert "freqtrade_config.json" in text
-
-
-# ---------------------------------------------------------------------------
-# 8. The forecasting page stays complete, honest and reproducible
-# ---------------------------------------------------------------------------
-
-
-def test_forecasting_page_pins_licences_honesty_traps_and_reproduction() -> None:
-    """The forecast layer page must document the licence, the honesty and the traps.
-
-    The tokens below are the ones a reader needs in order to trust (or reject)
-    the artifact: which weights are usable commercially, what a positive PnL
-    does *not* prove (with the two primary arXiv references), the library traps
-    measured on this machine, and the offline reproduction path.
-    """
-    text = read(FORECASTING)
-
-    # --- licences: 2.5 (the default) is Apache-2.0, 3.0 is non-commercial
-    assert "Apache-2.0" in text, "docs/forecasting.md does not document the Apache-2.0 weights"
-    assert "TimesFM Non-Commercial License v1.0" in text, (
-        "docs/forecasting.md does not name the TimesFM 3.0 weight licence"
-    )
-    assert "google/timesfm-2.5-200m-pytorch" in text, (
-        "docs/forecasting.md does not name the default checkpoint"
-    )
-
-    # --- honesty: PnL is not an edge, and the 2025-26 evidence is cited
-    assert "not evidence of an edge" in text, (
-        "docs/forecasting.md must state that a positive backtest PnL is not evidence of an edge"
-    )
-    for arxiv_id in ("2606.27100", "2607.05291"):
-        assert arxiv_id in text, f"docs/forecasting.md does not cite arXiv:{arxiv_id}"
-
-    # --- measured library traps
-    assert "mutates" in text, "docs/forecasting.md does not document the input-list mutation trap"
-    assert "MPS" in text, "docs/forecasting.md does not document the unsupported MPS path"
-
-    # --- the documented, copy-pasteable, offline reproduction path
-    for token in ("forecast-build", "forecast-skill", "run_backtest_on_config"):
-        assert token in text, f"docs/forecasting.md does not document {token!r}"
-
-
-def test_forecasting_page_documents_the_realtime_injection_and_the_startup_guard() -> None:
-    """The page must document that the realtime engine now injects the bundle.
-
-    The forecast layer used to carry a **scope limit**: the artifact was consumed
-    by the backtest and the validation layers, while the realtime engine resolved
-    a profile's strategy and nothing else, so a ``timesfm`` profile started, kept
-    every diagnostic at ``NaN`` and never emitted a signal.  That limit is gone,
-    and documentation that still announces it is worse than no documentation at
-    all: it tells an operator not to look for the behaviour that now exists.
-
-    What replaces it is the delivered surface, pinned here token by token: the
-    module that owns the injection, the two public functions, the coverage object
-    the operator reads, the profile key that declares the artifact, the offline
-    bootstrap command, and the **mandatory** startup guard with the exact command
-    that rebuilds a refused artifact.
-    """
-    text = read(FORECASTING)
-
-    # --- the reversed scope limit: the stale sentence is gone, not qualified
-    assert "does not inject features yet" not in text, (
-        "docs/forecasting.md still announces the retired scope limit "
-        "('does not inject features yet'): the realtime engine does inject the bundle now"
-    )
-
-    # --- the shipped surface of the realtime injection
-    for token in (
-        "realtime.features",
-        "resolve_profile_features",
-        "check_profile_forecast",
-        "ForecastCoverage",
-        "ProfileConfig.forecast",
-        "forecast-bootstrap",
-    ):
-        assert token in text, f"docs/forecasting.md does not document {token!r}"
-
-    # --- the guard is mandatory, and its refusal is actionable
-    assert "mandatory" in text, "docs/forecasting.md must state that the startup guard is mandatory"
-    assert "trading forecast-build" in text, (
-        "docs/forecasting.md must quote the rebuild command of a refused artifact"
-    )
-    # the artifact is loaded once, at startup -- never per candle -- which is the
-    # property an operator relies on when a profile starts at all.
-    assert "loaded once per profile, at startup, never per candle" in text, (
-        "docs/forecasting.md must state that the artifact is loaded once, at startup"
-    )
-    assert "resolve_strategy" in text, (
-        "docs/forecasting.md must name the single construction path that runs the guard"
-    )
