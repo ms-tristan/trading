@@ -171,7 +171,11 @@ on both sides — and the same economic horizon wins on all three candle grids.
 **The basket is the deployment unit.** The strategy is meant to be run as an
 **equal-weight basket of many symbols**, one profile per symbol, which is what
 the realtime layer does. Running it on a single symbol is not the tested
-configuration. Holdout basket, fees 10 bp/side, long/short 4h, fast/mid/slow =
+configuration. Concretely, the basket curve is built the way an account holding
+those profiles actually behaves: each symbol's equity curve is normalised by its
+own first value and the **levels** are averaged, so the weights **drift** with
+performance and the basket is *not* rebalanced back to equal weight every candle.
+Holdout basket, fees 10 bp/side, long/short 4h, fast/mid/slow =
 7/14/28 days, `enter_score 0.6`, `exit_score 0.0`, `atr_stop_multiplier 4.0`:
 
 | | DEV (5.37 y, 67 sym) | HOLDOUT (3.66 y, 71 sym) |
@@ -436,13 +440,27 @@ adding `--risk-free-rate 0.05` to match the configuration's benchmark setting.
 6. **Fees changed during the sample** (Binance ran a near-zero-fee promotion from
    mid-2022 to March 2023). A flat 10 bp/side is applied throughout: conservative
    for that window, correct elsewhere.
-7. **The analysis rebalances every candle.** A real deployment rebalances by
-   re-running the profiles; the difference is second-order, but it is not zero.
+7. **The basket is drifting-weight, not rebalanced.** Each symbol's curve is
+   normalised by its first value and the levels are averaged, so a symbol that
+   performs well grows to a larger share of the basket. A deployment that
+   re-weights back to equal capital per profile will differ; the difference is
+   second-order but not zero.
 8. **No paper-trading period was run.** A green backtest is a necessary
    condition, never a sufficient one — dry-run first.
 9. **The 1h grid degrades most on the holdout** (its median return turns negative
    at 15 bp), so **4h and 1d are the deployable grids**, even though 1h looks
    fine on DEV.
+10. **The data carries one known splice.** `LUNAUSDT` mixes the pre-collapse
+    token and the relaunched one under the same ticker: its close moves from
+    `5.0e-05` to `8.6` in a single 4h candle on 2022-05-31, a `+1.7e5×` artefact
+    that destroys any *rebalanced* buy & hold benchmark built from raw closes.
+    It does not move the numbers on this page: the drifting-weight basket above
+    is insensitive to it (the symbol's weight had already collapsed), and the
+    `4×ATR` stop caps what a short can lose on that candle. Re-measured with the
+    symbol excluded, the DEV basket changes by at most **0.4 index points out of
+    ~15** (`+1525.5 %` → `+1485.8 %` for the long/short variant) and the holdout
+    basket by less than **1 point** (`+155.7 %` → `+154.8 %`). Anyone rebuilding
+    the panel should still mask that candle.
 
 ## 8. What was tested and rejected
 
