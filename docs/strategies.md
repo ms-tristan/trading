@@ -208,6 +208,61 @@ wide stop only removes tail risk without costing performance. That is why the
 default is `atr_stop_multiplier = 4.0` and why `0.0` (no stop) is a legitimate
 setting, not a degenerate one.
 
+**An independent cross-sectional test agrees — and tempers the headline.** Every
+number above was read on the development panel — the symbols that selected the
+parameters. After the parameters were frozen, a **second symbol universe** was
+downloaded from the same source (Binance spot monthly klines): **67 further
+USDT pairs, disjoint from the 74 development symbols**, whose data was never
+inspected before the finalists were frozen. The same frozen parameters, the same
+protocol, the same fees (10 bp/side) and the same windows were re-run there, so
+**no instrument is shared with the universe that selected the parameters**.
+
+Equal-weight basket over the **HOLDOUT** (2023-01-01 → 2026-08-31):
+
+| symbol universe | momentum 4h long/short | equal-weight buy & hold | share of symbols beating buy & hold |
+| --- | --- | --- | --- |
+| the 71 development-panel symbols | +155.7 %, Sharpe 0.772, maxDD −39.1 % | +37.5 %, Sharpe 0.486, maxDD −78.1 % | 64.8 % |
+| the 67 fresh symbols | **+8.4 %, Sharpe 0.294, maxDD −47.4 %** | **−71.3 %, Sharpe 0.203, maxDD −96.1 %** | **71.6 %** |
+
+Supporting per-symbol medians on the fresh universe (holdout, long/short 4h):
+median Sharpe **0.250**, median return **−40.8 %**, median buy & hold **−79.7 %**,
+**34.3 %** of symbols positive, **71.6 %** beating buy & hold, median max
+drawdown **−83.6 %**, **114 trades**.
+
+**The edge over buy & hold replicates.** On a universe the parameters had never
+seen, the strategy still beat buy & hold by **+79.7 percentage points** (+8.4 %
+against −71.3 %) and did so on **71.6 %** of the symbols — a *higher* hit rate
+than the 64.8 % of the universe that selected it. In a window where the
+equal-weight buy & hold of the fresh universe lost **−71.3 %** (the median fresh
+symbol lost **−79.7 %** on buy & hold, with a **−96.1 %** basket drawdown), the
+long/short variant finished **positive** while buy & hold lost nearly
+everything.
+
+**The absolute return does not replicate.** +8.4 % over 3.66 years is not
++155.7 %. The universes differ in composition — the development panel is
+weighted towards large caps (BTC, ETH, SOL, BNB), while the fresh universe is
+almost entirely small alts — and the second half of the holdout was a brutal alt
+bear market. **The strategy is a defensive, alpha-over-buy-and-hold strategy
+whose absolute return is regime-dependent, not a money printer.** A deployment
+that cannot short gives up the bear-market half of the edge: on the fresh
+universe the long-only variant returned **−15.2 %** (Sharpe 0.112) and the daily
+variant **−25.2 %** (Sharpe 0.144).
+
+**The fresh universe's own DEV window was strongly positive.** Before
+2023-01-01, on the 46 fresh symbols that existed then, the same frozen
+parameters returned **+534.1 %** (Sharpe 0.840) for the long/short 4h basket
+against a buy & hold of **−15.9 %**, and **+747.7 %** for the daily variant. The
+two universes therefore bracket a wide range of outcomes for the *same*
+parameters: strongly positive on one window, merely defensive on the next.
+
+**The practical consequence is the composition of the basket.** Run the strategy
+as an equal-weight basket that **includes the majors** — the large caps the
+development panel is weighted towards — not on a basket of small alts only. The
+67 fresh symbols are a stress test of the least favourable case, not the
+deployment target: they show the edge over buy & hold surviving out of universe,
+and they show that the absolute return depends on which symbols the basket
+holds.
+
 ## 6. Reproduce it
 
 The strategy, its parameters and the platform plumbing are exercised offline by
@@ -241,6 +296,34 @@ research scripts — so a single-symbol CLI backtest is **not** expected to
 reproduce the basket figures, and a different result there is not a
 contradiction.
 
+**What the shipped CLI reports on real data.** The commands above, run on real
+Binance spot 4h OHLCV exported to CSV with `config/backtest_momentum.json` and
+`--risk-free-rate 0.05` (fees 10 bp/side, the configuration default), give one
+trajectory per symbol:
+
+| symbol | window | total return | Sharpe | max drawdown | trades | alpha vs buy & hold | walk-forward efficiency | is_consistent |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BTC/USDT | 2017-08-17 → 2026-08-31 (19 789 candles) | +4 851 % | 0.98 | −49.1 % | 306 | +3 169 pp | 0.80 | yes |
+| ETH/USDT | same window | +12 932 % | 1.05 | −66.0 % | 305 | — | 0.53 | yes |
+| SOL/USDT | 2020-08-11 → 2026-08-31 | +12 369 % | 1.26 | −61.6 % | 195 | — | −0.15 | **no** |
+
+On BTC/USDT the full gate set of the platform, computed by the shipped code, is:
+`strategy_beats_benchmark` **true** (alpha +31.69, beta 0.046, correlation
+0.058 — the strategy is nearly uncorrelated with holding the asset),
+`is_consistent` **true**, walk-forward `efficiency` **0.802**, `is_robust`
+**true** (36/36 parameter combinations positive, `positive_ratio` 1.0,
+`robust_ratio` 1.0, stability 13.63), `strategy_beats_random` **true**
+(`p_value` 0.0, `percentile` 100.0 from 1 000 random-entry simulations with the
+same trade count and exposure), and the trade-order Monte Carlo (2 000
+resamples) gives `prob_profit` 0.9825 with `VaR 95 %` +8.60.
+
+Honest reading: the same parameters pass every gate on BTC and ETH, but **SOL
+fails the walk-forward consistency gate** (`is_consistent` false, efficiency
+−0.15) — a single symbol is a single draw, which is exactly why §5 argues for
+the basket. These figures come from the same engine as everything else on this
+page and are reproducible with the commands already listed in this section,
+adding `--risk-free-rate 0.05` to match the configuration's benchmark setting.
+
 ## 7. Limitations
 
 1. **The multiple-testing budget is spent.** 3 414 DEV (family, configuration,
@@ -251,21 +334,30 @@ contradiction.
    read, and the holdout degraded by ~30 % instead of collapsing — which is what
    an overfitted configuration would not produce. Treat the holdout figures as
    the only ones with a clean interpretation.
-2. **Survivorship is reduced, not eliminated.** Delisted symbols are in the
+2. **The result depends materially on the symbol universe.** Two disjoint
+   universes were run with the same frozen parameters (§5), and they bracket a
+   wide range of outcomes: the 71 development-panel symbols returned **+155.7 %**
+   over the holdout against a buy & hold of **+37.5 %**, while the 67 fresh
+   symbols returned **+8.4 %** against a buy & hold of **−71.3 %**. The edge
+   over buy & hold replicates on both (**+79.7 pp**, and **71.6 %** of the fresh
+   symbols beat it); the absolute return does not, because it follows the
+   composition of the basket (large caps versus small alts) and the regime of the
+   window.
+3. **Survivorship is reduced, not eliminated.** Delisted symbols are in the
    panel, but the 74 symbols are those that had a Binance USDT pair at all.
-3. **One venue, one quote currency.** Binance spot, USDT. No funding, no borrow,
+4. **One venue, one quote currency.** Binance spot, USDT. No funding, no borrow,
    no leverage, no market impact, no partial fills.
-4. **The panel is alt-heavy.** The median panel symbol *lost* 53 % over the
+5. **The panel is alt-heavy.** The median panel symbol *lost* 53 % over the
    holdout, so the +37.5 % buy & hold it is compared against is far weaker than
    BTC's. On a single large cap the edge over buy & hold is smaller.
-5. **Fees changed during the sample** (Binance ran a near-zero-fee promotion from
+6. **Fees changed during the sample** (Binance ran a near-zero-fee promotion from
    mid-2022 to March 2023). A flat 10 bp/side is applied throughout: conservative
    for that window, correct elsewhere.
-6. **The analysis rebalances every candle.** A real deployment rebalances by
+7. **The analysis rebalances every candle.** A real deployment rebalances by
    re-running the profiles; the difference is second-order, but it is not zero.
-7. **No paper-trading period was run.** A green backtest is a necessary
+8. **No paper-trading period was run.** A green backtest is a necessary
    condition, never a sufficient one — dry-run first.
-8. **The 1h grid degrades most on the holdout** (its median return turns negative
+9. **The 1h grid degrades most on the holdout** (its median return turns negative
    at 15 bp), so **4h and 1d are the deployable grids**, even though 1h looks
    fine on DEV.
 
