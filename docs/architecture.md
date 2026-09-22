@@ -912,7 +912,7 @@ every `basic` profile, including the two shipped examples — keeps its behaviou
 **unchanged**: empty bundle, no loading, no guard. The operational semantics and
 the verbatim refusal message are in
 [`docs/realtime.md`](realtime.md) §3.1, and the layer itself in
-[`docs/forecasting.md`](forecasting.md).
+`docs/forecasting.md` (page retired: the forecast subsystem was removed).
 
 ### 4.11 La couche web — `trading_platform.web`
 
@@ -993,7 +993,7 @@ TimesFM model therefore **never** runs inside `Strategy.prepare()` /
 versioned parquet artifact that the strategy consumes as a deterministic
 external input. The full reference — artifact schema, backend contract, licence
 table, measured traps and the honesty section — is
-[`docs/forecasting.md`](forecasting.md).
+`docs/forecasting.md` (page retired: the forecast subsystem was removed).
 
 #### 4.13.1 Types and errors
 
@@ -1036,7 +1036,7 @@ the `quantile_levels` / `median` / `quantiles` columns (`list<float32>`, with
 backend, the model id, the context length, the stride, the horizon, the quantile
 levels, the feature list, the creation timestamp, the package version, the data
 span and the licence note. The exact schema and the commands are in
-[`docs/forecasting.md`](forecasting.md) §2 and §5.
+`docs/forecasting.md` (page retired: the forecast subsystem was removed) §2 and §5.
 
 #### 4.13.4 CLI commands
 

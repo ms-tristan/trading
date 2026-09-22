@@ -292,22 +292,6 @@ def test_the_json_profile_documents_are_deleted() -> None:
     assert not surviving, f"these JSON profile documents were not deleted: {surviving}"
 
 
-def test_the_makefile_bootstraps_a_forecast_profile() -> None:
-    """The three-command flow: download, build the artifact, build for a profile."""
-    text = makefile_text()
-
-    for target in ("data-download", "forecast-bootstrap", "forecast-bootstrap-seasonal"):
-        assert re.search(rf"^{re.escape(target)}:", text, flags=re.MULTILINE), target
-        assert f"make {target}" in text, f"`make help` does not mention {target!r}"
-
-    for variable in ("SYMBOL ?=", "TIMEFRAME ?=", "FORECAST_DIR ?="):
-        assert variable in text, f"the Makefile does not declare {variable!r}"
-
-    # the bootstrap targets are offline predictions: the offline backends only
-    assert "--backend naive" in text
-    assert "--backend seasonal" in text
-
-
 # ---------------------------------------------------------------------------
 # 4. Docker
 # ---------------------------------------------------------------------------

@@ -69,7 +69,7 @@ local et rapport. Aucun accès réseau n'est nécessaire.
 > The forecasting layer follows the same rule: the `naive` and `seasonal`
 > backends are pure numpy/pandas, so `forecast-build`, `forecast-skill`, the
 > tests and the offline backtest all run **without** `torch`
-> (see [`docs/forecasting.md`](forecasting.md)).
+> (see `docs/forecasting.md` (page retired: the forecast subsystem was removed)).
 
 ---
 
@@ -360,7 +360,7 @@ trading ([`docs/realtime.md`](realtime.md) §3.1).
 Every other forecast setting lives in the strategy parameters
 (`strategy.params`, §4.7). The artifact itself, its schema, the backends, the
 licence table and the measured library traps are documented in
-[`docs/forecasting.md`](forecasting.md).
+`docs/forecasting.md` (page retired: the forecast subsystem was removed).
 
 ---
 
@@ -617,7 +617,7 @@ These four commands build, measure and inspect the **offline** forecast artifact
 consumed by the `timesfm` strategy. None of them runs inside
 `prepare()`/`signals()`: prediction is pre-computed here, once, and the strategy
 reads the result as a deterministic external input
-([`docs/forecasting.md`](forecasting.md)).
+(`docs/forecasting.md` (page retired: the forecast subsystem was removed)).
 
 ```bash
 # build the artifact offline: random-walk baseline, no ML dependency, no network
@@ -670,7 +670,7 @@ candles fed to the backend, `--horizon` the number of stored steps and
 accept `--json`. **Do not read a positive PnL as an edge**: read
 `forecast-skill` first — `rmse_skill_score <= 0`, `mase >= 1` or a directional
 accuracy near `0.5` mean the artifact carries no usable skill
-([`docs/forecasting.md`](forecasting.md) §9).
+(`docs/forecasting.md` (page retired: the forecast subsystem was removed) §9).
 
 **The seasonal period follows the timeframe.** `--seasonal-period` defaults to
 the number of candles of one day at `--timeframe` — `1440` on `1m`, `288` on
@@ -1149,7 +1149,7 @@ inconnue, dont `api_key`, est refusée bruyamment) :
 
 The `forecast` key is documented in depth in
 [`docs/realtime.md`](realtime.md) §1 and §3.1 and in
-[`docs/forecasting.md`](forecasting.md); `"forecast": null` is the default every
+`docs/forecasting.md` (page retired: the forecast subsystem was removed); `"forecast": null` is the default every
 `basic` profile gets, and a `timesfm` profile declares its artifact path.
 
 `risk` (`RiskLimitsConfig`) — toutes les limites sont optionnelles, `null`
@@ -1414,7 +1414,7 @@ and `last_block_reason` stays `null` as long as the risk layer refuses nothing.
 A profile whose `n_trades` stays at `0` while `status` is `running` **is not
 trading**: read its `forecast_*` columns and its `exit_code`, and remember that
 the entry gates are deliberately strict — a *wired* artifact is not an
-*informative* one (§12.4, and [`docs/forecasting.md`](forecasting.md) §9).
+*informative* one (§12.4, and `docs/forecasting.md` (page retired: the forecast subsystem was removed) §9).
 
 The dashboard has its own targets, next to the Python ones:
 
@@ -1486,7 +1486,7 @@ versioned parquet artifact plus a `<artifact>.meta.json` sidecar. The complete
 reference — artifact schema, backend contract, licence table (TimesFM 2.5
 Apache-2.0 is the default; TimesFM 3.0 weights are
 non-commercial and opt-in only), measured hardware numbers, library traps and
-the honesty section — is [`docs/forecasting.md`](forecasting.md).
+the honesty section — is `docs/forecasting.md` (page retired: the forecast subsystem was removed).
 
 ### 12.1 Install
 
@@ -1569,7 +1569,7 @@ same fields to the robustness sweep.
 of the exit that fired (1 `FORECAST_FLIP`, 2 `EDGE_DECAY`, 3 `TARGET_REACHED`,
 4 `PATH_DEGRADED`, 5 `TIME_STOP`, 6 `VOL_REGIME`, 7 `STALE_FORECAST`,
 8 `ATR_STOP`). Every column, its NaN rule and the priority order of the exits
-are tabulated in [`docs/forecasting.md`](forecasting.md) §10.
+are tabulated in `docs/forecasting.md` (page retired: the forecast subsystem was removed) §10.
 
 ### 12.4 Honesty
 
@@ -1578,7 +1578,7 @@ The artifact can be measured, and it must be measured: run
 on foundation models for financial series finds **no reliable directional edge**
 on returns, and a positive backtest PnL is **not evidence of an edge**. The
 exact numbers, the arXiv references and how to read the skill metrics are in
-[`docs/forecasting.md`](forecasting.md) §9.
+`docs/forecasting.md` (page retired: the forecast subsystem was removed) §9.
 
 **Making the strategy usable changes nothing about that.** The realtime
 integration (§12.1) is engineering: it makes an existing, already-researched

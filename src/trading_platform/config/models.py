@@ -34,7 +34,6 @@ __all__ = [
     "BenchmarkConfig",
     "DataConfig",
     "ExchangeConfig",
-    "ForecastConfig",
     "MonitoringConfig",
     "ProfileConfig",
     "RealtimeConfig",
@@ -117,24 +116,6 @@ class StrategyConfig(BaseModel):
     name: str = "basic"
     timeframe: str = DEFAULT_TIMEFRAME
     params: dict[str, ParamValue] = Field(default_factory=dict)
-
-
-class ForecastConfig(BaseModel):
-    """Offline forecast artifact consumed by the ``timesfm`` strategy.
-
-    The artifact is built *outside* the strategy (``trading forecast-build``) and
-    read once per run through
-    :func:`trading_platform.strategy.features.resolve_features`, so a strategy
-    never performs I/O of its own and the whole decision path stays deterministic
-    and testable without any machine-learning dependency installed.
-
-    A missing path is a valid configuration: the strategy then produces **no
-    signal at all** (rather than guessing or raising).
-    """
-
-    model_config = {"extra": "forbid"}
-
-    artifact: Path | None = None
 
 
 class BacktestConfig(BaseModel):
@@ -264,15 +245,6 @@ class ProfileConfig(BaseModel):
     crossover that occurred within the last ``N`` candles.  The backtest is
     unaffected: it already reads every row.  The field is declared last so the
     field order of every pre-existing configuration never moves.
-
-    ``forecast`` is the *optional* path of the offline forecast artifact a
-    forecast-driven strategy consumes, built by ``trading forecast-build``.  It
-    is additive in exactly the same way: ``None`` (the default) means the
-    profile declares no forecast at all, which is the historical behaviour of
-    every ``basic`` profile.  A profile that *does* declare one is validated at
-    startup -- the artifact is loaded once and its coverage must reach the
-    profile's decision horizon -- so a stale or mismatched artifact refuses to
-    start instead of silently producing no signal.
     """
 
     model_config = {"extra": "forbid"}
@@ -292,14 +264,6 @@ class ProfileConfig(BaseModel):
     poll_interval_seconds: float = Field(default=5.0, gt=0)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     entry_lookback_candles: int = Field(default=0, ge=0, le=MAX_ENTRY_LOOKBACK_CANDLES)
-    forecast: Path | None = Field(
-        default=None,
-        description=(
-            "Path to the offline forecast artifact consumed by a forecast-driven "
-            "strategy (built by `trading forecast-build`); None means the profile "
-            "declares no forecast."
-        ),
-    )
 
     @property
     def effective_allocation(self) -> float:
@@ -311,30 +275,12 @@ class ProfileConfig(BaseModel):
         """
         return float(self.initial_balance if self.allocation is None else self.allocation)
 
-    @property
-    def forecast_artifact(self) -> Path | None:
-        """Return the forecast artifact this profile declares, or ``None``.
-
-        A forward-compatible accessor: the field is read through ``getattr`` so
-        the property keeps answering ``None`` for a profile whose ``forecast``
-        ever becomes a richer ``dict | model`` union -- a caller that only wants
-        the path never has to know which shape was declared.
-        """
-        declared = getattr(self, "forecast", None)
-        return declared if declared is None or isinstance(declared, Path) else None
-
     def strategy_params(self) -> dict[str, Any]:
         """Return the strategy parameters of this profile.
 
-        A copy of ``params``, plus the ``artifact`` key the forecast-driven
-        strategy reads when the profile declares a forecast artifact.  The
-        profile's own ``params`` mapping is never mutated.
+        A copy of ``params``: the profile's own mapping is never mutated.
         """
-        resolved: dict[str, Any] = dict(self.params)
-        artifact = self.forecast_artifact
-        if artifact is not None:
-            resolved["artifact"] = str(artifact)
-        return resolved
+        return dict(self.params)
 
     @field_validator("id")
     @classmethod
@@ -475,7 +421,6 @@ class AppConfig(BaseSettings):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     #: Declared last on purpose: the field order of every pre-existing
     #: configuration therefore never moves.
-    forecast: ForecastConfig = Field(default_factory=ForecastConfig)
 
     @property
     def timezone(self) -> str:

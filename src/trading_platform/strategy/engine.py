@@ -58,7 +58,6 @@ from trading_platform.core.models import (
     TradeRecord,
 )
 from trading_platform.strategy.base import Strategy, ensure_signal_frame, require_ohlcv_frame
-from trading_platform.strategy.features import FeatureBundle, attach_features, resolve_features
 from trading_platform.strategy.registry import get_strategy
 
 __all__ = [
@@ -389,7 +388,6 @@ def run_backtest_on_config(
     *,
     params: Mapping[str, Any] | None = None,
     symbol: str | None = None,
-    features: FeatureBundle | None = None,
 ) -> BacktestResult:
     """Backtest the strategy configured in ``cfg`` over ``data``.
 
@@ -406,27 +404,11 @@ def run_backtest_on_config(
     cfg, data, params, symbol:
         See the module documentation and
         :func:`~trading_platform.strategy.engine.run_backtest`.
-    features:
-        External features of the run.  ``None`` (the default) resolves them from
-        ``cfg`` and from the merged parameters through
-        :func:`~trading_platform.strategy.features.resolve_features`; a caller
-        that already holds a bundle — :func:`make_runner`, for example — passes
-        it explicitly so the artifact is read **once** per run instead of once
-        per window.
-
-    Raises
-    ------
-    ForecastArtifactError
-        If a forecast artifact is configured but cannot be read.  The error is
-        propagated unchanged (it is a ``TradingBacktestError``, so the CLI error
-        surface already handles it).
     """
     merged: dict[str, Any] = dict(cfg.strategy.params)
     if params:
         merged.update(dict(params))
     strategy = get_strategy(cfg.strategy.name, merged)
-    bundle = features if features is not None else resolve_features(cfg, merged)
-    attach_features(strategy, bundle)
     return run_backtest(
         strategy,
         data,
@@ -448,17 +430,9 @@ def make_runner(cfg: AppConfig, *, symbol: str | None = None) -> RunnerFn:
     configuration) — the validation layer runs it over arbitrary sub-windows:
 
     ``runner(data, params=None) -> BacktestResult``
-
-    The external features are resolved **once**, here, and the resulting bundle is
-    closed over by the runner: walk-forward, robustness and Monte Carlo therefore
-    never re-read the forecast artifact per window (an artifact read is expensive
-    and, more importantly, must not become a per-window side effect).  A per-call
-    ``artifact`` parameter override is consequently *not* re-resolved by the
-    runner — the configuration decides which artifact a run consumes.
     """
-    bundle = resolve_features(cfg)
 
     def _runner(data: pd.DataFrame, params: Mapping[str, Any] | None = None) -> BacktestResult:
-        return run_backtest_on_config(cfg, data, params=params, symbol=symbol, features=bundle)
+        return run_backtest_on_config(cfg, data, params=params, symbol=symbol)
 
     return _runner

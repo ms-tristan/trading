@@ -63,7 +63,6 @@ EXAMPLE_PROFILE_PAYLOADS: tuple[dict[str, Any], ...] = (
         "warmup_candles": 200,
         "poll_interval_seconds": 5.0,
         "allocation": 10_000.0,
-        "forecast": None,
         "risk": {
             "max_position_notional": 5_000.0,
             "max_order_notional": 1_000.0,
@@ -85,7 +84,6 @@ EXAMPLE_PROFILE_PAYLOADS: tuple[dict[str, Any], ...] = (
         "warmup_candles": 300,
         "poll_interval_seconds": 10.0,
         "allocation": 5_000.0,
-        "forecast": None,
         "risk": {
             "max_position_notional": 2_500.0,
             "max_order_notional": 500.0,

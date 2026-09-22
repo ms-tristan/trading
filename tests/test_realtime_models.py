@@ -1086,7 +1086,7 @@ def test_app_config_gains_the_two_new_sections() -> None:
     assert config.realtime == RealtimeConfig()
     assert config.monitoring == MonitoringConfig()
     fields = list(AppConfig.model_fields)
-    assert fields[-3:] == ["realtime", "monitoring", "forecast"]
+    assert fields[-2:] == ["realtime", "monitoring"]
     assert "realtime" in AppConfig.model_validate({}).model_dump()
     assert "monitoring" in AppConfig.model_validate({}).model_dump()
 
