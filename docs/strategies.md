@@ -263,6 +263,86 @@ deployment target: they show the edge over buy & hold surviving out of universe,
 and they show that the absolute return depends on which symbols the basket
 holds.
 
+**Statistical significance: the honest verdict.** Everything above is measured
+on a development window that was *searched*, and a search of this size has to be
+paid for. A formal multiple-testing and backtest-overfitting audit was therefore
+run on the whole programme — trial count, deflated Sharpe ratio (Bailey &
+López de Prado 2014, implemented from the definition), probability of backtest
+overfitting (CSCV), Hansen's Superior Predictive Ability test, and a zero-skill
+simulation on the same assets and the same windows. **Its verdict is
+unfavourable to the development-window result**, and the honesty stance of
+[`docs/testing-policy.md`](testing-policy.md) and §8 of
+[`docs/backtesting-methodology.md`](backtesting-methodology.md) require it to be
+recorded here rather than left out. The audit lives in the research scratch area
+(`.scratch/research/STATS_AUDIT.md`, raw numbers in
+`.scratch/research/results/stats_audit.json`), not in the shipped tree.
+
+**How many trials were run.** The programme evaluated **3 414 (family,
+configuration, timeframe) cells = 1 138 parameter sets** — **228 738 individual
+development-window backtests**. Correlation clustering puts the effective number
+of *independent* trials at roughly **900–2 700** (and 1 138 genuinely distinct
+parameter sets); 3 414 is the hard upper bound.
+
+**A pure-noise search of the same size produced a better-looking winner.**
+Zero-skill strategies with random block exposure were simulated on the same
+assets and the same windows, and their best-of-3 414 was compared with what the
+programme actually found (development-window median-symbol Sharpe):
+
+| | DEV median-symbol Sharpe |
+| --- | --- |
+| the delivered configuration (M1, 4h long/short) | **0.997** |
+| the best cell of the whole sweep, rejected by the pre-registered plateau rule | 1.236 |
+| null, zero-edge long/short rule: median of the best of 3 414 | **3.04** |
+| null, long/flat rule keeping the market drift: median of the best of 3 414 | **1.39** |
+
+**0 of 300** noise replications produced a best-of-3 414 below M1's figure: a
+search of this size would have had to be unlucky to select the configuration
+this programme selected.
+
+**Deflated Sharpe Ratio.** M1 on the development window gives **0.034** on the
+portfolio basis (N = 1 117) and **0.0002** on the median-symbol basis
+(N = 3 414). The DSR's own null distribution at that (N, T) is centred on
+**0.478** with a 5th percentile of **0.312**, so the observed value sits *below
+the 5th percentile of what pure noise produces*. The other finalists are no
+better — only the daily variant M3 reaches 0.383/0.510, a coin flip. On
+sensitivity: using N = 1 558 instead of 3 414 gives 0.0232/0.0006, and using the
+block-count effective sample size raises the portfolio-basis figure to 0.31.
+**No convention reaches 0.5.**
+
+**Minimum Backtest Length and the break-even trial count.** The trial count
+implies a MinBTL of **16.4 years** at the observed development-window Sharpe;
+the window is **5.37 years** (median symbol 2.69 years). The DSR would only
+reach 0.95 if the programme had run **6 independent trials** on the portfolio
+basis (0–25 depending on the finalist and the basis). It ran three orders of
+magnitude more.
+
+**Hansen's Superior Predictive Ability test.** Against buy & hold, over the full
+4h search space on the development window: **p = 0.574** (White's Reality Check
+0.653) — the best of 1 117 configurations does not beat buy & hold on the
+development window. On the holdout, over the 7 frozen finalists: **p = 0.589**.
+
+**The holdout is positive but not significant.** M1's own one-sided t-statistic
+on the holdout is **t = 1.48 (p = 0.069)** before any multiple-testing
+correction, and reaching t = 1.64 at that Sharpe would need **12.1 years**; the
+holdout is 3.67 years.
+
+**The one favourable diagnostic, and its limit.** The combinatorial
+purged/blocked cross-validation PBO for the momentum family is **0.13–0.17**
+(0.06–0.09 pooled over all 15 families), i.e. the *ranking* of parameters inside
+the family is stable. But those blocks are still inside the development window
+and in the same regime — precisely the stability the real holdout did not
+confirm (portfolio Sharpe **1.82 → 0.76**) — and PBO says nothing about the
+*level* of performance.
+
+**The verdict.** The development-window result is not merely statistically
+insignificant: **it is below what a search of this size would produce from noise
+alone**. The out-of-sample record is positive — it survived a 3.67-year holdout
+and replicated on a disjoint symbol universe — but **it is not statistically
+distinguishable from luck at these sample sizes and this trial count**. The
+strategy is therefore delivered as a **candidate** with a documented, plausible
+but unproven edge, to be **paper-traded before any capital is committed** —
+never read as a validated alpha.
+
 ## 6. Reproduce it
 
 The strategy, its parameters and the platform plumbing are exercised offline by
@@ -333,7 +413,10 @@ adding `--risk-free-rate 0.05` to match the configuration's benchmark setting.
    a fresh symbol universe. The finalists were frozen before the holdout was
    read, and the holdout degraded by ~30 % instead of collapsing — which is what
    an overfitted configuration would not produce. Treat the holdout figures as
-   the only ones with a clean interpretation.
+   the only ones with a clean interpretation. The multiple-testing audit of §5
+   makes the discount explicit: the delivered configuration's development-window
+   performance must be discounted accordingly, because a search of this size
+   produces a better-looking winner from noise alone.
 2. **The result depends materially on the symbol universe.** Two disjoint
    universes were run with the same frozen parameters (§5), and they bracket a
    wide range of outcomes: the 71 development-panel symbols returned **+155.7 %**
