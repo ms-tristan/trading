@@ -489,14 +489,14 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 | `GET /api/kill-switch` | `{kill_switch, reason, changed_at}` | — |
 | `POST /api/kill-switch` | body `{engage: bool, reason: str}` → `{kill_switch, reason, changed_at}` | 400 malformed body, 403 missing/invalid token, 403 server in read-only mode |
 | `GET /api/profiles/{id}/candles?limit=N` | `{candles: [{profile_id, timestamp, open, high, low, close, volume, closed}…], count}` (oldest first) | 404 unknown profile, 400 malformed `limit` |
-| `GET /api/catalog` | `{symbols: [{symbol, base, quote}…], strategies: [...], timeframes: [...], modes: [...]}` | — |
+| `GET /api/catalog` | `{symbols: [{symbol, base, quote}…], strategies: [...], timeframes: [...], modes: [...], forecast_strategies: [...]}` | — |
 | `GET /api/control` | `{engine_running, read_only, mutable, profiles: [{profile_id, paused, running}…]}` | — |
 | `GET /api/orphans` | the `orphaned_positions` report of the startup safety sweep (§4.1), on its own route | — |
 | `GET /api/operator-token` | `{valid: bool, reason: str, read_only?: bool}` — answers whether the `X-Operator-Token` header of the request authorises mutations | never 403 (see below) |
 | `POST /api/profiles/{id}/pause` | `{profile: ProfileSnapshot, paused: true}` | 400, 403, 404, 409, 503 |
 | `POST /api/profiles/{id}/resume` | `{profile: ProfileSnapshot, paused: false}` | 400, 403, 404, 409, 503 |
 | `DELETE /api/profiles/{id}` | `{profile_id, deleted: true}` | 400, 403, 404, 409, 503 |
-| `POST /api/profiles` | body `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?}` → `201 {profile: ProfileSnapshot}` | 400 malformed body / unknown strategy / unsupported timeframe, 403, 409 duplicate |
+| `POST /api/profiles` | body `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?, forecast?}` → `201 {profile: ProfileSnapshot}` | 400 malformed body / unknown strategy / unsupported timeframe / a forecast-driven strategy without a usable artifact, 403, 409 duplicate |
 
 `wallet` is the **additive** platform-wide view of the one shared wallet (§9):
 
@@ -594,6 +594,15 @@ static table), the strategy names of
 keys of `SUPPORTED_TIMEFRAMES` ordered shortest to longest, and `["paper",
 "live"]`. It answers identically with and without an engine and **never** answers
 a `500`: any failure degrades to the static catalog.
+
+`forecast_strategies` is the subset of `strategies` that **cannot be built
+without an offline forecast artifact** — `["timesfm"]` today. The marker is the
+strategy's own parameter model (`strategy_needs_forecast`, §4.2), never a
+hardcoded name, so a strategy that gains or loses its `artifact` field is
+reported correctly without a code change. The creation form reads it to ask for
+the artifact path *before* submitting: a `timesfm` profile created without one is
+refused by the engine, and the field is not rendered at all for a strategy that
+would ignore it.
 
 `GET /api/control` is what the dashboard reads before enabling its controls:
 `engine_running` (a lifecycle seam is attached), `read_only`, `mutable` (a

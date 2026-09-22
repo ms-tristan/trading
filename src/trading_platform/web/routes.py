@@ -94,7 +94,13 @@ from typing import Any, Protocol
 from urllib.parse import parse_qs
 
 from trading_platform.config.models import MonitoringConfig
-from trading_platform.core.errors import ConfigError, MonitoringError, ProfileError
+from trading_platform.core.errors import (
+    ConfigError,
+    ForecastArtifactError,
+    ForecastError,
+    MonitoringError,
+    ProfileError,
+)
 from trading_platform.realtime.catalog import default_catalog_body
 from trading_platform.realtime.clock import Clock, SystemClock
 from trading_platform.realtime.models import PlatformSnapshot, ProfileSnapshot, ProfileStatus
@@ -169,7 +175,16 @@ _PROFILE_ACTIONS: frozenset[str] = frozenset({"pause", "resume"})
 
 #: Keys and modes the creation body accepts (any other key is refused).
 _CREATE_FIELDS: frozenset[str] = frozenset(
-    {"profile_id", "symbol", "timeframe", "strategy", "mode", "initial_balance", "params"}
+    {
+        "profile_id",
+        "symbol",
+        "timeframe",
+        "strategy",
+        "mode",
+        "initial_balance",
+        "params",
+        "forecast",
+    }
 )
 
 #: Creation fields that must be present and carry a string.
@@ -960,8 +975,14 @@ class Router:
             return payload
         try:
             profile = seam.create_profile(payload)
-        except (MonitoringError, ProfileError, ConfigError) as exc:
-            return self._failed_mutation(exc)
+        except (
+            MonitoringError,
+            ProfileError,
+            ConfigError,
+            ForecastError,
+            ForecastArtifactError,
+        ) as exc:
+            return self._failed_create(exc)
         return _json_response(201, {"profile": _snapshot_payload(profile)})
 
     @staticmethod
@@ -979,6 +1000,25 @@ class Router:
         if isinstance(exc, ProfileError):
             return _json_response(409, {"error": str(exc)})
         return _json_response(400, {"error": str(exc)})
+
+    @staticmethod
+    def _failed_create(exc: Exception) -> HttpResponse:
+        """Map a **creation** failure onto its documented status code.
+
+        Creation reaches deeper than the other mutations: building the profile
+        resolves its strategy, which resolves the external features that strategy
+        needs, and a forecast-driven strategy without a usable artifact fails
+        there with a :class:`~trading_platform.core.errors.ForecastError`.  That
+        is a *client* mistake -- the request asked for a profile the platform
+        cannot build -- so it is answered as a ``400`` carrying the message that
+        already says what to do (build the artifact, declare its path), never as
+        a ``500``.  Reporting a missing artifact as a server fault would tell the
+        operator to retry something no retry can fix.
+        """
+        if isinstance(exc, (ForecastError, ForecastArtifactError)):
+            _LOGGER.warning("profile creation rejected: %s: %s", type(exc).__name__, exc)
+            return _json_response(400, {"error": str(exc)})
+        return Router._failed_mutation(exc)
 
     @staticmethod
     def _parse_create_body(body: bytes) -> dict[str, Any] | HttpResponse:
@@ -1027,6 +1067,19 @@ class Router:
                     400, {"error": "malformed request body: 'params' must be an object"}
                 )
             payload["params"] = dict(params)
+        if "forecast" in decoded:
+            forecast = decoded["forecast"]
+            # ``null`` is the explicit "this profile declares no artifact", which
+            # is the only valid value for a strategy that needs none.
+            if forecast is not None:
+                if not isinstance(forecast, str) or forecast.strip() == "":
+                    return _json_response(
+                        400,
+                        {
+                            "error": "malformed request body: 'forecast' must be a non-empty string or null"
+                        },
+                    )
+                payload["forecast"] = forecast.strip()
         return payload
 
     # -- health -------------------------------------------------------------

@@ -411,6 +411,12 @@ export interface CatalogPayload {
   strategies: string[];
   timeframes: string[];
   modes: RunMode[];
+  /**
+   * Subset of `strategies` whose strategy cannot be built without an offline
+   * forecast artifact. The form asks for its path only for these, and the
+   * server reports the rule — the dashboard never hard-codes `timesfm`.
+   */
+  forecast_strategies?: string[];
 }
 
 /** Runtime control state of a single profile (`GET /api/control`). */
@@ -479,4 +485,11 @@ export interface CreateProfileBody {
   mode: RunMode;
   initial_balance?: number;
   params?: Record<string, number | string | boolean>;
+  /**
+   * Path of the offline forecast artifact a forecast-driven strategy consumes
+   * (`timesfm`). Omitted for every other strategy; the server refuses a
+   * `timesfm` profile that declares none, because building it would resolve a
+   * strategy that cannot run without its artifact.
+   */
+  forecast?: string;
 }

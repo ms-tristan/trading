@@ -192,6 +192,12 @@ class RuntimeProfileController:
         }
         if payload.get("initial_balance") is not None:
             fields["initial_balance"] = payload["initial_balance"]
+        if payload.get("forecast") is not None:
+            # A forecast-driven strategy (``timesfm``) refuses to build without the
+            # artifact it consumes; the path is resolved and validated by the
+            # strategy seam at build time, so a wrong path fails with a
+            # ``ForecastError`` the caller maps onto an actionable 400.
+            fields["forecast"] = payload["forecast"]
         try:
             return ProfileConfig.model_validate(fields)
         except ValidationError as exc:

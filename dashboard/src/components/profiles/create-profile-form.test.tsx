@@ -400,17 +400,26 @@ describe('CreateProfileForm operator token reachability', () => {
     expect(screen.getByRole('button', { name: 'Save token' })).toBeInTheDocument();
     expect(screen.getByText(/no token saved in this tab/i)).toBeInTheDocument();
 
-    // The token is set before the profile is described: the token form is the
+    // The token is set before the profile is described: the token block is the
     // first block of the create form.
+    //
+    // The block is deliberately NOT a nested `<form>`: a form inside a form is
+    // invalid HTML, and the browser resolves it by dropping the inner one, so
+    // pressing Enter in a text field could submit the wrong form. The token
+    // control therefore saves through its own button and must stay a direct
+    // child of the create form.
     const form = container.querySelector('form');
     expect(form).not.toBeNull();
     const blocks = Array.from(form?.children ?? []);
-    const tokenForm = input.closest('form');
-    expect(tokenForm).not.toBe(form);
-    expect(blocks).toContain(tokenForm);
-    expect(blocks.indexOf(tokenForm as Element)).toBeLessThan(
+    const tokenBlock = input.closest('div.min-w-0');
+    expect(tokenBlock).not.toBeNull();
+    expect(tokenBlock).not.toBe(form);
+    expect(blocks).toContain(tokenBlock);
+    expect(blocks.indexOf(tokenBlock as Element)).toBeLessThan(
       blocks.findIndex((block) => block.querySelector('#create-profile-id') !== null),
     );
+    // No form may be nested inside the creation form.
+    expect(form?.querySelector('form')).toBeNull();
   });
 
   it('reports the stored state of a token saved earlier in the tab', () => {
@@ -543,5 +552,104 @@ describe('CreateProfileForm layout width', () => {
     );
 
     expect(container.querySelector('form')).toHaveClass('max-w-2xl');
+  });
+});
+
+describe('CreateProfileForm forecast artifact', () => {
+  /** A catalogue whose registry offers a forecast-driven strategy too. */
+  const FORECAST_CATALOG: CatalogPayload = {
+    ...CATALOG,
+    strategies: ['basic', 'timesfm'],
+    forecast_strategies: ['timesfm'],
+  };
+
+  function renderForecastForm(response: Response | Error): RecordedCall[] {
+    const seam = installFetch(response);
+    render(
+      <CreateProfileForm
+        catalog={FORECAST_CATALOG}
+        operatorToken={TOKEN}
+        fetchImpl={seam.impl}
+      />,
+    );
+    return seam.calls;
+  }
+
+  /** Fill the identity fields, then pick `strategy` in the combobox. */
+  async function fillUpToStrategy(
+    user: ReturnType<typeof userEvent.setup>,
+    strategy: string,
+  ): Promise<void> {
+    await user.type(screen.getByLabelText('Profile id'), 'zaaaa');
+    await user.click(combobox('Asset'));
+    await user.click(screen.getByRole('option', { name: /BTC\/USDT/ }));
+    await user.click(combobox('Strategy'));
+    await user.click(screen.getByRole('option', { name: strategy }));
+  }
+
+  it('asks for no artifact while a strategy that needs none is selected', () => {
+    renderForecastForm(jsonResponse(CREATED));
+
+    expect(screen.queryByLabelText(/forecast artifact/i)).not.toBeInTheDocument();
+  });
+
+  it('asks for the artifact only once a forecast-driven strategy is selected', async () => {
+    const user = userEvent.setup();
+    renderForecastForm(jsonResponse(CREATED));
+
+    await fillUpToStrategy(user, 'timesfm');
+
+    expect(screen.getByLabelText(/forecast artifact/i)).toBeInTheDocument();
+  });
+
+  it('never sends the request when the required artifact path is missing', async () => {
+    const calls = renderForecastForm(jsonResponse(CREATED));
+    const user = userEvent.setup();
+    await fillUpToStrategy(user, 'timesfm');
+
+    await user.click(submitButton());
+
+    // The failure is caught before any request leaves the browser, and the
+    // message says what to do rather than echoing a server refusal.
+    expect(await screen.findByText(/needs a forecast artifact/i)).toBeInTheDocument();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sends the artifact path for a forecast-driven strategy', async () => {
+    const calls = renderForecastForm(jsonResponse(CREATED));
+    const user = userEvent.setup();
+    await fillUpToStrategy(user, 'timesfm');
+    const fx = screen.getByLabelText(/forecast artifact/i) as HTMLInputElement;
+    await user.type(fx, '/app/artifacts/btc-1h.parquet');
+    // await a tick so React flushes the controlled value back into the DOM
+    await waitFor(() => {
+      expect(fx.value).toBe('/app/artifacts/btc-1h.parquet');
+    });
+
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(calls).toHaveLength(1);
+    });
+    expect(JSON.parse(String(calls[0]?.init?.body))).toMatchObject({
+      strategy: 'timesfm',
+      forecast: '/app/artifacts/btc-1h.parquet',
+    });
+  });
+
+  it('never sends an artifact path for a strategy that ignores one', async () => {
+    const calls = renderForecastForm(jsonResponse(CREATED));
+    const user = userEvent.setup();
+    await fillValidForm(user);
+
+    await user.click(submitButton());
+
+    // A `basic` profile declaring a forecast is a configuration the engine
+    // silently drops, so the form must not produce one.
+    await waitFor(() => {
+      expect(calls).toHaveLength(1);
+    });
+    const sent = JSON.parse(String(calls[0]?.init?.body)) as Record<string, unknown>;
+    expect(sent).not.toHaveProperty('forecast');
   });
 });

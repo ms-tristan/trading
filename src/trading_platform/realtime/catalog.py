@@ -61,6 +61,7 @@ __all__ = [
     "CATALOG_MODES",
     "CATALOG_TTL_SECONDS",
     "FALLBACK_SYMBOLS",
+    "STRATEGIES_REQUIRING_FORECAST",
     "STRATEGY_NAMES",
     "TIMEFRAME_ORDER",
     "MarketCatalog",
@@ -118,6 +119,39 @@ def _registered_strategy_names() -> list[str]:
 STRATEGY_NAMES: Callable[[], list[str]] = _registered_strategy_names
 
 
+def _strategies_requiring_forecast() -> list[str]:
+    """Return the registered strategies that cannot be built without an artifact.
+
+    The marker is the strategy's own parameter model (see
+    :func:`~trading_platform.realtime.features.strategy_needs_forecast`), never a
+    hardcoded name, so a strategy that gains or loses its ``artifact`` field is
+    reported correctly without touching this function.
+
+    The creation form reads this list to ask for the artifact path *before*
+    submitting: a ``timesfm`` profile created without one is refused by the
+    engine, and making the operator discover that from a failed request is
+    exactly the friction this avoids.
+    """
+    from trading_platform.config.models import ProfileConfig
+    from trading_platform.realtime.features import strategy_needs_forecast
+
+    required: list[str] = []
+    for name in strategy_names():
+        try:
+            probe = ProfileConfig(id="probe", symbol="BTC/USDT", timeframe="1h", strategy=name)
+        except (ValueError, TypeError):
+            # A strategy that refuses the probe is left to the registry's own
+            # failure when it is actually built; it is not reported here.
+            continue
+        if strategy_needs_forecast(probe):
+            required.append(name)
+    return required
+
+
+#: Callable returning the strategy names that need a forecast artifact.
+STRATEGIES_REQUIRING_FORECAST: Callable[[], list[str]] = _strategies_requiring_forecast
+
+
 def fallback_symbols(quote: str = "USDT") -> list[dict[str, str]]:
     """Return the static symbol table, filtered on ``quote``.
 
@@ -158,6 +192,7 @@ def default_catalog_body(quote: str = "USDT") -> dict[str, Any]:
         "strategies": STRATEGY_NAMES(),
         "timeframes": list(TIMEFRAME_ORDER),
         "modes": list(CATALOG_MODES),
+        "forecast_strategies": STRATEGIES_REQUIRING_FORECAST(),
     }
 
 
@@ -360,6 +395,7 @@ class MarketCatalog:
             "strategies": STRATEGY_NAMES(),
             "timeframes": list(TIMEFRAME_ORDER),
             "modes": list(CATALOG_MODES),
+            "forecast_strategies": STRATEGIES_REQUIRING_FORECAST(),
         }
 
     def invalidate(self) -> None:

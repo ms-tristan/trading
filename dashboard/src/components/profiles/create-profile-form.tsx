@@ -84,6 +84,13 @@ export const CREATE_PROFILE_MESSAGES = {
   timeframeRequired: 'Timeframe is required.',
   balanceInvalid: 'Initial balance must be greater than 0.',
   /**
+   * Rendered when the selected strategy consumes an offline forecast artifact
+   * and no path was given. Creating such a profile without one is refused by the
+   * server, so the form asks for it up front instead of letting the request fail.
+   */
+  forecastRequired:
+    'This strategy needs a forecast artifact. Build one with "trading forecast-build" and paste its path.',
+  /**
    * Guidance added to the mapped banner when the server refuses the creation
    * with a 403 because no valid operator token was sent. It tells the operator
    * what to do instead of leaving them with the raw refusal.
@@ -107,7 +114,8 @@ export type CreateProfileField =
   | 'symbol'
   | 'strategy'
   | 'timeframe'
-  | 'balance';
+  | 'balance'
+  | 'forecast';
 
 /** Validation state of every field (a message, or `null`). */
 export type CreateProfileErrors = Record<CreateProfileField, string | null>;
@@ -118,6 +126,7 @@ const NO_ERRORS: CreateProfileErrors = {
   strategy: null,
   timeframe: null,
   balance: null,
+  forecast: null,
 };
 
 /** DOM id of every field, used for the labels, the errors and the focus. */
@@ -127,6 +136,7 @@ const FIELD_IDS: Record<CreateProfileField, string> = {
   strategy: 'create-profile-strategy',
   timeframe: 'create-profile-timeframe',
   balance: 'create-profile-balance',
+  forecast: 'create-profile-forecast',
 };
 
 const INPUT_CLASSES = cn(
@@ -165,13 +175,17 @@ function initialTimeframe(timeframes: string[]): string {
 }
 
 /** One line of validation over the current field values. */
-function validate(values: {
-  profileId: string;
-  symbol: string;
-  strategy: string;
-  timeframe: string;
-  balance: string;
-}): CreateProfileErrors {
+function validate(
+  values: {
+    profileId: string;
+    symbol: string;
+    strategy: string;
+    timeframe: string;
+    balance: string;
+    forecast: string;
+  },
+  needsForecast: boolean,
+): CreateProfileErrors {
   const profileId = values.profileId.trim();
   let profileIdError: string | null = null;
   if (profileId === '') {
@@ -190,6 +204,16 @@ function validate(values: {
     balance: parseInitialBalance(values.balance) === null
       ? CREATE_PROFILE_MESSAGES.balanceInvalid
       : null,
+    /*
+     * The artifact is required exactly when the chosen strategy consumes one.
+     * The server says which strategies those are, so this never hard-codes a
+     * name, and a `basic` profile is never asked for an artifact it would only
+     * ignore.
+     */
+    forecast:
+      needsForecast && values.forecast.trim() === ''
+        ? CREATE_PROFILE_MESSAGES.forecastRequired
+        : null,
   };
 }
 
@@ -200,7 +224,14 @@ function hasErrors(errors: CreateProfileErrors): boolean {
 
 /** Move the focus to the first invalid field of `order`. */
 function focusFirstInvalidField(errors: CreateProfileErrors): void {
-  const order: CreateProfileField[] = ['profileId', 'symbol', 'strategy', 'timeframe', 'balance'];
+  const order: CreateProfileField[] = [
+    'profileId',
+    'symbol',
+    'strategy',
+    'timeframe',
+    'balance',
+    'forecast',
+  ];
   const first = order.find((field) => errors[field] !== null);
   if (first === undefined || typeof document === 'undefined') {
     return;
@@ -238,6 +269,7 @@ export function CreateProfileForm({
   const [timeframe, setTimeframe] = useState<string>(() => initialTimeframe(catalog.timeframes));
   const [mode, setMode] = useState<RunMode>('paper');
   const [balance, setBalance] = useState<string>(DEFAULT_INITIAL_BALANCE);
+  const [forecast, setForecast] = useState<string>('');
   const [errors, setErrors] = useState<CreateProfileErrors>(NO_ERRORS);
   const [pending, setPending] = useState<boolean>(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -264,6 +296,17 @@ export function CreateProfileForm({
     [catalog.modes],
   );
 
+  /*
+   * Whether the strategy currently selected consumes an offline forecast
+   * artifact. The server reports which strategies those are; an older server
+   * answering without the key simply never asks for a path, which is the
+   * behaviour of every strategy that needs none.
+   */
+  const needsForecast = useMemo<boolean>(
+    () => (catalog.forecast_strategies ?? []).includes(strategy.trim()),
+    [catalog.forecast_strategies, strategy],
+  );
+
   const handleSubmit = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
@@ -271,8 +314,8 @@ export function CreateProfileForm({
         return;
       }
 
-      const values = { profileId, symbol, strategy, timeframe, balance };
-      const nextErrors = validate(values);
+      const values = { profileId, symbol, strategy, timeframe, balance, forecast };
+      const nextErrors = validate(values, needsForecast);
       setErrors(nextErrors);
       setNotice(null);
       setFailure(null);
@@ -292,6 +335,14 @@ export function CreateProfileForm({
       const initialBalance = parseInitialBalance(balance);
       if (typeof initialBalance === 'number') {
         body.initial_balance = initialBalance;
+      }
+      /*
+       * The path is only sent when the selected strategy consumes an artifact:
+       * a `basic` profile declaring one would be a configuration the engine
+       * silently drops, so the form never produces it.
+       */
+      if (needsForecast && forecast.trim() !== '') {
+        body.forecast = forecast.trim();
       }
 
       // The caller may carry the token; the dashboard stores it in sessionStorage.
@@ -316,7 +367,9 @@ export function CreateProfileForm({
       balance,
       baseUrl,
       fetchImpl,
+      forecast,
       mode,
+      needsForecast,
       operatorToken,
       pending,
       profileId,
@@ -425,6 +478,45 @@ export function CreateProfileForm({
         emptyMessage="No strategy matches. Try another spelling, for example basic."
         error={errors.strategy}
       />
+
+      {/*
+        Rendered only for a strategy that consumes an offline forecast artifact:
+        asking every operator for a path the engine would ignore is noise, and
+        asking none of them for one a `timesfm` profile cannot start without is
+        a request that can only fail.
+      */}
+      {needsForecast ? (
+        <div className="flex flex-col gap-sm">
+          <label
+            htmlFor={FIELD_IDS.forecast}
+            className="text-xs font-medium text-muted-foreground"
+          >
+            Forecast artifact
+          </label>
+          <input
+            id={FIELD_IDS.forecast}
+            type="text"
+            value={forecast}
+            required
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="data/forecast/btc-usdt-1h.parquet"
+            aria-invalid={errors.forecast === null ? undefined : true}
+            aria-describedby={
+              errors.forecast === null ? undefined : `${FIELD_IDS.forecast}-error`
+            }
+            onChange={(event) => {
+              setForecast(event.target.value);
+            }}
+            className={cn(INPUT_CLASSES, errors.forecast === null ? 'border-border' : 'border-loss')}
+          />
+          <FieldError field="forecast" message={errors.forecast} />
+          <p className="text-xs text-muted-foreground">
+            Path of the artifact this strategy reads, as the server sees it. Build one with
+            &quot;trading forecast-build&quot;.
+          </p>
+        </div>
+      ) : null}
 
       <div className="flex flex-col gap-sm">
         <label

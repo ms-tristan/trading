@@ -52,8 +52,8 @@ EXPECTED_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 #: Bases the static table must always carry.
 REQUIRED_BASES = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX"}
 
-#: The four documented keys of ``GET /api/catalog``.
-CATALOG_KEYS = {"symbols", "strategies", "timeframes", "modes"}
+#: The documented keys of ``GET /api/catalog``.
+CATALOG_KEYS = {"symbols", "strategies", "timeframes", "modes", "forecast_strategies"}
 
 
 class FakeFetcher:

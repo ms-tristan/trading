@@ -876,7 +876,13 @@ def test_catalog_and_control_round_trip_over_http(server: MonitoringServer) -> N
     assert status == 200
     assert headers["Content-Type"] == "application/json; charset=utf-8"
     catalog = decode(payload)
-    assert sorted(catalog) == ["modes", "strategies", "symbols", "timeframes"]
+    assert sorted(catalog) == [
+        "forecast_strategies",
+        "modes",
+        "strategies",
+        "symbols",
+        "timeframes",
+    ]
     assert sorted(catalog["symbols"][0]) == ["base", "quote", "symbol"]
     assert catalog["modes"] == ["paper", "live"]
 

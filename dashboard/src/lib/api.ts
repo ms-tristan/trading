@@ -998,6 +998,9 @@ export async function createProfile(
   if (body.params !== undefined) {
     request.params = body.params;
   }
+  if (body.forecast !== undefined) {
+    request.forecast = body.forecast;
+  }
   const payload = await performRequest<unknown>(
     path,
     mutationInit(options, {

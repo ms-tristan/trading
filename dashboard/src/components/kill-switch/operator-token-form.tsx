@@ -43,7 +43,7 @@
  */
 
 import { useCallback, useId, useRef, useState, useSyncExternalStore } from 'react';
-import type { FormEvent, JSX } from 'react';
+import type { JSX } from 'react';
 
 import { KeyRound, ShieldCheck, Trash2 } from 'lucide-react';
 
@@ -161,8 +161,7 @@ export function OperatorTokenForm({
     readTokenSavedServerSnapshot,
   );
 
-  const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const handleSubmit = useCallback(() => {
     const input = inputRef.current;
     const value = input === null ? '' : input.value;
     saveOperatorToken(value);
@@ -212,7 +211,14 @@ export function OperatorTokenForm({
   }, [baseUrl, fetchImpl]);
 
   return (
-    <form onSubmit={handleSubmit} className={cn('min-w-0', className)}>
+    /*
+     * A `div`, not a `form`: this component is embedded in the profile creation
+     * form, and a `form` inside a `form` is invalid HTML — the browser resolves
+     * it by dropping the inner one, so pressing Enter in a text field could
+     * submit the wrong form entirely. Saving is therefore an explicit button
+     * action, and ``handleSubmit`` is driven from that click.
+     */
+    <div className={cn('min-w-0', className)}>
       <label
         htmlFor={tokenId}
         className="block text-xs font-medium uppercase tracking-wide text-muted-foreground"
@@ -234,7 +240,13 @@ export function OperatorTokenForm({
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
           )}
         />
-        <Button type="submit" size="sm" variant="secondary" icon={<KeyRound className="size-3.5" />}>
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          onClick={handleSubmit}
+          icon={<KeyRound className="size-3.5" />}
+        >
           Save token
         </Button>
         {tokenSaved ? (
@@ -291,6 +303,6 @@ export function OperatorTokenForm({
       {hint === undefined || hint === '' ? null : (
         <p className="mt-xs text-xs text-muted-foreground">{hint}</p>
       )}
-    </form>
+    </div>
   );
 }

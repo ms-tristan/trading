@@ -1305,6 +1305,29 @@ describe('profile lifecycle routes', () => {
     );
   });
 
+  it('sends the forecast artifact path when the profile declares one', async () => {
+    const { impl, calls } = recordingFetch(jsonResponse({ profile }));
+
+    await createProfile(
+      { ...createBody, strategy: 'timesfm', forecast: '/app/artifacts/btc-1h.parquet' },
+      { fetchImpl: impl, operatorToken: 'unit-test-secret' },
+    );
+
+    // The client builds its request from an explicit allow-list, so a field it
+    // forgets is silently dropped rather than refused by the server: this pins
+    // the one a forecast-driven strategy cannot start without.
+    expect(calls[0]?.init?.body).toBe(
+      JSON.stringify({
+        profile_id: 'beta',
+        symbol: 'BTC/USDT',
+        timeframe: '1h',
+        strategy: 'timesfm',
+        mode: 'paper',
+        forecast: '/app/artifacts/btc-1h.parquet',
+      }),
+    );
+  });
+
   it('sends no body on delete', async () => {
     const { impl, calls } = recordingFetch(jsonResponse(deleted));
 

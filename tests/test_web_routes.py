@@ -30,6 +30,8 @@ import pytest
 from trading_platform.config.models import MonitoringConfig, ProfileConfig
 from trading_platform.core.errors import (
     ConfigError,
+    ForecastArtifactError,
+    ForecastError,
     MonitoringError,
     ProfileError,
     StateStoreError,
@@ -196,7 +198,7 @@ PROFILE_KEYS = sorted(
 KILL_SWITCH_KEYS = ["changed_at", "kill_switch", "reason"]
 
 #: Exact keys of ``GET /api/catalog`` and of one symbol entry.
-CATALOG_KEYS = ["modes", "strategies", "symbols", "timeframes"]
+CATALOG_KEYS = ["forecast_strategies", "modes", "strategies", "symbols", "timeframes"]
 CATALOG_SYMBOL_KEYS = ["base", "quote", "symbol"]
 
 #: Exact keys of ``GET /api/control`` and of one profile entry.
@@ -3009,3 +3011,112 @@ def test_the_token_route_is_not_a_profile_route(writable: Router) -> None:
     """A typo in the path stays a 404: the new route matches exactly."""
     assert writable.handle("GET", "/api/operator-tokens").status == 404
     assert writable.handle("GET", "/api/operator-token/extra").status == 404
+
+
+# ---------------------------------------------------------------------------
+# creation: the forecast artifact of a forecast-driven strategy
+# ---------------------------------------------------------------------------
+
+
+def test_a_creation_may_declare_a_forecast_artifact(
+    writable: Router, controller: FakeController
+) -> None:
+    """The path reaches the controller, which is what builds the profile."""
+    payload = {**CREATE_BODY, "strategy": "timesfm", "forecast": "/app/artifacts/btc-1h.parquet"}
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+
+    assert response.status == 201
+    assert controller.create_calls[0]["forecast"] == "/app/artifacts/btc-1h.parquet"
+
+
+def test_a_creation_without_a_forecast_omits_the_field(
+    writable: Router, controller: FakeController
+) -> None:
+    """A strategy that needs no artifact is never handed one."""
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(CREATE_BODY).encode(), headers=AUTH
+    )
+
+    assert response.status == 201
+    assert "forecast" not in controller.create_calls[0]
+
+
+@pytest.mark.parametrize("forecast", ["", "   ", 7, [], {}])
+def test_a_malformed_forecast_is_refused_before_the_controller(
+    writable: Router, controller: FakeController, forecast: Any
+) -> None:
+    """A non-string, blank path is a malformed body, not a creation attempt."""
+    payload = {**CREATE_BODY, "forecast": forecast}
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+
+    assert response.status == 400
+    assert "forecast" in payload_of(response)["error"]
+    assert controller.create_calls == []
+
+
+def test_an_explicit_null_forecast_is_accepted(
+    writable: Router, controller: FakeController
+) -> None:
+    """``null`` is the documented "declares no artifact" and is not an error."""
+    payload = {**CREATE_BODY, "forecast": None}
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+
+    assert response.status == 201
+    assert "forecast" not in controller.create_calls[0]
+
+
+def test_a_missing_forecast_artifact_is_a_400_not_a_500(
+    writable: Router, controller: FakeController
+) -> None:
+    """A forecast-driven strategy with no artifact is the caller's mistake.
+
+    Building the profile resolves the strategy, which fails with a
+    ``ForecastArtifactError``.  That is a client error the message already
+    explains, so it must not be reported as a server fault the operator would
+    retry in vain.
+    """
+    controller.failure = ForecastArtifactError(
+        "profile 'zaaaa' uses strategy 'timesfm', which needs a forecast artifact, "
+        "but declares no 'forecast' path"
+    )
+    payload = {**CREATE_BODY, "profile_id": "zaaaa", "strategy": "timesfm"}
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+
+    assert response.status == 400
+    assert "forecast artifact" in payload_of(response)["error"]
+
+
+def test_an_unusable_forecast_artifact_is_a_400(
+    writable: Router, controller: FakeController
+) -> None:
+    """Any forecast failure is the same class of client error as a missing one."""
+    controller.failure = ForecastError("forecast artifact is corrupt: bad magic")
+    response = writable.handle(
+        "POST",
+        "/api/profiles",
+        body=json.dumps({**CREATE_BODY, "forecast": "/tmp/bad.parquet"}).encode(),
+        headers=AUTH,
+    )
+
+    assert response.status == 400
+    assert "corrupt" in payload_of(response)["error"]
+
+
+def test_a_forecast_failure_never_leaks_into_the_other_lifecycle_routes(
+    writable: Router, controller: FakeController
+) -> None:
+    """The narrowed mapping stays on creation: a delete failure keeps its code."""
+    controller.failure = ForecastArtifactError("unexpected here")
+    response = writable.handle("DELETE", f"/api/profiles/{PROFILE_A}", headers=AUTH)
+
+    # ``DELETE`` maps through the shared handler, so an unmapped exception is
+    # still the documented 500 -- only creation narrows it to a 400.
+    assert response.status == 500
