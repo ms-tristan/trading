@@ -74,6 +74,7 @@ Trading/
 │   │   ├── indicators.py             # EMA, RSI, ATR — calculs purs, sans dépendance externe
 │   │   ├── base.py                   # Strategy : contrat prepare / signals / run
 │   │   ├── basic.py                  # BasicStrategy : croisement EMA + filtre RSI + stop ATR
+│   │   ├── momentum.py               # MomentumStrategy : multi-horizon day-scaled momentum, optional ATR stop (see docs/strategies.md)
 │   │   ├── timesfm_forecast.py       # TimesfmForecastStrategy : entries/exits driven by the forecast artifact
 │   │   ├── features.py               # feature-injection seam: resolves the forecast artifact into a ForecastStore
 │   │   ├── registry.py               # register_strategy / get_strategy (résolution par nom)
@@ -81,7 +82,8 @@ Trading/
 │   │   ├── freqtrade_parameters.py   # traduction ParamsModel / PARAM_SPACE -> IntParameter, DecimalParameter, CategoricalParameter
 │   │   ├── freqtrade_stoploss.py     # stop-loss par bougie -> stop Freqtrade : table d'entrée + ratio par trade
 │   │   ├── freqtrade_adapter.py      # make_freqtrade_strategy : fabrique une IStrategy générique depuis une Strategy du registre
-│   │   └── freqtrade_basic.py        # BasicFreqtradeStrategy : la classe concrète de `basic`, chargeable par nom
+│   │   ├── freqtrade_basic.py        # BasicFreqtradeStrategy : la classe concrète de `basic`, chargeable par nom
+│   │   └── freqtrade_momentum.py     # MomentumFreqtradeStrategy : the concrete class of `momentum`, loadable by name
 │   ├── validation/
 │   │   ├── split.py                  # split_is_oos / make_windows : découpage IS/OOS + purge
 │   │   ├── walk_forward.py           # walk_forward : fenêtres glissantes ou ancrées
@@ -358,6 +360,7 @@ de test ne peut pas sortir sur le réseau.
 | `Strategy.signals` | `signals(data: pd.DataFrame) -> pd.DataFrame` | ajoute les colonnes de signal (`entry_long`, `exit_long`, `entry_short`, `exit_short`, `stop_loss` ; le squelette est *long only* par défaut, les colonnes *short* restent déclarées) |
 | `Strategy.run` | `run(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]` | rend `(prepared, signals)` — le point d'entrée du moteur |
 | `BasicStrategy` | `name = "basic"` ; paramètres `ema_fast=9`, `ema_slow=21`, `rsi_period=14`, `rsi_min=30.0`, `rsi_max=70.0`, `atr_period=14`, `atr_stop_multiplier=2.0`, `allow_short=False` | croisement EMA + filtre RSI + stop ATR (`stop_loss` = `close − atr_stop_multiplier × ATR` sur la bougie de signal) |
+| `MomentumStrategy` | `name = "momentum"` ; parameters `fast_days=7`, `mid_days=14`, `slow_days=28`, `enter_score=0.6`, `exit_score=0.0`, `atr_period=14`, `atr_stop_multiplier=4.0`, `allow_short=False` | multi-horizon day-scaled momentum: `momentum_score = (sign(roc(close, fast)) + sign(roc(close, mid)) + sign(roc(close, slow))) / 3`, long entry at `momentum_score >= enter_score`, exit at `momentum_score <= exit_score`, mirrored short side when `allow_short` is set, `stop_loss = close − atr_stop_multiplier × ATR` (all `NaN` when the multiplier is `0.0`). The three lookbacks are given in **days** and converted into candle counts from the frame's own grid, so the same parameters mean the same economic horizon on 1h, 4h and 1d; the indicator columns are exactly `momentum_fast`, `momentum_mid`, `momentum_slow`, `momentum_score`, `atr`, `candles_per_day`. Rules, parameters and the full validation evidence: [`docs/strategies.md`](strategies.md) |
 | `TimesfmForecastStrategy` | `name = "timesfm"`; `TimesFMForecastParams` (pydantic) + `PARAM_SPACE` | strategy driven by the forecast artifact: AND-composed entries, a priority-ordered exit decision tree, the `forecast_*` diagnostic columns and `exit_code` (§4.14) |
 | `register_strategy` | `register_strategy(cls: type[Strategy]) -> type[Strategy]` | décorateur de classe qui enregistre la stratégie dans `STRATEGIES` |
 | `get_strategy` | `get_strategy(name: str, params: Mapping[str, Any] \| None = None) -> Strategy` | instancie une stratégie enregistrée |
@@ -366,6 +369,12 @@ de test ne peut pas sortir sur le réseau.
 | `validate_freqtrade_adapter_class` | `validate_freqtrade_adapter_class(cls) -> None` | vérifie que la classe produite est une `IStrategy` valide (version d'interface, les trois `populate_*`, attributs requis) et lève `StrategyError` sinon ; rend `None` quand tout est conforme |
 | `freqtrade_available` | `freqtrade_available() -> bool` | `True` si le paquet externe `freqtrade` est importable — import **paresseux**, jamais au chargement du paquet |
 | `BasicFreqtradeStrategy` | `make_freqtrade_strategy("basic")` ; `BASIC_FREQTRADE_STRATEGY_NAME = "BasicStrategy"` | la classe concrète chargeable par nom qui expose la stratégie maison `basic` à Freqtrade |
+
+**Strategy catalogue.** The rules, the parameters and the measured validation
+evidence of the shipped strategies are documented in
+[`docs/strategies.md`](strategies.md): `basic` is the historical reference
+implementation, `momentum` is the research-validated multi-horizon momentum
+strategy.
 
 ### 4.4.1 Inventaire de l'adaptateur Freqtrade — `trading_platform.strategy.freqtrade_*`
 
@@ -391,6 +400,8 @@ couche 3 et ne sont utilisés que par le chemin d'exposition à Freqtrade (§4.9
 | `freqtrade_strategy_namespace` | `freqtrade_adapter` | construit l'espace de noms injecté dans `type(...)` : attributs d'instance gelés (`timeframe`, `can_short`, `minimal_roi`, `process_only_new_candles`, `use_custom_stoploss`, `INTERFACE_VERSION`…) et les trois `populate_*` |
 | `BasicFreqtradeStrategy` | `freqtrade_basic` | la classe concrète de `basic` : `make_freqtrade_strategy("basic")`, chargeable par nom par Freqtrade |
 | `BASIC_FREQTRADE_STRATEGY_NAME` | `freqtrade_basic` | `"BasicStrategy"` — le nom visible côté Freqtrade, celui de `config/freqtrade_config.json` et `config/freqtrade_dryrun.json` |
+| `MomentumFreqtradeStrategy` | `freqtrade_momentum` | the concrete class of `momentum`: `make_freqtrade_strategy("momentum")`, loadable by name by Freqtrade |
+| `MOMENTUM_FREQTRADE_STRATEGY_NAME` | `freqtrade_momentum` | `"MomentumStrategy"` — the name Freqtrade sees, i.e. the class name of the shipped shim `user_data/strategies/MomentumStrategy.py` |
 
 **Note de nommage.** La conversion « stop absolu -> ratio » existe en deux
 exemplaires : l'**helper natif de Freqtrade** `stoploss_from_absolute`

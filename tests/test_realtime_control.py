@@ -332,7 +332,7 @@ def test_a_command_that_never_returns_times_out_and_is_cancelled(tmp_path: Path)
         (valid_payload(profile_id=7), "invalid profile id: 7 (expected"),
         (
             valid_payload(strategy="nope"),
-            "unknown strategy: 'nope' (available: basic)",
+            "unknown strategy: 'nope' (available: basic, momentum)",
         ),
         (
             valid_payload(timeframe="2h"),

@@ -32,6 +32,7 @@ user_data/*
 !user_data/strategies/
 user_data/strategies/*
 !user_data/strategies/BasicStrategy.py
+!user_data/strategies/MomentumStrategy.py
 *.log
 logs/
 freqtrade-*.log

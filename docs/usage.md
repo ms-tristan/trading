@@ -7,7 +7,8 @@ Documents liés :
 
 - [`docs/architecture.md`](architecture.md) — couches, interfaces gelées, contrat OHLCV ;
 - [`docs/backtesting-methodology.md`](backtesting-methodology.md) — protocole de validation et seuils ;
-- [`docs/testing-policy.md`](testing-policy.md) — politique de tests, commande complète, seuil de couverture.
+- [`docs/testing-policy.md`](testing-policy.md) — politique de tests, commande complète, seuil de couverture ;
+- [`docs/strategies.md`](strategies.md) — the strategy catalogue: the `momentum` rules, its parameters and its validation evidence.
 
 ---
 
@@ -173,6 +174,52 @@ lente **et** que le RSI est strictement dans `]rsi_min, rsi_max[` ; sortie sur
 croisement inverse ou sur stop ATR. `strategy.params` est aussi la base du
 balayage paramétrique (`validation.robustness_grid`), et une grille vide laisse
 la CLI utiliser `BasicStrategy.PARAM_SPACE`.
+
+**The `momentum` strategy.** `strategy.name = "momentum"` selects the
+research-validated multi-horizon momentum strategy
+(`trading_platform.strategy.momentum`, layer 3). Its parameters and defaults:
+
+| Parameter | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `fast_days` | `7` | `>= 1` | short momentum lookback, in **days** |
+| `mid_days` | `14` | `>= 2` | mid lookback, in days; must be `> fast_days` |
+| `slow_days` | `28` | `>= 3` | long lookback, in days; must be `> mid_days` |
+| `enter_score` | `0.6` | `0 < x <= 1` | long entry when the score is at or above it (with the default: "at least two of the three horizons agree") |
+| `exit_score` | `0.0` | `-1 <= x <= 1` | long exit when the score is at or below it; must be `< enter_score` |
+| `atr_period` | `14` | `>= 2` | period of the ATR used by the stop column |
+| `atr_stop_multiplier` | `4.0` | `>= 0.0` | stop distance in ATR units; **`0.0` means "no stop"** (the whole `stop_loss` column is `NaN`) |
+| `allow_short` | `false` | boolean | enables the two short-side signal columns |
+
+The three lookbacks are given in **days** and converted into candle counts from
+the frame's own grid (`candles_per_day = max(1, round(1440 / median spacing in
+minutes))`: 24 candles a day on `1h`, 6 on `4h`, 1 on `1d`), so the same
+parameters mean the same economic horizon on every timeframe. The entry is a
+**state**, not a crossover event. The full rules, the measured validation
+evidence and the limitations are in [`docs/strategies.md`](strategies.md).
+
+Two configurations ship with the repository:
+
+| File | Timeframe | Shorts | Use |
+| --- | --- | --- | --- |
+| `config/backtest_momentum.json` | `4h` | yes (`backtest.allow_short` **and** the strategy `allow_short` are `true`) | the validated long/short configuration |
+| `config/backtest_momentum_spot.json` | `4h` | no (spot-only) | the same strategy where shorting is impossible |
+
+Both set `benchmark.variant = "buy_and_hold"` with
+`benchmark.risk_free_rate = 0.05`, so the reported Sharpe ratios stay comparable
+with the research numbers of [`docs/strategies.md`](strategies.md) §5:
+
+```bash
+.venv/bin/python -m trading_platform.cli config validate --config config/backtest_momentum.json
+.venv/bin/python -m trading_platform.cli config validate --config config/backtest_momentum_spot.json
+.venv/bin/python -m trading_platform.cli backtest     --config config/backtest_momentum.json
+.venv/bin/python -m trading_platform.cli walk-forward --config config/backtest_momentum.json
+.venv/bin/python -m trading_platform.cli robustness   --config config/backtest_momentum.json
+.venv/bin/python -m trading_platform.cli backtest     --config config/backtest_momentum_spot.json
+```
+
+A single-symbol run is **not** the tested deployment unit: the evidence of
+[`docs/strategies.md`](strategies.md) §5 is an equal-weight basket of many
+symbols (one profile per symbol), which is what the realtime layer runs.
 
 ### 3.5 `backtest` — exécution
 
@@ -953,6 +1000,7 @@ jamais besoin) :
 | Nom maison (`strategy.name`) | Classe adaptateur | Nom Freqtrade (config `strategy:`) |
 | --- | --- | --- |
 | `basic` | `BasicFreqtradeStrategy` | `BasicStrategy` |
+| `momentum` | `MomentumFreqtradeStrategy` | `MomentumStrategy` |
 
 `config/freqtrade_config.json` (live) et `config/freqtrade_dryrun.json` (paper)
 déclarent tous les deux `"strategy": "BasicStrategy"` : c'est le nom attendu par
@@ -963,6 +1011,17 @@ fichier suivi de `user_data/` : il ne contient aucune logique, seulement le
 `make_freqtrade_strategy("basic")` et une déclaration de classe d'une ligne pour
 donner à Freqtrade le nom qu'il attend. Le reste de `user_data/` est l'état
 écrit par Freqtrade et reste git-ignoré.
+
+> **Update — the `momentum` shim.** With the momentum delivery,
+> `user_data/strategies/` tracks **two** shims instead of one:
+> `user_data/strategies/BasicStrategy.py` (above) and
+> `user_data/strategies/MomentumStrategy.py`, which is the same two-line recipe
+> around `make_freqtrade_strategy("momentum")`. Freqtrade resolves a strategy by
+> its **class name**, so the class is still literally called `MomentumStrategy`
+> and is selected with `--strategy MomentumStrategy`; `config/freqtrade_config.json`
+> and `config/freqtrade_dryrun.json` keep `"strategy": "BasicStrategy"` until an
+> operator deliberately switches one of them. The `.gitignore` exception that
+> keeps the momentum shim tracked sits next to the historical one.
 
 **4. Lancer le bot.** Freqtrade cherche les stratégies dans
 `user_data/strategies/` : le shim y est déjà, rien à copier.
