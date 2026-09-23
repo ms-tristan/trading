@@ -1042,6 +1042,43 @@ def test_profile_config_accepts_the_live_mode_and_supported_timeframes() -> None
             assert profile.timeframe == timeframe
 
 
+def test_profile_config_history_override_is_optional_and_declared_last() -> None:
+    """The per-profile history window is additive: absent means "use realtime".
+
+    It is appended **after** ``entry_lookback_candles`` on purpose, so the field
+    order of every pre-existing configuration never moves.
+    """
+    assert ProfileConfig.model_fields["history_candles"].default is None
+    assert list(ProfileConfig.model_fields)[-1] == "history_candles"
+    assert list(ProfileConfig.model_fields)[-2] == "entry_lookback_candles"
+
+    default = ProfileConfig(id="x", symbol="BTC/USDT")
+    assert default.history_candles is None
+    assert default.model_dump()["history_candles"] is None
+
+    for value in (1, 300, 40321, 200_000):
+        assert ProfileConfig(id="x", symbol="BTC/USDT", history_candles=value).history_candles == (
+            value
+        )
+    for rejected in (0, -1, -40321):
+        with pytest.raises(ValidationError):
+            ProfileConfig(id="x", symbol="BTC/USDT", history_candles=rejected)
+
+
+def test_effective_history_candles_prefers_the_override() -> None:
+    """``None`` answers the realtime setting exactly; a value answers itself."""
+    inherited = ProfileConfig(id="x", symbol="BTC/USDT")
+    assert inherited.effective_history_candles(300) == 300
+    assert inherited.effective_history_candles(1) == 1
+    assert inherited.effective_history_candles(42_000) == 42_000
+
+    overridden = ProfileConfig(id="x", symbol="BTC/USDT", history_candles=42_000)
+    assert overridden.effective_history_candles(300) == 42_000
+    # the override survives the JSON round trip the state store performs
+    assert ProfileConfig.model_validate(overridden.model_dump(mode="json")) == overridden
+    assert ProfileConfig.model_validate(inherited.model_dump(mode="json")).history_candles is None
+
+
 def test_risk_limits_bounds() -> None:
     assert RiskLimitsConfig(max_open_positions=0).max_open_positions == 0
     assert RiskLimitsConfig(max_drawdown_pct=1).max_drawdown_pct == 1

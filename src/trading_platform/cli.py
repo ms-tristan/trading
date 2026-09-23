@@ -1699,6 +1699,13 @@ def _realtime_stream_factory(realtime: RealtimeConfig, clock: Any) -> Any:
     :class:`~trading_platform.data.loader.OHLCVLoader` of the profile's exchange,
     whose provider is only built (and therefore only needs the optional ``ccxt``
     extra) when that profile is actually wired.
+
+    The history window is **per profile**: ``realtime.history_candles`` is the
+    default of every profile, and a profile that declares its own
+    ``ProfileConfig.history_candles`` is served that window instead -- the only way
+    an intraday profile can be given the tens of thousands of candles an intraday
+    warm-up needs without forcing every other profile to ask for as many.  An
+    absent override reproduces the previous window exactly.
     """
     from trading_platform.data.loader import CsvDataProvider, OHLCVLoader
     from trading_platform.realtime.stream import PollingMarketStream
@@ -1721,7 +1728,7 @@ def _realtime_stream_factory(realtime: RealtimeConfig, clock: Any) -> Any:
             provider,
             clock=clock,
             exchange=str(profile.exchange),
-            history_candles=int(realtime.history_candles),
+            history_candles=int(profile.effective_history_candles(realtime.history_candles)),
             poll_interval_seconds=float(profile.poll_interval_seconds),
             timeout_seconds=float(realtime.stream_poll_timeout_seconds),
             max_reconnects=int(realtime.max_stream_reconnects),
@@ -1935,7 +1942,9 @@ def _realtime_engine(
 
     orchestrator = _realtime_orchestrator(profiles, realtime, monitoring, clock=clock, store=store)
     catalog = _realtime_catalog(profiles, realtime)
-    controller = RuntimeProfileController(orchestrator=orchestrator)
+    controller = RuntimeProfileController(
+        orchestrator=orchestrator, history_candles=int(realtime.history_candles)
+    )
     server = create_server(
         orchestrator,
         monitor=_realtime_monitor(store, clock=clock, realtime=realtime),
@@ -1982,7 +1991,7 @@ def _state_db_writable(path: Path) -> tuple[bool, str]:
 
 
 def _realtime_profile_entry(
-    profile: ProfileConfig, *, environ: Mapping[str, str], gate: Any
+    profile: ProfileConfig, *, environ: Mapping[str, str], gate: Any, history_candles: int
 ) -> dict[str, Any]:
     """Build the ``realtime check`` entry of one profile (no order, no network).
 
@@ -1990,9 +1999,25 @@ def _realtime_profile_entry(
     validation belongs to the pydantic configuration layer, which already ran --
     and the credentials are only ever probed for **presence**: neither a value nor
     a network call is involved.
+
+    ``history_candles`` is the realtime-level window this profile is resolved
+    against (the profile's own :meth:`ProfileConfig.effective_history_candles`
+    answers the effective one).  The warm-up contract is reported under the
+    additive ``warmup`` key -- the full finding set, warning and error alike -- and
+    every **error** severity finding is also appended to ``issues``: that is what
+    keeps ``ok`` and the exit code semantics unchanged, because an impossible
+    profile is exactly a profile that cannot start.  A warning never reaches
+    ``issues``: a profile that is merely not warm *yet* must still report ``ok``.
     """
+    # Imported inside the function body on purpose: ``cli`` stays importable
+    # without the engine layer, exactly like every other realtime seam here.
     from trading_platform.realtime.credentials import credentials_from_env
     from trading_platform.realtime.risk import RiskLimits
+    from trading_platform.realtime.warmup import (
+        SEVERITY_ERROR,
+        profile_warmup_findings,
+        warmup_report,
+    )
 
     issues: list[str] = []
     risk = RiskLimits.from_config(profile.risk).to_dict()
@@ -2019,6 +2044,12 @@ def _realtime_profile_entry(
                 f"live profile {profile.id!r} has no credentials in the environment: "
                 f"{_CREDENTIAL_HELP}"
             )
+
+    issues.extend(
+        str(finding.message)
+        for finding in profile_warmup_findings(profile, history_candles=int(history_candles))
+        if str(finding.severity) == SEVERITY_ERROR
+    )
     return {
         "id": str(profile.id),
         "symbol": str(profile.symbol),
@@ -2030,6 +2061,7 @@ def _realtime_profile_entry(
         "credentials_present": configured,
         "live_gate_allowed": allowed,
         "risk": risk,
+        "warmup": warmup_report(profile, history_candles=int(history_candles)),
     }
 
 
@@ -2132,7 +2164,13 @@ def _realtime_preflight(
 
     gate = LiveTradingGate(os.environ)
     entries = [
-        _realtime_profile_entry(profile, environ=os.environ, gate=gate) for profile in profiles
+        _realtime_profile_entry(
+            profile,
+            environ=os.environ,
+            gate=gate,
+            history_candles=int(realtime.history_candles),
+        )
+        for profile in profiles
     ]
 
     kill_switch = KillSwitch(

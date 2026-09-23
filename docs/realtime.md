@@ -45,10 +45,11 @@ below is the schema of that row, not of a file.
 | `stake_amount` | amount committed per entry (default: the whole available balance) |
 | `exchange` | name of the execution venue |
 | `enabled` | a disabled profile is persisted but never started |
-| `warmup_candles` | number of past candles the strategy receives on every decision |
+| `warmup_candles` | the **frame budget**: number of past candles the runner asks the stream for on every decision, and therefore the window the strategy is warmed up on (§2.2) |
 | `poll_interval_seconds` | polling cadence specific to the profile |
 | `risk` | `RiskLimitsConfig` block (§3) |
 | `entry_lookback_candles` | live-only catch-up window: the entry decision may act on a crossover that occurred within the last N candles (0, the default, keeps the historical behaviour: only the last row decides); ignored by the backtest, which already reads every row; 0 <= N <= 200 |
+| `history_candles` | **optional per-profile override** of the live stream window, in candles (`>= 1`); `None`, the default, means "use `realtime.history_candles`", so an absent override reproduces the previous behaviour exactly. This is what lets one intraday profile be fed tens of thousands of candles without forcing every other profile to ask for as many. Declared **last** in the model, so no serialised profile changes shape (§2.2, §8) |
 
 The complete profile set is the `profiles` table of the state store. The two
 other sections of the retired document are settings, and they are rows of the
@@ -170,6 +171,33 @@ decide on a candle several days old **while filling it at the current day's
 price**. Deterministic replay of a past window is the job of
 `ReplayMarketStream` (`realtime run --once`, tests), never that of a live
 stream.
+
+**Two different bounds: the frame budget and the stream window.** The frame a
+runner warms its strategy up on is built from
+`stream.history(symbol, timeframe, count=warmup_candles)`, so
+**`warmup_candles` bounds what the strategy sees**: the candles a strategy
+declares it needs (`Strategy.required_candles`, see
+[`docs/strategies.md`](strategies.md) §3.1) have to fit inside that frame, and a
+profile whose strategy needs more can never warm up at all. **`history_candles`
+bounds what the stream itself asks the venue for**:
+`PollingMarketStream.next_candle` polls
+`[now - history_candles * candle_delta(timeframe), now]` on every attempt. The
+knob is a **realtime-level** setting (`RealtimeConfig.history_candles`, 300 by
+default) shared by every profile, and the profile carries an **optional
+per-profile override** (`ProfileConfig.history_candles`, `None` by default,
+`>= 1`): one profile can therefore be served the tens of thousands of candles an
+intraday warm-up needs — 40321 of them on `1m` with the default `momentum`
+parameters — without forcing every other profile to ask for as many. An absent
+override therefore reproduces the previous behaviour **byte-for-byte**: the
+profile is served `realtime.history_candles`, which is why the field is declared
+**last** in `ProfileConfig`: no serialised profile changes shape.
+
+A profile that asks for **more warm-up candles than its stream window holds**
+(`warmup_candles > history_candles`) is reported as a **WARNING** everywhere and
+is never refused (§8). The reason is the sentence above: the frame the strategy
+receives is bounded by `warmup_candles`, so a smaller stream window does not by
+itself silence the profile — but the operator asked for more history than the
+engine is configured to serve, and that must be visible rather than inferred.
 
 ### 2.3 Mandatory reuse
 
@@ -514,7 +542,7 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 | `POST /api/profiles/{id}/pause` | `{profile: ProfileSnapshot, paused: true}` | 400, 403, 404, 409, 503 |
 | `POST /api/profiles/{id}/resume` | `{profile: ProfileSnapshot, paused: false}` | 400, 403, 404, 409, 503 |
 | `DELETE /api/profiles/{id}` | `{profile_id, deleted: true}` | 400, 403, 404, 409, 503 |
-| `POST /api/profiles` | body `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?}` → `201 {profile: ProfileSnapshot}` | 400 malformed body / unknown strategy / unsupported timeframe, 403, 409 duplicate |
+| `POST /api/profiles` | body `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?, warmup_candles?, history_candles?}` → `201 {profile: ProfileSnapshot}` | 400 malformed body / unknown strategy / unsupported timeframe / a profile that can never warm up, 403, 409 duplicate |
 
 `wallet` is the **additive** platform-wide view of the one shared wallet (§9):
 
@@ -684,10 +712,13 @@ Payloads (exact keys):
 
 - `realtime check` → `{command: "realtime-check", ok, state_db,
   state_db_writable, kill_switch, profiles: [{id, symbol, timeframe, strategy,
-  mode, ok, issues, credentials_present, live_gate_allowed, risk}], issues}`.
+  mode, ok, issues, credentials_present, live_gate_allowed, risk, warmup}],
+  issues}`.
   The **top-level `issues` key** carries the *platform* problems (a non-writable
   state directory, an unusable store); the `issues` of each profile carry the
-  *profile's* problems. Exit `1` as soon as one profile cannot start. Zero
+  *profile's* problems. The `warmup` block is the additive warm-up report of §8
+  (`candles_per_day`, `required_candles`, `warmup_candles`, `history_candles`,
+  `findings`). Exit `1` as soon as one profile cannot start. Zero
   profiles is a legal platform, so an empty `profiles` list answers `ok: true`.
 - `realtime run` / `run --once` → `{command: "realtime-run", ok, state_db,
   profiles: [ProfileSnapshot…], decisions: [TradeSignalDecision…], url}`. `url` is
@@ -750,6 +781,14 @@ fast as the CPU allows (it is backfill), it is not a live follow-up of real time
 - `realtime check` attests the **absence** of credentials, not their validity: it
   opens no connection, so an invalid key/secret pair will only be detected at the
   first real call to the broker.
+- A grid the platform can now **feed** is not a grid that was **validated**. The
+  per-profile `history_candles` override and the warm-up contract make an
+  intraday `momentum` profile *run*, and stop it from running *silently* when it
+  cannot — they say nothing about whether it makes money. The validated grids,
+  the cost of a large window and the honest verdict are in
+  [`docs/strategies.md`](strategies.md) §3.1, §5 and §7: `4h` and `1d` are the
+  deployable grids, `1h` was measured and degrades on the holdout, and
+  `5m`/`15m`/`30m`/`1m` were never validated at all.
 
 ## 8. Profile lifecycle and candle history
 
@@ -790,14 +829,93 @@ this route — is the one that leaves an orphan, and the next boot flattens it
 (§4.1).
 
 **Create validates against the catalog.** `POST /api/profiles` accepts
-`{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?}`,
+`{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?, warmup_candles?, history_candles?}`,
 refuses an unknown field, a field of the wrong type, an unknown strategy (the
-message names the available ones), an unsupported timeframe and a malformed
-identifier with `400`, and a duplicate identifier with `409`. On success the
-profile is written to the `profiles` table and **started immediately** in the
-running engine, and the `201` body carries its `ProfileSnapshot`, so the dashboard
-refreshes without guessing. It is the supported way to create the profiles of a
-freshly deployed, empty host.
+message names the available ones), an unsupported timeframe, a `warmup_candles` or
+`history_candles` that is not a positive integer and a malformed identifier with
+`400`, and a duplicate identifier with `409`. On success the profile is written to
+the `profiles` table and **started immediately** in the running engine, and the
+`201` body carries its `ProfileSnapshot`, so the dashboard refreshes without
+guessing. It is the supported way to create the profiles of a freshly deployed,
+empty host. The two warm-up keys are optional and purely additive: an absent
+`warmup_candles` keeps the model default and an absent `history_candles` keeps the
+realtime-level window, so a body written before this delivery behaves exactly as
+it did.
+
+**The warm-up contract is enforced, never silent.** A strategy declares how many
+candles a frame must hold before it can emit **any** signal
+(`Strategy.required_candles`, part of the frozen strategy contract; `0` for a
+strategy that declares no warm-up). Three numbers decide whether a profile can be
+fed, and `realtime.warmup` is the single arithmetic authority that compares them:
+the candles the strategy **requires** on the profile's candle grid, the candles
+the profile **asks for** (`warmup_candles`, the frame budget of §2.2) and the
+candles the stream is configured to **serve** (`history_candles`, the realtime
+setting or the profile's own override). Two findings come out of it, and they are
+not the same thing:
+
+* **`strategy-warmup-impossible` (`error`)** — `required_candles >
+  warmup_candles`: the frame can *never* grow to the strategy's warm-up, so the
+  profile would run for ever with zero signals. It is **refused where the profile
+  is created**: `POST /api/profiles` answers the documented `400` with a message
+  that names the strategy, the timeframe, the candles required (and the day
+  lookback behind them), the candles the profile only ever asks the stream for,
+  and the timeframes that **would** work with those parameters, cheapest grid
+  first. The same sentence is used by every surface that reports it, so an
+  operator who read it once recognises it everywhere.
+* **`warmup-exceeds-history` (`warning`)** — `warmup_candles > history_candles`:
+  the profile asks the stream for more candles than its window holds. It is
+  **reported, never refused**: the frame the strategy receives is bounded by
+  `warmup_candles` (§2.2), so a smaller stream window does not by itself silence
+  the profile, and refusing it would refuse working configurations. It is logged
+  at create (`profile_warmup_coherence`) and at start (`warmup_coherence`), both
+  at `WARNING`, with the fix spelled out (raise `history_candles` — the realtime
+  setting or the per-profile override — to at least `warmup_candles`, or lower
+  `warmup_candles`). The stream the runner polls is built with the **effective**
+  window — `cli.py`'s stream factory passes
+  `profile.effective_history_candles(realtime.history_candles)` to
+  `PollingMarketStream`, and the runner receives the same number — so the window
+  the finding names is the window that actually polls.
+
+**`realtime check` reports the same contract.** Every profile entry carries an
+**additive** `warmup` key; the existing keys keep their names, their types and
+their positions:
+
+```
+{"candles_per_day": num, "required_candles": int, "warmup_candles": int,
+ "history_candles": int,
+ "findings": [{"code": "strategy-warmup-impossible" | "warmup-exceeds-history",
+               "severity": "error" | "warning", "message": str}]}
+```
+
+`candles_per_day` is the profile's grid (1440 on `1m`, 288 on `5m`, 24 on `1h`,
+1 on `1d`), `history_candles` is the window the profile is effectively served
+(its own override, or `realtime.history_candles`), and `findings` is `[]` for a
+coherent profile. An **error** finding is also appended to that profile's
+`issues`, and that is what keeps the documented semantics unchanged rather than
+bending them: the profile reports `ok: false`, the payload reports `ok: false`
+and `realtime check` exits `1`, exactly as for any other profile that cannot
+start. A **warning** finding never reaches `issues`: it appears under
+`warmup.findings` alone, and `ok` and the exit code are untouched — a profile
+that is merely misconfigured on its window is still a profile that starts.
+
+**Start-time semantics: never-warm-up is fatal, not-warm-yet is not.** At profile
+start (`ProfileRunner._prepare`) the runner compares what the strategy requires
+with what the profile asks the stream for, and the two outcomes are deliberately
+different:
+
+* when the requirement can **never** be satisfied with the configured
+  `warmup_candles`, the runner logs `warmup_impossible` at `ERROR`, persists
+  `ProfileStatus.ERROR` with the actionable message as its detail and raises, so
+  the profile does **not** poll for ever with zero signals. At boot the
+  orchestrator quarantines it — the failure is published through
+  `profile_failures` on `GET /api/health` while every other profile keeps running
+  — and a profile started later simply ends in `ERROR`;
+* when the requirement is simply **not satisfied yet** but will be as candles
+  accumulate, the tick logs `warmup_incomplete` at `WARNING` — naming the rows
+  received, the candles required, `warmup_candles` and the grid — and returns
+  without a decision. The profile **keeps running** and warms up on its own:
+  every profile legitimately starts with a short frame, and ending it there would
+  turn a normal warm-up into an outage.
 
 **The `profiles` table is the source of truth.** Adding or removing a profile is
 one transaction of the state store (an UPSERT on the natural key, or a `DELETE`),

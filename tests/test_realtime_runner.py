@@ -1250,6 +1250,103 @@ def test_an_incomplete_warm_up_places_no_order(install: Any, logs: Any) -> None:
     assert runner.health().lag_seconds > 0.0
 
 
+class DeclaringStrategy(ScriptedStrategy):
+    """A scripted strategy that declares a warm-up requirement.
+
+    It stands in for the delivered ``momentum`` contract without paying for a
+    40 000-candle frame: the runner's side of the contract only has to compare
+    the frame length with ``required_candles``, whatever the number is.
+    """
+
+    name = "declaring"
+    required = 100
+
+    def required_candles(self, candles_per_day: float = 1.0) -> int:
+        """Return the declared requirement, whatever the grid is."""
+        return int(self.required)
+
+
+class LegacyStrategy(ScriptedStrategy):
+    """A duck-typed strategy written before the warm-up member existed."""
+
+    name = "legacy"
+    required_candles = None  # type: ignore[assignment]
+
+
+def test_the_tick_warning_names_the_warm_up_arithmetic(
+    monkeypatch: pytest.MonkeyPatch, logs: Any
+) -> None:
+    """A frame below the declared requirement warns with the numbers, and survives.
+
+    The profile keeps running -- this is the "not warm yet" side of the contract,
+    which must never be fatal -- and the record carries what the strategy needs,
+    the rows it got and the grid they were measured on.
+    """
+    instance = DeclaringStrategy({"mode": "entry_long"})
+    monkeypatch.setattr(runner_module, "resolve_strategy", lambda _profile: instance)
+    runner, _stream, _gateway, store, _clock = build(stream=FakeStream(make_frame(60), cursor=40))
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(scenario()) is None
+
+    warnings = [record for record in logs if getattr(record, "event", None) == "warmup_incomplete"]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert warnings[0].context["required_candles"] == 100
+    # five rows: the four history rows strictly before the candle, plus the candle
+    assert warnings[0].context["rows"] == 5
+    assert warnings[0].context["candles_per_day"] == pytest.approx(24.0)
+    assert store.statuses[-1][1] is ProfileStatus.RUNNING
+    assert ProfileStatus.ERROR not in [status for _identifier, status, _detail in store.statuses]
+
+
+def test_a_satisfied_requirement_lets_the_tick_through(
+    monkeypatch: pytest.MonkeyPatch, logs: Any
+) -> None:
+    """The other side of the same boundary: three candles are enough here."""
+    instance = DeclaringStrategy({"mode": "entry_long"})
+    instance.required = 3
+    monkeypatch.setattr(runner_module, "resolve_strategy", lambda _profile: instance)
+    runner, _stream, gateway, _store, _clock = build(stream=FakeStream(make_frame(60), cursor=40))
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.action is SignalAction.ENTER_LONG
+    assert len(gateway.submissions) == 1
+    assert "warmup_incomplete" not in events(logs)
+
+
+def test_a_strategy_without_the_member_keeps_the_historical_two_row_floor(
+    monkeypatch: pytest.MonkeyPatch, logs: Any
+) -> None:
+    """A seam written before the contract declares nothing and is never refused.
+
+    ``required_candles`` is read defensively, exactly like the stream's
+    ``max_wait_seconds``: an injected strategy that does not expose it keeps the
+    historical ``MIN_FRAME_ROWS`` behaviour instead of crashing the tick.
+    """
+    instance = LegacyStrategy({"mode": "entry_long"})
+    monkeypatch.setattr(runner_module, "resolve_strategy", lambda _profile: instance)
+    runner, _stream, gateway, _store, _clock = build(stream=FakeStream(make_frame(60), cursor=40))
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    decision = run(scenario())
+    assert decision is not None
+    assert decision.action is SignalAction.ENTER_LONG
+    assert len(gateway.submissions) == 1
+    assert "warmup_incomplete" not in events(logs)
+
+
 def test_the_frame_ends_at_the_emitted_candle(install: Any) -> None:
     """The strategy sees the candles strictly before t, then t itself."""
     seen: list[pd.DatetimeIndex] = []

@@ -41,10 +41,26 @@ Two properties matter for a faithful reading of the rules:
 * ``NaN`` never fires a signal: while any of the three horizons is still
   undefined the score is ``NaN`` and every comparison against it is ``False``
   (the score is deliberately **not** filled with ``0``).
+
+Warm-up (declared, enforced, never silent)
+    ``roc(close, horizon)`` loses its first ``horizon`` values, so the score is
+    defined only from the candle that follows the longest lookback: a frame
+    must hold ``max(fast, mid, slow) + 1`` candles before this strategy can emit
+    **any** signal.  On the default parameters that is 40 321 rows on a 1m grid,
+    673 on 1h, 169 on 4h and 29 on 1d.
+    :meth:`MomentumStrategy.required_candles` declares that number (so the
+    platform can refuse a profile it could never feed, or report it through
+    ``realtime check``), and :meth:`MomentumStrategy.prepare` logs one
+    structured ``strategy.warmup_incomplete`` warning when it is handed a
+    shorter frame.  A short frame is **not** an error — walk-forward windows and
+    unit tests legitimately use them — so ``prepare`` never raises for that
+    reason: it only makes the situation visible.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from typing import ClassVar, cast
 
 import numpy as np
@@ -62,6 +78,13 @@ from trading_platform.strategy.base import (
 from trading_platform.strategy.indicators import atr, roc
 
 __all__ = ["MomentumParams", "MomentumStrategy", "MomentumStrategyParams"]
+
+#: Module logger.  The strategy layer must not import
+#: :mod:`trading_platform.realtime.observability` (``realtime`` may import
+#: ``strategy``, never the reverse: the layer direction is frozen), so the
+#: warm-up warning is emitted through a plain module logger carrying the same
+#: ``event`` extra as the rest of the platform.
+_LOGGER = logging.getLogger(__name__)
 
 #: Indicator columns added by :meth:`MomentumStrategy.prepare`.
 INDICATOR_COLUMNS: tuple[str, ...] = (
@@ -147,6 +170,13 @@ class MomentumStrategy(Strategy):
         on every timeframe.  The OHLCV columns of the input are copied unchanged
         and the index is preserved exactly; ``data`` itself is never mutated.
 
+        A frame shorter than :meth:`required_candles` cannot warm up: the score
+        stays ``NaN`` on every row and no entry or exit can ever fire.  That is
+        legitimate in walk-forward windows and in unit tests, so the method logs
+        a single structured ``strategy.warmup_incomplete`` **warning** and keeps
+        going — it never raises for a short frame, and it stays completely
+        silent once the frame is long enough.
+
         Raises
         ------
         StrategyError
@@ -157,9 +187,25 @@ class MomentumStrategy(Strategy):
         # ``require_ohlcv_frame`` guarantees a DatetimeIndex; the cast only
         # restates that guarantee for the type checker.
         per_day = _candles_per_day(cast(pd.DatetimeIndex, frame.index))
-        fast_horizon = max(1, round(params.fast_days * per_day))
-        mid_horizon = max(1, round(params.mid_days * per_day))
-        slow_horizon = max(1, round(params.slow_days * per_day))
+        fast_horizon, mid_horizon, slow_horizon = _horizons(params, per_day)
+        required = max(fast_horizon, mid_horizon, slow_horizon) + 1
+        if len(frame) < required:
+            _LOGGER.warning(
+                "strategy %s cannot warm up on this frame: %d row(s) received,"
+                " %d required (%g candles/day; longest lookback %d candles + 1)",
+                self.name,
+                len(frame),
+                required,
+                per_day,
+                required - 1,
+                extra={
+                    "event": "strategy.warmup_incomplete",
+                    "strategy": self.name,
+                    "rows": len(frame),
+                    "required_candles": required,
+                    "candles_per_day": per_day,
+                },
+            )
 
         close = frame["close"]
         fast = roc(close, fast_horizon)
@@ -177,6 +223,42 @@ class MomentumStrategy(Strategy):
         )
         frame["candles_per_day"] = np.full(len(frame), per_day, dtype="float64")
         return frame
+
+    def required_candles(self, candles_per_day: float = 1.0) -> int:
+        """Return the rows a frame must hold before this strategy can emit a signal.
+
+        ``roc(close, horizon)`` is undefined on the first ``horizon`` rows, so
+        the score — and therefore every entry and every exit — needs
+        ``max(fast, mid, slow) + 1`` candles, the three lookbacks being the
+        day-based parameters converted with the frame's candle grid.  On the
+        default parameters (7 / 14 / 28 days) that is 40 321 rows on a 1m grid,
+        8 065 on 5m, 2 689 on 15m, 1 345 on 30m, 673 on 1h, 169 on 4h and 29 on
+        1d; with the default ``candles_per_day`` (a daily grid) it is 29.
+
+        The method is pure and never raises: a non-finite, zero or negative
+        ``candles_per_day`` is treated as ``1.0``, and it reads nothing but the
+        validated parameters.  It shares :func:`_horizons` with :meth:`prepare`,
+        so the declared warm-up can never drift from the computed lookbacks.
+
+        Parameters
+        ----------
+        candles_per_day:
+            How many candles of the target frame fit in one 24-hour day (1m
+            ``1440``, 5m ``288``, 15m ``96``, 30m ``48``, 1h ``24``, 4h ``6``,
+            1d ``1``).
+
+        Returns
+        -------
+        int
+            ``max(fast, mid, slow) + 1`` candles.
+        """
+        try:
+            per_day = float(candles_per_day)
+        except (TypeError, ValueError):
+            per_day = 1.0
+        if not math.isfinite(per_day) or per_day <= 0.0:
+            per_day = 1.0
+        return max(_horizons(self._momentum_params, per_day)) + 1
 
     def signals(self, data: pd.DataFrame) -> pd.DataFrame:
         """Return the signal frame of a prepared frame.
@@ -234,6 +316,27 @@ class MomentumStrategy(Strategy):
             index=data.index,
         )
         return ensure_signal_frame(signals, data.index)
+
+
+def _horizons(params: MomentumStrategyParams, per_day: float) -> tuple[int, int, int]:
+    """Return the ``(fast, mid, slow)`` lookbacks of ``params`` in candles.
+
+    Each day-based parameter is multiplied by ``per_day`` (the number of candles
+    the frame holds in one 24-hour day), rounded to the nearest candle and
+    floored at ``1`` so that a very coarse grid still compares two distinct
+    candles.  :meth:`MomentumStrategy.prepare` and
+    :meth:`MomentumStrategy.required_candles` both go through this single
+    helper, so the lookbacks actually computed and the warm-up declared can never
+    drift apart.
+
+    The function is pure and never raises for a validated
+    :class:`MomentumStrategyParams`, whatever the (finite, positive) grid.
+    """
+    return (
+        max(1, round(params.fast_days * per_day)),
+        max(1, round(params.mid_days * per_day)),
+        max(1, round(params.slow_days * per_day)),
+    )
 
 
 def _candles_per_day(index: pd.DatetimeIndex) -> float:

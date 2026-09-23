@@ -1360,6 +1360,12 @@ class RealtimeOrchestrator:
             store=self._store,
             clock=self._clock,
             timeout_seconds=float(self._realtime.stream_poll_timeout_seconds),
+            # The window this stream is configured to serve the profile: the
+            # realtime-level history setting, or the profile's own override.  The
+            # runner compares it against the profile's warm-up so that "asks for
+            # more than the stream serves" is reported at start instead of being
+            # invisible -- and "can never warm up" is an ERROR before the first tick.
+            history_candles=int(profile.effective_history_candles(self._realtime.history_candles)),
         )
         self._warn_on_idle_bound(profile, runner.stream)
         report = gateway.reconcile()

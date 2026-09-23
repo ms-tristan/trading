@@ -188,6 +188,19 @@ class Strategy(ABC):
     Subclasses must set :attr:`name`, :attr:`ParamsModel` and implement
     :meth:`prepare` and :meth:`signals` (and may declare :attr:`PARAM_SPACE` for
     the robustness layer).
+
+    Warm-up declaration (part of the frozen strategy contract)
+    ---------------------------------------------------------
+    :meth:`required_candles` returns **the number of candles a frame must hold
+    before this strategy can emit ANY signal**; ``0`` means the strategy
+    declares no warm-up requirement.  A strategy whose lookbacks are already
+    expressed in candles keeps the safe ``0`` default and is never constrained
+    by it: ``basic`` sizes ``ema_fast``, ``ema_slow``, ``rsi`` and ``atr``
+    directly in candles, so it declares nothing and inherits that default
+    instead of inventing a floor.  A strategy whose lookbacks are day-based
+    (they have to be converted with the frame's candle grid) declares the
+    resulting candle count, so the platform can refuse a profile it could never
+    feed instead of running it forever with no signal.
     """
 
     #: Identifier used by the registry, the CLI and ``BacktestResult``.
@@ -286,6 +299,36 @@ class Strategy(ABC):
         pure: calling it twice on the same input returns the same frame and
         leaves the input untouched.
         """
+
+    def required_candles(self, candles_per_day: float = 1.0) -> int:
+        """Number of candles a frame must hold before this strategy can emit ANY signal.
+
+        Part of the frozen strategy contract.  ``0`` — the default returned by
+        this base implementation — means the strategy declares **no warm-up
+        requirement**: it inherits the safe value untouched, so declaring a
+        floor is always an explicit, deliberate act of the subclass.
+
+        The method is **pure** (it reads nothing but :attr:`params`, never a
+        frame, never the disk) and it **never raises**: a non-finite, zero or
+        negative ``candles_per_day`` is treated as ``1.0``.
+
+        Parameters
+        ----------
+        candles_per_day:
+            How many candles of the target frame fit in one 24-hour day.  It is
+            the grid of the frame the strategy will actually be fed, so a
+            day-based lookback can be converted into a candle count.  It is
+            irrelevant for a strategy that declares ``0``.
+
+        Returns
+        -------
+        int
+            The minimum number of rows a frame must hold for :meth:`signals` to
+            be able to emit anything but ``False``.  A frame shorter than that
+            is **not** an error (walk-forward windows and unit tests
+            legitimately use short frames) but it cannot warm up.
+        """
+        return 0
 
     def run(self, data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return ``(prepared, signals)`` for ``data`` — the engine entry point."""
