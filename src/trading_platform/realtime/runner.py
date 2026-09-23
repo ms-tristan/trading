@@ -62,7 +62,9 @@ The gate is plain in-memory state of the runner and never touches the store, the
 status, the strategy or the gateway; ``resume()`` clears it.
 
 Every ``await`` of a wait this module owns is bounded by an explicit
-``asyncio.wait_for`` timeout, so no tick can hang.
+``asyncio.wait_for`` timeout, so no tick can hang -- and that bound is always
+strictly greater than the longest wait the wrapped call may legitimately take,
+including the stream's whole poll interval (see :func:`stream_wait_bound`).
 """
 
 from __future__ import annotations
@@ -116,7 +118,7 @@ if TYPE_CHECKING:
     from trading_platform.realtime.store import StateStore
     from trading_platform.realtime.stream import MarketStream
 
-__all__ = ["ProfileRunner"]
+__all__ = ["ProfileRunner", "stream_wait_bound"]
 
 _LOGGER = logging.getLogger(LOGGER_NAME)
 
@@ -141,6 +143,37 @@ _ORDER_TYPE = OrderType.MARKET
 
 #: Prefix every ``STOPPED`` detail carries in front of the last error.
 _STOP_PREFIX = "stopped after: "
+
+
+def stream_wait_bound(timeout_seconds: float, max_wait_seconds: float = 0.0) -> float:
+    """Return the bound a caller must apply around one call that may legitimately idle.
+
+    The bound is derived from the wait itself -- the larger of the configured stream
+    timeout and the stream's declared maximum wait -- never from the timeout alone,
+    and it is always **strictly greater** than that wait (see
+    :data:`_BOUND_MARGIN_RATIO`).
+
+    The bound the runner applies around a call that may legitimately idle must be
+    STRICTLY GREATER than the longest wait that call can take, for ANY
+    (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
+    equal ones and the deployment's 30 s / 10 s.
+
+    Parameters
+    ----------
+    timeout_seconds:
+        Configured bound of one stream call -- ``stream_poll_timeout_seconds``.
+    max_wait_seconds:
+        Longest wait the stream declares it may legitimately take
+        (``MarketStream.max_wait_seconds``).  ``0.0`` for a stream that never waits,
+        which reduces the bound to the configured timeout plus its margin.
+
+    Returns
+    -------
+    float
+        The larger of the two waits, plus the proportional and absolute margin.
+    """
+    wait = max(0.0, float(timeout_seconds), float(max_wait_seconds))
+    return (wait * (1.0 + _BOUND_MARGIN_RATIO)) + _BOUND_MARGIN_FLOOR_SECONDS
 
 
 def _strip_stop_prefix(text: str) -> str:
@@ -287,7 +320,10 @@ class ProfileRunner:
     timeout_seconds:
         Bound applied to every ``await`` this runner owns.  The orchestrator
         passes ``RealtimeConfig.stream_poll_timeout_seconds``; the default is the
-        profile's own poll interval.
+        profile's own poll interval.  The bound actually applied here additionally
+        carries the stream's own longest legitimate wait
+        (``MarketStream.max_wait_seconds``), because a stream that idles is allowed
+        to idle a whole poll interval -- see :meth:`_bound`.
     """
 
     def __init__(
@@ -315,6 +351,10 @@ class ProfileRunner:
         )
         if self._timeout <= 0:
             raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds!r}")
+        # The stream declares its own longest legitimate wait.  Read defensively:
+        # an external duck-typed stream that predates the member must not crash the
+        # boot, it simply declares no wait.
+        self._stream_wait = max(0.0, float(getattr(stream, "max_wait_seconds", 0.0)))
         self._counters: Counters = Counters() if counters is None else counters
         self._strategy: Strategy | None = None
         self._started = False
@@ -468,11 +508,23 @@ class ProfileRunner:
     def _bound(self) -> float:
         """Return the bound applied to one wait of this profile's loop.
 
-        Derived from ``self._timeout`` and always strictly greater than it, so no
-        wait of the loop can be cut short by a bound equal to its own nominal
-        duration (see :data:`_BOUND_MARGIN_RATIO`).
+        The bound the runner applies around a call that may legitimately idle must be
+        STRICTLY GREATER than the longest wait that call can take, for ANY
+        (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
+        equal ones and the deployment's 30 s / 10 s.  It is therefore derived from
+        the wait itself -- the larger of ``self._timeout`` and the wait the stream
+        declares through ``MarketStream.max_wait_seconds`` -- and never from
+        ``self._timeout`` alone (see :func:`stream_wait_bound`).
+
+        The deployment's pair is the case this exists for: with a profile pacing at
+        ``poll_interval_seconds = 30`` and ``stream_poll_timeout_seconds = 10``, the
+        old bound of ``10 * 1.05 + 0.05 = 10.55 s`` cut the polling stream's
+        legitimate 30 s idle sleep, raised ``TimeoutError`` on the first idle poll
+        and crash-looped the container.  The new bound is
+        ``30 * 1.05 + 0.05 = 31.55 s``, so no wait the stream is entitled to take is
+        ever cut, whatever the two configured values are.
         """
-        return self._timeout * (1.0 + _BOUND_MARGIN_RATIO) + _BOUND_MARGIN_FLOOR_SECONDS
+        return stream_wait_bound(self._timeout, self._stream_wait)
 
     async def stop(self) -> None:
         """Persist ``STOPPED``; the runner closes nothing it does not own.
@@ -593,8 +645,9 @@ class ProfileRunner:
         timeframe = str(self._profile.timeframe)
 
         # 1. the next candle, always bounded.  The bound carries the same
-        #    head-room as the pacing sleep: a stream that is idle legitimately
-        #    waits a whole poll interval, which may equal ``self._timeout``.
+        #    head-room as the pacing sleep, plus the stream's own declared wait:
+        #    a stream that is idle legitimately waits a whole poll interval, which
+        #    may equal -- or exceed -- ``self._timeout``.
         candle = await asyncio.wait_for(
             self._stream.next_candle(symbol, timeframe),
             timeout=self._bound(),

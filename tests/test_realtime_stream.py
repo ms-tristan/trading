@@ -56,7 +56,16 @@ EPOCH = pd.Timestamp("2024-01-01", tz="UTC")
 
 #: The exact member set every implementation must expose (the seam contract).
 DOCUMENTED_MEMBERS = frozenset(
-    {"start", "stop", "next_candle", "history", "connected", "last_error", "reconnect_count"}
+    {
+        "start",
+        "stop",
+        "next_candle",
+        "history",
+        "connected",
+        "last_error",
+        "reconnect_count",
+        "max_wait_seconds",
+    }
 )
 
 BTC = "BTC/USDT"
@@ -200,6 +209,7 @@ class FakeChild:
         connected: bool = False,
         last_error: str | None = None,
         reconnect_count: int = 0,
+        max_wait_seconds: float = 0.0,
     ) -> None:
         self.label = label
         self.events = list(events or [])
@@ -212,6 +222,7 @@ class FakeChild:
         self._connected = connected
         self._last_error = last_error
         self._reconnect_count = reconnect_count
+        self._max_wait_seconds = float(max_wait_seconds)
         self._index = 0
 
     async def start(self) -> None:
@@ -249,6 +260,44 @@ class FakeChild:
     @property
     def reconnect_count(self) -> int:
         return self._reconnect_count
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a ``next_candle`` call of this fake may legitimately take."""
+        return self._max_wait_seconds
+
+
+class LegacyFakeChild:
+    """A duck-typed child written against the seam **before** ``max_wait_seconds``.
+
+    External streams are structural, so a composite must keep accepting a child
+    that declares no wait at all and contribute ``0.0`` in its place instead of
+    raising ``AttributeError`` at boot.
+    """
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        return None
+
+    async def history(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+        return empty_frame()
+
+    @property
+    def connected(self) -> bool:
+        return True
+
+    @property
+    def last_error(self) -> str | None:
+        return None
+
+    @property
+    def reconnect_count(self) -> int:
+        return 0
 
 
 def candle(timestamp: str, *, symbol: str = BTC, close: float = 100.0) -> CandleEvent:
@@ -1383,15 +1432,91 @@ def test_composite_fan_out_is_bounded() -> None:
 
 
 @pytest.mark.parametrize(
-    "cls",
-    [ReplayMarketStream, PollingMarketStream, CcxtProMarketStream, CompositeMarketStream],
+    ("cls", "build_instance"),
+    [
+        (ReplayMarketStream, lambda: ReplayMarketStream({(BTC, HOUR): replay_frame(2)})),
+        (PollingMarketStream, lambda: PollingMarketStream(GridProvider(), clock=ManualClock())),
+        (CcxtProMarketStream, lambda: CcxtProMarketStream(clock=ManualClock())),
+        (
+            CompositeMarketStream,
+            lambda: CompositeMarketStream({(BTC, HOUR): FakeChild("child")}),
+        ),
+    ],
 )
-def test_every_class_exposes_the_documented_member_set(cls: type) -> None:
+def test_every_class_exposes_the_documented_member_set(cls: type, build_instance: Any) -> None:
+    """Every stream exposes the documented members, the declared wait included.
+
+    ``max_wait_seconds`` is read-only on the class **and** answers a non-negative
+    float on a built instance: the runner derives its bound from that value, so a
+    missing or negative member would silently disarm the idle-poll invariant.
+    """
     for name in ("start", "stop", "next_candle", "history"):
         assert asyncio.iscoroutinefunction(getattr(cls, name)), name
-    for name in ("connected", "last_error", "reconnect_count"):
+    for name in ("connected", "last_error", "reconnect_count", "max_wait_seconds"):
         assert isinstance(getattr(cls, name), property), name
     assert set(dir(cls)) >= DOCUMENTED_MEMBERS
+
+    instance = build_instance()
+    declared_wait = instance.max_wait_seconds
+    assert isinstance(declared_wait, float), cls.__name__
+    assert declared_wait >= 0.0, cls.__name__
+
+
+def test_max_wait_seconds_declares_the_longest_legitimate_wait() -> None:
+    """Each implementation answers the longest wait one ``next_candle`` may take.
+
+    This is the value the runner's bound is derived from, so each shape matters:
+
+    * a replay reads prepared rows and never waits -- ``0.0``;
+    * the deployment's polling pair (``poll_interval_seconds = 30``,
+      ``timeout_seconds = 10``) declares the **30 s** idle poll, not the 10 s
+      timeout: deriving the bound from the timeout alone cut that healthy idle poll
+      into a ``TimeoutError`` and crash-looped every profile;
+    * a retry may instead sleep the whole bounded backoff series, which dominates a
+      tiny poll interval (``1 + 2 + 4 + 8 = 15 s`` for a base of 1 s and
+      ``max_reconnects = 5``), so the declared wait is the longer of the two;
+    * a composite delegates to exactly one child per call, so its declared wait is
+      the longest declared wait of the children it may route to.
+    """
+    assert ReplayMarketStream({(BTC, HOUR): replay_frame(2)}).max_wait_seconds == 0.0
+
+    deployment = PollingMarketStream(
+        GridProvider(), clock=ManualClock(), poll_interval_seconds=30.0, timeout_seconds=10.0
+    )
+    assert deployment.max_wait_seconds == 30.0
+    # The declared wait is the longer of the two inputs the stream was built with,
+    # and the cadence itself is readable back for a caller deriving its own bound.
+    assert deployment.poll_interval_seconds == 30.0
+
+    retrying = PollingMarketStream(
+        GridProvider(),
+        clock=ManualClock(),
+        poll_interval_seconds=0.01,
+        reconnect_backoff_seconds=1.0,
+        max_reconnects=5,
+    )
+    assert retrying.max_wait_seconds == 15.0
+
+    live = CcxtProMarketStream(
+        clock=ManualClock(),
+        timeout_seconds=10.0,
+        reconnect_backoff_seconds=1.0,
+        max_reconnects=5,
+    )
+    assert live.max_wait_seconds == 15.0
+    assert live.timeout_seconds == 10.0
+
+    composite = CompositeMarketStream(
+        {
+            (BTC, HOUR): FakeChild("idle", max_wait_seconds=0.0),
+            (ETH, HOUR): FakeChild("paced", max_wait_seconds=30.0),
+        }
+    )
+    assert composite.max_wait_seconds == 30.0
+
+    # A duck-typed child that predates the member declares no wait at all.
+    legacy = CompositeMarketStream({(BTC, HOUR): LegacyFakeChild()})
+    assert legacy.max_wait_seconds == 0.0
 
 
 def test_a_local_fake_satisfies_the_market_stream_protocol() -> None:

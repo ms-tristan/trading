@@ -1361,6 +1361,7 @@ class RealtimeOrchestrator:
             clock=self._clock,
             timeout_seconds=float(self._realtime.stream_poll_timeout_seconds),
         )
+        self._warn_on_idle_bound(profile, runner.stream)
         report = gateway.reconcile()
         self._reports[profile_id] = bool(report.ok)
         if not report.ok:
@@ -1384,6 +1385,56 @@ class RealtimeOrchestrator:
             # closed again here, before the first tick, so a restart can never open a
             # position the operator asked not to open.
             runner.pause()
+
+    def _warn_on_idle_bound(self, profile: ProfileConfig, stream: MarketStream) -> None:
+        """Warn loudly when a profile polls slower than the configured stream timeout.
+
+        A profile whose ``poll_interval_seconds`` exceeds
+        ``stream_poll_timeout_seconds`` is perfectly legal -- the runner's bound
+        carries the stream's own declared wait, so the platform boots and the tick
+        survives the longer idle poll -- but the mismatch between the two configured
+        values is worth naming, loudly and once per built profile.  Before that bound
+        carried the declared wait, the runner would have bounded the tick by
+        ``stream_poll_timeout_seconds`` alone and killed the profile on its first
+        legitimate idle poll.
+
+        The trigger is the operator's pair -- the profile's own
+        ``poll_interval_seconds`` against ``stream_poll_timeout_seconds`` -- and
+        nothing else: a stream whose declared wait is longer because its retry
+        backoff series is longer is not a misconfiguration, and naming it one would
+        make this event lie.  The record still carries the declared wait and the
+        bound the runner really applies, so the mismatch can be read off the log.
+
+        This is a **warning, never a refusal**: refusing to boot would turn a
+        misconfiguration into an outage.
+        """
+        poll_interval = float(profile.poll_interval_seconds)
+        timeout = float(self._realtime.stream_poll_timeout_seconds)
+        if poll_interval <= timeout:
+            return
+        stream_wait = max(0.0, float(getattr(stream, "max_wait_seconds", 0.0)))
+        # Imported here on purpose: a module-level import of the runner would close
+        # the CLI's import cycle.
+        from trading_platform.realtime.runner import stream_wait_bound
+
+        log_event(
+            _LOGGER,
+            "profile_poll_interval_exceeds_stream_timeout",
+            level=logging.WARNING,
+            profile_id=str(profile.id),
+            symbol=str(profile.symbol),
+            poll_interval_seconds=poll_interval,
+            stream_poll_timeout_seconds=timeout,
+            stream_max_wait_seconds=stream_wait,
+            # Bit for bit the bound the runner of this profile applies: the runner
+            # derives it from these very two values (see ``ProfileRunner._bound``).
+            tick_bound_seconds=stream_wait_bound(timeout, stream_wait),
+            detail=(
+                f"the profile idles {poll_interval:g} s while the stream timeout is "
+                f"{timeout:g} s; the tick bound carries the stream's declared wait, so "
+                "the profile keeps running -- the poll interval no longer has to be lowered"
+            ),
+        )
 
     def _sync_live_wallet(self) -> None:
         """Mirror the venue account into the shared wallet once, best-effort.

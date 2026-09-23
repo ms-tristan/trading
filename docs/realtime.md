@@ -243,6 +243,52 @@ The real-time engine **implements no formula**. It assembles:
    to a real broker: the mode is part of the identity of the profile and of every
    persisted order, and the broker checks its own mode.
 
+### 3.1 The idle-poll bound: a bound is never equal to the wait it wraps
+
+**The bound applied around any call that may legitimately idle must be strictly
+greater than the longest wait that call can take.** An idle poll is healthy, not
+a hang: `next_candle` answers `None` when no new **closed** candle exists yet
+(§2.2; `market_data.candles_skipped` says how many candles were skipped) and the
+stream waits its own cadence before asking again. A bound that cuts that wait is
+not a bound — it is a **race**: it killed every profile on its first idle poll
+(`profile_crashed error="TimeoutError"`) and crash-looped the container (79
+restarts of the shipped 30 s / 10 s configuration).
+
+A stream declares its longest legitimate wait through the read-only member
+`MarketStream.max_wait_seconds` (`realtime/stream.py`):
+
+| stream | `max_wait_seconds` |
+| --- | --- |
+| `PollingMarketStream` | its `poll_interval_seconds`, or its whole retry backoff series when that is longer |
+| `CcxtProMarketStream` | its read timeout, or that same retry backoff series when that is longer |
+| `CompositeMarketStream` | the longest wait of its children |
+| `ReplayMarketStream` | `0.0` (a replay never idles) |
+
+The runner no longer derives its bound from `stream_poll_timeout_seconds` alone:
+it is `max(stream_poll_timeout_seconds, max_wait_seconds)` plus a proportional
+margin and a small floor, so the shipped pair — profile
+`poll_interval_seconds = 30.0`, `stream_poll_timeout_seconds = 10.0` — is bounded
+by ~31.6 s instead of ~10.55 s, and the 30 s idle wait completes. A single
+`realtime run --once` tick budgets, per profile, the same bound that profile's
+runner applies — the stream's declared wait included, the retry backoff series
+and all — plus one stream timeout for the shutdown, so it cannot cut an idle poll
+either.
+
+Because the two values meet at boot, the platform checks the pair when the
+profiles are wired to the realtime settings and logs a **WARNING** — event
+`profile_poll_interval_exceeds_stream_timeout`, naming both values — whenever a
+profile's `poll_interval_seconds` is longer than `stream_poll_timeout_seconds`.
+The trigger is that pair alone: a stream that declares a longer wait only because
+its retry backoff series is longer is not a misconfiguration and stays silent.
+The record also carries the declared wait and the bound the runner really applies
+(`stream_max_wait_seconds`, `tick_bound_seconds`), so the mismatch can be read
+straight off the log.
+It is a **warning, never a refusal to boot**: refusing would turn a
+misconfiguration into an outage. The 30 s / 10 s pair legitimately fires it, a
+profile whose poll interval is not longer stays silent, and with the bound above
+the warning no longer announces a crash: lowering `poll_interval_seconds` is
+**not** needed to keep the platform up.
+
 ## 4. Persistence, restart and reconciliation
 
 - The state lives in **a single SQLite file** (`realtime.state_db`, default
