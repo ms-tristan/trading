@@ -113,6 +113,76 @@ candle grids (§5), which is a cross-timeframe consistency check the data cannot
 fake. It is also why the parameter names carry the `_days` suffix: `7` means
 "one week" on every timeframe, not "seven candles".
 
+### 3.1 The warm-up requirement: the candles a frame must hold
+
+The conversion has a hard consequence, and it is part of the strategy contract
+rather than an implementation detail: `momentum_score` is `NaN` until the
+*longest* horizon is defined, and `NaN` never fires a signal (§2). A frame must
+therefore hold
+
+```
+required = max(1, round(slow_days * candles_per_day)) + 1
+```
+
+candles before `momentum` can emit **any** signal on a given grid — the longest
+lookback, plus the one candle the first rate of change needs. `MomentumStrategy`
+declares that number through `Strategy.required_candles(candles_per_day)`
+(`strategy/base.py`), a pure member of the frozen strategy contract whose base
+implementation returns `0`, "no warm-up requirement": that default is what the
+historical `basic` reference keeps, because its EMAs, RSI and ATR are already
+expressed in candles, so declaring a floor would invent a constraint it never
+had. With the default `momentum` parameters (7 / 14 / 28 days, so
+`slow_days = 28`):
+
+| timeframe | candles/day | candles required (`28 x candles/day + 1`) |
+| --- | --- | --- |
+| `1m` | 1440 | **40321** |
+| `5m` | 288 | **8065** |
+| `15m` | 96 | **2689** |
+| `30m` | 48 | **1345** |
+| `1h` | 24 | **673** |
+| `4h` | 6 | **169** |
+| `1d` | 1 | **29** |
+
+The operator rule is one line — `warmup_candles >= slow_days * candles_per_day` —
+and the exact requirement is that **plus one candle**: `required_candles()`
+returns `max(fast, mid, slow) + 1`, the `+1` being the first close on which the
+score is defined at all. A profile that asks the stream for fewer candles than
+the grid requires — `warmup_candles = 200`, the platform default, on every grid
+of the table except `4h` and `1d` — can never warm up: the score stays `NaN` on
+every row and the profile emits zero signals for ever. That situation is no
+longer silent: the platform refuses such a profile where it is created, reports
+it through `realtime check` and ends it with an actionable error at start
+([`docs/realtime.md`](realtime.md) §8) — but the arithmetic above is what an
+operator has to satisfy.
+
+**What a large window costs.** Feeding an intraday grid its requirement is a
+configuration change, not a code change, and it is paid once.
+`data.loader.OHLCVLoader.load` is **cache-first**: it reads the parquet cache of
+`(exchange, symbol, timeframe)` and calls `download()` only when that cache does
+not cover the requested window. `download()` paginates at
+`_PAGE_LIMIT = 1000` candles per request, so a 42000-candle `1m` window is
+**~42 downloads** per `(exchange, symbol, timeframe)` — 42 paginated requests —
+**the first time only**; from then on the parquet cache serves the whole window
+without a network call. The same arithmetic gives about 9 requests on `5m`, 3 on
+`15m`, 2 on `30m` and a single request on `1h`, `4h` and `1d`.
+
+**A grid that runs is not a grid that was validated.** The grids this page
+actually **validated** are **4h and 1d** — the deployable ones, and also the two
+whose default 200-candle warm-up already exceeds the requirement (169 and 29).
+`1h` was measured and **degrades**: its holdout median return turns negative at
+15 bp/side (§7, item 9). The `5m`, `15m`, `30m` and `1m` grids are merely
+**possible**: they were **never validated at all**, nothing on this page measures
+them, and the table above only says what it would take to make the strategy run
+there. Feeding a grid enough candles makes the strategy
+**compute** — it does not make it **profitable**, and §5 is the only evidence
+this page accepts about that. What the warm-up requirement does show is that the
+strategy itself is not the limitation: measured on a 200 000-row `1m` frame, the
+score is defined on 159 680 bars, 68 713 entry signals are emitted and the
+engine closes 30 trades. The `1m` incident was a **missing configuration
+contract** — a profile the platform accepted and could never feed — not a
+strategy that cannot work on `1m`.
+
 ## 4. The execution model it inherits
 
 `momentum` is an ordinary `Strategy`; it inherits the whole execution model of
@@ -461,6 +531,22 @@ adding `--risk-free-rate 0.05` to match the configuration's benchmark setting.
     ~15** (`+1525.5 %` → `+1485.8 %` for the long/short variant) and the holdout
     basket by less than **1 point** (`+155.7 %` → `+154.8 %`). Anyone rebuilding
     the panel should still mask that candle.
+11. **The warm-up is a configuration contract, and running a grid is not
+    validating it.** `momentum` needs `max(fast, mid, slow) + 1` candles before
+    it can emit any signal: 40321 on `1m`, 8065 on `5m`, 2689 on `15m`, 1345 on
+    `30m`, 673 on `1h`, 169 on `4h` and 29 on `1d` with the default 7/14/28-day
+    parameters (§3.1). The operator rule is
+    `warmup_candles >= slow_days * candles_per_day`, plus one candle for the
+    exact requirement. An under-provisioned profile does not fail loudly by
+    itself — it runs and produces zero signals for ever — which is why the
+    platform now refuses an impossible profile where it is created, reports it
+    through `realtime check` and ends it in `ERROR` at start
+    ([`docs/realtime.md`](realtime.md) §8), and why feeding an intraday grid is a
+    configuration decision with a first-download cost (§3.1). **Satisfying that
+    requirement makes the strategy run, not profit**: the deliverable grids are
+    the validated `4h` and `1d`; `1h` was measured and degrades on the holdout
+    (item 9); `5m`, `15m`, `30m` and `1m` were never validated at all. A green
+    `1m` run is a run, not evidence, and must not be read as one.
 
 ## 8. What was tested and rejected
 

@@ -30,7 +30,9 @@ Frozen order of one tick (each step numbered as in the delivery brief)
 2. skip a candle that is not strictly newer than the persisted watermark, so a
    restart neither replays nor skips one;
 3. rebuild the frame ending at that candle (``history`` + the candle), through
-   ``ensure_ohlcv``; fewer than two rows means the warm-up is incomplete;
+   ``ensure_ohlcv``; fewer rows than ``max(MIN_FRAME_ROWS,
+   strategy.required_candles(grid))`` means the warm-up is **not satisfied yet**
+   -- a warning, never fatal, because the frame grows with every candle;
 4. run the strategy -- ``prepare`` then ``signals`` -- and read the **last** row,
    which is the just-closed candle;
 5. check the static stop of an open position *first*, intrabar;
@@ -111,6 +113,11 @@ from trading_platform.realtime.models import (
 )
 from trading_platform.realtime.observability import LOGGER_NAME, Counters, log_event
 from trading_platform.realtime.strategies import resolve_strategy
+from trading_platform.realtime.warmup import (
+    SEVERITY_ERROR,
+    candles_per_day,
+    profile_warmup_findings,
+)
 from trading_platform.strategy.base import Strategy
 
 if TYPE_CHECKING:
@@ -324,6 +331,15 @@ class ProfileRunner:
         carries the stream's own longest legitimate wait
         (``MarketStream.max_wait_seconds``), because a stream that idles is allowed
         to idle a whole poll interval -- see :meth:`_bound`.
+    history_candles:
+        The window the live stream is configured to serve this profile
+        (``RealtimeConfig.history_candles``, or the profile's own override -- see
+        :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`).
+        It is used by the start-time warm-up check to name a profile that asks for
+        more candles than the stream serves (a warning: the frame the strategy
+        receives is bounded by ``warmup_candles``, so the profile still runs).
+        ``None`` means "no stream window was resolved", in which case the check
+        falls back to this runner's own ``warmup_candles`` and changes nothing.
     """
 
     def __init__(
@@ -337,6 +353,7 @@ class ProfileRunner:
         warmup_candles: int | None = None,
         counters: Counters | None = None,
         timeout_seconds: float | None = None,
+        history_candles: int | None = None,
     ) -> None:
         self._profile = profile
         self._stream = stream
@@ -346,6 +363,7 @@ class ProfileRunner:
         self._warmup = int(
             profile.warmup_candles if warmup_candles is None else max(1, int(warmup_candles))
         )
+        self._history = None if history_candles is None else max(1, int(history_candles))
         self._timeout = float(
             profile.poll_interval_seconds if timeout_seconds is None else timeout_seconds
         )
@@ -357,6 +375,7 @@ class ProfileRunner:
         self._stream_wait = max(0.0, float(getattr(stream, "max_wait_seconds", 0.0)))
         self._counters: Counters = Counters() if counters is None else counters
         self._strategy: Strategy | None = None
+        self._warmup_checked = False
         self._started = False
         self._status = ProfileStatus.STOPPED
         self._degraded_detail = ""
@@ -679,7 +698,13 @@ class ProfileRunner:
         frame = ensure_ohlcv(
             self._build_frame(history, candle, stamp), name=f"realtime:{self.profile_id}"
         )
-        if len(frame) < MIN_FRAME_ROWS:
+        # The warm-up contract, "not warm YET" side: a frame shorter than what the
+        # strategy needs cannot emit a signal, but the history grows with every
+        # candle, so this is a warning and the tick simply does nothing.  A frame
+        # that can NEVER warm up was already refused at start time (see
+        # :meth:`_check_warmup`); it never reaches this branch.
+        required = self._required_candles()
+        if len(frame) < max(MIN_FRAME_ROWS, required):
             self._lag_seconds = self._lag(stamp)
             log_event(
                 _LOGGER,
@@ -690,6 +715,8 @@ class ProfileRunner:
                 timeframe=timeframe,
                 rows=len(frame),
                 warmup_candles=self._warmup,
+                required_candles=required,
+                candles_per_day=candles_per_day(timeframe),
             )
             return None
 
@@ -903,9 +930,100 @@ class ProfileRunner:
         and the orchestrator's ``_build_runner`` -- goes through it, so an unknown
         strategy name or a rejected parameter set fails **here, at startup**,
         before the first candle, instead of starting inert.
+
+        Once the strategy is resolved, the warm-up contract is applied **once**
+        per runner (see :meth:`_check_warmup`): a profile whose strategy needs more
+        candles than the profile ever asks the stream for goes to ``ERROR`` here,
+        before the first tick, instead of polling for ever with zero signals.
         """
         if self._strategy is None:
             self._strategy = resolve_strategy(self._profile)
+        if not self._warmup_checked:
+            self._check_warmup()
+            self._warmup_checked = True
+
+    def _check_warmup(self) -> None:
+        """Apply the warm-up contract at start time.
+
+        The arithmetic belongs to :mod:`trading_platform.realtime.warmup`; this is
+        the runner's side of it, and the two halves are deliberately different:
+
+        * an **impossible** profile -- the strategy needs more candles than the
+          profile asks the stream for, so the frame can *never* warm up -- is
+          logged as ``warmup_impossible``, persisted as
+          :attr:`~trading_platform.realtime.models.ProfileStatus.ERROR` with the
+          actionable message as its detail, and re-raised as a
+          :class:`~trading_platform.core.errors.RealtimeError`.  The orchestrator
+          catches it at boot (:data:`_PROFILE_BOOT_ERRORS`) and quarantines the
+          profile, or through ``_supervise`` and persists ``ERROR``: the loop ends,
+          so the profile does **not** run for ever with zero signals;
+        * a **merely incoherent** profile -- it asks for more candles than the
+          stream window holds -- is logged as ``warmup_coherence`` and the profile
+          keeps running: the frame the strategy receives is bounded by
+          ``warmup_candles``, so this is reported, never fatal;
+        * a profile whose frame is simply **not warm yet** (short history at the
+          first ticks) is untouched here: :meth:`run_once` logs
+          ``warmup_incomplete`` and lets the candles accumulate.
+
+        The check is idempotent and runs once per healthy runner: the guard is
+        armed only after a passing check, so a runner that raises here keeps
+        raising on every later call instead of silently starting to trade.
+        """
+        findings = profile_warmup_findings(
+            self._profile,
+            history_candles=self._warmup if self._history is None else self._history,
+        )
+        for finding in findings:
+            if finding.severity == SEVERITY_ERROR:
+                log_event(
+                    _LOGGER,
+                    "warmup_impossible",
+                    level=logging.ERROR,
+                    profile_id=self.profile_id,
+                    symbol=str(self._profile.symbol),
+                    timeframe=str(self._profile.timeframe),
+                    required_candles=self._required_candles(),
+                    warmup_candles=self._warmup,
+                )
+                self._status = ProfileStatus.ERROR
+                self._store.save_status(
+                    self.profile_id, ProfileStatus.ERROR, detail=finding.message
+                )
+                raise RealtimeError(finding.message)
+            log_event(
+                _LOGGER,
+                "warmup_coherence",
+                level=logging.WARNING,
+                profile_id=self.profile_id,
+                symbol=str(self._profile.symbol),
+                timeframe=str(self._profile.timeframe),
+                warmup_candles=self._warmup,
+                history_candles=self._warmup if self._history is None else self._history,
+                message=finding.message,
+            )
+
+    def _required_candles(self) -> int:
+        """Return the candles the resolved strategy needs on this profile's grid.
+
+        The grid comes from the profile's own timeframe through the platform's
+        single arithmetic authority
+        (:func:`~trading_platform.realtime.warmup.candles_per_day`), so what the
+        start-time check, the tick guard and ``realtime check`` compare can never
+        drift apart.
+
+        The member is read **defensively**: an external duck-typed strategy that
+        predates the warm-up contract (a test seam, a third-party strategy)
+        declares no requirement and keeps the historical ``MIN_FRAME_ROWS``
+        behaviour -- exactly as the stream's ``max_wait_seconds`` is read -- because
+        a seam written before a member existed must not crash the tick.
+        """
+        strategy = self._strategy
+        if strategy is None:  # pragma: no cover - _prepare always runs first
+            raise RealtimeError(f"profile {self.profile_id!r} has no resolved strategy")
+        reader = getattr(strategy, "required_candles", None)
+        if reader is None:
+            return 0
+        return int(reader(candles_per_day(str(self._profile.timeframe))))
 
     def _strategy_run(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Run the strategy's ``prepare`` and ``signals`` on ``frame``."""

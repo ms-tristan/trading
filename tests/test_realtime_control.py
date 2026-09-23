@@ -11,6 +11,7 @@ by ``concurrent.futures``, which is the behaviour being pinned).
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -27,6 +28,7 @@ from trading_platform.realtime.models import (
     ProfileStatus,
     RunMode,
 )
+from trading_platform.realtime.observability import LOGGER_NAME
 
 #: How long a test may wait for the engine thread.  Every wait is bounded.
 _WAIT = 5.0
@@ -157,11 +159,17 @@ def controller_for(
     fake: FakeOrchestrator,
     *,
     timeout_seconds: float = 10.0,
+    history_candles: int | None = None,
 ) -> RuntimeProfileController:
-    """Build a controller over one local fake platform."""
+    """Build a controller over one local fake platform.
+
+    ``history_candles`` is the realtime-level window the platform serves a
+    profile by default; ``None`` keeps the controller's own documented fallback.
+    """
     return RuntimeProfileController(
         orchestrator=fake,  # type: ignore[arg-type]
         timeout_seconds=timeout_seconds,
+        history_candles=history_candles,
     )
 
 
@@ -384,3 +392,123 @@ def test_create_profile_refuses_a_duplicate_identifier(tmp_path: Path) -> None:
             controller.create_profile(valid_payload())
     assert str(excinfo.value) == "profile already exists: 'sol-paper'"
     assert fake.names() == ["profile_config"]
+
+
+# ---------------------------------------------------------------------------
+# the warm-up contract at the place the profile is created
+# ---------------------------------------------------------------------------
+
+
+def test_create_profile_refuses_a_profile_that_can_never_warm_up(tmp_path: Path) -> None:
+    """The incident profile is refused where it is created, with the arithmetic.
+
+    A ``momentum`` profile on 1m asks the stream for 200 candles while its
+    strategy needs 40 321: no frame it will ever build can warm up, so the
+    platform refuses it *before* anything reaches the engine loop instead of
+    running it for ever with zero signals.
+    """
+    fake = FakeOrchestrator()
+    controller = controller_for(tmp_path, fake, history_candles=300)
+    payload = valid_payload(strategy="momentum", timeframe="1m", warmup_candles=200)
+
+    with pytest.raises(ConfigError) as excinfo:
+        controller.create_profile(payload)
+
+    message = str(excinfo.value)
+    assert "can never warm up" in message
+    assert "'momentum'" in message
+    assert "'1m'" in message
+    assert "40321" in message
+    assert "200" in message
+    # the timeframes that WOULD work with the same parameters
+    assert "4h" in message and "1d" in message
+    assert fake.calls == []
+
+
+def test_create_profile_accepts_the_four_hour_grid_of_the_same_strategy(tmp_path: Path) -> None:
+    """169 candles is all ``momentum`` needs on 4h: the default warm-up feeds it."""
+    fake = FakeOrchestrator()
+    controller = controller_for(tmp_path, fake, history_candles=300)
+    payload = valid_payload(strategy="momentum", timeframe="4h", warmup_candles=200)
+
+    with EngineThread() as engine:
+        engine.bind(controller)
+        created = controller.create_profile(payload)
+
+    assert created.profile_id == "sol-paper"
+    assert fake.names() == ["profile_config", "add_profile"]
+    forwarded = fake.calls[-1][1][0]
+    assert isinstance(forwarded, ProfileConfig)
+    assert forwarded.strategy == "momentum"
+    assert forwarded.timeframe == "4h"
+
+
+def test_create_profile_forwards_both_warm_up_overrides(tmp_path: Path) -> None:
+    """``warmup_candles`` and ``history_candles`` reach the created profile."""
+    fake = FakeOrchestrator()
+    controller = controller_for(tmp_path, fake, history_candles=300)
+    payload = valid_payload(
+        strategy="momentum",
+        timeframe="1m",
+        warmup_candles=40321,
+        history_candles=42000,
+    )
+
+    with EngineThread() as engine:
+        engine.bind(controller)
+        controller.create_profile(payload)
+
+    forwarded = fake.calls[-1][1][0]
+    assert forwarded.warmup_candles == 40321
+    assert forwarded.history_candles == 42000
+    assert forwarded.effective_history_candles(300) == 42000
+
+
+def test_create_profile_reports_an_incoherent_window_and_still_creates(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A warm-up wider than the stream window is reported, never refused.
+
+    The frame the strategy receives is bounded by ``warmup_candles``, so a
+    smaller stream window does not by itself silence the profile: the operator
+    gets a warning naming both numbers and the profile is created.
+    """
+    fake = FakeOrchestrator()
+    controller = controller_for(tmp_path, fake, history_candles=300)
+    payload = valid_payload(strategy="momentum", timeframe="1m", warmup_candles=40321)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER_NAME),
+        EngineThread() as engine,
+    ):
+        engine.bind(controller)
+        created = controller.create_profile(payload)
+
+    assert created.profile_id == "sol-paper"
+    reported = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == ("profile_warmup_coherence")
+    ]
+    assert len(reported) == 1
+    assert reported[0].levelno == logging.WARNING
+    assert reported[0].context["warmup_candles"] == 40321
+    assert reported[0].context["history_candles"] == 300
+
+
+def test_create_profile_never_refuses_a_strategy_without_a_warm_up(tmp_path: Path) -> None:
+    """The regression guard: ``basic`` declares nothing and keeps being created.
+
+    With a one-candle stream window and a 40-candle warm-up -- the existing
+    ``realtime check`` seed -- the coherence mismatch must stay a warning.
+    """
+    fake = FakeOrchestrator()
+    controller = controller_for(tmp_path, fake, history_candles=1)
+    payload = valid_payload(strategy="basic", timeframe="1m", warmup_candles=40)
+
+    with EngineThread() as engine:
+        engine.bind(controller)
+        created = controller.create_profile(payload)
+
+    assert created.profile_id == "sol-paper"
+    assert fake.names() == ["profile_config", "add_profile"]

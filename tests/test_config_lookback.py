@@ -123,10 +123,11 @@ def test_entry_lookback_accepts_the_documented_bounds(value: int) -> None:
 
     assert profile.entry_lookback_candles == value
     assert ProfileConfig.model_fields["entry_lookback_candles"].default == 0
-    # the catch-up window is declared last, so the order of every pre-existing
-    # field never moves
-    assert list(ProfileConfig.model_fields)[-1] == "entry_lookback_candles"
-    assert list(ProfileConfig.model_fields)[-2] == "risk"
+    # the catch-up window stays where it was declared, and the per-profile history
+    # override is appended after it, so the order of every pre-existing field never
+    # moves and no serialised profile changes shape
+    assert list(ProfileConfig.model_fields)[-2:] == ["entry_lookback_candles", "history_candles"]
+    assert list(ProfileConfig.model_fields)[-3] == "risk"
 
 
 # ---------------------------------------------------------------------------

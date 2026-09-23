@@ -180,12 +180,31 @@ _PROFILE_LEAVES: frozenset[str] = frozenset(
 _PROFILE_ACTIONS: frozenset[str] = frozenset({"pause", "resume"})
 
 #: Keys and modes the creation body accepts (any other key is refused).
+#:
+#: ``warmup_candles`` and ``history_candles`` carry the warm-up contract to the
+#: create surface: the first is how many candles the profile asks the stream for,
+#: the second is its optional per-profile history override.  Both are validated
+#: here as positive integers and forwarded to the controller, which refuses a
+#: profile that could never warm up with them.
 _CREATE_FIELDS: frozenset[str] = frozenset(
-    {"profile_id", "symbol", "timeframe", "strategy", "mode", "initial_balance", "params"}
+    {
+        "profile_id",
+        "symbol",
+        "timeframe",
+        "strategy",
+        "mode",
+        "initial_balance",
+        "params",
+        "warmup_candles",
+        "history_candles",
+    }
 )
 
 #: Creation fields that must be present and carry a string.
 _CREATE_STRINGS: tuple[str, ...] = ("profile_id", "symbol", "timeframe", "strategy")
+
+#: Creation fields that must carry a strictly positive integer when present.
+_CREATE_POSITIVE_INTS: tuple[str, ...] = ("warmup_candles", "history_candles")
 
 #: The two documented run modes of a creation body.
 _CREATE_MODES: frozenset[str] = frozenset({"paper", "live"})
@@ -487,6 +506,19 @@ def _positive_number(value: Any) -> float | None:
     if not math.isfinite(number) or number <= 0:
         return None
     return number
+
+
+def _positive_int(value: Any) -> int | None:
+    """Return ``value`` as a strictly positive ``int``, or ``None``.
+
+    Booleans are refused (``True`` is not a candle count), and so are floats
+    (``200.0``) and strings (``"200"``): the two fields this validates --
+    ``warmup_candles`` and ``history_candles`` -- are integer counts, and JSON
+    carries them as integers.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
 
 
 def _is_scalar_mapping(value: Any) -> bool:
@@ -1051,6 +1083,16 @@ class Router:
                     400, {"error": "malformed request body: 'params' must be an object"}
                 )
             payload["params"] = dict(params)
+        for name in _CREATE_POSITIVE_INTS:
+            if name not in decoded:
+                continue
+            count = _positive_int(decoded[name])
+            if count is None:
+                return _json_response(
+                    400,
+                    {"error": f"malformed request body: {name!r} must be a positive integer"},
+                )
+            payload[name] = count
         return payload
 
     # -- health -------------------------------------------------------------

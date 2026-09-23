@@ -2727,6 +2727,86 @@ def test_create_forwards_the_documented_body_and_answers_201(
     }
 
 
+def test_the_create_body_carries_the_warm_up_overrides(
+    writable: Router, controller: FakeController
+) -> None:
+    """``warmup_candles`` and ``history_candles`` reach the controller as integers.
+
+    They are the two fields that let an operator give one profile enough history
+    to warm up -- the profile the incident was reported on needed 42 000 candles
+    on a 1m grid -- so the create surface has to accept them.
+    """
+    payload: dict[str, Any] = {
+        **CREATE_BODY,
+        "strategy": "momentum",
+        "timeframe": "1m",
+        "warmup_candles": 40321,
+        "history_candles": 42000,
+    }
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+    assert response.status == 201
+    assert controller.create_calls == [
+        {
+            **CREATE_BODY,
+            "strategy": "momentum",
+            "timeframe": "1m",
+            "warmup_candles": 40321,
+            "history_candles": 42000,
+        }
+    ]
+
+
+@pytest.mark.parametrize("field", ["warmup_candles", "history_candles"])
+@pytest.mark.parametrize("value", [0, -1, 200.0, "200", True, None])
+def test_the_create_body_refuses_a_non_positive_candle_count(
+    writable: Router, controller: FakeController, field: str, value: Any
+) -> None:
+    """A candle count is a strictly positive integer, or it is a 400."""
+    body = json.dumps({**CREATE_BODY, field: value}).encode()
+    response = writable.handle("POST", "/api/profiles", body=body, headers=AUTH)
+    assert response.status == 400
+    assert payload_of(response) == {
+        "error": f"malformed request body: {field!r} must be a positive integer"
+    }
+    assert controller.create_calls == []
+
+
+def test_an_impossible_profile_is_refused_with_the_documented_400(
+    writable: Router, controller: FakeController
+) -> None:
+    """The controller's warm-up refusal travels as the documented ``400``.
+
+    The message is the platform's own: naming the strategy, the timeframe, the
+    candles required and the candles available, plus the timeframes that would
+    work instead.  The dashboard shows exactly this sentence.
+    """
+    message = (
+        "profile 'sol-paper' can never warm up: strategy 'momentum' on timeframe '1m' "
+        "needs 40321 candles but the profile only ever asks the stream for 200 candles; "
+        "timeframes that would work with these parameters: 4h (169), 1d (29); "
+        "raise warmup_candles to at least 40321"
+    )
+    controller.failure = ConfigError(message)
+    payload: dict[str, Any] = {
+        **CREATE_BODY,
+        "strategy": "momentum",
+        "timeframe": "1m",
+        "warmup_candles": 200,
+    }
+
+    response = writable.handle(
+        "POST", "/api/profiles", body=json.dumps(payload).encode(), headers=AUTH
+    )
+
+    assert response.status == 400
+    assert payload_of(response) == {"error": message}
+    assert controller.create_calls == [
+        {**CREATE_BODY, "strategy": "momentum", "timeframe": "1m", "warmup_candles": 200}
+    ]
+
+
 @pytest.mark.parametrize("method,path,body", LIFECYCLE_CALLS)
 def test_a_read_only_server_refuses_every_lifecycle_route(
     read_only_with_controller: Router,

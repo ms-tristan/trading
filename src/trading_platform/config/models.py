@@ -56,12 +56,18 @@ _PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 #: Upper bound of ``ProfileConfig.entry_lookback_candles``.
 #:
-#: The value is deliberate: it equals the default ``warmup_candles`` and stays
-#: below the smallest ``history_candles`` (300) able to feed a full warmup, so
-#: the configured maximum is always satisfiable by a well-configured profile
-#: while an absurd value is refused loudly by the field bounds.  This constant
-#: is the single source of truth shared by the live runner guard and the tests;
-#: it is intentionally absent from ``__all__`` so the public surface is stable.
+#: The value is deliberate: it equals the default ``warmup_candles`` (200) and
+#: stays below the default realtime ``history_candles`` (300), so the configured
+#: maximum is satisfiable by a well-configured profile out of the box while an
+#: absurd value is refused loudly by the field bounds.  It is deliberately *not*
+#: a hard floor on the history a profile may request: the per-profile
+#: ``ProfileConfig.history_candles`` override may go lower than this bound (it is
+#: only ``ge=1``), which is exactly the coherence the live warm-up contract
+#: reports -- a lookback wider than the history a profile is served is a
+#: misconfiguration, not something this constant can prevent.  The value itself
+#: is unchanged, so no serialised profile moves.  This constant is the single
+#: source of truth shared by the live runner guard and the tests; it is
+#: intentionally absent from ``__all__`` so the public surface is stable.
 MAX_ENTRY_LOOKBACK_CANDLES: int = 200
 
 
@@ -245,6 +251,13 @@ class ProfileConfig(BaseModel):
     crossover that occurred within the last ``N`` candles.  The backtest is
     unaffected: it already reads every row.  The field is declared last so the
     field order of every pre-existing configuration never moves.
+
+    ``history_candles`` is the optional per-profile override of the realtime-level
+    history window: ``None`` means "use ``realtime.history_candles``", so an absent
+    override reproduces the previous behaviour exactly while one profile can be fed
+    a much longer window than the others.  A strategy whose warm-up needs tens of
+    thousands of candles on an intraday grid (``momentum`` on ``1m``) can therefore
+    be served without forcing every other profile to pay for that window.
     """
 
     model_config = {"extra": "forbid"}
@@ -264,6 +277,9 @@ class ProfileConfig(BaseModel):
     poll_interval_seconds: float = Field(default=5.0, gt=0)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     entry_lookback_candles: int = Field(default=0, ge=0, le=MAX_ENTRY_LOOKBACK_CANDLES)
+    # Declared last on purpose: the field order of every pre-existing
+    # configuration never moves.
+    history_candles: int | None = Field(default=None, ge=1)
 
     @property
     def effective_allocation(self) -> float:
@@ -274,6 +290,20 @@ class ProfileConfig(BaseModel):
         existed strictly equivalent to the new model.
         """
         return float(self.initial_balance if self.allocation is None else self.allocation)
+
+    def effective_history_candles(self, realtime_history_candles: int) -> int:
+        """Return the history window this profile is actually served.
+
+        ``history_candles`` when the profile overrides it, otherwise the
+        realtime-level ``realtime_history_candles`` the caller resolved: the
+        fallback is what keeps an absent override strictly equivalent to the
+        previous behaviour.  This is a pure configuration-level computation, so it
+        deliberately does **not** import the strategy registry (the layer direction
+        is frozen).
+        """
+        return int(
+            realtime_history_candles if self.history_candles is None else self.history_candles
+        )
 
     def strategy_params(self) -> dict[str, Any]:
         """Return the strategy parameters of this profile.

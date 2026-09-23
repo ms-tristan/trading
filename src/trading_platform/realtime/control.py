@@ -38,11 +38,12 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from pydantic import ValidationError
 
 from trading_platform.config.loader import _format_validation_error
-from trading_platform.config.models import ProfileConfig
+from trading_platform.config.models import ProfileConfig, RealtimeConfig
 from trading_platform.core.constants import SUPPORTED_TIMEFRAMES, timeframe_minutes
 from trading_platform.core.errors import ConfigError, MonitoringError, ProfileError
 from trading_platform.realtime.models import ProfileSnapshot, RunMode
 from trading_platform.realtime.observability import LOGGER_NAME, log_event
+from trading_platform.realtime.warmup import SEVERITY_ERROR, profile_warmup_findings
 from trading_platform.strategy.registry import strategy_names
 
 if TYPE_CHECKING:
@@ -82,6 +83,13 @@ class RuntimeProfileController:
         How long a command may block the calling thread before it is abandoned with
         a :class:`~trading_platform.core.errors.MonitoringError`.  The bound is what
         keeps an HTTP worker from waiting for ever on a stuck engine.
+    history_candles:
+        The history window the engine serves a profile by default -- the realtime
+        setting ``realtime.history_candles`` of the running platform.  It is used
+        by the create-time warm-up check to tell "this profile can never warm up"
+        (refused) from "this profile asks for more than the stream serves"
+        (reported).  ``None`` falls back to the model default, so a controller
+        built without it keeps the documented behaviour.
     """
 
     def __init__(
@@ -89,9 +97,15 @@ class RuntimeProfileController:
         *,
         orchestrator: RealtimeOrchestrator,
         timeout_seconds: float = 10.0,
+        history_candles: int | None = None,
     ) -> None:
         self._orchestrator = orchestrator
         self._timeout_seconds = float(timeout_seconds)
+        self._history_candles = (
+            int(RealtimeConfig().history_candles)
+            if history_candles is None
+            else max(1, int(history_candles))
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -140,9 +154,12 @@ class RuntimeProfileController:
         Raises
         ------
         ConfigError
-            Invalid identifier, unknown strategy, unsupported timeframe, or any
-            field :class:`~trading_platform.config.models.ProfileConfig` rejects
-            (mode, balance, parameters).
+            Invalid identifier, unknown strategy, unsupported timeframe, any field
+            :class:`~trading_platform.config.models.ProfileConfig` rejects (mode,
+            balance, parameters) -- or a profile whose strategy can **never** warm
+            up with the candles the profile asks the stream for: the platform must
+            refuse a profile it can never feed instead of running it for ever with
+            zero signals.
         ProfileError
             The identifier is already declared by the state store or by the running
             registry.
@@ -165,9 +182,43 @@ class RuntimeProfileController:
         profile = self._build_profile(
             identifier, strategy=strategy, timeframe=timeframe, payload=payload
         )
+        self._check_warmup(profile)
         if self._orchestrator.profile_config(identifier) is not None:
             raise ProfileError(f"profile already exists: {identifier!r}")
         return self._call(lambda: self._orchestrator.add_profile(profile))
+
+    def _check_warmup(self, profile: ProfileConfig) -> None:
+        """Refuse an impossible profile, report an incoherent one.
+
+        The arithmetic is the platform's single authority
+        (:mod:`trading_platform.realtime.warmup`), applied here -- in the calling
+        thread, before anything reaches the engine loop -- so a profile that could
+        never warm up is refused at the very place it is created, with the message
+        the API documents:
+
+        * an **error** finding (``required_candles > warmup_candles``) raises
+          :class:`~trading_platform.core.errors.ConfigError`, which
+          ``web/routes.py::_failed_mutation`` maps onto the documented ``400``:
+          the profile is never created and never started;
+        * a **warning** finding (``warmup_candles > history_candles``) is logged
+          and the profile *is* created: the frame the strategy receives is bounded
+          by ``warmup_candles``, so a smaller stream window does not by itself
+          silence the profile and refusing it would refuse working configurations.
+        """
+        for finding in profile_warmup_findings(profile, history_candles=self._history_candles):
+            if finding.severity == SEVERITY_ERROR:
+                raise ConfigError(finding.message)
+            log_event(
+                _LOGGER,
+                "profile_warmup_coherence",
+                level=logging.WARNING,
+                profile_id=str(profile.id),
+                symbol=str(profile.symbol),
+                timeframe=str(profile.timeframe),
+                warmup_candles=int(profile.warmup_candles),
+                history_candles=self._history_candles,
+                message=finding.message,
+            )
 
     @staticmethod
     def _build_profile(
@@ -181,6 +232,9 @@ class RuntimeProfileController:
 
         Only the fields the API documents are read; ``mode`` defaults to ``paper``
         and the balance to the model default when the body omits them.
+        ``warmup_candles`` and ``history_candles`` are forwarded only when the body
+        carries them, so an absent override keeps the model default (and therefore
+        the realtime-level behaviour) byte-for-byte.
         """
         fields: dict[str, Any] = {
             "id": identifier,
@@ -192,6 +246,10 @@ class RuntimeProfileController:
         }
         if payload.get("initial_balance") is not None:
             fields["initial_balance"] = payload["initial_balance"]
+        if payload.get("warmup_candles") is not None:
+            fields["warmup_candles"] = payload["warmup_candles"]
+        if payload.get("history_candles") is not None:
+            fields["history_candles"] = payload["history_candles"]
         try:
             return ProfileConfig.model_validate(fields)
         except ValidationError as exc:

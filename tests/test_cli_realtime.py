@@ -87,8 +87,24 @@ CHECK_PROFILE_KEYS = frozenset(
         "credentials_present",
         "live_gate_allowed",
         "risk",
+        # additive: the warm-up contract of the profile (see WARMUP_KEYS)
+        "warmup",
     }
 )
+
+#: Keys documented for the additive ``warmup`` block of a profile entry.
+WARMUP_KEYS = frozenset(
+    {
+        "candles_per_day",
+        "required_candles",
+        "warmup_candles",
+        "history_candles",
+        "findings",
+    }
+)
+
+#: Keys documented for one warm-up finding.
+WARMUP_FINDING_KEYS = frozenset({"code", "severity", "message"})
 
 #: Keys documented for the ``realtime-run``/``realtime-serve`` payloads.
 RUN_KEYS = frozenset({"command", "ok", "state_db", "profiles", "decisions", "url"})
@@ -151,6 +167,23 @@ def profile(
             "max_daily_trades": 10,
         },
     }
+
+
+def momentum_profile(
+    identifier: str, timeframe: str, warmup_candles: int, **overrides: Any
+) -> dict[str, Any]:
+    """Return one momentum profile of the incident's shape.
+
+    The delivered strategy reads its three lookbacks in **days**, converting them
+    with the candle grid of the timeframe, so the same parameters need 40 321
+    candles on a 1m grid and 169 on a 4h one: this helper is how a scenario asks
+    ``realtime check`` about that arithmetic.
+    """
+    document = profile(identifier, BTC, timeframe, 10000.0, 1000.0)
+    document["strategy"] = "momentum"
+    document["warmup_candles"] = int(warmup_candles)
+    document.update(overrides)
+    return document
 
 
 def store_raw_profile(database: Path, definition: Mapping[str, Any]) -> None:
@@ -442,6 +475,132 @@ def test_check_accepts_a_valid_paper_document(tmp_path: Path) -> None:
         assert entry["live_gate_allowed"] is True
         assert entry["mode"] == "paper"
         assert entry["risk"]["max_open_positions"] == 1
+        # The additive warm-up block reports the numbers and the findings alike.
+        warmup = entry["warmup"]
+        assert set(warmup) == WARMUP_KEYS
+        assert warmup["candles_per_day"] == pytest.approx(
+            24.0 if entry["id"] == "btc-paper" else 6.0
+        )
+        # ``basic`` sizes its lookbacks in candles: it declares no warm-up at all.
+        assert warmup["required_candles"] == 0
+        assert warmup["warmup_candles"] == WARMUP
+        assert warmup["history_candles"] == HISTORY_CANDLES
+        # The scenario's stream window is 1 candle while the profiles ask for 40:
+        # a real misconfiguration, reported as a warning -- and never in ``issues``,
+        # because a warning must not turn a working platform into a failure.
+        assert [finding["severity"] for finding in warmup["findings"]] == ["warning"]
+        for finding in warmup["findings"]:
+            assert set(finding) == WARMUP_FINDING_KEYS
+            assert finding["code"] == "warmup-exceeds-history"
+            assert str(WARMUP) in finding["message"]
+            assert str(HISTORY_CANDLES) in finding["message"]
+
+
+def test_check_reports_an_impossible_warm_up_as_a_finding(tmp_path: Path) -> None:
+    """The incident profile is a finding: ``ok`` is ``False`` and the exit code is 1.
+
+    A ``momentum`` profile on 1m asking for 200 candles needs 40 321: the frame it
+    builds can never warm up, so the pre-flight must say so instead of reporting a
+    profile that will run for ever with zero signals as healthy.
+    """
+    database = seed_profiles(
+        tmp_path, profiles=[momentum_profile("momentum-1m", "1m", warmup_candles=200)]
+    )
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 1
+    assert payload["ok"] is False
+    # The finding belongs to the profile entry, not to the platform-level issues.
+    assert payload["issues"] == []
+    entry = payload["profiles"][0]
+    assert set(entry) == CHECK_PROFILE_KEYS
+    assert entry["ok"] is False
+    assert len(entry["issues"]) == 1
+    assert "can never warm up" in entry["issues"][0]
+
+    warmup = entry["warmup"]
+    assert set(warmup) == WARMUP_KEYS
+    assert warmup["candles_per_day"] == pytest.approx(1440.0)
+    assert warmup["required_candles"] == 40321
+    assert warmup["warmup_candles"] == 200
+    assert warmup["history_candles"] == HISTORY_CANDLES
+    assert [finding["code"] for finding in warmup["findings"]] == [
+        "strategy-warmup-impossible",
+        "warmup-exceeds-history",
+    ]
+    assert [finding["severity"] for finding in warmup["findings"]] == ["error", "warning"]
+    # The error finding is repeated verbatim in ``issues``; the warning is not.
+    assert entry["issues"] == [
+        finding["message"] for finding in warmup["findings"] if finding["severity"] == "error"
+    ]
+
+
+def test_check_reports_a_coherence_warning_without_failing(tmp_path: Path) -> None:
+    """A 4h momentum profile inside a 1-candle window: warning only, exit code 0."""
+    database = seed_profiles(
+        tmp_path, profiles=[momentum_profile("momentum-4h", "4h", warmup_candles=200)]
+    )
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    entry = payload["profiles"][0]
+    assert entry["ok"] is True
+    assert entry["issues"] == []
+    warmup = entry["warmup"]
+    # 169 candles are all this profile needs on a 4h grid.
+    assert warmup["candles_per_day"] == pytest.approx(6.0)
+    assert warmup["required_candles"] == 169
+    assert [finding["severity"] for finding in warmup["findings"]] == ["warning"]
+    assert entry["warmup"]["findings"][0]["code"] == "warmup-exceeds-history"
+
+
+def test_check_is_green_for_a_momentum_profile_that_can_be_fed(tmp_path: Path) -> None:
+    """The fixed configuration: 40 321 candles asked for, 50 000 served, no finding."""
+    database = seed_profiles(
+        tmp_path,
+        profiles=[momentum_profile("momentum-1m", "1m", warmup_candles=40321)],
+        realtime={"history_candles": 50000},
+    )
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    entry = payload["profiles"][0]
+    assert entry["ok"] is True
+    assert entry["issues"] == []
+    warmup = entry["warmup"]
+    assert warmup["required_candles"] == 40321
+    assert warmup["warmup_candles"] == 40321
+    assert warmup["history_candles"] == 50000
+    assert warmup["findings"] == []
+
+
+def test_check_never_refuses_a_strategy_without_a_warm_up(tmp_path: Path) -> None:
+    """A 1m ``basic`` profile at the default warm-up stays exactly as green as before."""
+    database = seed_profiles(
+        tmp_path,
+        profiles=[profile("basic-1m", BTC, "1m", 10000.0, 1000.0)],
+        realtime={"history_candles": 300},
+    )
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    entry = payload["profiles"][0]
+    assert entry["strategy"] == "basic"
+    assert entry["ok"] is True
+    assert entry["issues"] == []
+    assert entry["warmup"]["required_candles"] == 0
+    assert entry["warmup"]["findings"] == []
 
 
 def test_check_on_a_fresh_database_is_ok_with_zero_profiles(tmp_path: Path) -> None:
