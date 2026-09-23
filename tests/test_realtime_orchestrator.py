@@ -146,7 +146,14 @@ def make_frame(symbol: str = SYMBOL_BTC, rows: int = 6, *, base: float = 100.0) 
 class FakeStream:
     """Deterministic :class:`MarketStream` owned by one profile."""
 
-    def __init__(self, symbol: str, *, cursor: int = 1, rows: int = 6) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        cursor: int = 1,
+        rows: int = 6,
+        max_wait_seconds: float = 0.0,
+    ) -> None:
         self.symbol = symbol
         self.frame = make_frame(symbol, rows=rows)
         self.cursor = int(cursor)
@@ -156,6 +163,7 @@ class FakeStream:
         self.connected = True
         self.last_error: str | None = None
         self.reconnect_count = 0
+        self._max_wait_seconds = float(max_wait_seconds)
 
     def seek(self, cursor: int) -> None:
         """Move the emission cursor."""
@@ -191,6 +199,11 @@ class FakeStream:
     async def history(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         await asyncio.sleep(_STREAM_TICK)
         return self.frame.iloc[: self.cursor].iloc[-int(count) :].copy()
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a ``next_candle`` call of this fake may legitimately take."""
+        return self._max_wait_seconds
 
 
 class MismatchBroker(PaperBroker):
@@ -2120,4 +2133,134 @@ def test_a_profile_boot_failure_never_echoes_the_value_it_carries(
     assert snapshot is not None
     assert snapshot.status is ProfileStatus.ERROR
     assert secret not in str(snapshot.health.last_error)
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# 15. the boot-time idle-bound warning
+# ---------------------------------------------------------------------------
+
+#: The warning the boot emits when a profile may idle longer than the configured
+#: stream timeout (a loud record, never a refusal to boot).
+IDLE_BOUND_EVENT = "profile_poll_interval_exceeds_stream_timeout"
+
+
+def test_the_boot_warns_when_the_poll_interval_exceeds_the_stream_timeout(
+    tmp_path: Path, logs: Any
+) -> None:
+    """A profile pacing slower than the stream timeout is named, loudly, once.
+
+    The deployment runs a profile with ``poll_interval_seconds = 30`` under
+    ``stream_poll_timeout_seconds = 10``.  That pair is legal -- the runner's bound
+    carries the stream's own declared wait -- but it is exactly the configuration
+    that crash-looped the stack before the fix: the tick was bounded by the 10 s
+    stream timeout alone (``10 * 1.05 + 0.05 = 10.55 s``) and cut the healthy 30 s
+    idle poll, so every profile died with ``TimeoutError`` and the container
+    restarted (79 times observed).
+
+    The boot therefore warns instead of staying silent -- and instead of refusing
+    to boot, which would turn a misconfiguration into an outage.  The record names
+    both values, the profile and the symbol, and carries the bound the runner will
+    really apply so the operator can see the mismatch is already covered.
+    """
+    streams: list[FakeStream] = []
+
+    def factory(target: ProfileConfig) -> FakeStream:
+        stream = FakeStream(str(target.symbol), max_wait_seconds=30.0)
+        streams.append(stream)
+        return stream
+
+    profiles = [profile("btc-paper", SYMBOL_BTC, poll_interval_seconds=30.0)]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        stream_factory=factory,
+        realtime=realtime_config(tmp_path, stream_poll_timeout_seconds=10.0),
+    )
+
+    run(orchestrator.run_once())
+
+    warnings = [record for record in logs if getattr(record, "event", "") == IDLE_BOUND_EVENT]
+    assert len(warnings) == 1
+    record = warnings[0]
+    assert record.levelno == logging.WARNING
+    assert record.profile_id == "btc-paper"
+    context = record.context
+    assert context["poll_interval_seconds"] == 30.0
+    assert context["stream_poll_timeout_seconds"] == 10.0
+    assert context["stream_max_wait_seconds"] == 30.0
+    assert context["symbol"] == SYMBOL_BTC
+    # The bound the runner really applies dominates the wait it wraps.
+    assert context["tick_bound_seconds"] > 30.0
+    # The platform booted anyway: the warning is loud, never a refusal.
+    assert orchestrator.runner("btc-paper") is not None
+    assert streams[0].started == 1
+    store.close()
+
+
+def test_the_boot_stays_silent_when_the_poll_interval_fits_the_stream_timeout(
+    tmp_path: Path, logs: Any
+) -> None:
+    """The control case: a profile that never out-idles the timeout warns about nothing.
+
+    Without it the warning test would pass on a boot that logs the event for every
+    profile, which is the opposite of "name the mismatch".
+    """
+    streams: list[FakeStream] = []
+
+    def factory(target: ProfileConfig) -> FakeStream:
+        stream = FakeStream(str(target.symbol), max_wait_seconds=5.0)
+        streams.append(stream)
+        return stream
+
+    profiles = [profile("btc-paper", SYMBOL_BTC, poll_interval_seconds=5.0)]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        stream_factory=factory,
+        realtime=realtime_config(tmp_path, stream_poll_timeout_seconds=10.0),
+    )
+
+    run(orchestrator.run_once())
+
+    assert IDLE_BOUND_EVENT not in events(logs)
+    assert orchestrator.runner("btc-paper") is not None
+    assert streams[0].started == 1
+    store.close()
+
+
+def test_the_boot_stays_silent_when_only_the_declared_backoff_exceeds_the_timeout(
+    tmp_path: Path, logs: Any
+) -> None:
+    """The trigger is the operator's pair, not the stream's whole declared wait.
+
+    A stream may legitimately declare a wait longer than ``stream_poll_timeout_seconds``
+    for a reason that has nothing to do with the profile's cadence: the polling stream
+    declares the whole bounded retry backoff series (15 s with the shipped
+    ``reconnect_backoff_seconds = 1.0`` and ``max_stream_reconnects = 5``), which
+    dominates a 5 s poll interval.  Naming *that* a "poll interval exceeds the stream
+    timeout" would make the event lie about the configuration the operator wrote, so
+    the warning must key on the profile's own pair -- and the runner's bound, which
+    carries the declared wait, is what keeps such a stream safe.
+    """
+    streams: list[FakeStream] = []
+
+    def factory(target: ProfileConfig) -> FakeStream:
+        stream = FakeStream(str(target.symbol), max_wait_seconds=15.0)
+        streams.append(stream)
+        return stream
+
+    profiles = [profile("btc-paper", SYMBOL_BTC, poll_interval_seconds=5.0)]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        stream_factory=factory,
+        realtime=realtime_config(tmp_path, stream_poll_timeout_seconds=10.0),
+    )
+
+    run(orchestrator.run_once())
+
+    assert IDLE_BOUND_EVENT not in events(logs)
+    assert orchestrator.runner("btc-paper") is not None
+    assert streams[0].started == 1
     store.close()

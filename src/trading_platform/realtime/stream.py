@@ -37,6 +37,20 @@ Contract shared by every implementation
   explicit timeout; a retry loop is bounded by ``max_reconnects`` and ends in a
   :class:`~trading_platform.core.errors.MarketStreamError`.
 
+Declared wait and the caller's bound
+------------------------------------
+Every implementation declares the longest wait a single :meth:`MarketStream.next_candle`
+call may legitimately block on through :attr:`MarketStream.max_wait_seconds`, and a
+caller looping on ``next_candle`` derives its own bound from that value plus its own
+margin.  The invariant is binding: the bound the runner applies around a call that may
+legitimately idle must be STRICTLY GREATER than the longest wait that call can take, for
+ANY (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including equal
+ones and the 30 s / 10 s pair the Docker deployment ships.  Deriving that bound from the
+stream timeout alone is what crash-looped the platform: the polling stream idled for the
+profile's 30 s poll interval while the caller's bound wrapped only the 10 s stream
+timeout, so every profile died with a ``TimeoutError`` on its first idle poll.  The
+declared wait is what keeps an idle poll from being cut.
+
 Time-free replay vs wall-clock time
 -----------------------------------
 :class:`ReplayMarketStream` takes no :class:`Clock`: it emits the timestamps
@@ -79,6 +93,7 @@ __all__ = [
     "MarketStream",
     "PollingMarketStream",
     "ReplayMarketStream",
+    "max_backoff_seconds",
 ]
 
 #: ``__name__`` resolves to ``trading_platform.realtime.stream``.
@@ -100,6 +115,32 @@ def _wait_bound(delay: float) -> float:
     two deadlines collide and a healthy idle poll is reported as a timeout.
     """
     return max(0.0, float(delay)) * (1.0 + _WAIT_MARGIN_RATIO) + _WAIT_MARGIN_FLOOR_SECONDS
+
+
+def max_backoff_seconds(base: float, max_reconnects: int) -> float:
+    """Return the longest total backoff a retry loop with this budget can sleep.
+
+    ``_backoff(attempt)`` is called only while ``attempt < max_reconnects`` and
+    sleeps ``base * 2 ** (attempt - 1)``, so the delays it can wait are a geometric
+    series of ratio 2: 1 + 2 + 4 + 8 = 15 s for a base of 1.0 s and
+    ``max_reconnects = 5``.  Its last term is exactly
+    ``base * 2 ** (max_reconnects - 2)``, which the value returned here --
+    ``base * (2 ** (max_reconnects - 1) - 1)`` -- dominates, so a caller deriving
+    its own bound from it never cuts a retry the stream is entitled to take.
+
+    Both retrying streams fold it into
+    :attr:`~trading_platform.realtime.stream.MarketStream.max_wait_seconds`, and a
+    caller that has to derive a bound for a stream it is about to build (the
+    ``realtime run --once`` tick budget) reads it here instead of restating the
+    arithmetic, so the declared wait and the budget that wraps it cannot drift
+    apart.
+
+    A budget below two attempts never reaches a delay at all, so the answer is
+    ``0.0``.
+    """
+    if max_reconnects < 2:
+        return 0.0
+    return max(0.0, float(base)) * float(2 ** (int(max_reconnects) - 1) - 1)
 
 
 _MISSING_CCXT_PRO = "ccxt.pro is not installed: pip install -e '.[exchange]'"
@@ -252,6 +293,23 @@ class MarketStream(Protocol):
 
         ``None`` means "nothing new within the poll interval"; the caller decides
         when to ask again.
+        """
+        ...  # pragma: no cover - protocol definition
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
+
+        ``None`` from ``next_candle`` means "nothing new within one poll interval", so a
+        stream that paces itself may legitimately wait that long before answering:
+        the caller's bound must be derived from this value (plus its own margin),
+        never from ``timeout_seconds`` alone -- a bound equal to the wait it wraps is a
+        race, not a bound.  A stream that never waits answers ``0.0``.
+
+        The bound the runner applies around a call that may legitimately idle must be
+        STRICTLY GREATER than the longest wait that call can take, for ANY
+        (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
+        equal ones and the deployment's 30 s / 10 s.
         """
         ...  # pragma: no cover - protocol definition
 
@@ -437,6 +495,17 @@ class ReplayMarketStream:
     def reconnect_count(self) -> int:
         """Always ``0``: a replay never reconnects."""
         return 0
+
+    # -- declared wait -----------------------------------------------------
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """``0.0``: the replay emits prepared rows and never reads a clock or sleeps.
+
+        The caller is therefore free to bound a ``next_candle`` call by its own
+        timeout alone, because no call of this stream can legitimately idle.
+        """
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +789,28 @@ class PollingMarketStream:
         """Monotonic number of failed polls since the stream was created."""
         return self._reconnect_count
 
+    # -- declared wait -----------------------------------------------------
+
+    @property
+    def poll_interval_seconds(self) -> float:
+        """Cadence of the stream: the idle wait taken after a poll with nothing new."""
+        return self._poll_interval_seconds
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
+
+        An idle poll sleeps exactly :attr:`poll_interval_seconds`, which is the same
+        value :meth:`_idle` sleeps, and a retry may instead sleep the whole bounded
+        backoff series of :meth:`_backoff`.  Whichever is longer is what a caller has
+        to accommodate: bounding this call by ``timeout_seconds`` alone cut a healthy
+        idle poll into a ``TimeoutError`` and crash-looped the deployment.
+        """
+        return max(
+            self._poll_interval_seconds,
+            max_backoff_seconds(self._reconnect_backoff_seconds, self._max_reconnects),
+        )
+
 
 # ---------------------------------------------------------------------------
 # live ccxt.pro stream (optional extra, imported lazily)
@@ -959,6 +1050,28 @@ class CcxtProMarketStream:
         """Monotonic number of failed reads since the stream was created."""
         return self._reconnect_count
 
+    # -- declared wait -----------------------------------------------------
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Explicit bound this stream puts on a single venue read."""
+        return self._timeout_seconds
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
+
+        The ``watch_ohlcv`` read is already bounded by :attr:`timeout_seconds`, and a
+        failed read may then sleep the whole bounded backoff series of
+        :meth:`_backoff`, so the longest legitimate wait is the longer of the two --
+        a caller bound by the read timeout alone would cut a retry the stream is
+        entitled to take.
+        """
+        return max(
+            self._timeout_seconds,
+            max_backoff_seconds(self._reconnect_backoff_seconds, self._max_reconnects),
+        )
+
 
 # ---------------------------------------------------------------------------
 # multiplexer
@@ -1112,3 +1225,19 @@ class CompositeMarketStream:
     def reconnect_count(self) -> int:
         """Sum of the children's reconnect counters."""
         return sum(self._streams[key].reconnect_count for key in self.keys())
+
+    # -- declared wait -----------------------------------------------------
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
+
+        ``next_candle`` delegates to exactly one child, so the composite's longest
+        legitimate wait is the longest wait of any child this call may be routed to.
+        A duck-typed child that predates this member declares no wait and therefore
+        contributes ``0.0``.
+        """
+        return max(
+            (float(getattr(self._streams[key], "max_wait_seconds", 0.0)) for key in self.keys()),
+            default=0.0,
+        )

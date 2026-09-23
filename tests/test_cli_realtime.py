@@ -24,6 +24,7 @@ import asyncio
 import http.client
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
@@ -702,17 +703,28 @@ def test_run_once_prints_a_human_summary(tmp_path: Path) -> None:
 def test_run_once_turns_a_hanging_stream_into_a_domain_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every await is bounded: a stream that never answers fails loudly, it never hangs."""
+    """Every await is bounded: a stream that never answers fails loudly, it never hangs.
+
+    The tick budget is now derived from the profile's own legitimate wait
+    (``max(poll_interval_seconds, stream_poll_timeout_seconds)`` plus its margin),
+    not from ``stream_poll_timeout_seconds`` alone -- the old arithmetic
+    (``timeout * (profiles + 1)``) cut a healthy idle poll of a profile pacing
+    slower than the stream timeout, which is exactly the defect this package
+    fixes.  The scenario therefore keeps the poll interval *inside* the stream
+    timeout (0.05 s against 0.05 s) so that the 30 s hang really is an unbounded
+    await, and the command still fails fast instead of hanging.
+    """
     from trading_platform.realtime import stream as stream_module
 
     async def never(self: Any, symbol: str, timeframe: str) -> None:
         await asyncio.sleep(30.0)
 
     monkeypatch.setattr(stream_module.PollingMarketStream, "next_candle", never)
-    profiles = [profile("btc-paper", BTC, "1h", 10000.0, 1000.0)]
+    definition = profile("btc-paper", BTC, "1h", 10000.0, 1000.0)
+    definition["poll_interval_seconds"] = 0.05
     database = seed_profiles(
         tmp_path,
-        profiles=profiles,
+        profiles=[definition],
         realtime={"stream_poll_timeout_seconds": 0.05},
     )
 
@@ -722,6 +734,133 @@ def test_run_once_turns_a_hanging_stream_into_a_domain_error(
     assert result.exit_code == 1
     assert payload["ok"] is False
     assert "error:" in combined_output(result)
+
+
+@pytest.mark.parametrize(
+    ("poll_interval_seconds", "stream_timeout_seconds", "profile_count"),
+    [
+        (30.0, 10.0, 2),
+        (5.0, 5.0, 1),
+        (0.05, 0.05, 1),
+        (1.0, 10.0, 2),
+    ],
+)
+def test_the_tick_budget_covers_every_legitimate_per_profile_wait(
+    poll_interval_seconds: float, stream_timeout_seconds: float, profile_count: int
+) -> None:
+    """INVARIANT: one tick budgets every profile's legitimate wait, with margin.
+
+    The bound the runner applies around a call that may legitimately idle must be
+    STRICTLY GREATER than the longest wait that call can take, for ANY
+    (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
+    equal ones and the deployment's 30 s / 10 s.  ``realtime run --once`` wraps the
+    whole sequential tick in one outer ``asyncio.wait_for``, so that budget has to
+    dominate the per-profile bounds it contains -- otherwise the outer deadline
+    becomes the crash: with the old ``timeout * (profiles + 1)`` formula the
+    deployment's two profiles got a 30 s budget that cut the second profile's own
+    legitimate 30 s idle poll.
+
+    Pure arithmetic, no clock and no duration: the check is on the invariant and on
+    the fact that a timeout-dominated tick is never budgeted below the previous
+    formula (``timeout * (profiles + 1)``), which is now only a floor -- the
+    per-profile margin makes the new budget strictly larger for any positive wait.
+    """
+    from trading_platform.cli import _realtime_tick_budget
+    from trading_platform.realtime.runner import stream_wait_bound
+
+    documents = []
+    for position in range(profile_count):
+        document = profile(f"profile-{position}", BTC, "1h", 10000.0, 1000.0)
+        document["poll_interval_seconds"] = poll_interval_seconds
+        documents.append(document)
+    profiles = [ProfileConfig.model_validate(document) for document in documents]
+    realtime = RealtimeConfig(stream_poll_timeout_seconds=stream_timeout_seconds)
+
+    budget = _realtime_tick_budget(profiles, realtime)
+
+    per_profile_wait = max(float(poll_interval_seconds), float(stream_timeout_seconds))
+    per_profile_bound = stream_wait_bound(per_profile_wait)
+    # Strictly greater than the sum of the per-profile waits plus their margin.
+    assert budget >= profile_count * per_profile_bound * math.nextafter(1.0, math.inf)
+    # The previous, timeout-dominated formula stays a lower bound of the new one.
+    assert budget >= float(stream_timeout_seconds) * (profile_count + 1)
+
+    if poll_interval_seconds <= stream_timeout_seconds:
+        # Timeout-dominated tick: the budget is the per-profile bound plus the one
+        # bare stream timeout that pays for the shutdown, so it never shrank.
+        assert budget >= profile_count * per_profile_bound
+
+
+def test_the_tick_budget_covers_the_declared_wait_of_the_stream_it_builds() -> None:
+    """The budget must dominate the bound of the stream the CLI really builds.
+
+    The stream this command builds is a ``PollingMarketStream``, which declares
+    ``max(poll_interval_seconds, the whole retry backoff series)``: with the shipped
+    ``reconnect_backoff_seconds = 1.0`` and ``max_stream_reconnects = 5`` that series
+    is 15 s, so a profile pacing at 5 s under a 10 s stream timeout still gets a
+    runner bound of ``stream_wait_bound(10, 15) = 15.8 s`` -- larger than the stream
+    timeout, and larger than any budget derived from the poll interval and the
+    timeout alone.  The tick budget therefore has to be the sum of the per-profile
+    bounds the runners apply, not one shared wait multiplied by the profile count:
+    a bound narrower than the waits it wraps is the very defect this package fixes.
+
+    Pure arithmetic on the real seam members: no clock, no tick, no duration.
+    """
+    from trading_platform.cli import _realtime_tick_budget
+    from trading_platform.realtime.runner import stream_wait_bound
+    from trading_platform.realtime.stream import PollingMarketStream
+
+    class IdleProvider:
+        """Minimal provider: this test only reads the stream's declared wait."""
+
+        def fetch_ohlcv(self, symbol: str, timeframe: str, since: Any, until: Any) -> Any:
+            return make_ohlcv(rows=2)
+
+    realtime = RealtimeConfig(
+        stream_poll_timeout_seconds=10.0,
+        reconnect_backoff_seconds=1.0,
+        max_stream_reconnects=5,
+    )
+    documents = []
+    streams = []
+    for position in range(2):
+        document = profile(f"profile-{position}", BTC, "1h", 10000.0, 1000.0)
+        document["poll_interval_seconds"] = 5.0
+        documents.append(document)
+        streams.append(
+            PollingMarketStream(
+                IdleProvider(),
+                clock=ManualClock(),
+                poll_interval_seconds=5.0,
+                timeout_seconds=float(realtime.stream_poll_timeout_seconds),
+                max_reconnects=int(realtime.max_stream_reconnects),
+                reconnect_backoff_seconds=float(realtime.reconnect_backoff_seconds),
+            )
+        )
+    profiles = [ProfileConfig.model_validate(document) for document in documents]
+
+    # The retry series, not the cadence, is what these streams declare.
+    declared = [stream.max_wait_seconds for stream in streams]
+    assert declared == [15.0, 15.0]
+
+    # The bound each of those profiles' runners applies, from the public seam.
+    per_profile_bounds = [
+        stream_wait_bound(float(realtime.stream_poll_timeout_seconds), wait) for wait in declared
+    ]
+    assert per_profile_bounds == [stream_wait_bound(10.0, 15.0)] * 2
+
+    budget = _realtime_tick_budget(profiles, realtime)
+
+    # Strictly greater than the sum of the bounds it wraps (the extra stream timeout
+    # pays for the shutdown), so no legitimate wait of the second profile is cut.
+    assert budget > sum(per_profile_bounds)
+    assert budget >= sum(per_profile_bounds) + float(realtime.stream_poll_timeout_seconds)
+    # And the poll-interval/timeout-only shape really was narrower than that sum:
+    # it would have cut the second profile's declared wait.  This is the assertion
+    # that fails on the previous budget formula.
+    timeout_only = 2 * stream_wait_bound(max(5.0, float(realtime.stream_poll_timeout_seconds)))
+    assert timeout_only + float(realtime.stream_poll_timeout_seconds) < sum(per_profile_bounds)
+    assert budget > timeout_only
 
 
 # ---------------------------------------------------------------------------

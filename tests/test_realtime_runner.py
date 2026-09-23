@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -150,6 +151,7 @@ class FakeStream:
         reconnect_count: int = 0,
         history_override: pd.DataFrame | None = None,
         closed: bool = True,
+        max_wait_seconds: float = 0.0,
     ) -> None:
         self.frame = make_frame() if frame is None else frame
         self.cursor = int(cursor)
@@ -162,6 +164,7 @@ class FakeStream:
         self.connected = True
         self.last_error: str | None = None
         self.reconnect_count = int(reconnect_count)
+        self._max_wait_seconds = float(max_wait_seconds)
 
     def seek(self, cursor: int) -> None:
         """Move the emission cursor (used to replay one candle again)."""
@@ -189,6 +192,32 @@ class FakeStream:
             return self._history_override.copy()
         emitted = self.frame.iloc[: self.cursor]
         return emitted.iloc[-int(count) :].copy()
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a ``next_candle`` call of this fake may legitimately take."""
+        return self._max_wait_seconds
+
+
+class IdleWaitStream(FakeStream):
+    """A stream whose ``next_candle`` idles its whole declared wait, like a poll.
+
+    A polling stream that finds no new closed candle sleeps its
+    ``poll_interval_seconds`` before answering ``None`` (``PollingMarketStream``
+    does it through the injected :class:`Clock`).  This fake reproduces exactly
+    that shape -- it declares ``max_wait_seconds`` and really sleeps it through the
+    clock -- which is the only way an *outer* bound can be observed cutting a
+    healthy poll.
+    """
+
+    def __init__(self, *, clock: Any, max_wait_seconds: float) -> None:
+        super().__init__(max_wait_seconds=max_wait_seconds)
+        self._clock = clock
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        self.calls += 1
+        await self._clock.sleep(self.max_wait_seconds)
+        return None
 
 
 class FakeStore:
@@ -1282,6 +1311,116 @@ def test_a_non_positive_timeout_is_refused() -> None:
         build(timeout_seconds=0.0)
 
 
+@pytest.mark.parametrize(
+    ("poll_interval_seconds", "timeout_seconds"),
+    [
+        (2.0, 1.0),
+        (30.0, 10.0),
+        (5.0, 5.0),
+        (0.05, 0.05),
+        (1.0, 1e-9),
+        (1e6, 1e6),
+    ],
+)
+def test_every_bound_the_tick_applies_is_strictly_greater_than_the_wait_it_wraps(
+    install: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    poll_interval_seconds: float,
+    timeout_seconds: float,
+) -> None:
+    """INVARIANT: a bound that cuts a legitimate wait is a crash, not a bound.
+
+    The bound the runner applies around a call that may legitimately idle must be
+    STRICTLY GREATER than the longest wait that call can take, for ANY
+    (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
+    equal ones and the deployment's 30 s / 10 s.
+
+    Before the fix the bound was derived from ``stream_poll_timeout_seconds``
+    alone, so on the deployment's pair (a stream pacing at a 30 s poll interval
+    under a 10 s stream timeout) the tick applied ``10 * 1.05 + 0.05 = 10.55 s``
+    around a healthy 30 s idle poll: ``asyncio.wait_for`` raised ``TimeoutError``
+    on the very first idle poll and every profile crash-looped.  A bound EQUAL to
+    the wait it wraps is the same race -- the two deadlines collide on the loop --
+    hence the strict comparison, made float-exact with ``math.nextafter``.
+
+    The comparison is on the *bound* the tick applies, captured from a spy on
+    ``asyncio.wait_for``: no wall clock is read and no duration is asserted, so the
+    test cannot rot as the suite gets faster or slower.
+    """
+    install(mode="hold")
+    bounds: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def bound_spy(awaitable: Any, timeout: float | None = None) -> Any:
+        bounds.append(float("inf") if timeout is None else float(timeout))
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(runner_module.asyncio, "wait_for", bound_spy)
+    stream = FakeStream(max_wait_seconds=poll_interval_seconds)
+    runner, _stream, _gateway, _store, _clock = build(
+        stream=stream,
+        profile_config=profile(poll_interval_seconds=poll_interval_seconds),
+        timeout_seconds=timeout_seconds,
+    )
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    # The real ``wait_for`` bounds the harness: the spy only records, it never
+    # replaces the bound that keeps a hung implementation from hanging the suite.
+    asyncio.run(real_wait_for(scenario(), timeout=TIMEOUT))
+
+    longest_wait = max(float(poll_interval_seconds), float(timeout_seconds))
+    strictly_above = longest_wait * math.nextafter(1.0, math.inf)
+    assert bounds, "the tick applied no bound at all"
+    for bound in bounds:
+        assert bound > float(timeout_seconds), bound
+        assert bound > float(poll_interval_seconds), bound
+        assert bound >= strictly_above, bound
+
+
+def test_an_idle_poll_of_the_whole_interval_is_never_cut(install: Any) -> None:
+    """The previous failure, with a real clock: a 4x idle poll is not a timeout.
+
+    Before the fix, the deployment's own shape -- a stream whose legitimate idle
+    poll (30 s) is longer than the configured ``stream_poll_timeout_seconds``
+    (10 s) -- made ``run_once`` raise ``TimeoutError`` on the first idle poll, which
+    the orchestrator recorded as ``profile_crashed`` and the container restarted
+    (79 restarts observed).  The bound was ``10 * 1.05 + 0.05 = 10.55 s`` around a
+    healthy 30 s sleep.  Here the same ratio is scaled down 375x:
+    ``poll_interval_seconds = 4 * timeout_seconds`` (0.08 s against 0.02 s), so the
+    whole test stays well under a quarter of a second.
+
+    A real clock is required and is the point of this test: ``ManualClock.sleep``
+    returns immediately, so the inner wait would complete instantly and the outer
+    ``asyncio.wait_for`` would never be reached -- the manual clock is exactly why
+    the suite never caught this defect in production.  The assertion is about the
+    absence of a ``TimeoutError`` and about the profile staying healthy, never about
+    a wall-clock duration.
+    """
+    install(mode="hold")
+    clock = SystemClock()
+    timeout_seconds = 0.02
+    poll_interval_seconds = 4 * timeout_seconds
+    stream = IdleWaitStream(clock=clock, max_wait_seconds=poll_interval_seconds)
+    runner, _stream, _gateway, _store, _clock = build(
+        stream=stream,
+        clock=clock,
+        profile_config=profile(poll_interval_seconds=poll_interval_seconds),
+        timeout_seconds=timeout_seconds,
+    )
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(scenario()) is None
+    assert stream.calls == 1
+    assert runner.counters().errors == 0
+    assert runner.health().status is not ProfileStatus.ERROR
+
+
 # ---------------------------------------------------------------------------
 # run(): the loop, its pacing and its failure surface
 # ---------------------------------------------------------------------------
@@ -1333,6 +1472,44 @@ def test_the_pacing_sleep_survives_when_the_interval_equals_the_timeout(
         await runner.run(max_iterations=3)
 
     run(scenario())
+    assert runner.counters().errors == 0
+    assert runner.health().status is not ProfileStatus.ERROR
+
+
+def test_run_once_survives_an_idle_poll_when_the_interval_equals_the_timeout(
+    install: Any,
+) -> None:
+    """``run_once`` covers the equal pair too: the idle poll is never cut.
+
+    The twin of the pacing test above, on the other bounded await of the loop: with
+    ``poll_interval_seconds == timeout_seconds`` the stream's whole idle poll sits
+    exactly on the configured ``stream_poll_timeout_seconds``, so any bound derived
+    from the timeout *alone* is at best a race and at worst the ``TimeoutError``
+    that crash-looped the deployment.
+
+    A real clock is required for the same reason as above -- ``ManualClock.sleep``
+    returns immediately, so the outer bound would never be reached and the test
+    would pass whatever the bound is.  Both values are tiny, so the wait costs
+    ``0.05 s``.  Note that this pair alone does not prove the whole invariant: the
+    old proportional margin still cleared a wait equal to the timeout, and the
+    defect only fired once the poll interval grew past it -- which
+    :func:`test_an_idle_poll_of_the_whole_interval_is_never_cut` reproduces.
+    """
+    install(mode="hold")
+    clock = SystemClock()
+    stream = IdleWaitStream(clock=clock, max_wait_seconds=0.05)
+    runner, _stream, _gateway, _store, _clock = build(
+        stream=stream,
+        clock=clock,
+        profile_config=profile(poll_interval_seconds=0.05),
+        timeout_seconds=0.05,
+    )
+
+    async def scenario() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(scenario()) is None
     assert runner.counters().errors == 0
     assert runner.health().status is not ProfileStatus.ERROR
 

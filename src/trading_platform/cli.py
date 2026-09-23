@@ -1759,6 +1759,45 @@ def _realtime_profiles(orchestrator: Any) -> list[dict[str, Any]]:
     return [entry.to_dict() for entry in orchestrator.snapshot().profiles]
 
 
+def _realtime_tick_budget(profiles: Sequence[ProfileConfig], realtime: RealtimeConfig) -> float:
+    """Return the budget of one whole ``realtime run --once`` tick, in seconds.
+
+    The orchestrator ticks its profiles sequentially, so the budget is, per profile,
+    **the very bound that profile's runner applies** around its idle-able calls --
+    the larger of the stream timeout and the stream's own declared wait, plus its
+    margin -- and one bare stream timeout for the shutdown.
+
+    The declared wait is the part that cannot be skipped.  The stream this command
+    builds is a :class:`~trading_platform.realtime.stream.PollingMarketStream`, which
+    declares ``max(poll_interval_seconds, the whole retry backoff series)``: a profile
+    pacing below the stream timeout whose retry series is longer still gets a runner
+    bound larger than the timeout, and a tick budget derived from the poll interval
+    and the timeout alone would cut it.  Bounding the whole tick by
+    ``stream_poll_timeout_seconds`` per profile is the same defect the runner's own
+    bound had: with the deployment's 30 s poll interval and a 10 s stream timeout,
+    two profiles got a 30 s budget that cut a perfectly legitimate 30 s idle poll of
+    the second one.
+    """
+    # Imported here on purpose: ``cli`` is imported by the realtime package, so a
+    # module-level import of the runner and of the stream seam would be circular.
+    from trading_platform.realtime.runner import stream_wait_bound as _bound
+    from trading_platform.realtime.stream import max_backoff_seconds as _retry_wait
+
+    timeout = float(realtime.stream_poll_timeout_seconds)
+    # The longest retry series the streams of this configuration can sleep, exactly
+    # as they compute it themselves.
+    retry_wait = _retry_wait(
+        float(realtime.reconnect_backoff_seconds), int(realtime.max_stream_reconnects)
+    )
+    return (
+        sum(
+            _bound(max(timeout, float(profile.poll_interval_seconds), retry_wait))
+            for profile in profiles
+        )
+        + timeout
+    )
+
+
 def _realtime_tick(
     profiles: Sequence[ProfileConfig],
     realtime: RealtimeConfig,
@@ -1772,11 +1811,12 @@ def _realtime_tick(
     Returns the decisions of the tick and the profile snapshots **read before the
     store is closed** (a snapshot read after ``stop()`` would be reading a closed
     database).  The bound is explicit: the orchestrator ticks its profiles
-    sequentially, so the budget is one stream timeout per profile plus one for
-    the shutdown.
+    sequentially, so the budget is, per profile, the bound that profile's runner
+    applies -- the stream's declared wait included -- plus one stream timeout for
+    the shutdown; see :func:`_realtime_tick_budget`.
     """
     orchestrator = _realtime_orchestrator(profiles, realtime, monitoring, clock=clock, store=store)
-    budget = float(realtime.stream_poll_timeout_seconds) * (len(profiles) + 1)
+    budget = _realtime_tick_budget(profiles, realtime)
     decisions_payload: list[dict[str, Any]] = []
     profiles_payload: list[dict[str, Any]] = []
     try:

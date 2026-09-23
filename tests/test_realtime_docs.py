@@ -272,7 +272,14 @@ def test_architecture_documents_the_four_seams_and_the_snapshot_provider() -> No
 
     for name in REALTIME_PROTOCOLS:
         assert f"class {name}(Protocol)" in text, f"architecture.md does not freeze {name}"
-    for member in ("next_candle", "submit", "reconcile", "append_equity", "last_processed_candle"):
+    for member in (
+        "next_candle",
+        "max_wait_seconds",
+        "submit",
+        "reconcile",
+        "append_equity",
+        "last_processed_candle",
+    ):
         assert member in text, f"architecture.md does not document {member}"
 
 
@@ -916,3 +923,64 @@ def test_usage_documents_the_new_endpoints_in_french() -> None:
         "chandeliers japonais",
     ):
         assert token in text, f"usage.md does not document {token!r}"
+
+
+# ---------------------------------------------------------------------------
+# 11. the idle-poll bound: the invariant, the boot warning and the new member
+# ---------------------------------------------------------------------------
+
+#: The subsection of ``docs/realtime.md`` that carries the invariant.
+IDLE_BOUND_HEADING = "### 3.1 The idle-poll bound: a bound is never equal to the wait it wraps"
+
+#: The one sentence the documentation page and the code share, verbatim.
+IDLE_BOUND_INVARIANT = (
+    "The bound applied around any call that may legitimately idle must be "
+    "strictly greater than the longest wait that call can take."
+)
+
+#: The boot-time warning raised when a profile polls slower than the stream
+#: timeout: it names both values and never refuses the boot.
+IDLE_BOUND_WARNING_EVENT = "profile_poll_interval_exceeds_stream_timeout"
+
+#: The deployment's own pair -- profile poll interval, stream poll timeout --
+#: under which every profile used to die on its first idle poll.
+IDLE_BOUND_SHIPPED_PAIR = ("30.0", "10.0")
+
+
+def test_realtime_page_documents_the_idle_poll_bound() -> None:
+    """§3.1 states the invariant, the seam, the warning and the shipped pair.
+
+    The bound is the whole point of the section: a bound equal to (or shorter
+    than) the wait it wraps is the race that crash-looped the container, so the
+    page must say *strictly greater* and name the configuration pair that used
+    to fire it.
+    """
+    text = read(REALTIME)
+    flattened = " ".join(text.split())
+
+    # the heading, at the END of §3: the next top-level heading is §4
+    assert IDLE_BOUND_HEADING in text
+    after = text.split(IDLE_BOUND_HEADING, 1)[1]
+    next_section = next(line for line in after.splitlines() if line.startswith("## "))
+    assert next_section == "## 4. Persistence, restart and reconciliation"
+    assert "strictly greater" in flattened
+    # the invariant itself, verbatim (the page wraps it, the sentence is one)
+    assert IDLE_BOUND_INVARIANT in flattened
+    # the seam: every stream declares its longest legitimate wait
+    assert "max_wait_seconds" in flattened
+    assert "PollingMarketStream" in flattened
+    assert "CcxtProMarketStream" in flattened
+    assert "CompositeMarketStream" in flattened
+    assert "ReplayMarketStream" in flattened
+    # the deployment's own pair: 30 s of legitimate idle under a 10 s timeout
+    for value in IDLE_BOUND_SHIPPED_PAIR:
+        assert value in flattened, f"docs/realtime.md does not name {value!r}"
+    assert "30 s / 10 s" in flattened
+    # the boot-time warning: named, both values, a warning and not a refusal
+    assert IDLE_BOUND_WARNING_EVENT in flattened
+    assert "warning" in flattened.lower()
+    assert "refusal to boot" in flattened
+    # a closed candle, not a missing one: the page's own event vocabulary is reused
+    assert "market_data.candles_skipped" in flattened
+    # ... and the workaround the operator had to apply is no longer needed
+    assert "no longer" in flattened
