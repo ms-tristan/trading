@@ -87,6 +87,7 @@ HEALTH_KEYS = [
     "checked_at",
     "kill_switch",
     "orphaned_positions",
+    "profile_failures",
     "profiles_running",
     "profiles_total",
     "status",
@@ -367,6 +368,8 @@ class FakeProvider:
     candle_calls: list[tuple[str, int]] = field(default_factory=list)
     orphans: Any = None
     orphan_error: Exception | None = None
+    profile_failures_map: Mapping[str, str] = field(default_factory=dict)
+    profile_failures_error: Exception | None = None
 
     def snapshot(self) -> PlatformSnapshot:
         if self.snapshot_error is not None:
@@ -406,6 +409,12 @@ class FakeProvider:
         if self.orphan_error is not None:
             raise self.orphan_error
         return self.orphans
+
+    def profile_failures(self) -> Mapping[str, str]:
+        """Return what could not be loaded, built or started (``{}`` when clean)."""
+        if self.profile_failures_error is not None:
+            raise self.profile_failures_error
+        return dict(self.profile_failures_map)
 
     def engage_kill_switch(self, reason: str) -> Any:
         self.engaged_calls.append(reason)
@@ -476,6 +485,29 @@ class UncensusedProvider(FakeProvider):
         if name == "orphan_report":
             raise AttributeError(name)
         return object.__getattribute__(self, name)
+
+
+class LegacyProfileFailuresProvider(FakeProvider):
+    """Provider written **before** the profile-failure surface existed.
+
+    It answers no ``profile_failures`` member at all: the router must tolerate it
+    through ``getattr`` and render the key as an explicit ``{}`` instead of crashing
+    the health route, answering ``null`` or dropping the key.
+    """
+
+    profile_failures = None  # type: ignore[assignment]
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "profile_failures":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+
+class NonMappingProfileFailuresProvider(FakeProvider):
+    """Provider whose failure report is not a mapping (a broken read)."""
+
+    def profile_failures(self) -> Any:
+        return ["zaaaa"]
 
 
 @dataclass
@@ -1272,9 +1304,125 @@ def test_the_orphan_block_is_additive_on_every_payload_it_touches(
     assert isinstance(health["kill_switch"], bool)
     assert isinstance(health["checked_at"], str)
     assert isinstance(health["orphaned_positions"], dict)
+    assert isinstance(health["profile_failures"], dict)
     assert isinstance(profiles["profiles"], list)
     assert isinstance(profiles["generated_at"], str)
     assert profiles["wallet"] is None
+
+
+# ---------------------------------------------------------------------------
+# what could not be loaded: additive, always present, never a 500
+# ---------------------------------------------------------------------------
+
+#: A deterministic failure report: the profile whose strategy left the registry and
+#: the row whose payload cannot be decoded.
+PROFILE_FAILURES: dict[str, str] = {
+    "zaaaa": "unknown strategy: 'timesfm' (available: basic, momentum)",
+    "ghost-paper": "1 validation error for ProfileConfig / api_secret / "
+    "Extra inputs are not permitted [type=extra_forbidden]",
+}
+
+
+def test_health_surfaces_the_profile_failures_the_provider_reports(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """``GET /api/health`` renders what could not be loaded, verbatim."""
+    provider.profile_failures_map = dict(PROFILE_FAILURES)
+    router = build_router(provider, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert health["profile_failures"] == PROFILE_FAILURES
+    # the failure list alone never degrades the status: the orchestrator already
+    # degrades through the ERROR status of the failed profile
+    assert health["status"] == "ok"
+
+
+def test_health_prefers_the_profile_failures_of_the_reported_body(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The engine's own health body wins: it is the object the orchestrator computed."""
+    provider.profile_failures_map = {"ignored": "the accessor is not asked"}
+    provider.health_body = {
+        "status": "degraded",
+        "profiles_total": 1,
+        "profiles_running": 0,
+        "uptime_seconds": 42.5,
+        "profile_failures": {"zaaaa": "unknown strategy: 'timesfm'"},
+    }
+    router = build_router(provider, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert health["profile_failures"] == {"zaaaa": "unknown strategy: 'timesfm'"}
+    # The additive key changes nothing about ``status``: this route still derives it
+    # from the kill switch and the orphan sweep, exactly as it did before.
+    assert health["status"] == "ok"
+
+
+def test_a_provider_without_the_profile_failure_member_answers_an_empty_object(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A provider written before the key existed is tolerated through getattr."""
+    legacy = LegacyProfileFailuresProvider(profiles=provider.profiles, health_body={"status": "ok"})
+    router = build_router(legacy, monitor, manual_clock)
+
+    response = router.handle("GET", "/api/health")
+    health = payload_of(response)
+
+    assert response.status == 200
+    assert sorted(health) == HEALTH_KEYS
+    assert health["profile_failures"] == {}
+    assert health["profile_failures"] is not None
+    assert health["status"] == "ok"
+
+
+def test_a_broken_profile_failure_read_never_breaks_the_health_route(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A failure list that cannot be read is ``{}``, never a ``500``.
+
+    A health route answering ``500`` is exactly the outage this key exists to
+    surface, so -- unlike the orphan read -- ``MonitoringError`` is swallowed too.
+    """
+    provider.profile_failures_error = MonitoringError("cannot read the failed profiles")
+    router = build_router(provider, monitor, manual_clock)
+
+    response = router.handle("GET", "/api/health")
+    health = payload_of(response)
+
+    assert response.status == 200
+    assert sorted(health) == HEALTH_KEYS
+    assert health["profile_failures"] == {}
+    assert health["status"] == "ok"
+
+
+def test_a_non_mapping_profile_failure_read_answers_an_empty_object(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The key is always an object: a list (or anything else) is ``{}`` on the wire."""
+    broken = NonMappingProfileFailuresProvider(profiles=provider.profiles)
+    router = build_router(broken, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(health) == HEALTH_KEYS
+    assert health["profile_failures"] == {}
+
+
+def test_the_profile_failure_key_is_never_null_or_missing_on_a_clean_platform(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A clean platform answers ``{}``: a consumer can tell it from a missing key."""
+    router = build_router(provider, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+
+    assert "profile_failures" in health
+    assert health["profile_failures"] == {}
+    assert json.dumps(health).count('"profile_failures"') == 1
 
 
 def test_profiles_payload_has_exactly_the_documented_keys(router: Router) -> None:

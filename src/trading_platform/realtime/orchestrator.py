@@ -72,6 +72,28 @@ orchestrator with an empty ``profiles`` sequence therefore succeeds,
 store) is prepared regardless of how many profiles there are.  The duplicated-id
 check stays: a platform that silently drops a profile is still worse than one that
 refuses to start.
+
+One broken profile is quarantined, never fatal
+----------------------------------------------
+A profile can be unstartable for reasons that have nothing to do with the rest of
+the platform -- the live outage was a persisted ``strategy`` name whose strategy had
+been removed by a release, and the same shape appears when a venue refuses a
+credential or a stream factory rejects a symbol.  The boot therefore treats each
+profile **independently**: a profile whose runner cannot be built (see
+:meth:`RealtimeOrchestrator._prepare_runners`) or cannot be started (see
+:meth:`RealtimeOrchestrator._start_runner`) is *quarantined* -- the reason is
+sanitised and recorded through :meth:`RealtimeOrchestrator._record_profile_failure`,
+the profile is persisted as ``ERROR`` and published by
+:meth:`RealtimeOrchestrator.profile_failures` -- while every other profile is built
+and supervised exactly as before, and the monitoring API still binds.  The whole
+platform is never taken down by one profile, and the failure is never invisible
+either: it is logged as ``profile_boot_failed``, it degrades
+:meth:`RealtimeOrchestrator.health` and it is carried by the additive
+``profile_failures`` key of the monitoring payload.
+
+Two failure classes are deliberately **not** quarantined: :class:`asyncio.CancelledError`
+(a shutdown is not a profile fault) and an unexpected :class:`Exception`, which is a
+programming bug and stays loud.
 """
 
 from __future__ import annotations
@@ -103,6 +125,7 @@ from trading_platform.core.errors import (
     ProfileError,
     RealtimeError,
     RiskLimitExceededError,
+    StrategyError,
     WalletError,
 )
 from trading_platform.core.models import Direction, TradeRecord
@@ -135,6 +158,17 @@ from trading_platform.realtime.orphans import (
 )
 
 # --- END ORPHAN SWEEP WIRING (WP3) -----------------------------------------
+# --- PROFILE QUARANTINE WIRING ---------------------------------------------
+# The one profile-related helper the orchestrator borrows from the store: the
+# sanitiser that strips the value a validation error echoes.  A profile row is
+# exactly where an operator might have hand-written a credential, and the reason
+# recorded below reaches the log stream *and* the ``profile_failures`` block of the
+# monitoring payload, so it is never the raw exception text.  The private alias is
+# intentional: the store publishes the public ``redact_profile_error`` and keeps
+# this name for its existing callers.
+from trading_platform.realtime.store import _redact_profile_error
+
+# --- END PROFILE QUARANTINE WIRING -----------------------------------------
 
 if TYPE_CHECKING:
     from trading_platform.realtime.broker import Broker
@@ -173,6 +207,33 @@ BrokerFactory = Callable[[ProfileConfig], "Broker"]
 _UNHEALTHY_STATUSES: frozenset[ProfileStatus] = frozenset(
     {ProfileStatus.DEGRADED, ProfileStatus.ERROR, ProfileStatus.HALTED}
 )
+
+#: Errors that quarantine **one** profile instead of aborting the boot.
+#:
+#: :class:`~trading_platform.core.errors.RealtimeError` covers the engine's own
+#: failures (a missing credential, an unreachable venue, a rejected symbol).
+#: :class:`~trading_platform.core.errors.StrategyError` is *not* a
+#: ``RealtimeError`` -- it belongs to the backtest hierarchy -- yet an unknown
+#: strategy name or a rejected parameter set is exactly the configuration mistake
+#: the platform must survive: it is what kept the live ``zaaaa`` profile (whose
+#: ``timesfm`` strategy had been removed by a release) from taking the whole
+#: platform down.  Both are caught; anything else stays loud.
+_PROFILE_BOOT_ERRORS: tuple[type[BaseException], ...] = (RealtimeError, StrategyError)
+
+
+def _sanitised_failure(exc: BaseException, reason: str) -> BaseException:
+    """Return ``exc`` when its rendering is already sanitised, else a safe stand-in.
+
+    The original exception is returned untouched in the common case, which keeps its
+    type and its traceback in the hands of the runner.  An exception whose rendering
+    still carries a value (pydantic echoes it as ``input_value=...``) is replaced by
+    a :class:`~trading_platform.core.errors.RealtimeError` built from the sanitised
+    reason alone, so nothing that renders or logs it can leak the value.
+    """
+    if _redact_profile_error(exc) == str(exc):
+        return exc
+    return RealtimeError(reason)
+
 
 #: Prefix of the ``meta`` key holding the persisted pause flag of one profile.
 #:
@@ -413,6 +474,11 @@ class RealtimeOrchestrator:
         self._reports: dict[str, bool] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._started_ids: set[str] = set()
+        #: Profiles this process could not build or start, mapped to the sanitised
+        #: reason.  A profile that fails here is quarantined -- every other profile
+        #: keeps running and the platform boots -- and the mapping is published by
+        #: :meth:`profile_failures` and by :meth:`health`.
+        self._boot_failures: dict[str, str] = {}
         self._kill_switch: KillSwitch | None = None
         self._wallet = wallet
         #: Guards the one-shot restore of the shared wallet: the boot runs on the
@@ -543,13 +609,20 @@ class RealtimeOrchestrator:
     # -- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
-        """Persist the profiles, reconcile them, and supervise one task each."""
+        """Persist the profiles, reconcile them, and supervise one task each.
+
+        A profile whose start fails is quarantined (see
+        :meth:`_record_profile_failure`) and simply gets no supervised task: the
+        platform still starts, every other profile still runs, and the failure is
+        published by :meth:`profile_failures`.
+        """
         runner_ids = self._prepare_runners()
         if self._monotonic_start is None:
             self._monotonic_start = float(self._clock.monotonic())
             self._started_at = pd.Timestamp(self._clock.now())
         for profile_id in runner_ids:
-            await self._start_runner(profile_id)
+            if not await self._start_runner(profile_id):
+                continue
             self._tasks[profile_id] = asyncio.create_task(
                 self._supervise(self._runners[profile_id])
             )
@@ -597,6 +670,10 @@ class RealtimeOrchestrator:
         list[TradeSignalDecision]
             The decisions the tick produced, in profile-id order.  A profile whose
             stream had nothing new contributes no entry.
+
+        A profile that cannot be started is quarantined (see
+        :meth:`_record_profile_failure`) and contributes no decision; the tick still
+        runs every other profile.
         """
         runner_ids = self._prepare_runners()
         if self._monotonic_start is None:
@@ -604,7 +681,8 @@ class RealtimeOrchestrator:
             self._started_at = pd.Timestamp(self._clock.now())
         decisions = []
         for profile_id in runner_ids:
-            await self._start_runner(profile_id)
+            if not await self._start_runner(profile_id):
+                continue
             decision = await self._runners[profile_id].run_once()
             if decision is not None:
                 decisions.append(decision)
@@ -662,8 +740,59 @@ class RealtimeOrchestrator:
             ),
         )
 
+    def profile_failures(self) -> dict[str, str]:
+        """Return the profiles that could not be loaded, built or started, sorted.
+
+        The mapping is ``profile_id -> sanitised reason``, and it merges two
+        sources:
+
+        1. what the **store** could not read, as reported by its
+           ``load_profile_failures()`` accessor (a persisted row whose payload is
+           no longer a valid profile, e.g. one carrying a field a previous release
+           removed).  The accessor is read through ``getattr`` -- a store that does
+           not implement it (an in-memory double, an older adapter) simply
+           contributes nothing -- and a store that raises while answering is logged
+           as ``profile_failures_unavailable`` and contributes nothing either;
+        2. what **this process** could not build or start (:attr:`_boot_failures`),
+           which wins for a profile id both sources know about.
+
+        The method **never raises** and answers ``{}`` when nothing is wrong, so a
+        read-only caller (the monitoring API) can always ask.  That is the whole
+        point: the outage this contract comes from was invisible because the reason
+        only ever reached a crash-looping container's log.
+
+        The result is sorted by profile id, so the payload is stable across calls
+        and diffable in a monitoring system.
+        """
+        merged: dict[str, str] = {}
+        reader = getattr(self._store, "load_profile_failures", None)
+        if callable(reader):
+            try:
+                reported = reader()
+                if isinstance(reported, Mapping):
+                    merged.update({str(key): str(value) for key, value in reported.items()})
+            except Exception as exc:  # a broken store must never hide the rest
+                log_event(
+                    _LOGGER,
+                    "profile_failures_unavailable",
+                    level=logging.WARNING,
+                    error=str(exc),
+                )
+        merged.update(self._boot_failures)
+        return dict(sorted(merged.items()))
+
     def health(self) -> dict[str, Any]:
-        """Return the ``/api/health`` body of the platform (no HTTP concern here)."""
+        """Return the ``/api/health`` body of the platform (no HTTP concern here).
+
+        ``profile_failures`` is the one additive key: the profiles that could not be
+        loaded, built or started, mapped to their sanitised reason (see
+        :meth:`profile_failures`).  It is **always present** and ``{}`` when every
+        profile is fine, so an operator (or a script) reads what the platform could
+        not start without parsing the log stream.  It never changes the meaning of
+        the keys beside it: ``status`` is still degraded by a profile status and by
+        the kill switch, and a failed profile is persisted as ``ERROR``, which is
+        what makes it degrade.
+        """
         snapshot = self.snapshot()
         profiles = snapshot.profiles
         engaged = self.kill_switch_state().engaged
@@ -684,6 +813,9 @@ class RealtimeOrchestrator:
             # and found nothing" (which carries a ``swept_at`` timestamp).
             "orphaned_positions": self._orphan_payload(),
             # --- END ORPHAN SWEEP WIRING (WP3) -----------------------------
+            # The one additive key of this delivery: what could not be loaded,
+            # built or started, sanitised.  Always present, ``{}`` when clean.
+            "profile_failures": self.profile_failures(),
         }
 
     # --- ORPHAN SWEEP WIRING (WP3) -----------------------------------------
@@ -924,12 +1056,73 @@ class RealtimeOrchestrator:
         self._by_id[resolved] = profile
         self._profiles = (*self._profiles, profile)
         self._build_runner(profile, factory)
-        await self._start_runner(resolved)
-        self._tasks[resolved] = asyncio.create_task(self._supervise(self._runners[resolved]))
+        # A profile that cannot be started is still added, persisted and reported by
+        # ``profile_failures()``: it simply gets no supervised task, because there is
+        # nothing to supervise.  Building the task unconditionally would index a
+        # runner that ran but never started, and hide the failure behind a KeyError.
+        if await self._start_runner(resolved):
+            self._tasks[resolved] = asyncio.create_task(self._supervise(self._runners[resolved]))
         log_event(_LOGGER, "profile_added", profile_id=resolved, profiles=len(self._profiles))
         return self._require_snapshot(profile.id)
 
     # -- wiring -------------------------------------------------------------
+
+    def _record_profile_failure(self, profile_id: str, exc: BaseException) -> str:
+        """Quarantine one profile and return the sanitised reason.
+
+        This is the single place a profile is declared unstartable, and it is
+        deliberately *total*: the failure is remembered for
+        :meth:`profile_failures`, the profile is marked ``ERROR`` so
+        :meth:`health` degrades, and the event ``profile_boot_failed`` is logged --
+        none of which may itself take the platform down.  Persisting the status is
+        best-effort: a store that refuses the write is logged as
+        ``profile_boot_failure_not_persisted`` and the platform keeps booting,
+        because a monitoring write must never be the reason an engine stays down.
+
+        The reason is rendered by the store's :func:`_redact_profile_error`, so a
+        profile row an operator hand-wrote a credential into can never echo it into
+        the log stream or into the monitoring payload.
+        """
+        resolved = str(profile_id)
+        reason = _redact_profile_error(exc)
+        self._boot_failures[resolved] = reason
+        # A runner that was already built owns the profile's read model: without
+        # this the dashboard would keep reporting whatever status the runner had
+        # before its start failed (``STOPPED``), and `health()` would answer "ok"
+        # about a profile that is not trading.  ``mark_crashed`` is the existing
+        # "this profile ended on an error" path of the runner: it sets ERROR in
+        # memory *and* persists it.  It renders and logs what it is given, so it is
+        # handed the sanitised failure -- see :func:`_sanitised_failure`.
+        runner = self._runners.get(resolved)
+        if runner is not None:
+            try:
+                runner.mark_crashed(_sanitised_failure(exc, reason))
+            except RealtimeError as persist_exc:
+                log_event(
+                    _LOGGER,
+                    "profile_boot_failure_not_persisted",
+                    level=logging.ERROR,
+                    profile_id=resolved,
+                    error=_redact_profile_error(persist_exc),
+                )
+        try:
+            self._store.save_status(resolved, ProfileStatus.ERROR, detail=reason)
+        except RealtimeError as persist_exc:
+            log_event(
+                _LOGGER,
+                "profile_boot_failure_not_persisted",
+                level=logging.ERROR,
+                profile_id=resolved,
+                error=_redact_profile_error(persist_exc),
+            )
+        log_event(
+            _LOGGER,
+            "profile_boot_failed",
+            level=logging.WARNING,
+            profile_id=resolved,
+            error=reason,
+        )
+        return reason
 
     def _prepare_runners(self) -> list[str]:
         """Initialize the store, adopt the settings, sweep orphans, build the runners.
@@ -957,9 +1150,17 @@ class RealtimeOrchestrator:
         method answers ``[]``, which leaves ``_prepared`` set so that
         :meth:`add_profile` can wire a profile created through the API without a
         restart.
+
+        A profile that cannot be **built** (a venue refusing a credential, a stream
+        factory rejecting a symbol) is quarantined by
+        :meth:`_record_profile_failure` instead of aborting the loop: the remaining
+        profiles are still built, the orphan sweep and the wallet steps are
+        untouched, and ``_prepared`` is still set, so the platform serves its API
+        with the profiles it *can* run.  The quarantined id is not in the returned
+        list, so no runner is started for it.
         """
         if self._prepared:
-            return self._enabled_ids()
+            return self._runnable_ids()
         factory = self._stream_factory
         if factory is None:
             raise MarketStreamError("no market stream factory: inject one")
@@ -978,10 +1179,25 @@ class RealtimeOrchestrator:
         self._sweep_orphaned_positions()
         for profile_id in self._enabled_ids():
             profile = self._by_id[profile_id]
-            self._build_runner(profile, factory)
+            try:
+                self._build_runner(profile, factory)
+            except _PROFILE_BOOT_ERRORS as exc:
+                # One profile is not the platform: quarantine it and keep booting.
+                self._record_profile_failure(profile_id, exc)
         self._sync_live_wallet()
         self._prepared = True
-        return self._enabled_ids()
+        return self._runnable_ids()
+
+    def _runnable_ids(self) -> list[str]:
+        """Return the enabled profiles that actually got a runner built.
+
+        A quarantined profile (see :meth:`_record_profile_failure`) has no runner
+        and therefore no entry in :attr:`_runners`; leaving it out of the boot list
+        is what keeps :meth:`start` and :meth:`run_once` from indexing a runner that
+        does not exist, while the profile stays visible in the read model as
+        ``ERROR``.
+        """
+        return [profile_id for profile_id in self._enabled_ids() if profile_id in self._runners]
 
     def _load_settings_into_configs(self) -> None:
         """Adopt the settings the state store holds, exactly once per orchestrator.
@@ -1225,20 +1441,42 @@ class RealtimeOrchestrator:
             self._platform_state = PlatformRiskState(clock=self._clock)
         return self._platform_state
 
-    async def _start_runner(self, profile_id: str) -> None:
+    async def _start_runner(self, profile_id: str) -> bool:
         """Start the stream and the runner of one profile, exactly once.
 
         The orchestrator owns the streams (it built them through the factory), so it
         is the one that starts and stops them; the runner only reads them.
+
+        Returns
+        -------
+        bool
+            ``True`` when the profile is started (or was already started) and
+            ``False`` when it could not be: the failure is then quarantined by
+            :meth:`_record_profile_failure` and the caller simply skips the profile.
+            Starting a profile is the point where the strategy is resolved (see
+            :meth:`~trading_platform.realtime.runner.ProfileRunner.start`), so this is
+            where a profile whose ``strategy`` left the registry used to take the
+            whole platform down with it.
+
+        Only :data:`_PROFILE_BOOT_ERRORS` -- a realtime failure or a broken strategy
+        configuration -- is quarantined.  :class:`asyncio.CancelledError` propagates
+        (a shutdown is not a profile fault) and so does any other exception, because
+        a programming bug must stay loud rather than become a silently degraded
+        profile.
         """
         if profile_id in self._started_ids:
-            return
-        await asyncio.wait_for(
-            self._streams[profile_id].start(),
-            timeout=float(self._realtime.stream_poll_timeout_seconds),
-        )
-        await self._runners[profile_id].start()
+            return True
+        try:
+            await asyncio.wait_for(
+                self._streams[profile_id].start(),
+                timeout=float(self._realtime.stream_poll_timeout_seconds),
+            )
+            await self._runners[profile_id].start()
+        except _PROFILE_BOOT_ERRORS as exc:
+            self._record_profile_failure(profile_id, exc)
+            return False
         self._started_ids.add(profile_id)
+        return True
 
     async def _supervise(self, runner: ProfileRunner) -> None:
         """Keep one profile's failure from taking the platform down with it."""

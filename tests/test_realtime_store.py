@@ -17,7 +17,11 @@ The group numbering follows the work-package brief:
 8. candle watermark;
 9. ``profile_state`` on an unknown profile;
 10. the bounded candle history;
-11. the shared platform wallet (schema version 3): persistence, single row, migration.
+11. the shared platform wallet (schema version 3): persistence, single row, migration;
+12. the store seam: the backing file, the contracted members and the frozen schema
+    version -- ``4`` is the profile-payload prune, whose own contract (the forward
+    migration and the quarantine of an unreadable row) is pinned in
+    ``tests/test_realtime_store_migration.py``.
 
 Corruption is injected through a *second*, direct SQLite connection: the store's
 ``flock`` protects writers that go through the store, it is not a file-system lock.
@@ -257,7 +261,14 @@ def test_store_satisfies_the_protocol(store: SqliteStateStore) -> None:
 
 
 def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
-    """Pin the seam the other packages consume: no member added, none forgotten."""
+    """Pin the seam the other packages consume: no member added, none forgotten.
+
+    ``load_profile_failures`` joined the seam with the quarantine contract: the
+    monitoring read model publishes what the state store could not load, and it
+    reaches it through the protocol like every other store member.  Tolerant profile
+    reads themselves changed no signature of the seam (``load_profiles`` is still
+    declared with the keyword-only ``strict`` flag defaulting to the tolerant read).
+    """
     expected = {
         "append_candle",
         "append_equity",
@@ -277,6 +288,7 @@ def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
         "list_orders",
         "list_positions",
         "list_trades",
+        "load_profile_failures",
         "load_profiles",
         "load_status",
         "load_wallet",
@@ -753,12 +765,39 @@ def test_corrupted_trade_payload_is_reported_as_a_store_error(
 def test_corrupted_profile_payload_is_reported_as_a_store_error(
     store: SqliteStateStore, db_path: Path
 ) -> None:
+    """The profile read became tolerant by default; strict mode still raises.
+
+    The contract changed in this delivery: the state store gained a tolerant profile
+    read, because one unreadable row used to abort the whole read -- and with it the
+    boot of the platform.  ``load_profiles()`` now skips the row (and reports it
+    through :meth:`SqliteStateStore.load_profile_failures`), while
+    ``load_profiles(strict=True)`` keeps the raising behaviour this test always
+    pinned.  The message is the one it always was.
+
+    The unreadable value is a credential-shaped string, not the historical
+    ``bad id!``: pydantic echoes it in its ``input_value=...`` fragment, which is
+    exactly what the sanitisation has to neutralise, so the reason is checked for
+    the value as well.
+    """
+    secret = "s3cr3t-hunter2"
     store.save_profile(make_profile())
     with raw_connection(db_path) as conn:
-        conn.execute("UPDATE profiles SET payload = ?", ('{"id": "bad id!"}',))
+        conn.execute(
+            "UPDATE profiles SET payload = ?",
+            (json.dumps({"id": "btc-paper", "symbol": "BTC/USDT", "initial_balance": secret}),),
+        )
 
     with pytest.raises(StateStoreError, match="corrupted payload"):
-        store.load_profiles()
+        store.load_profiles(strict=True)
+
+    # the same store, read tolerantly: the unreadable row is skipped, not fatal
+    assert store.load_profiles() == []
+    failures = store.load_profile_failures()
+    assert set(failures) == {"btc-paper"}
+    assert failures["btc-paper"]
+    # the rule and the field path are kept, the value never is
+    assert "initial_balance" in failures["btc-paper"]
+    assert secret not in failures["btc-paper"]
 
 
 def test_corrupted_status_is_reported_as_a_store_error(
@@ -1419,15 +1458,17 @@ def test_candle_series_limit_boundaries(store: SqliteStateStore) -> None:
     assert store.candle_series("never-seen") == []
 
 
-def test_a_version_1_database_is_migrated_to_version_3_without_touching_a_row(
+def test_a_version_1_database_is_migrated_to_version_4_without_touching_a_row(
     db_path: Path, clock: ManualClock
 ) -> None:
-    """A deployed version-1 database is carried to version 3, losing nothing.
+    """A deployed version-1 database is carried to version 4, losing nothing.
 
-    Version 3 adds the ``wallet`` table. The migration is purely additive, so every
-    row the deployed build wrote must survive it byte for byte -- that is the
-    property this test pins, and it is the reason the assertion compares whole
-    snapshots rather than a count.
+    Version 3 adds the ``wallet`` table and version 4 prunes the ``profiles`` payload
+    keys the current ``ProfileConfig`` no longer declares.  The additive part touches
+    no row, and the prune of version 4 has nothing to do on this fixture -- both
+    deployed payloads carry only declared keys -- so every row the deployed build
+    wrote must survive byte for byte.  That is the property this test pins, and it is
+    the reason the assertion compares whole snapshots rather than a count.
     """
     write_version_1_database(db_path)
     before = table_snapshot(db_path)
@@ -1449,10 +1490,19 @@ def test_a_version_1_database_is_migrated_to_version_3_without_touching_a_row(
     try:
         # (a) every pre-existing row is still there, byte for byte
         assert table_snapshot(db_path) == before
+        # (a2) and the payload prune of version 4 rewrote neither deployed profile
+        #      row: both carry only declared keys, so payload *and* ``updated_at``
+        #      are the ones the deployed build wrote
+        with raw_connection(db_path) as conn:
+            profiles_after = sorted(
+                tuple(row)
+                for row in conn.execute("SELECT profile_id, payload, updated_at FROM profiles")
+            )
+        assert profiles_after == sorted(before["profiles"])
         # (b) the stored version is now the one of this build
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [3]
+        assert versions == [SCHEMA_VERSION] == [4]
         # (c) the wallet table exists, is empty, and records no wallet at all: the
         #     engine must initialise the configured value instead of a silent 0.0
         assert "wallet" in _table_names(db_path)
@@ -1497,7 +1547,10 @@ def test_a_version_2_database_gains_the_wallet_table(db_path: Path, clock: Manua
     """Version 2 had the candles table but no wallet: reopening it only adds the wallet.
 
     The DDL is applied to a database of *any* older version, so the same additive
-    migration that carries version 1 to version 3 has to carry version 2 as well.
+    migration that carries version 1 to version 4 has to carry version 2 as well --
+    and the payload prune of version 4, which runs on the same path, has nothing to
+    do here: the single profile row carries only declared keys and survives the boot
+    byte for byte.
     """
     first = SqliteStateStore(db_path, clock=clock)
     first.initialize()
@@ -1516,9 +1569,17 @@ def test_a_version_2_database_gains_the_wallet_table(db_path: Path, clock: Manua
     store.initialize()
     try:
         assert table_snapshot(db_path) == before
+        # the version-4 payload prune left the deployed profile row alone: payload and
+        # ``updated_at`` are byte-for-byte the ones the previous build wrote
+        with raw_connection(db_path) as conn:
+            profiles_after = sorted(
+                tuple(row)
+                for row in conn.execute("SELECT profile_id, payload, updated_at FROM profiles")
+            )
+        assert profiles_after == sorted(before["profiles"])
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [3]
+        assert versions == [SCHEMA_VERSION] == [4]
         assert _row_counts(db_path)["wallet"] == 0
         assert store.load_wallet() is None
         assert [item.id for item in store.load_profiles()] == ["btc-paper"]
@@ -1573,10 +1634,14 @@ def test_a_broken_candles_table_is_reported_as_a_store_error(
 def test_the_wallet_table_is_created_by_the_current_schema(
     store: SqliteStateStore, db_path: Path
 ) -> None:
-    """A brand new database ships the wallet table, empty."""
+    """A brand new database ships the wallet table, empty.
+
+    The stored version is the one of this build, ``4``: the wallet arrived with
+    version 3 and the profile-payload prune is version 4, which changes no table.
+    """
     assert "wallet" in _table_names(db_path)
     assert _row_counts(db_path)["wallet"] == 0
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
 
 
 def test_load_wallet_of_an_empty_table_is_none(store: SqliteStateStore) -> None:
@@ -1777,20 +1842,26 @@ def test_a_store_without_a_file_answers_none() -> None:
     assert InMemoryStore().state_path() is None
 
 
-def test_the_schema_version_is_still_three() -> None:
-    """The settings work added no table and no column: the schema did not move."""
-    assert SCHEMA_VERSION == 3
+def test_the_schema_version_is_four() -> None:
+    """Version 4 is the profile-payload prune, and it was required.
+
+    The settings work added no table and no column, but the release that removed the
+    ``forecast`` field from ``ProfileConfig`` (which is ``extra="forbid"``) left the
+    rows that still carried it in place.  A field *removal* is not additive, so the
+    schema moved: version 4 prunes from every ``profiles`` payload exactly the
+    top-level keys the current model does not declare.
+    """
+    assert SCHEMA_VERSION == 4
 
 
-def test_a_version_three_database_opens_with_no_migration(
-    db_path: Path, clock: ManualClock
-) -> None:
-    """A database written before the settings change reopens untouched.
+def test_a_version_three_database_is_migrated_to_four(db_path: Path, clock: ManualClock) -> None:
+    """A version-3 database is carried to version 4 without losing a row.
 
-    The settings live in the existing ``meta`` table, so a version-3 database
-    written by the previous build must gain no object, lose no row and keep its
-    stored version: the regression pinned here is that this change is *additive to
-    nothing at all*.
+    The ``3 -> 4`` step prunes the payload keys the current ``ProfileConfig`` does not
+    declare.  The profile below carries only declared keys, so the prune rewrites no
+    row at all -- payload and ``updated_at`` stay byte-for-byte what the previous
+    build wrote -- and reopening the migrated file a second time changes nothing
+    either.
     """
     first = SqliteStateStore(db_path, clock=clock)
     first.initialize()
@@ -1799,6 +1870,10 @@ def test_a_version_three_database_opens_with_no_migration(
     first.save_wallet(cash=9_000.0, initial_balance=10_000.0)
     first.set_meta("entry_crossing:btc-paper", stamp(4).isoformat())
     first.close()
+
+    # the file as the previous build left it: everything on disk, stored as version 3
+    with raw_connection(db_path) as conn:
+        conn.execute("UPDATE schema_version SET version = 3")
 
     before = table_snapshot(db_path)
     tables_before = _table_names(db_path)
@@ -1814,7 +1889,18 @@ def test_a_version_three_database_opens_with_no_migration(
         assert table_snapshot(db_path) == before
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [3]
+        assert versions == [SCHEMA_VERSION] == [4]
+        # the payload carried no undeclared key, so the prune left the row alone:
+        # payload *and* ``updated_at`` are the ones the previous build wrote
+        payload_before, updated_before = next(
+            (row[1], row[2]) for row in before["profiles"] if row[0] == "btc-paper"
+        )
+        with raw_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT payload, updated_at FROM profiles WHERE profile_id = ?", ("btc-paper",)
+            ).fetchone()
+        assert row is not None
+        assert (str(row[0]), str(row[1])) == (payload_before, updated_before)
         # and every row still decodes with the meaning it had before
         assert [item.id for item in reopened.load_profiles()] == ["btc-paper"]
         assert reopened.get_position("btc-paper", "BTC/USDT") is not None
@@ -1824,6 +1910,20 @@ def test_a_version_three_database_opens_with_no_migration(
         assert reopened.get_meta("entry_crossing:btc-paper") == stamp(4).isoformat()
     finally:
         reopened.close()
+
+    # a second open of the migrated file is a no-op as well: the migration is
+    # idempotent, so nothing changes after the first pass
+    again = SqliteStateStore(db_path, clock=clock)
+    again.initialize()
+    try:
+        assert _table_names(db_path) == tables_before
+        assert table_snapshot(db_path) == before
+        with raw_connection(db_path) as conn:
+            versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
+        assert versions == [SCHEMA_VERSION] == [4]
+        assert [item.id for item in again.load_profiles()] == ["btc-paper"]
+    finally:
+        again.close()
 
 
 def test_the_meta_table_is_the_only_settings_storage(store: SqliteStateStore) -> None:

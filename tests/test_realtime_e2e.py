@@ -36,7 +36,7 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
-from trading_platform.cli import app
+from trading_platform.cli import _realtime_clock, _realtime_orchestrator, app
 from trading_platform.config import (
     MonitoringConfig,
     ProfileConfig,
@@ -66,7 +66,8 @@ LAST_CANDLE = "2024-01-05T23:00:00+00:00"
 #: The exact key set of the ``/api/health`` body served by the monitoring surface.
 #: ``wallet`` is the shared platform wallet view every profile funds its orders
 #: from: it is **additive**, always present, and ``null`` when the provider reports
-#: none.
+#: none.  ``profile_failures`` is the second additive key: what could not be
+#: loaded, built or started, always present and ``{}`` when everything is fine.
 HEALTH_KEYS = frozenset(
     {
         "status",
@@ -78,11 +79,34 @@ HEALTH_KEYS = frozenset(
         "checked_at",
         "wallet",
         "orphaned_positions",
+        "profile_failures",
     }
 )
 
 CLIENT_TIMEOUT = 5.0
 JOIN_TIMEOUT = 5.0
+
+#: Bound of one in-process engine tick (the stream timeout of the scenario plus the
+#: shutdown budget, exactly like the CLI's own bound).
+BOOT_TIMEOUT = 30.0
+
+#: The strategy the live ``zaaaa`` row named and which the release that removed the
+#: forecast subsystem removed from the registry with it.
+GONE_STRATEGY = "timesfm"
+
+#: The instant every legacy row carries in ``updated_at``.
+LEGACY_UPDATED_AT = "2024-01-05T00:00:00+00:00"
+
+#: The schema version the build that wrote those rows left in the database.
+LEGACY_SCHEMA_VERSION = 3
+
+#: The row no JSON reader can decode, with the value a hand edit must never leak.
+UNREADABLE_PROFILE_ID = "ghost-paper"
+UNREADABLE_SECRET = "s3cr3t-hunter2"
+UNREADABLE_PAYLOAD = (
+    '{"id": "ghost-paper", "symbol": "BTC/USDT", "strategy": "basic", '
+    f'"api_secret": "{UNREADABLE_SECRET}"'
+)
 
 
 @pytest.fixture(autouse=True)
@@ -936,4 +960,200 @@ def test_a_live_polling_stream_trades_its_first_tick_with_a_full_warmup(
         assert provider.calls, "the live stream never asked the provider for candles"
         assert provider.calls[0][3] == LIVE_NOW
     finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. the production outage: a stale database boots and says what it skipped
+# ---------------------------------------------------------------------------
+
+
+def age_the_state_database(database: Path) -> None:
+    """Rebuild the database in the shape the live one had after the release.
+
+    Three rows, exactly like the incident: the two an older build wrote -- their
+    payload still carries the ``forecast`` key that build knew and the release
+    removed from ``ProfileConfig`` -- one whose ``strategy`` that same release
+    removed from the registry, and one whose payload is not valid JSON at all (an
+    interrupted hand edit, carrying a value an operator typed in).
+
+    The writes are raw SQLite, and the stored schema version is stamped back to the
+    version the old build left: no public API can produce such rows, and a database
+    that already declares the current version would not be migrated.  This is
+    precisely the file a deployed container had on its volume.
+    """
+    connection = sqlite3.connect(database)
+    try:
+        rows = connection.execute(
+            "SELECT profile_id, payload FROM profiles ORDER BY profile_id ASC"
+        ).fetchall()
+        assert rows, "the scenario wrote no profile row"
+        for profile_id, payload in rows:
+            stale = json.loads(str(payload))
+            stale["forecast"] = None
+            connection.execute(
+                "UPDATE profiles SET payload = ?, updated_at = ? WHERE profile_id = ?",
+                (json.dumps(stale), LEGACY_UPDATED_AT, profile_id),
+            )
+        # the profile whose strategy no longer exists, written by the same old build
+        orphaned = json.loads(str(rows[0][1]))
+        orphaned.update({"id": "zaaaa", "strategy": GONE_STRATEGY, "forecast": None})
+        connection.execute(
+            "INSERT INTO profiles (profile_id, payload, updated_at) VALUES (?, ?, ?)",
+            ("zaaaa", json.dumps(orphaned), LEGACY_UPDATED_AT),
+        )
+        connection.execute(
+            "INSERT INTO profiles (profile_id, payload, updated_at) VALUES (?, ?, ?)",
+            (UNREADABLE_PROFILE_ID, UNREADABLE_PAYLOAD, LEGACY_UPDATED_AT),
+        )
+        connection.execute("UPDATE schema_version SET version = ?", (LEGACY_SCHEMA_VERSION,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_stale_state_database_boots_and_the_api_names_what_it_skipped(
+    tmp_path: Path,
+) -> None:
+    """The outage regression: one stale row can no longer hide the whole platform.
+
+    The container used to end in a ``Restarting`` loop over this exact database: the
+    persisted rows carried a field the release had removed, ``load_profiles()``
+    aborted on the first of them, the engine never started, the monitoring API never
+    bound and the dashboard answered "the monitoring API is unreachable".  The
+    delivery has to make that manual repair unnecessary, so this test walks the
+    shipped path over a database built the way the live one was:
+
+    1. ``realtime run --once`` -- the engine boot -- exits ``0`` and ticks the
+       profiles it *can* run, instead of exiting ``1`` for the one it cannot;
+    2. the monitoring API binds over the same database and ``GET /api/health``
+       answers ``200``, with ``profile_failures`` naming both the row that could not
+       be decoded and the profile whose strategy left the registry -- and never the
+       value that row carries.
+    """
+    database = write_scenario(tmp_path)
+    age_the_state_database(database)
+
+    # ---- 1. the shipped engine path: the crash-restart loop is gone -------------
+    payload = tick(database)
+    assert [item["profile_id"] for item in payload["profiles"]] == [
+        "btc-paper",
+        "eth-paper",
+        "zaaaa",
+    ]
+    assert payload["ok"] is True
+
+    # ---- 2. the shipped monitoring surface over the very same database ----------
+    settings = resolved_settings(database)  # read before the writer lock is taken
+    # the clock of the shipped run: ``realtime.start_at`` is the replay anchor, so the
+    # engine sees the same closed candle the CLI tick saw
+    clock = _realtime_clock(settings.realtime)
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    orchestrator = None
+    try:
+        # the migration already pruned the removed key: the two legacy rows load
+        # again, and only the row no reader can decode is reported
+        loaded = store.load_profiles()
+        assert [item.id for item in loaded] == ["btc-paper", "eth-paper", "zaaaa"]
+        assert set(store.load_profile_failures()) == {UNREADABLE_PROFILE_ID}
+
+        # the engine of ``realtime run``, over the state store it was given
+        orchestrator = _realtime_orchestrator(
+            loaded, settings.realtime, settings.monitoring, clock=clock, store=store
+        )
+        asyncio.run(asyncio.wait_for(orchestrator.run_once(), timeout=BOOT_TIMEOUT))
+
+        # the failed profile is degraded for real, and every good one is running
+        engine_health = orchestrator.health()
+        assert engine_health["status"] == "degraded"
+        assert engine_health["profiles_running"] == 2
+        assert "unknown strategy" in engine_health["profile_failures"]["zaaaa"]
+
+        server = create_server(
+            orchestrator,
+            monitor=Monitor(store, clock=clock, realtime=settings.realtime),
+            config=MonitoringConfig(port=0),
+            read_only=True,
+            version="e2e",
+        )
+        thread = start_in_thread(server)
+        port = server.port
+        assert port != 0
+        try:
+            status, health = get(port, "/api/health")
+        finally:
+            server.shutdown()
+            thread.join(timeout=JOIN_TIMEOUT)
+            server.server_close()
+
+        assert status == 200
+        assert set(health) == HEALTH_KEYS
+        assert health["profiles_total"] == 3
+        assert health["profiles_running"] == 2
+        failures = health["profile_failures"]
+        assert set(failures) == {UNREADABLE_PROFILE_ID, "zaaaa"}
+        assert "unknown strategy" in failures["zaaaa"]
+        assert GONE_STRATEGY in failures["zaaaa"]
+        assert failures[UNREADABLE_PROFILE_ID]
+        # the value a hand edit put in the row never reaches the monitoring payload
+        assert UNREADABLE_SECRET not in json.dumps(health)
+    finally:
+        if orchestrator is not None:
+            asyncio.run(orchestrator.stop())
+        else:  # pragma: no cover - the wiring above is what fails first
+            store.close()
+
+
+def test_the_read_only_surface_reports_the_rows_it_could_not_load(tmp_path: Path) -> None:
+    """``realtime serve`` runs no engine, yet it must name what it could not read.
+
+    The read-only command rebuilds the dashboard view from the state store alone, so
+    the only failures it can know about are the rows the store itself could not
+    decode.  Serving a *shorter* profile list silently would hide exactly what the
+    operator needs to see, so the additive key travels through the read-only
+    provider too -- the composition here is the one ``realtime serve`` builds.
+    """
+    from trading_platform.cli import _PersistedSnapshotProvider
+
+    database = write_scenario(tmp_path)
+    age_the_state_database(database)
+
+    clock = SystemClock()
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    server = None
+    try:
+        provider = _PersistedSnapshotProvider(
+            store, clock=clock, realtime=RealtimeConfig(state_db=database)
+        )
+        server = create_server(
+            provider,
+            monitor=provider.monitor,
+            config=MonitoringConfig(port=0),
+            read_only=True,
+            version="e2e",
+        )
+        thread = start_in_thread(server)
+        port = server.port
+        assert port != 0
+        try:
+            status, health = get(port, "/api/health")
+        finally:
+            server.shutdown()
+            thread.join(timeout=JOIN_TIMEOUT)
+            server.server_close()
+            server = None
+
+        assert status == 200
+        assert set(health) == HEALTH_KEYS
+        # the migrated rows are served, the undecodable one is reported
+        assert health["profiles_total"] == 3
+        assert set(health["profile_failures"]) == {UNREADABLE_PROFILE_ID}
+        assert health["profile_failures"][UNREADABLE_PROFILE_ID]
+        assert UNREADABLE_SECRET not in json.dumps(health)
+        assert provider.profile_failures() == health["profile_failures"]
+    finally:
+        if server is not None:  # pragma: no cover - the shutdown above is the path
+            server.server_close()
         store.close()

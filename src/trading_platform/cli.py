@@ -2074,8 +2074,18 @@ def _realtime_preflight(
         store = _realtime_store(realtime, clock)
         try:
             store.initialize()
-            profiles = store.load_profiles()
-        except TradingBacktestError as exc:  # pragma: no cover - probed just above
+            # ``realtime check`` is the pre-flight *validation* of the state
+            # database, so it is the one caller that asks for the strict read: a
+            # persisted row the current profile model refuses (a timeframe a
+            # previous, laxer build could have written, a field a release removed
+            # without migrating) is the finding this command exists to report --
+            # exit code 1 and the sanitised reason in ``issues`` -- while every
+            # engine path loads tolerantly and quarantines the row instead.
+            profiles = store.load_profiles(strict=True)
+        except TradingBacktestError as exc:
+            # The strict read is what turns an unreadable row into the finding this
+            # command reports: nothing is printed as a traceback, the sanitised
+            # reason travels in ``issues`` and the exit code is ``1``.
             issues.append(str(exc))
         finally:
             store.close()
@@ -2488,6 +2498,34 @@ class _PersistedSnapshotProvider:
         from trading_platform.realtime.orphans import load_orphan_report
 
         return load_orphan_report(self._store)
+
+    def profile_failures(self) -> dict[str, str]:
+        """Return what the last profile read of the store could not load.
+
+        ``realtime serve`` runs no engine, so the only thing it can report is what
+        the **store** could not decode: a persisted row whose payload is no longer a
+        valid profile (a field a release removed, a hand-edited row, a corrupt
+        value) is skipped by ``load_profiles()`` and named here with its sanitised
+        reason.  That is what makes the read-only surface show an operator what is
+        missing instead of silently serving a shorter profile list.
+
+        The accessor is read through ``getattr`` so a store double written before
+        the profile-failure surface existed still satisfies the provider protocol,
+        and it answers ``{}`` -- never ``None``, never an exception -- when there is
+        nothing to report.
+        """
+        try:
+            reader = getattr(self._store, "load_profile_failures", None)
+            if not callable(reader):
+                return {}
+            return {str(key): str(value) for key, value in dict(reader()).items()}
+        except Exception as exc:  # a failure list must never break the API
+            import logging
+
+            from trading_platform.realtime.observability import LOGGER_NAME
+
+            logging.getLogger(LOGGER_NAME).warning("profile failures unavailable: %s", exc)
+            return {}
 
     def candle_series(self, profile_id: str, limit: int) -> list[CandleRow]:
         """Return the persisted candles of one profile, oldest first.

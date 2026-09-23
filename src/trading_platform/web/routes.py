@@ -56,6 +56,18 @@ or a script can read the warning without parsing the health body.  A closure
 never degrades the health status; a position that could **not** be closed does,
 and is logged at ``ERROR`` as loudly as a success.
 
+Unreadable profiles (additive)
+------------------------------
+``GET /api/health`` carries one more extra key, ``profile_failures``: an object
+mapping the id of every profile that could **not** be loaded, built or started to
+its sanitised reason.  It is **always present** and ``{}`` when every profile is
+fine -- never ``null`` -- so a consumer can tell "nothing failed" from "the key is
+missing".  It never degrades the status by itself: a failed profile is persisted as
+``ERROR``, which is what degrades (the read-only surface of ``realtime serve`` runs
+no engine and has nothing to degrade *with*), and a failure list that cannot be
+read must never break the health route -- a health route answering ``500`` is
+exactly the outage this key exists to make impossible.
+
 Profile lifecycle
 -----------------
 The four lifecycle routes require the operator token and are refused with the
@@ -232,6 +244,18 @@ class SnapshotProvider(Protocol):
         as an explicit JSON ``null``, never as a missing key, so a consumer can
         always tell "swept, nothing found" from "never swept".  A provider that
         cannot answer at all is tolerated through ``getattr``.
+        """
+        ...
+
+    def profile_failures(self) -> Mapping[str, str]:
+        """Return the profiles that could not be loaded, built or started.
+
+        The mapping is ``profile_id -> sanitised reason`` (the orchestrator
+        publishes it from the state store and from its own boot failures, the
+        read-only adapter from the store alone).  ``{}`` means "every profile is
+        fine"; the router renders the *key* as an always-present object, never as a
+        missing key and never as ``null``.  A provider that cannot answer at all is
+        tolerated through ``getattr``, exactly like :meth:`orphan_report`.
         """
         ...
 
@@ -1052,6 +1076,13 @@ class Router:
         least once, again always present.  A **closure** never degrades the status
         -- the sweep did its job -- but a position that could not be closed does,
         and is logged at ``ERROR`` so a failure is reported as loudly as a success.
+
+        ``profile_failures`` is what could not be loaded, built or started
+        (:meth:`_profile_failures_payload`): an always-present object, ``{}`` when
+        every profile is fine.  It never degrades the status on its own -- the
+        failed profile is already persisted as ``ERROR``, which does -- and it can
+        never raise, because a health route that answers ``500`` is exactly the
+        outage this key exists to prevent.
         """
         raw = self._provider.health()
         reported: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
@@ -1089,7 +1120,42 @@ class Router:
             "checked_at": _iso(self._clock.now()),
             "wallet": _snapshot_payload(reported.get("wallet")),
             "orphaned_positions": orphans,
+            "profile_failures": self._profile_failures_payload(reported),
         }
+
+    # -- unreadable profiles ------------------------------------------------
+
+    def _profile_failures_payload(self, reported: Mapping[str, Any]) -> dict[str, str]:
+        """Return what could not be loaded, built or started, as ``{id: reason}``.
+
+        Two sources, in this order:
+
+        1. ``profile_failures`` of the provider's own health body -- the
+           orchestrator publishes the mapping there, so the router renders the very
+           object the engine computed instead of asking twice;
+        2. the provider's ``profile_failures()`` accessor, read through ``getattr``
+           so a provider written before the key existed keeps working (the CLI's
+           read-only adapter is the shipped one).
+
+        The method is deliberately unable to fail: an accessor that raises is logged
+        as a warning and answers ``{}``, a non-mapping answer answers ``{}``, and
+        :class:`~trading_platform.core.errors.MonitoringError` is **not** re-raised
+        (unlike the orphan read) -- a list of failures must never be the reason the
+        health route breaks, because an unreachable health route is the outage this
+        key exists to surface.  The result is always a plain ``dict[str, str]``, so
+        the key is always present and never ``null``.
+        """
+        try:
+            candidate: Any = reported.get("profile_failures")
+            if not isinstance(candidate, Mapping):
+                reader = getattr(self._provider, "profile_failures", None)
+                candidate = reader() if callable(reader) else None
+            if not isinstance(candidate, Mapping):
+                return {}
+            return {str(key): str(value) for key, value in candidate.items()}
+        except Exception as exc:  # a failure list must never break the health route
+            _LOGGER.warning("profile failures unavailable: %s", exc)
+            return {}
 
     # -- orphaned positions -------------------------------------------------
 
