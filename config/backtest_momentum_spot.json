@@ -1,0 +1,105 @@
+{
+  "backtest": {
+    "allow_short": false,
+    "compute_metrics": true,
+    "fee_rate": 0.001,
+    "initial_balance": 10000.0,
+    "max_open_trades": 1,
+    "slippage": 0.0005,
+    "stake_amount": null
+  },
+  "benchmark": {
+    "enabled": true,
+    "n_random_simulations": 1000,
+    "random_entry_seed": 42,
+    "risk_free_rate": 0.05,
+    "variant": "buy_and_hold"
+  },
+  "data": {
+    "allow_network": true,
+    "cache_dir": "data/cache",
+    "data_dir": "data",
+    "end": "2026-08-31T00:00:00Z",
+    "format": "parquet",
+    "max_gap_factor": 30.0,
+    "max_missing_ratio": 0.01,
+    "start": "2017-08-17T00:00:00Z",
+    "timeframe": "4h",
+    "validate": true
+  },
+  "exchange": {
+    "fee_rate": 0.001,
+    "market": "spot",
+    "name": "binance",
+    "quote_currency": "USDT",
+    "rate_limit_ms": 200,
+    "slippage": 0.0005
+  },
+  "log_level": "INFO",
+  "monitoring": {
+    "host": "127.0.0.1",
+    "max_request_bytes": 65536,
+    "port": 8080,
+    "refresh_seconds": 2.0,
+    "request_timeout_seconds": 10.0
+  },
+  "project_name": "trading-platform",
+  "realtime": {
+    "allow_network": true,
+    "benchmark_variant": "buy_and_hold",
+    "cache_dir": "data/cache",
+    "csv_dir": null,
+    "data_dir": "data",
+    "format": "parquet",
+    "history_candles": 300,
+    "kill_switch_file": null,
+    "logs_dir": "data/realtime/logs",
+    "max_stream_reconnects": 5,
+    "platform_initial_balance": null,
+    "platform_max_daily_loss": null,
+    "platform_max_total_notional": null,
+    "poll_interval_seconds": 5.0,
+    "reconcile_interval_seconds": 60.0,
+    "reconnect_backoff_seconds": 1.0,
+    "risk_free_rate": 0.0,
+    "start_at": null,
+    "state_db": "data/realtime/state.db",
+    "stream_poll_timeout_seconds": 10.0
+  },
+  "reporting": {
+    "basename": "momentum_spot",
+    "formats": [
+      "markdown",
+      "json"
+    ],
+    "include_trades": true,
+    "output_dir": "reports/momentum_spot",
+    "title": "Momentum 4h long-only spot (2017-2026)",
+    "trade_limit": 50
+  },
+  "strategy": {
+    "name": "momentum",
+    "params": {
+      "allow_short": false,
+      "atr_stop_multiplier": 4.0,
+      "enter_score": 0.6,
+      "exit_score": 0.0,
+      "fast_days": 7,
+      "mid_days": 14,
+      "slow_days": 28
+    },
+    "timeframe": "4h"
+  },
+  "validation": {
+    "in_sample_ratio": 0.7,
+    "mode": "rolling",
+    "monte_carlo_method": "trade_resample",
+    "n_monte_carlo": 1000,
+    "n_windows": 5,
+    "purge_candles": 0,
+    "random_seed": 42,
+    "robustness_grid": {},
+    "robustness_max_combinations": 512,
+    "robustness_metric": "sharpe_ratio"
+  }
+}

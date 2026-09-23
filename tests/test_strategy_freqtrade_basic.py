@@ -3,7 +3,11 @@
 The module under test is the *concrete* half of the Freqtrade adapter: it is the
 only place where a Freqtrade-facing class is built **at import time**, and it is
 paired with ``user_data/strategies/BasicStrategy.py``, the file Freqtrade
-resolves by class name.
+resolves by class name.  ``freqtrade_momentum`` and its own shim
+(``user_data/strategies/MomentumStrategy.py``) are the symmetric second
+exposure, and they are covered here by the same two groups: the offline guards
+are mirrored for them, and their live contract is asserted only under a real
+Freqtrade.
 
 Two groups, and the split mirrors ``docs/testing-policy.md`` §1.2:
 
@@ -57,6 +61,12 @@ INIT_PATH = REPO_ROOT / "src" / "trading_platform" / "strategy" / "__init__.py"
 #: The Freqtrade entry point: the file ``StrategyResolver`` scans.
 SHIM_PATH = REPO_ROOT / "user_data" / "strategies" / "BasicStrategy.py"
 
+#: The concrete exposure module of the second shipped strategy.
+MOMENTUM_MODULE_PATH = REPO_ROOT / "src" / "trading_platform" / "strategy" / "freqtrade_momentum.py"
+
+#: The Freqtrade entry point of the ``momentum`` strategy (the second shim).
+MOMENTUM_SHIM_PATH = REPO_ROOT / "user_data" / "strategies" / "MomentumStrategy.py"
+
 #: The rules this work package appends to ``.gitignore``.
 GITIGNORE_PATH = REPO_ROOT / ".gitignore"
 
@@ -76,11 +86,15 @@ METADATA: dict[str, object] = {"pair": "BTC/USDT", "timeframe": "1h", "dataframe
 #: The comment the shim must keep: a factory alias resolves to ``(None, None)``.
 SHIM_CLASS_STATEMENT = "class BasicStrategy(BasicFreqtradeStrategy):"
 
+#: The same literal statement, for the ``momentum`` shim.
+MOMENTUM_SHIM_CLASS_STATEMENT = "class MomentumStrategy(MomentumFreqtradeStrategy):"
+
 #: ``.gitignore`` lines appended by this work package, in order.
 GITIGNORE_APPENDED = (
     "!user_data/strategies/",
     "user_data/strategies/*",
     "!user_data/strategies/BasicStrategy.py",
+    "!user_data/strategies/MomentumStrategy.py",
 )
 
 #: The public API of ``trading_platform.strategy``, name for name.
@@ -189,8 +203,8 @@ def _house_signals(frame: pd.DataFrame) -> pd.DataFrame:
     return strategy.signals(strategy.prepare(frame))
 
 
-def _resolved_shim_class() -> tuple[type, Path]:
-    """Return ``(class, path)`` for ``BasicStrategy`` as Freqtrade resolves it.
+def _resolve_shim(shim_path: Path, object_name: str) -> tuple[type, Path]:
+    """Return ``(class, path)`` for ``object_name`` as Freqtrade resolves it.
 
     The real ``StrategyResolver._search_object`` is used on the *shipped*
     ``user_data/strategies`` directory: no network, no configuration file, no
@@ -198,12 +212,20 @@ def _resolved_shim_class() -> tuple[type, Path]:
     """
     from freqtrade.resolvers.strategy_resolver import StrategyResolver
 
-    cls, path = StrategyResolver._search_object(
-        REPO_ROOT / "user_data" / "strategies", object_name="BasicStrategy"
-    )
-    assert cls is not None, "user_data/strategies/BasicStrategy.py does not resolve"
+    cls, path = StrategyResolver._search_object(shim_path.parent, object_name=object_name)
+    assert cls is not None, f"the shim {shim_path.name} does not resolve"
     assert path is not None
     return cls, path
+
+
+def _resolved_shim_class() -> tuple[type, Path]:
+    """Return ``(class, path)`` for ``BasicStrategy`` as Freqtrade resolves it."""
+    return _resolve_shim(SHIM_PATH, "BasicStrategy")
+
+
+def _resolved_momentum_shim_class() -> tuple[type, Path]:
+    """Return ``(class, path)`` for ``MomentumStrategy`` as Freqtrade resolves it."""
+    return _resolve_shim(MOMENTUM_SHIM_PATH, "MomentumStrategy")
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +271,34 @@ def test_strategy_namespace_never_imports_freqtrade_basic() -> None:
     assert source.count("freqtrade_basic") == docstring.count("freqtrade_basic")
 
 
+def test_strategy_namespace_never_imports_freqtrade_momentum() -> None:
+    """The same rule for the second concrete module, and the same AST proof.
+
+    ``freqtrade_momentum`` also builds its class at import time, so a top-level
+    import of it would break ``import trading_platform`` on a ``.[dev]``-only
+    checkout.  The house ``momentum`` strategy is reached through
+    :mod:`trading_platform.strategy.registry`; it is deliberately **not**
+    re-exported by the namespace, whose ``__all__`` is pinned name for name by
+    :func:`test_strategy_namespace_reexports_the_adapter_api`.  The name is
+    checked as an AST import, and the module is asserted to be absent from the
+    namespace altogether — the mirror of the ``freqtrade_basic`` check above,
+    where the name *is* documented in the docstring.
+    """
+    source = INIT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+            imported.extend(alias.name for alias in node.names)
+    assert imported, "the namespace is expected to import its public objects"
+    assert not [name for name in imported if "freqtrade_momentum" in name]
+    assert "freqtrade_momentum" not in source
+    assert not [name for name in EXPECTED_PUBLIC_API if "momentum" in name.lower()]
+
+
 def test_importing_the_strategy_namespace_survives_a_missing_freqtrade() -> None:
     """End-to-end proof: ``import trading_platform.strategy`` works without the extra."""
     result = subprocess.run(
@@ -276,7 +326,10 @@ def test_the_shim_carries_a_literal_class_statement() -> None:
     source = SHIM_PATH.read_text(encoding="utf-8")
     assert SHIM_CLASS_STATEMENT in source
     assert "from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy" in source
-    assert sorted(path.name for path in SHIM_PATH.parent.glob("*.py")) == ["BasicStrategy.py"]
+    assert sorted(path.name for path in SHIM_PATH.parent.glob("*.py")) == [
+        "BasicStrategy.py",
+        "MomentumStrategy.py",
+    ]
     # No rule is recopied in the shim: the class body is the docstring only.
     tree = ast.parse(source)
     shim_class = next(
@@ -287,6 +340,55 @@ def test_the_shim_carries_a_literal_class_statement() -> None:
     assert [child for child in shim_class.body if not isinstance(child, ast.Expr)] == [], (
         "the shim must stay an empty subclass"
     )
+
+
+def test_the_momentum_shim_carries_a_literal_class_statement() -> None:
+    """The ``momentum`` shim obeys the same resolver rule as the ``basic`` one.
+
+    Offline on purpose: it reads the shipped file as text and parses it, so the
+    assertion holds on the CI, where the optional ``freqtrade`` extra is absent.
+    The class body must stay docstring-only — the day-to-candle inference, the
+    score and the signals all live in
+    :mod:`trading_platform.strategy.momentum`, reached through the generated
+    adapter class.
+    """
+    source = MOMENTUM_SHIM_PATH.read_text(encoding="utf-8")
+    assert MOMENTUM_SHIM_CLASS_STATEMENT in source
+    assert (
+        "from trading_platform.strategy.freqtrade_momentum import MomentumFreqtradeStrategy"
+        in source
+    )
+    tree = ast.parse(source)
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    assert [node.name for node in classes] == ["MomentumStrategy"]
+    assert [child for child in classes[0].body if not isinstance(child, ast.Expr)] == [], (
+        "the shim must stay an empty subclass"
+    )
+    imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
+    assert [node.module for node in imports] == ["trading_platform.strategy.freqtrade_momentum"]
+
+
+def test_the_momentum_module_imports_no_freqtrade_symbol_directly() -> None:
+    """Offline AST guard: the module talks to Freqtrade only through the adapter.
+
+    Reading and parsing the shipped module works on a checkout without the
+    optional extra.  ``freqtrade_momentum`` must take every symbol from
+    :mod:`trading_platform.strategy.freqtrade_adapter` — the single seam that
+    knows how to build an ``IStrategy`` — so the adapter stays the only module
+    that names Freqtrade, and the one factory call at module level stays the only
+    place where the class is built.
+    """
+    tree = ast.parse(MOMENTUM_MODULE_PATH.read_text(encoding="utf-8"))
+    imported: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+            imported.extend(alias.name for alias in node.names)
+    assert not [name for name in imported if name == "freqtrade" or name.startswith("freqtrade.")]
+    assert "trading_platform.strategy.freqtrade_adapter" in imported
+    assert "make_freqtrade_strategy" in imported
 
 
 def test_gitignore_allows_the_shim_and_keeps_the_readme_rule() -> None:
@@ -398,6 +500,125 @@ def test_the_three_populate_methods_render_the_freqtrade_signal_columns(
 
 
 # ---------------------------------------------------------------------------
+# the shipped momentum class -- same contract, its own frozen defaults
+# ---------------------------------------------------------------------------
+
+
+def test_the_momentum_module_freezes_its_public_api_and_documents_the_extra() -> None:
+    """``freqtrade_momentum`` exposes two names, and its docstring states the rules.
+
+    The four documented facts are the ones a reader cannot recover from the code
+    alone: the optional extra, the module-level factory call, the "``class
+    name``" resolution rule of ``StrategyResolver`` and the directory it scans.
+    """
+    pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
+    from trading_platform.strategy import freqtrade_momentum
+
+    docstring = freqtrade_momentum.__doc__ or ""
+    assert "freqtrade" in docstring and "extra" in docstring
+    assert "class name" in docstring
+    assert "user_data/strategies" in docstring
+    assert freqtrade_momentum.__all__ == [
+        "MOMENTUM_FREQTRADE_STRATEGY_NAME",
+        "MomentumFreqtradeStrategy",
+    ]
+
+
+def test_the_momentum_class_name_is_the_one_the_resolver_looks_up() -> None:
+    """The three spellings of the name agree: constant, class, ``default_class_name``."""
+    pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
+    from trading_platform.strategy.freqtrade_adapter import default_class_name
+    from trading_platform.strategy.freqtrade_momentum import (
+        MOMENTUM_FREQTRADE_STRATEGY_NAME,
+        MomentumFreqtradeStrategy,
+    )
+
+    name = MOMENTUM_FREQTRADE_STRATEGY_NAME
+    assert name == "MomentumStrategy"
+    assert MomentumFreqtradeStrategy.__name__ == name
+    assert default_class_name("momentum") == name
+    assert MOMENTUM_SHIM_PATH.stem == name
+
+
+def test_the_momentum_class_is_a_valid_freqtrade_istrategy() -> None:
+    """Every attribute Freqtrade reads is present, with the research-validated value.
+
+    ``timeframe`` is ``"4h"`` and not the house default (``"1h"``): ``4h`` and
+    ``1d`` are the deployable grids of the momentum research, ``1h`` degraded the
+    most on the holdout.  ``startup_candle_count`` is the warm-up derived from the
+    parameter model — ``28``, the largest integer default (``slow_days``).
+    """
+    pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
+    from freqtrade.strategy import IStrategy
+
+    from trading_platform.strategy.freqtrade_adapter import validate_freqtrade_adapter_class
+    from trading_platform.strategy.freqtrade_momentum import MomentumFreqtradeStrategy
+
+    assert issubclass(MomentumFreqtradeStrategy, IStrategy)
+    assert MomentumFreqtradeStrategy.INTERFACE_VERSION == 3
+    assert MomentumFreqtradeStrategy.__name__ == "MomentumStrategy"
+    assert MomentumFreqtradeStrategy.timeframe == "4h"
+    assert MomentumFreqtradeStrategy.stoploss == -0.99
+    assert MomentumFreqtradeStrategy.use_custom_stoploss is True
+    assert MomentumFreqtradeStrategy.minimal_roi == {"0": 100.0}
+    assert MomentumFreqtradeStrategy.can_short is False
+    assert MomentumFreqtradeStrategy.startup_candle_count == 28
+    assert MomentumFreqtradeStrategy.house_strategy_name == "momentum"
+    assert validate_freqtrade_adapter_class(MomentumFreqtradeStrategy) is None
+
+
+def test_the_momentum_class_instantiates_with_the_empty_config() -> None:
+    """Freqtrade's own ``{}`` config is enough to build an instance."""
+    pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
+    from freqtrade.strategy import IStrategy
+
+    from trading_platform.strategy.freqtrade_momentum import MomentumFreqtradeStrategy
+
+    instance = MomentumFreqtradeStrategy({})
+    assert isinstance(instance, IStrategy)
+    assert instance.timeframe == "4h"
+    assert instance.house_strategy_name == "momentum"
+    assert instance._entry_stops == {}
+
+
+def test_the_momentum_populate_methods_render_the_house_columns(
+    ohlcv_frame: pd.DataFrame,
+) -> None:
+    """The momentum indicators and the Freqtrade signal columns reach the frame.
+
+    The frame is shorter than the longest look-back (``ohlcv_frame`` is 500 hourly
+    candles, the slow horizon is 28 days), so the scores are ``NaN`` here and no
+    entry fires: what this test pins is the **translation** — the indicator
+    columns survive the trip and Freqtrade's four order columns exist under their
+    own spelling.
+    """
+    pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
+    from trading_platform.strategy.freqtrade_adapter import FREQTRADE_ORDER_COLUMNS
+    from trading_platform.strategy.freqtrade_momentum import MomentumFreqtradeStrategy
+    from trading_platform.strategy.momentum import INDICATOR_COLUMNS
+
+    instance = MomentumFreqtradeStrategy({})
+    frame = _freqtrade_frame(ohlcv_frame)
+
+    indicators = instance.populate_indicators(frame, METADATA)
+    for column in INDICATOR_COLUMNS:
+        assert column in indicators.columns, f"{column} is missing from populate_indicators"
+    entries = instance.populate_entry_trend(indicators, METADATA)
+    exits = instance.populate_exit_trend(entries, METADATA)
+
+    for column in FREQTRADE_ORDER_COLUMNS:
+        assert column in exits.columns
+    assert "entry_long" not in exits.columns
+    assert "entry_short" not in exits.columns
+    assert len(exits) == len(ohlcv_frame)
+    assert exits["date"].tolist() == frame["date"].tolist()
+    assert exits["enter_long"].dtype == bool
+    assert exits["enter_short"].dtype == bool
+    # The adapter records the absolute stops of the analysed pair, NaN being "no stop".
+    assert {pair for pair, _ in instance._entry_stops} <= {"BTC/USDT"}
+
+
+# ---------------------------------------------------------------------------
 # load-by-name -- the reason the shim exists
 # ---------------------------------------------------------------------------
 
@@ -415,6 +636,31 @@ def test_the_strategy_resolver_loads_the_shim_by_name() -> None:
     instance = cls({})
     assert isinstance(instance, IStrategy)
     assert instance.house_strategy_name == "basic"
+    assert instance._entry_stops == {}
+
+
+def test_the_strategy_resolver_loads_the_momentum_shim_by_name() -> None:
+    """``--strategy MomentumStrategy`` resolves through the **real** resolver.
+
+    Both halves of ``StrategyResolver._search_object`` are exercised on the
+    shipped directory: the file text contains ``class MomentumStrategy(`` and the
+    class it keeps has ``__module__ == "MomentumStrategy"`` (the file stem).  The
+    resolved class is the house ``momentum`` strategy, on the ``4h`` grid.
+    """
+    pytest.importorskip("freqtrade", reason="freqtrade is not part of the dev extra")
+    from freqtrade.strategy import IStrategy
+
+    from trading_platform.strategy.freqtrade_momentum import MOMENTUM_FREQTRADE_STRATEGY_NAME
+
+    cls, path = _resolved_momentum_shim_class()
+    assert path == MOMENTUM_SHIM_PATH
+    assert cls.__module__ == "MomentumStrategy"
+    assert cls.__name__ == MOMENTUM_FREQTRADE_STRATEGY_NAME == "MomentumStrategy"
+    assert issubclass(cls, IStrategy)
+    instance = cls({})
+    assert isinstance(instance, IStrategy)
+    assert instance.timeframe == "4h"
+    assert instance.house_strategy_name == "momentum"
     assert instance._entry_stops == {}
 
 

@@ -29,7 +29,7 @@ import pandas as pd
 
 from trading_platform.core.errors import StrategyError
 
-__all__ = ["atr", "ema", "rsi", "true_range"]
+__all__ = ["atr", "ema", "roc", "rsi", "sma", "true_range"]
 
 
 # ---------------------------------------------------------------------------
@@ -289,3 +289,70 @@ def atr(
         index=ranges.index,
         name="atr",
     )
+
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    """Simple moving average of ``series``.
+
+    Equivalent to ``series.rolling(window=period, min_periods=period).mean()``:
+    the first ``period - 1`` values are ``NaN`` and the first defined value sits
+    at position ``period - 1``.  ``period == 1`` therefore returns the input
+    values unchanged (as a fresh copy).
+
+    The result is a ``float64`` :class:`pandas.Series` named ``"sma"`` (the
+    literal name, never the input one), indexed exactly like ``series`` —
+    ``index.name`` included; the input is never mutated.
+
+    Parameters
+    ----------
+    series:
+        Input values (any numeric dtype).  Never mutated.
+    period:
+        Number of observations in each window, must be ``>= 1``.
+
+    Raises
+    ------
+    StrategyError
+        If ``period`` is not an integer ``>= 1``, or if ``series`` is not a
+        numeric :class:`pandas.Series`.
+    """
+    length = _validate_period(period)
+    values = _as_float_series(series, name="series")
+    averaged = values.rolling(window=length, min_periods=length).mean()
+    return _finite(averaged.to_numpy(dtype="float64"), index=values.index, name="sma")
+
+
+def roc(series: pd.Series, period: int) -> pd.Series:
+    """Rate of change of ``series`` over ``period`` observations.
+
+    Computed as ``series / series.shift(period) - 1.0``: the first ``period``
+    values are ``NaN`` (they have no counterpart to be compared with) and the
+    result is a fraction, not a percentage (``0.05`` means ``+5 %``).
+
+    A ``NaN`` or zero denominator yields ``NaN``: the division is guarded and
+    every infinite value is mapped to ``NaN``, so the result never contains
+    ``inf``.
+
+    The result is a ``float64`` :class:`pandas.Series` named ``"roc"`` (the
+    literal name, never the input one), indexed exactly like ``series`` —
+    ``index.name`` included; the input is never mutated.
+
+    Parameters
+    ----------
+    series:
+        Input values (any numeric dtype).  Never mutated.
+    period:
+        Number of observations between the two compared values, must be
+        ``>= 1``.
+
+    Raises
+    ------
+    StrategyError
+        If ``period`` is not an integer ``>= 1``, or if ``series`` is not a
+        numeric :class:`pandas.Series`.
+    """
+    length = _validate_period(period)
+    values = _as_float_series(series, name="series")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        change = values / values.shift(length) - 1.0
+    return _finite(change.to_numpy(dtype="float64"), index=values.index, name="roc")
