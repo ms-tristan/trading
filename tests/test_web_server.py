@@ -358,6 +358,7 @@ def test_real_round_trip_on_health_and_profiles(server: MonitoringServer) -> Non
         "checked_at",
         "kill_switch",
         "orphaned_positions",
+        "profile_failures",
         "profiles_running",
         "profiles_total",
         "status",

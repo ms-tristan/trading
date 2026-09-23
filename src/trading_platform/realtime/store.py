@@ -48,6 +48,29 @@ answers ``None`` for a database that never stored one.  Schema version ``3`` add
 that table; the migration is additive, so a database deployed at version ``1`` or
 ``2`` simply gains the empty ``wallet`` table and the wallet is initialised from the
 configuration at the next boot.
+
+Schema version ``4`` is the **first non-additive step** of the store: it rewrites the
+``profiles`` payloads and drops exactly the top-level keys the *current*
+:class:`~trading_platform.config.models.ProfileConfig` does not declare (see
+:meth:`SqliteStateStore._migrate_profiles_payload`).  The step is driven by
+``ProfileConfig.model_fields`` and deliberately **not** by a hard-coded list of
+removed names, because the declared field set of the current model *is* the contract
+a payload has to satisfy: the next release that removes a field prunes the persisted
+rows carrying it during its own boot, with no migration ever written against the
+name of the field it removes (the release that removed ``forecast`` shipped none, and
+a stale row then bricked the platform).  The rewrite touches a row only when that row
+actually carries an unknown key, so a clean database -- the live one was repaired by
+hand -- migrates without a single row write, and a payload that is not valid JSON is
+left byte for byte untouched for the read path to report.
+
+Reading follows from the same principle: **one bad row must never take the platform
+down again**.  :meth:`SqliteStateStore.load_profiles` is tolerant by default -- it
+skips a row it cannot decode or validate, logs the *sanitised* reason at ``WARNING``
+and keeps loading every other profile -- and the failures it saw are readable through
+:meth:`SqliteStateStore.load_profile_failures`, which the monitoring read model
+publishes so an unreadable profile can never again be invisible.  A caller that
+genuinely wants validation to fail loudly asks for the strict read
+(``load_profiles(strict=True)``), which restores the previous raising behaviour.
 """
 
 from __future__ import annotations
@@ -90,6 +113,7 @@ __all__ = [
     "SqliteStateStore",
     "StateStore",
     "WalletRow",
+    "redact_profile_error",
 ]
 
 logger = logging.getLogger(__name__)
@@ -99,8 +123,11 @@ logger = logging.getLogger(__name__)
 #: History: ``1`` was the first shipped schema (profiles, orders, fills, positions,
 #: equity, trades, status, meta); ``2`` adds the bounded ``candles`` table; ``3``
 #: adds the single-row ``wallet`` table (the shared platform wallet every profile
-#: funds its orders from).
-SCHEMA_VERSION: int = 3
+#: funds its orders from); ``4`` removes from every ``profiles`` payload the
+#: top-level keys the current :class:`~trading_platform.config.models.ProfileConfig`
+#: no longer declares, which makes the ``3 -> 4`` step the **first non-additive**
+#: migration of this store.
+SCHEMA_VERSION: int = 4
 
 #: How many candles the store keeps **per profile** (the bounded retention window).
 #:
@@ -314,15 +341,28 @@ def _trade_key(profile_id: str, trade: TradeRecord) -> str:
 _INPUT_VALUE_PATTERN = re.compile(r"input_value=.*?(?=,\s*input_type=|\]|$)", re.DOTALL)
 
 
-def _redact_profile_error(exc: BaseException) -> str:
+def redact_profile_error(exc: BaseException) -> str:
     """Return ``exc`` rendered with every echoed *value* removed.
 
     A profile row is the one place a credential could have been hand-written, and
     pydantic echoes the offending value in its message (``input_value='s3cr3t'``).
     The rule and the field path are what an operator needs; the value is not, and a
     message carrying it ends up in the monitoring payload and in the logs.
+
+    This is the only sanctioned way to render a profile failure: the tolerant read
+    (:meth:`SqliteStateStore.load_profiles`), the reason it publishes through
+    :meth:`SqliteStateStore.load_profile_failures` and the strict mode all go
+    through it.
     """
     return _INPUT_VALUE_PATTERN.sub("input_value=<redacted>", str(exc))
+
+
+#: Backwards-compatible private alias of :func:`redact_profile_error`.
+#:
+#: The implementation was private before the quarantine accessor made the sanitised
+#: reason part of the store's public surface; the alias keeps every internal call
+#: site -- and every importer written against the old private name -- working.
+_redact_profile_error = redact_profile_error
 
 
 def _rollback(conn: sqlite3.Connection) -> None:
@@ -392,8 +432,23 @@ class StateStore(Protocol):
         """Persist (or update) the configuration of one profile."""
         ...
 
-    def load_profiles(self) -> list[ProfileConfig]:
-        """Return every persisted profile, ordered by ``profile_id``."""
+    def load_profiles(self, *, strict: bool = False) -> list[ProfileConfig]:
+        """Return every readable persisted profile, ordered by ``profile_id``.
+
+        Tolerant by default: a row whose payload cannot be decoded or validated is
+        skipped and reported through :meth:`load_profile_failures`, never fatal.
+        ``strict=True`` restores the raising behaviour, for a caller that wants
+        validation to fail loudly.
+        """
+        ...
+
+    def load_profile_failures(self) -> dict[str, str]:
+        """Return ``profile_id -> sanitised reason`` of the most recent profile read.
+
+        The reasons are the rows :meth:`load_profiles` could not decode, rendered so
+        that no stored value is ever echoed.  The method never raises and answers
+        ``{}`` when there is nothing to report.
+        """
         ...
 
     def delete_profile(self, profile_id: str) -> bool:
@@ -555,6 +610,11 @@ class SqliteStateStore:
         self._initialized = False
         self._generation = 0
         self._lock_fd: int | None = None
+        # ``profile_id -> sanitised reason`` of the rows the most recent
+        # ``load_profiles`` could not read.  Declared here, and not only set by the
+        # read, so ``load_profile_failures`` answers on a store that was never
+        # initialized.
+        self._profile_failures: dict[str, str] = {}
 
     # -- introspection ------------------------------------------------------
 
@@ -624,12 +684,16 @@ class SqliteStateStore:
         try:
             conn = self._new_connection()
             self._apply_pragmas(conn)
-            # v1/v2 -> v3 forward migration, additive only: ``_create_schema`` runs
-            # first and every statement is ``CREATE TABLE/INDEX IF NOT EXISTS``, so a
-            # database deployed at version 1 or 2 simply gains the empty ``candles``
-            # and/or ``wallet`` table (and its index) here, while every existing table,
-            # column and row is left untouched; ``_check_schema_version`` then bumps
-            # the stored version to 3.
+            # v1/v2/v3 -> v4 forward migration.  ``_create_schema`` runs first and
+            # every statement is ``CREATE TABLE/INDEX IF NOT EXISTS``, so a database
+            # deployed at version 1 or 2 simply gains the empty ``candles`` and/or
+            # ``wallet`` table (and its index) here, while every existing table,
+            # column and row is left untouched.  ``_check_schema_version`` then runs
+            # the first **non-additive** step of the store -- the ``3 -> 4`` prune of
+            # the ``profiles`` payload keys the current ``ProfileConfig`` no longer
+            # declares, see :meth:`_migrate_profiles_payload` -- inside the very same
+            # migration transaction as the version bump, and a database already at
+            # version 4 touches neither a row nor the version.
             self._create_schema(conn)
             self._check_schema_version(conn)
         except BaseException:
@@ -639,7 +703,13 @@ class SqliteStateStore:
         logger.debug("state store %s initialized (schema version %s)", self._path, SCHEMA_VERSION)
 
     def close(self) -> None:
-        """Close every connection and release the writer lock (deletes nothing)."""
+        """Close every connection and release the writer lock (deletes nothing).
+
+        The quarantine report of the last read is dropped with the connections: a
+        closed store has no live read to answer for, so
+        :meth:`load_profile_failures` answers ``{}`` again.
+        """
+        self._profile_failures = {}
         with self._connections_lock:
             connections = [conn for _thread, conn in self._connections.values()]
             self._connections.clear()
@@ -696,7 +766,12 @@ class SqliteStateStore:
             ) from exc
 
     def _check_schema_version(self, conn: sqlite3.Connection) -> None:
-        """Compare the stored schema version with :data:`SCHEMA_VERSION`."""
+        """Compare the stored schema version with :data:`SCHEMA_VERSION`.
+
+        An older database is migrated in place: the ``3 -> 4`` payload prune and the
+        version bump run in **one** transaction, so the rewrite either commits
+        together with the new version or is rolled back whole.
+        """
         try:
             rows = conn.execute("SELECT version FROM schema_version").fetchall()
         except sqlite3.Error as exc:
@@ -720,9 +795,90 @@ class SqliteStateStore:
                 SCHEMA_VERSION,
             )
             with _transaction(conn, "initialize"):
+                # The prune runs for every older version, not only for 3: it is a
+                # no-op on a payload that already matches the current model, and
+                # running it unconditionally means no later version step has to
+                # remember which payload change it introduced.
+                self._migrate_profiles_payload(conn)
                 conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             return
         logger.debug("state store %s already uses schema version %s", self._path, stored)
+
+    def _migrate_profiles_payload(self, conn: sqlite3.Connection) -> None:
+        """Drop the ``profiles`` payload keys the current ``ProfileConfig`` rejects.
+
+        This is the ``3 -> 4`` step, the first **non-additive** migration of the
+        store.  Schema version ``3`` predates the release that removed the ``forecast``
+        field from :class:`~trading_platform.config.models.ProfileConfig` -- which is
+        ``extra="forbid"`` -- and removed the ``timesfm`` strategy from the registry,
+        without migrating the rows the previous builds had persisted.  A row written
+        before it therefore carries a key the model no longer declares, and nothing but
+        this method stood between such a row and a store read that aborted.
+
+        The keys a row may keep are ``ProfileConfig.model_fields`` -- the declared
+        field set of the model **of this build** -- and never a hard-coded list of
+        removed names: the model declaration is the contract the payload has to
+        satisfy, so the field a later release removes is pruned by that release's own
+        boot, automatically.  The comparison is strictly top-level (a nested object is
+        the model's business, never pruned), and the rewritten document is serialised
+        by :func:`_dumps`, the very helper :meth:`save_profile` uses, so every
+        surviving key keeps its exact JSON content.  ``updated_at`` is never written.
+
+        The method is idempotent and a **no-op on a clean database**: a row that
+        carries no unknown key is not written at all, so an already-conforming row
+        keeps its bytes and the migrated file differs from the original only by the
+        version row.  A payload that is not valid JSON, or is not a JSON object, is
+        left **byte for byte** untouched and logged instead: mangling it here would
+        destroy the only copy of what the operator wrote, and the tolerant read
+        reports it as a failed profile anyway.
+
+        The caller owns the transaction (see :meth:`_check_schema_version`) and the
+        connection is used directly: a ``sqlite3.Error`` is deliberately not caught
+        here, because the enclosing :func:`_transaction` converts it into a
+        :class:`~trading_platform.core.errors.StateStoreError` and rolls the whole
+        migration back.
+        """
+        declared = set(ProfileConfig.model_fields)
+        rows = conn.execute("SELECT profile_id, payload FROM profiles").fetchall()
+        for row in rows:
+            profile_id = str(row["profile_id"])
+            try:
+                data = json.loads(str(row["payload"]))
+            except ValueError as exc:
+                logger.warning(
+                    "state store %s: profile %s payload is not valid JSON, left untouched "
+                    "by the v3 -> v4 migration: %s",
+                    self._path,
+                    profile_id,
+                    redact_profile_error(exc),
+                )
+                continue
+            if not isinstance(data, dict):
+                logger.warning(
+                    "state store %s: profile %s payload is not a JSON object, left untouched "
+                    "by the v3 -> v4 migration",
+                    self._path,
+                    profile_id,
+                )
+                continue
+            unknown = [key for key in data if key not in declared]
+            if not unknown:
+                # Nothing to prune, so the row is not written back at all: an UPDATE
+                # would rewrite identical content and touch ``updated_at`` for nothing.
+                continue
+            pruned = {key: value for key, value in data.items() if key in declared}
+            conn.execute(
+                "UPDATE profiles SET payload = ? WHERE profile_id = ?",
+                (_dumps(pruned), profile_id),
+            )
+            logger.warning(
+                "state store %s: profile %s migrated, dropped %d field(s) removed from "
+                "ProfileConfig: %s",
+                self._path,
+                profile_id,
+                len(unknown),
+                sorted(unknown),
+            )
 
     # -- connections --------------------------------------------------------
 
@@ -835,8 +991,39 @@ class SqliteStateStore:
                 (spec.id, payload, now),
             )
 
-    def load_profiles(self) -> list[ProfileConfig]:
-        """Return every persisted profile, ordered by ``profile_id``."""
+    def load_profiles(self, *, strict: bool = False) -> list[ProfileConfig]:
+        """Return every readable persisted profile, ordered by ``profile_id``.
+
+        Tolerant by default: a row whose payload cannot be decoded or validated is
+        **skipped**, not fatal.  One unreadable row used to abort the whole read, and
+        because that read is the orchestrator's only source of profiles, a single
+        stale row kept the engine from starting, the monitoring API from binding and
+        the dashboard from showing anything but an unreachable API.  A bad row is now
+        a quarantined profile: the reason is logged at ``WARNING`` **sanitised** (see
+        :func:`redact_profile_error` -- a profile row is exactly where an operator
+        might have hand-written a credential, so the value is never echoed) and
+        published through :meth:`load_profile_failures`, and every other profile
+        still loads.
+
+        Parameters
+        ----------
+        strict:
+            Keyword-only, ``False`` by default.  ``True`` restores the previous
+            raising behaviour: the first row that cannot be decoded or validated
+            raises :class:`~trading_platform.core.errors.StateStoreError`, which the
+            boot path of the engine -- and every other production caller -- does not
+            ask for.
+
+        Raises
+        ------
+        StateStoreError
+            In **both** modes when the ``profiles`` table itself cannot be read (an
+            infrastructure failure, never a bad row), and in strict mode for the
+            first unreadable row.
+        """
+        # The report answers for the most recent read, so it starts empty on every
+        # call -- including a call that fails on the table read itself.
+        self._profile_failures = {}
         rows = self._fetchall(
             "load_profiles", "SELECT profile_id, payload FROM profiles ORDER BY profile_id ASC"
         )
@@ -850,11 +1037,43 @@ class SqliteStateStore:
                 # value in its message, and a profile row is exactly where an
                 # operator might have hand-written a credential.  The reason is kept
                 # (field path and rule), the value never is.
-                raise StateStoreError(
-                    f"state store read failed (load_profiles): corrupted payload for "
-                    f"{profile_id}: {_redact_profile_error(exc)}"
-                ) from exc
+                reason = redact_profile_error(exc)
+                self._profile_failures[profile_id] = reason
+                if strict:
+                    raise StateStoreError(
+                        f"state store read failed (load_profiles): corrupted payload for "
+                        f"{profile_id}: {reason}"
+                    ) from exc
+                logger.warning(
+                    "state store %s: skipping unreadable profile %s (load_profiles): %s",
+                    self._path,
+                    profile_id,
+                    reason,
+                )
         return profiles
+
+    def load_profile_failures(self) -> dict[str, str]:
+        """Return the profiles the most recent :meth:`load_profiles` could not read.
+
+        The mapping is ``profile_id -> sanitised reason`` (see
+        :func:`redact_profile_error`), and it is a **copy**: the caller may keep or
+        mutate it without touching the store.  Every reason is the one logged by the
+        tolerant read, so the monitoring payload and the log stream tell the same
+        story about what could not be loaded.
+
+        It answers ``{}`` before the first read, after a read in which every row
+        decoded, and after :meth:`close` -- in all three cases there is nothing to
+        report, which the read model renders as "every profile loaded".
+
+        The accessor is deliberately the one profile read that can never fail: it
+        reads no SQL, needs no initialized store and holds no connection, so a
+        dashboard asking a broken store what it could not load still gets an answer.
+        """
+        try:
+            return dict(self._profile_failures)
+        except Exception:  # pragma: no cover - defensive read of a plain dict attribute
+            logger.warning("state store %s: cannot report the failed profiles", self._path)
+            return {}
 
     def delete_profile(self, profile_id: str) -> bool:
         """Remove the row of ``profile_id``; answer whether one was removed.

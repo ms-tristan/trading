@@ -296,9 +296,43 @@ The real-time engine **implements no formula**. It assembles:
   **advisory**: it protects two `SqliteStateStore` instances, not a third-party
   process that would write into the file while bypassing the store. A newer
   schema version also raises `StateStoreError` instead of writing blindly.
+- The stored schema version is now **4**, and the `v3 -> v4` step is the first
+  **non-additive** one. It rewrites the rows of the `profiles` table, dropping
+  exactly the keys the current `ProfileConfig` does not declare
+  (`ProfileConfig.model_fields`), preserving every other key byte-for-byte and
+  never touching `updated_at`. That is deliberate: a field is removed by a
+  release, and the migration that prunes it must already be in place for the
+  **next** removal, so the declared field set of the current model is the
+  contract — never a hard-coded list of removed names. The rewrite runs inside the
+  **same transaction** that bumps the stored `schema_version`, so a crash migrates
+  nothing; it is **idempotent**; and it is a **no-op on a clean database** — a row
+  that carries no undeclared key is never rewritten, so its `payload` and its
+  `updated_at` stay byte-for-byte identical (the deployed database, already
+  repaired by hand, opens on version `4` without a single row changing). A row
+  whose payload is not valid JSON — or is not a JSON object — is left
+  **untouched**: the migration never mangles what it cannot read, and the
+  tolerant read below quarantines it instead. A dropped key is accounted for by
+  its **name** alone; the value it held is never echoed.
+- **One unreadable profile row can no longer take the platform down.** The read
+  **quarantines**: `load_profiles()` skips a row it cannot decode or validate,
+  logs it at `WARNING` with the **sanitised** reason — the field path and the
+  rule, never the offending value, because a profile row is exactly where an
+  operator might have hand-written a credential — and keeps loading every other
+  profile. `SqliteStateStore.load_profile_failures()` answers `profile_id ->
+  sanitised reason` for the failures of the **most recent** read; it never raises
+  and answers `{}` when there is nothing to report. The read is tolerant by
+  default — `load_profiles(*, strict=False)` — and `load_profiles(strict=True)` is
+  the **loud** path, kept for callers that genuinely want validation to fail: it
+  raises `StateStoreError` as it always did. A profile whose `strategy` is no
+  longer registered does not abort the boot either: it is reported as failed
+  (`ProfileStatus.ERROR`) while every other profile keeps running. The previous
+  behaviour was not survivable — **one** stale row raised `StateStoreError`, so
+  the orchestrator never started, the monitoring API never bound, and the
+  dashboard showed `The monitoring API is unreachable`: one row, the whole
+  platform.
 - **One** shared wallet holds the USDT cash, and it is the only thing that can
-  fund an order (§9). It is a single row of the `wallet` table — schema version
-  **3**, `wallet_id = 1` enforced by a `CHECK` — written through
+  fund an order (§9). It is a single row of the `wallet` table — added by schema
+  version **3**, with `wallet_id = 1` enforced by a `CHECK` — written through
   `StateStore.save_wallet` after every accepted fill and restored **once** at
   startup (`PlatformWallet.restore`), before the first candle of the first
   profile. A restart therefore **never** resets the cash. When the store holds no
@@ -416,7 +450,7 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 
 | Method and route | 200 response | Errors |
 | --- | --- | --- |
-| `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at, wallet, orphaned_positions}` | — |
+| `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at, wallet, orphaned_positions, profile_failures}` | — |
 | `GET /api/profiles` | `{profiles: [ProfileSnapshot…], generated_at, wallet}` | — |
 | `GET /api/profiles/{id}` | `ProfileSnapshot` | 404 `{error}` |
 | `GET /api/profiles/{id}/equity` | `{points: [{timestamp, equity, cash, position_value}…]}` | 404 |
@@ -480,6 +514,17 @@ switch, so an unclosable position is as loud as a closed one. `GET /api/orphans`
 is read-only, needs no operator token, and answers the same object — a platform
 that was never swept answers `swept_at: null` with empty lists rather than a
 `404`.
+
+`profile_failures` is the **additive** answer to "what could not be loaded": an
+object `{profile_id: sanitised reason}` carrying the failures of the most recent
+profile read (§4). The key is **always present** and is never `null`: it is `{}`
+when nothing failed, so a consumer distinguishes "no profile failed" from "the key
+is missing". A reason is never a value — it is the sanitised field path and the
+rule — because a profile row is exactly where an operator might have hand-written
+a credential. An outage that used to leave the dashboard at
+`The monitoring API is unreachable` can therefore no longer be invisible: a
+platform that quarantined a row says so here while every other profile keeps
+running.
 
 A `ProfileSnapshot` carries every key it always carried — `profile_id`, `symbol`,
 `timeframe`, `strategy`, `mode`, `status`, `initial_balance`, `equity`, `cash`,

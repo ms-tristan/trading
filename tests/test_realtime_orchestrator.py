@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from trading_platform.core.errors import (
     MarketStreamError,
     ProfileError,
     StateStoreError,
+    StrategyError,
 )
 from trading_platform.core.models import Direction
 from trading_platform.realtime import runner as runner_module
@@ -97,8 +99,8 @@ START = pd.Timestamp("2024-01-01T00:00:00Z")
 SYMBOL_BTC = "BTC/USDT"
 SYMBOL_ETH = "ETH/USDT"
 
-#: The exact key set of the ``/api/health`` body (the shared wallet view and the
-#: orphan-sweep report included).
+#: The exact key set of the ``/api/health`` body (the shared wallet view, the
+#: orphan-sweep report and the profile-failure report included).
 HEALTH_KEYS = frozenset(
     {
         "status",
@@ -110,6 +112,7 @@ HEALTH_KEYS = frozenset(
         "checked_at",
         "wallet",
         "orphaned_positions",
+        "profile_failures",
     }
 )
 
@@ -1901,4 +1904,220 @@ def test_delete_profile_cancels_the_working_orders_before_it_flattens(
     assert still_working == []
     assert store.list_positions("btc-paper") == []
     assert [item.id for item in store.load_profiles()] == ["eth-paper"]
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# 14. one broken profile is quarantined, never fatal
+# ---------------------------------------------------------------------------
+
+#: The strategy the live ``zaaaa`` row named and which no longer exists in the
+#: registry: the release that removed the forecast subsystem removed it too.
+GONE_STRATEGY = "timesfm"
+
+#: A payload no reader can decode, written the way an interrupted hand edit leaves a
+#: row.  It carries a value that must never reach a reason or a payload: a profile row
+#: is exactly where an operator might have hand-written a credential.
+UNREADABLE_PROFILE_ID = "ghost-paper"
+UNREADABLE_SECRET = "s3cr3t-hunter2"
+UNREADABLE_PAYLOAD = (
+    '{"id": "ghost-paper", "symbol": "BTC/USDT", "strategy": "basic", '
+    f'"api_secret": "{UNREADABLE_SECRET}"'
+)
+
+
+def insert_raw_profile_row(path: Path, profile_id: str, payload: str) -> None:
+    """Write one ``profiles`` row verbatim: a row no public API would produce."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO profiles (profile_id, payload, updated_at) VALUES (?, ?, ?)",
+            (profile_id, payload, "2024-01-01T00:00:00+00:00"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+class LegacyStore:
+    """Minimal store double written **before** the profile-failure accessor existed.
+
+    It answers no ``load_profile_failures`` member at all, which is the shape the
+    orchestrator must survive: the failures of the previous read are simply unknown.
+    """
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "load_profile_failures":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+
+class ExplodingFailuresStore:
+    """Store whose failure report raises, so the accessor can never be trusted."""
+
+    def load_profile_failures(self) -> dict[str, str]:
+        raise StateStoreError("cannot report the failed profiles")
+
+
+def test_a_profile_whose_strategy_left_the_registry_does_not_stop_the_platform(
+    tmp_path: Path, logs: Any
+) -> None:
+    """The ``zaaaa`` half of the outage: an unknown strategy quarantines one profile.
+
+    The live platform booted a persisted profile whose ``strategy`` had been removed
+    by a release.  Resolving the strategy happens when the runner starts, and that
+    call used to propagate: the whole boot aborted, no profile ran and the monitoring
+    API never bound.  The platform must now start, run every other profile, degrade
+    its health and name what it could not start.
+    """
+    healthy = profile("btc-paper", SYMBOL_BTC)
+    orphaned = profile("zaaaa", SYMBOL_ETH, strategy=GONE_STRATEGY)
+    orchestrator, store, _clock, streams = build_orchestrator(tmp_path, [healthy, orphaned])
+
+    async def scenario() -> tuple[dict[str, Any], ProfileSnapshot | None, dict[str, str]]:
+        await orchestrator.start()
+        await asyncio.sleep(_SETTLE)
+        # read before ``stop()``: it persists STOPPED over every profile
+        return (
+            orchestrator.health(),
+            orchestrator.profile_snapshot("zaaaa"),
+            orchestrator.profile_failures(),
+        )
+
+    health, failed, failures = run(scenario())
+    assert set(health) == HEALTH_KEYS
+    assert health["profiles_total"] == 2
+    assert health["profiles_running"] == 1
+    assert health["status"] == "degraded"
+    assert list(failures) == ["zaaaa"]
+    assert "unknown strategy" in failures["zaaaa"]
+    assert GONE_STRATEGY in failures["zaaaa"]
+    assert failed is not None
+    assert failed.status is ProfileStatus.ERROR
+    # the healthy profile really ran: its supervised task polled its stream
+    assert streams[0].calls >= 1
+    boot = [record for record in logs if getattr(record, "event", None) == "profile_boot_failed"]
+    assert len(boot) == 1
+    assert boot[0].profile_id == "zaaaa"
+    assert "unknown strategy" in boot[0].context["error"]
+    assert boot[0].levelno == logging.WARNING
+    assert orchestrator._prepared is True
+    store.close()
+
+
+def test_profile_failures_reports_the_rows_the_store_could_not_read(tmp_path: Path) -> None:
+    """A row the store cannot decode is named, and every other profile still loads.
+
+    The unreadable row is written with raw SQLite (no public API can produce it) and
+    the read is the store's own: the orchestrator only *reports* what the store
+    quarantined, so the monitoring payload and the log stream tell the same story.
+    """
+    database = tmp_path / "state.db"
+    seeding = SqliteStateStore(database, clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)))
+    seeding.initialize()
+    try:
+        seeding.save_profile(profile("btc-paper", SYMBOL_BTC))
+    finally:
+        seeding.close()
+    insert_raw_profile_row(database, UNREADABLE_PROFILE_ID, UNREADABLE_PAYLOAD)
+
+    store = SqliteStateStore(database, clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)))
+    store.initialize()
+    try:
+        loaded = store.load_profiles()
+        assert [item.id for item in loaded] == ["btc-paper"]
+        assert set(store.load_profile_failures()) == {UNREADABLE_PROFILE_ID}
+
+        orchestrator, _store, _clock, _streams = build_orchestrator(tmp_path, loaded, store=store)
+        failures = orchestrator.profile_failures()
+
+        assert set(failures) == {UNREADABLE_PROFILE_ID}, failures
+        assert failures[UNREADABLE_PROFILE_ID]
+        assert UNREADABLE_SECRET not in json.dumps(failures)
+        assert "btc-paper" not in failures
+    finally:
+        store.close()
+
+
+def test_profile_failures_answers_an_empty_mapping_when_nothing_can_report(
+    tmp_path: Path, logs: Any
+) -> None:
+    """The accessor never raises: a legacy store answers ``{}``, a broken one is logged."""
+    healthy = [profile("btc-paper", SYMBOL_BTC)]
+    realtime = RealtimeConfig(state_db=tmp_path / "unused.db", logs_dir=tmp_path / "logs")
+
+    legacy = RealtimeOrchestrator(
+        profiles=healthy,
+        store=LegacyStore(),  # type: ignore[arg-type]
+        clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
+        realtime=realtime,
+    )
+    assert legacy.profile_failures() == {}
+
+    broken = RealtimeOrchestrator(
+        profiles=healthy,
+        store=ExplodingFailuresStore(),  # type: ignore[arg-type]
+        clock=ManualClock(datetime(2024, 1, 1, 6, 0, tzinfo=UTC)),
+        realtime=realtime,
+    )
+    assert broken.profile_failures() == {}
+    unavailable = [
+        record
+        for record in logs
+        if getattr(record, "event", None) == "profile_failures_unavailable"
+    ]
+    assert len(unavailable) == 1
+    assert "cannot report the failed profiles" in unavailable[0].context["error"]
+
+
+def test_a_profile_boot_failure_never_echoes_the_value_it_carries(
+    tmp_path: Path, logs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential a profile row carries reaches neither the log nor the payload.
+
+    Pydantic echoes the offending value in its message (``input_value='...'``), and a
+    profile row is exactly where an operator might have hand-written a credential.
+    The quarantine path therefore renders the reason **sanitised** and hands the
+    runner a safe failure to record, so nothing that logs or publishes the failure
+    can leak the value.
+    """
+    secret = "s3cr3t-hunter2"
+
+    def explode(_profile: ProfileConfig) -> Any:
+        raise StrategyError(
+            "1 validation error for ParamsModel\napi_key\n"
+            "  Extra inputs are not permitted "
+            f"[type=extra_forbidden, input_value='{secret}', input_type=str]"
+        )
+
+    monkeypatch.setattr(runner_module, "resolve_strategy", explode)
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, [profile("zaaaa", SYMBOL_ETH)]
+    )
+
+    async def scenario() -> tuple[dict[str, str], dict[str, Any], ProfileSnapshot | None]:
+        await orchestrator.run_once()
+        return (
+            orchestrator.profile_failures(),
+            orchestrator.health(),
+            orchestrator.profile_snapshot("zaaaa"),
+        )
+
+    failures, health, snapshot = run(scenario())
+    rendered = json.dumps(
+        {
+            "failures": failures,
+            "health": health,
+            "logs": [
+                [str(record.getMessage()), {key: str(value) for key, value in vars(record).items()}]
+                for record in logs
+            ],
+        }
+    )
+    assert secret not in rendered
+    assert "extra_forbidden" in failures["zaaaa"]
+    assert "input_value=<redacted>" in failures["zaaaa"]
+    assert snapshot is not None
+    assert snapshot.status is ProfileStatus.ERROR
+    assert secret not in str(snapshot.health.last_error)
     store.close()
