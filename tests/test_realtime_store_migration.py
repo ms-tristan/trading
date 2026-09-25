@@ -72,6 +72,12 @@ VERSION_FIVE = 5
 #: migration must never touch it, so any rewrite is visible at a glance.
 LEGACY_UPDATED_AT = "2023-12-31T23:59:59+00:00"
 
+#: The two ledger amounts of the hand-written legacy ``wallet`` row.  They are kept as
+#: Python floats and bound as parameters rather than inlined in the SQL text, so the
+#: statement stays valid on every SQLite build the test suite runs against.
+LEGACY_CASH = 4_242.0
+LEGACY_INITIAL_BALANCE = 10_000.0
+
 #: The profile whose row is unreadable in the quarantine fixtures.
 BROKEN_PROFILE_ID = "bbb-paper"
 
@@ -820,10 +826,14 @@ def test_the_two_non_additive_steps_run_together_on_a_version_three_database(
             "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id = 1), cash REAL NOT NULL, "
             "initial_balance REAL NOT NULL, updated_at TEXT NOT NULL)"
         )
+        # The two amounts are bound parameters, never spelled out in the SQL
+        # text: the underscore digit separators of a Python float literal
+        # (``10_000.0``) are not valid SQL on the SQLite builds older than
+        # 3.46 that the CI runner ships, so an inlined literal would make this
+        # test pass on a developer machine and fail on the runner.
         conn.execute(
-            "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
-            "VALUES (1, 4242.0, 10_000.0, ?)",
-            (LEGACY_UPDATED_AT,),
+            "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) VALUES (1, ?, ?, ?)",
+            (LEGACY_CASH, LEGACY_INITIAL_BALANCE, LEGACY_UPDATED_AT),
         )
 
     store = SqliteStateStore(db_path, clock=clock)
@@ -834,11 +844,11 @@ def test_the_two_non_additive_steps_run_together_on_a_version_three_database(
             ProfileConfig.model_fields
         )
         assert "wallet_id IN (1, 2)" in wallet_table_sql(db_path)
-        assert wallet_rows(db_path) == [(1, 4_242.0, 10_000.0, LEGACY_UPDATED_AT)]
+        assert wallet_rows(db_path) == [(1, LEGACY_CASH, LEGACY_INITIAL_BALANCE, LEGACY_UPDATED_AT)]
         assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
         assert [item.id for item in store.load_profiles()] == ["btc-paper"]
         paper = store.load_wallet()
-        assert paper is not None and paper.cash == pytest.approx(4_242.0)
+        assert paper is not None and paper.cash == pytest.approx(LEGACY_CASH)
         assert store.load_wallet(mode="live") is None
     finally:
         store.close()
