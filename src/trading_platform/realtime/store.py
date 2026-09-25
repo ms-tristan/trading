@@ -38,16 +38,29 @@ columns (one row per profile and timestamp, see :class:`CandleRow`) and the stor
 keeps only the most recent :data:`CANDLE_WINDOW` rows of each profile, so the chart
 surface has real price history without ever letting the database grow without bound.
 
-The shared platform wallet is the second exception.  It is a **single** row of the
-``wallet`` table (``wallet_id = 1``, enforced by a ``CHECK``), holding the USDT cash
-every profile funds its orders from, together with the initial balance the wallet was
-started with.  It is written through :meth:`SqliteStateStore.save_wallet` -- an
-``INSERT ... ON CONFLICT(wallet_id) DO UPDATE``, so re-saving it can never create a
-second row -- and read back through :meth:`SqliteStateStore.load_wallet`, which
-answers ``None`` for a database that never stored one.  Schema version ``3`` adds
-that table; the migration is additive, so a database deployed at version ``1`` or
-``2`` simply gains the empty ``wallet`` table and the wallet is initialised from the
-configuration at the next boot.
+The shared platform wallet is the second exception.  It is a row of the ``wallet``
+table holding the USDT cash every profile of one **run mode** funds its orders from,
+together with the initial balance that ledger was started with.  Schema version ``5``
+makes the table **one ledger per mode**, and the mapping from a mode to its row id is
+written down here and nowhere else:
+
+* :data:`WALLET_ID_PAPER` = ``1`` -- the **paper** ledger
+  (:attr:`~trading_platform.realtime.models.RunMode.PAPER`), the local simulated cash
+  the paper broker mutates;
+* :data:`WALLET_ID_LIVE` = ``2`` -- the **live** ledger
+  (:attr:`~trading_platform.realtime.models.RunMode.LIVE`), the read-only mirror of a
+  real venue account.
+
+The ids are *stable*: ``1`` is the id the single-row table of schema version ``3``
+already used, so the ``4 -> 5`` migration keeps a legacy row **as the paper ledger**
+instead of losing it.  Both ledgers are written through
+:meth:`SqliteStateStore.save_wallet` -- an ``INSERT ... ON CONFLICT(wallet_id) DO
+UPDATE`` on the resolved id, so re-saving a ledger can never create a duplicate row --
+and read back through :meth:`SqliteStateStore.load_wallet`, which answers ``None`` for
+a mode whose ledger holds no row.  Schema version ``3`` added that table; the
+migration is additive, so a database deployed at version ``1`` or ``2`` simply gains
+the empty ``wallet`` table and the ledgers are initialised from the configuration at
+the next boot.
 
 Schema version ``4`` is the **first non-additive step** of the store: it rewrites the
 ``profiles`` payloads and drops exactly the top-level keys the *current*
@@ -62,6 +75,18 @@ a stale row then bricked the platform).  The rewrite touches a row only when tha
 actually carries an unknown key, so a clean database -- the live one was repaired by
 hand -- migrates without a single row write, and a payload that is not valid JSON is
 left byte for byte untouched for the read path to report.
+
+Schema version ``5`` is the **second non-additive step**: the ``wallet`` table stops
+being a single-row table and becomes **one ledger per mode**, keyed by the stable row
+ids :data:`WALLET_ID_PAPER` (``1``) and :data:`WALLET_ID_LIVE` (``2``).
+``CREATE TABLE IF NOT EXISTS`` cannot widen the ``CHECK (wallet_id = 1)`` constraint
+of an already-deployed file, so the table is rebuilt -- ``wallet_new`` ->
+``INSERT INTO wallet_new SELECT ...`` -> ``DROP TABLE wallet`` -> ``RENAME`` -- by
+:meth:`SqliteStateStore._migrate_wallet_modes`.  The rebuild is a **migration, never a
+reset**: the legacy row is ``wallet_id = 1``, which *is* the paper id, so the ledger
+the previous build held survives as the **paper ledger** with its cash and its initial
+balance intact, and the live ledger simply has no row until a venue balance is
+mirrored into it.
 
 Reading follows from the same principle: **one bad row must never take the platform
 down again**.  :meth:`SqliteStateStore.load_profiles` is tolerant by default -- it
@@ -109,6 +134,8 @@ from trading_platform.realtime.models import (
 __all__ = [
     "CANDLE_WINDOW",
     "SCHEMA_VERSION",
+    "WALLET_ID_LIVE",
+    "WALLET_ID_PAPER",
     "CandleRow",
     "SqliteStateStore",
     "StateStore",
@@ -118,6 +145,22 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: Stable row id of the **paper** ledger in the ``wallet`` table.
+#:
+#: ``1`` is the id the single-row ``wallet`` table of schema version ``3`` already
+#: used, so the ``4 -> 5`` migration keeps the legacy row as this very ledger rather
+#: than losing it.  Together with :data:`WALLET_ID_LIVE` this pair is the **only**
+#: place the mode -> row id mapping is written down; every reader and writer of the
+#: table resolves its id through :meth:`SqliteStateStore._wallet_id`.
+WALLET_ID_PAPER: int = 1
+
+#: Stable row id of the **live** ledger in the ``wallet`` table.
+#:
+#: The live ledger is the read-only mirror of a real venue account; it holds no row
+#: until a venue balance has been mirrored into it, and that absence is what makes
+#: ``load_wallet(mode="live")`` answer ``None`` instead of an invented ``0.0``.
+WALLET_ID_LIVE: int = 2
+
 #: Schema version written into the ``schema_version`` table by this build.
 #:
 #: History: ``1`` was the first shipped schema (profiles, orders, fills, positions,
@@ -126,8 +169,11 @@ logger = logging.getLogger(__name__)
 #: funds its orders from); ``4`` removes from every ``profiles`` payload the
 #: top-level keys the current :class:`~trading_platform.config.models.ProfileConfig`
 #: no longer declares, which makes the ``3 -> 4`` step the **first non-additive**
-#: migration of this store.
-SCHEMA_VERSION: int = 4
+#: migration of this store; ``5`` rebuilds the ``wallet`` table into **one ledger per
+#: mode** (row ``1`` paper, row ``2`` live -- see :data:`WALLET_ID_PAPER` and
+#: :data:`WALLET_ID_LIVE`), the second non-additive step, which keeps a legacy
+#: ``wallet_id = 1`` row as the paper ledger.
+SCHEMA_VERSION: int = 5
 
 #: How many candles the store keeps **per profile** (the bounded retention window).
 #:
@@ -202,8 +248,13 @@ _DDL: tuple[str, ...] = (
     ),
     "CREATE INDEX IF NOT EXISTS idx_candles_profile ON candles(profile_id, timestamp)",
     (
+        # One ledger **per mode**: ``wallet_id`` 1 is the paper ledger and 2 the live
+        # one (see ``WALLET_ID_PAPER``/``WALLET_ID_LIVE``, the only place the mapping
+        # is written down).  A database created before schema version 5 carries the
+        # narrower ``CHECK (wallet_id = 1)``; ``CREATE TABLE IF NOT EXISTS`` cannot
+        # widen it, which is why ``_migrate_wallet_modes`` rebuilds the table.
         "CREATE TABLE IF NOT EXISTS wallet ("
-        "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id = 1), cash REAL NOT NULL, "
+        "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id IN (1, 2)), cash REAL NOT NULL, "
         "initial_balance REAL NOT NULL, updated_at TEXT NOT NULL)"
     ),
 )
@@ -245,13 +296,18 @@ class CandleRow:
 
 @dataclass(frozen=True)
 class WalletRow:
-    """The persisted state of the shared platform wallet (one row, always).
+    """The persisted state of **one** ledger of the platform (one row per mode).
 
-    The wallet is the single source of truth for the USDT cash of the whole
-    platform: every profile funds its orders from it.  ``cash`` is what is left to
-    deploy right now, ``initial_balance`` is what the wallet started with (it is the
-    denominator of the platform-wide P&L) and ``updated_at`` is the instant of the
-    last accepted write.
+    A ledger is the single source of truth for the USDT cash of every profile that
+    runs in one mode: the paper ledger is spent by the paper venues, the live ledger
+    mirrors a real venue account.  ``cash`` is what is left to deploy right now,
+    ``initial_balance`` is what that ledger started with (it is the denominator of
+    the platform-wide P&L) and ``updated_at`` is the instant of the last accepted
+    write.
+
+    The mode is the **key** (the ``wallet_id`` of the row), never a column: this
+    dataclass therefore carries exactly the three columns of the table it was read
+    from and is unchanged by the per-mode change.
     """
 
     cash: float
@@ -462,12 +518,31 @@ class StateStore(Protocol):
         """
         ...
 
-    def save_wallet(self, *, cash: float, initial_balance: float) -> None:
-        """Persist the shared platform wallet (one row, upserted in place)."""
+    def save_wallet(
+        self,
+        *,
+        cash: float,
+        initial_balance: float,
+        mode: str | RunMode = RunMode.PAPER,
+    ) -> None:
+        """Persist one mode's ledger (one row, upserted in place).
+
+        ``mode`` is an **optional keyword defaulting to paper**, so every caller
+        written before the per-mode ledgers existed keeps addressing the ledger it
+        always addressed.  The row id is resolved from ``mode`` (see
+        :data:`WALLET_ID_PAPER`/:data:`WALLET_ID_LIVE`); an unknown mode raises
+        :class:`~trading_platform.core.errors.StateStoreError`.
+        """
         ...
 
-    def load_wallet(self) -> WalletRow | None:
-        """Return the persisted shared wallet, or ``None`` when never written."""
+    def load_wallet(self, *, mode: str | RunMode = RunMode.PAPER) -> WalletRow | None:
+        """Return one mode's persisted ledger, or ``None`` when that mode has no row.
+
+        The optional ``mode`` keyword defaults to paper, exactly like
+        :meth:`save_wallet`; ``None`` means "this ledger holds no row yet" and is
+        the signal the engine initialises from the configuration -- it is never a
+        ledger of ``0.0``.
+        """
         ...
 
     def upsert_order(self, order: Order) -> None:
@@ -768,9 +843,10 @@ class SqliteStateStore:
     def _check_schema_version(self, conn: sqlite3.Connection) -> None:
         """Compare the stored schema version with :data:`SCHEMA_VERSION`.
 
-        An older database is migrated in place: the ``3 -> 4`` payload prune and the
-        version bump run in **one** transaction, so the rewrite either commits
-        together with the new version or is rolled back whole.
+        An older database is migrated in place: the ``3 -> 4`` payload prune, the
+        ``4 -> 5`` wallet rebuild and the version bump all run in **one**
+        transaction, so the rewrites either commit together with the new version or
+        are rolled back whole.
         """
         try:
             rows = conn.execute("SELECT version FROM schema_version").fetchall()
@@ -800,6 +876,10 @@ class SqliteStateStore:
                 # running it unconditionally means no later version step has to
                 # remember which payload change it introduced.
                 self._migrate_profiles_payload(conn)
+                # Likewise the wallet rebuild runs for every older version: it is a
+                # no-op on a table that already carries the per-mode CHECK, so the
+                # step belongs to the *table shape* rather than to a version number.
+                self._migrate_wallet_modes(conn)
                 conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             return
         logger.debug("state store %s already uses schema version %s", self._path, stored)
@@ -879,6 +959,86 @@ class SqliteStateStore:
                 len(unknown),
                 sorted(unknown),
             )
+
+    def _migrate_wallet_modes(self, conn: sqlite3.Connection) -> None:
+        """Rebuild the ``wallet`` table so it accepts one ledger per mode.
+
+        This is the ``4 -> 5`` step, the second **non-additive** migration of the
+        store.  Schema version ``4`` shipped a single-row ``wallet`` table whose
+        ``CHECK (wallet_id = 1)`` refuses a second ledger, and ``CREATE TABLE IF NOT
+        EXISTS`` -- the only DDL this store applies at boot -- leaves an existing
+        table exactly as it is.  A database written by the previous build would
+        therefore reject the live ledger's ``wallet_id = 2`` for ever, so the table
+        has to be **rebuilt**: ``wallet_new`` carries the new
+        ``CHECK (wallet_id IN (1, 2))``, every row of the old table is copied into
+        it, the old table is dropped and the new one is renamed into its place.
+
+        The rebuild preserves the legacy row instead of dropping it, and that is the
+        whole point: the previous build wrote its single ledger as ``wallet_id = 1``,
+        which *is* :data:`WALLET_ID_PAPER`, so the deployed ledger survives **as the
+        paper ledger** -- same cash, same initial balance, same ``updated_at``.  The
+        live ledger simply has no row until a venue balance is mirrored into it.
+
+        The method is idempotent and a **no-op on a clean database**: the table is
+        read back first and left untouched when it already accepts both ids, so an
+        already-migrated file (and a file this build created) reopens without a
+        single write.  A missing ``wallet`` table -- a version ``1`` or ``2``
+        database -- never reaches here with nothing to do: ``_create_schema`` runs
+        before this method and creates the per-mode table, and this rewrite then
+        finds it already correct.
+
+        The caller owns the transaction (see :meth:`_check_schema_version`) and the
+        connection is used directly: a ``sqlite3.Error`` is deliberately not caught
+        here, because the enclosing :func:`_transaction` converts it into a
+        :class:`~trading_platform.core.errors.StateStoreError` and rolls the whole
+        migration back -- a half-rebuilt wallet table would be far worse than a
+        failed boot.
+        """
+        if self._wallet_accepts_both_modes(conn):
+            # Nothing to rebuild, so the table is not touched at all: a DROP/RENAME
+            # cycle on an already-correct table would rewrite the file for nothing
+            # and would make the boot non-idempotent on disk.
+            return
+        conn.execute(
+            "CREATE TABLE wallet_new ("
+            "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id IN (1, 2)), cash REAL NOT NULL, "
+            "initial_balance REAL NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        # ``SELECT *`` copies the four columns positionally, which is the whole row:
+        # the legacy ``wallet_id = 1`` row therefore becomes the paper ledger.
+        conn.execute(
+            "INSERT INTO wallet_new (wallet_id, cash, initial_balance, updated_at) "
+            "SELECT wallet_id, cash, initial_balance, updated_at FROM wallet"
+        )
+        conn.execute("DROP TABLE wallet")
+        conn.execute("ALTER TABLE wallet_new RENAME TO wallet")
+        logger.warning(
+            "state store %s: wallet table migrated to one ledger per mode "
+            "(wallet_id 1 = paper, 2 = live); the legacy row is now the paper ledger",
+            self._path,
+        )
+
+    def _wallet_accepts_both_modes(self, conn: sqlite3.Connection) -> bool:
+        """Whether the ``wallet`` table already carries the per-mode ``CHECK``.
+
+        The answer is read from ``sqlite_master`` -- the DDL SQLite actually stores --
+        rather than from the stored schema version, so the rebuild is driven by the
+        real shape of the table on disk.  A file whose version row was hand-edited
+        (or bumped by a build that failed half-way) is therefore still repaired
+        instead of bricking on the next live write.
+
+        A ``wallet`` table that does not exist at all is *not* "already correct": this
+        helper answers ``False`` in that case, because the caller must then be able to
+        tell.  In practice it cannot happen -- ``_create_schema`` runs first -- and
+        the rebuild's own failure is reported as a :class:`StateStoreError` by the
+        enclosing transaction, which is exactly what a missing table deserves.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wallet'"
+        ).fetchone()
+        if row is None:
+            return False
+        return "wallet_id IN (1, 2)" in str(row[0])
 
     # -- connections --------------------------------------------------------
 
@@ -1088,43 +1248,72 @@ class SqliteStateStore:
             cursor = conn.execute("DELETE FROM profiles WHERE profile_id = ?", (str(profile_id),))
             return bool(cursor.rowcount)
 
-    # -- shared platform wallet ---------------------------------------------
+    # -- platform wallets, one ledger per mode ------------------------------
 
-    def save_wallet(self, *, cash: float, initial_balance: float) -> None:
-        """Persist the shared platform wallet, upserting the single ``wallet_id = 1`` row.
+    def save_wallet(
+        self,
+        *,
+        cash: float,
+        initial_balance: float,
+        mode: str | RunMode = RunMode.PAPER,
+    ) -> None:
+        """Persist one mode's ledger, upserting the row of that mode.
 
-        The ``ON CONFLICT(wallet_id) DO UPDATE`` clause is what makes the wallet a
-        *single* row for ever: the very first save inserts it, every later save
-        overwrites the cash and the initial balance of that same row, inside one
-        ``BEGIN IMMEDIATE ... COMMIT``.  A failed save (a ``NaN`` cash, which SQLite
-        stores as ``NULL``, violates ``cash REAL NOT NULL``) rolls back and leaves the
-        previous wallet exactly as it was, reported as :class:`StateStoreError`.
-        """
-        now = self._now_iso()
-        with self._write("save_wallet") as conn:
-            conn.execute(
-                "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
-                "VALUES (1, ?, ?, ?) ON CONFLICT(wallet_id) DO UPDATE SET "
-                "cash = excluded.cash, initial_balance = excluded.initial_balance, "
-                "updated_at = excluded.updated_at",
-                (float(cash), float(initial_balance), now),
-            )
+        The row id is resolved from ``mode`` through :meth:`_wallet_id` -- never a
+        hard-coded ``1`` -- and the ``ON CONFLICT(wallet_id) DO UPDATE`` clause is
+        what makes a ledger a *single* row for ever: the first save of a mode inserts
+        it, every later save overwrites the cash and the initial balance of that same
+        row, inside one ``BEGIN IMMEDIATE ... COMMIT``.  Writing the live ledger can
+        therefore never touch the paper one.
 
-    def load_wallet(self) -> WalletRow | None:
-        """Return the persisted shared wallet, or ``None`` when never written.
+        ``mode`` is an optional keyword defaulting to
+        :attr:`~trading_platform.realtime.models.RunMode.PAPER`, so every caller
+        written before the per-mode ledgers existed keeps writing the paper ledger.
 
-        ``None`` is the signal the engine uses to initialise the wallet from the
-        configuration (the configured platform initial balance, or the sum of the
-        profile allocations) -- it is never confused with a wallet of ``0.0``.
+        A failed save (a ``NaN`` cash, which SQLite stores as ``NULL``, violates
+        ``cash REAL NOT NULL``) rolls back and leaves the previous ledger exactly as
+        it was, reported as :class:`StateStoreError`.
 
         Raises
         ------
         StateStoreError
-            If the stored ``updated_at`` is not a valid timestamp.
+            If ``mode`` is not a known run mode, or if the write fails.
         """
+        wallet_id = self._wallet_id(mode)
+        now = self._now_iso()
+        with self._write("save_wallet") as conn:
+            conn.execute(
+                "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(wallet_id) DO UPDATE SET "
+                "cash = excluded.cash, initial_balance = excluded.initial_balance, "
+                "updated_at = excluded.updated_at",
+                (wallet_id, float(cash), float(initial_balance), now),
+            )
+
+    def load_wallet(self, *, mode: str | RunMode = RunMode.PAPER) -> WalletRow | None:
+        """Return one mode's persisted ledger, or ``None`` when that mode has no row.
+
+        Each mode is **independent**: the paper ledger and the live ledger are two
+        rows of one table, so reading one never observes the other.  ``None`` is the
+        signal the engine uses to initialise a ledger from the configuration (the
+        configured platform initial balance, or the sum of the profile allocations)
+        -- it is never confused with a ledger of ``0.0``, which is a value.
+
+        ``mode`` is an optional keyword defaulting to
+        :attr:`~trading_platform.realtime.models.RunMode.PAPER`, exactly like
+        :meth:`save_wallet`.
+
+        Raises
+        ------
+        StateStoreError
+            If ``mode`` is not a known run mode, or if the stored ``updated_at`` is
+            not a valid timestamp.
+        """
+        wallet_id = self._wallet_id(mode)
         row = self._fetchone(
             "load_wallet",
-            "SELECT cash, initial_balance, updated_at FROM wallet WHERE wallet_id = 1",
+            "SELECT cash, initial_balance, updated_at FROM wallet WHERE wallet_id = ?",
+            (wallet_id,),
         )
         if row is None:
             return None
@@ -1133,6 +1322,32 @@ class SqliteStateStore:
             initial_balance=float(row["initial_balance"]),
             updated_at=_parse_timestamp(row["updated_at"], operation="load_wallet", key="wallet"),
         )
+
+    def _wallet_id(self, mode: str | RunMode) -> int:
+        """Return the stable row id of one ledger, or refuse an unknown mode.
+
+        This is the **single** resolution point of the mode -> row id mapping: the
+        ids themselves live in :data:`WALLET_ID_PAPER`/:data:`WALLET_ID_LIVE`, and
+        every read and write of the ``wallet`` table goes through here, so a mode can
+        never be silently mapped to the wrong ledger.
+
+        An unknown mode is refused rather than defaulted: writing the paper ledger
+        because a caller passed a typo'd mode would publish one mode's cash as
+        another's, and that is a money bug, not a convenience.
+
+        Raises
+        ------
+        StateStoreError
+            If ``mode`` is not ``"paper"``/``"live"`` (nor the matching
+            :class:`~trading_platform.realtime.models.RunMode`).
+        """
+        try:
+            resolved = RunMode(mode)
+        except ValueError as exc:
+            raise StateStoreError(
+                f"state store wallet: unknown run mode {mode!r}; expected 'paper' or 'live'"
+            ) from exc
+        return WALLET_ID_PAPER if resolved is RunMode.PAPER else WALLET_ID_LIVE
 
     # -- orders -------------------------------------------------------------
 

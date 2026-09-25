@@ -17,10 +17,13 @@ The group numbering follows the work-package brief:
 8. candle watermark;
 9. ``profile_state`` on an unknown profile;
 10. the bounded candle history;
-11. the shared platform wallet (schema version 3): persistence, single row, migration;
+11. the platform wallets, one ledger per mode (schema versions 3 and 5): persistence,
+    the stable row ids (``1`` paper, ``2`` live), the independence of the two ledgers
+    and migration;
 12. the store seam: the backing file, the contracted members and the frozen schema
-    version -- ``4`` is the profile-payload prune, whose own contract (the forward
-    migration and the quarantine of an unreadable row) is pinned in
+    version -- ``5`` rebuilds the ``wallet`` table into one ledger per mode, and the
+    two non-additive steps (the ``profiles`` payload prune of ``4`` and the wallet
+    rebuild of ``5``) have their forward-migration contract pinned in
     ``tests/test_realtime_store_migration.py``.
 
 Corruption is injected through a *second*, direct SQLite connection: the store's
@@ -29,6 +32,7 @@ Corruption is injected through a *second*, direct SQLite connection: the store's
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sqlite3
@@ -62,6 +66,8 @@ from trading_platform.realtime.models import (
 from trading_platform.realtime.store import (
     CANDLE_WINDOW,
     SCHEMA_VERSION,
+    WALLET_ID_LIVE,
+    WALLET_ID_PAPER,
     CandleRow,
     SqliteStateStore,
     StateStore,
@@ -268,6 +274,11 @@ def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
     reaches it through the protocol like every other store member.  Tolerant profile
     reads themselves changed no signature of the seam (``load_profiles`` is still
     declared with the keyword-only ``strict`` flag defaulting to the tolerant read).
+
+    The per-mode ledgers added **no member**: they widened the signature of the two
+    wallet members instead, so the member set below is unchanged and the shape of
+    ``save_wallet``/``load_wallet`` is pinned separately by
+    :func:`test_the_wallet_members_take_an_optional_mode_keyword_defaulting_to_paper`.
     """
     expected = {
         "append_candle",
@@ -308,6 +319,35 @@ def test_the_protocol_exposes_exactly_the_contracted_members() -> None:
 
     for name in expected:
         assert callable(getattr(SqliteStateStore, name)), name
+
+
+def test_the_wallet_members_take_an_optional_mode_keyword_defaulting_to_paper() -> None:
+    """The per-mode ledgers widened the two wallet members and nothing else.
+
+    The keyword is **optional** and defaults to :attr:`RunMode.PAPER`, so every call
+    written before the per-mode ledgers existed keeps addressing the ledger it always
+    addressed -- and the Protocol and the SQLite implementation agree exactly, which
+    is what makes ``isinstance(store, StateStore)`` a real guarantee rather than a
+    name check.
+    """
+    for member in ("save_wallet", "load_wallet"):
+        for declared in (getattr(StateStore, member), getattr(SqliteStateStore, member)):
+            parameters = inspect.signature(declared).parameters
+            assert "mode" in parameters, f"{member} does not take the mode keyword"
+            assert parameters["mode"].default is RunMode.PAPER, (
+                f"{member}'s mode keyword must default to RunMode.PAPER"
+            )
+            assert parameters["mode"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_wallet_row_is_unchanged_by_the_per_mode_ledgers() -> None:
+    """The mode is the **key** of a ledger, never a column: ``WalletRow`` keeps its fields.
+
+    The per-mode change added no store member, no table and no column: it widened the
+    ``CHECK`` of the existing ``wallet`` table, so the payload of a ledger still
+    carries exactly the three columns of the row it was read from.
+    """
+    assert set(WalletRow.__dataclass_fields__) == {"cash", "initial_balance", "updated_at"}
 
 
 def test_profile_round_trip(store: SqliteStateStore) -> None:
@@ -986,6 +1026,11 @@ def test_every_method_requires_initialize(db_path: Path) -> None:
         ("load_profiles", store.load_profiles),
         ("save_wallet", lambda: store.save_wallet(cash=1.0, initial_balance=1.0)),
         ("load_wallet", store.load_wallet),
+        (
+            "save_wallet(mode=live)",
+            lambda: store.save_wallet(cash=1.0, initial_balance=1.0, mode="live"),
+        ),
+        ("load_wallet(mode=live)", lambda: store.load_wallet(mode="live")),
         ("upsert_order", lambda: store.upsert_order(make_order())),
         ("get_order", lambda: store.get_order("x")),
         ("list_orders", lambda: store.list_orders("btc-paper")),
@@ -1458,17 +1503,19 @@ def test_candle_series_limit_boundaries(store: SqliteStateStore) -> None:
     assert store.candle_series("never-seen") == []
 
 
-def test_a_version_1_database_is_migrated_to_version_4_without_touching_a_row(
+def test_a_version_1_database_is_migrated_to_the_current_schema_without_touching_a_row(
     db_path: Path, clock: ManualClock
 ) -> None:
-    """A deployed version-1 database is carried to version 4, losing nothing.
+    """A deployed version-1 database is carried to the current version, losing nothing.
 
-    Version 3 adds the ``wallet`` table and version 4 prunes the ``profiles`` payload
-    keys the current ``ProfileConfig`` no longer declares.  The additive part touches
-    no row, and the prune of version 4 has nothing to do on this fixture -- both
-    deployed payloads carry only declared keys -- so every row the deployed build
-    wrote must survive byte for byte.  That is the property this test pins, and it is
-    the reason the assertion compares whole snapshots rather than a count.
+    Version 3 adds the ``wallet`` table, version 4 prunes the ``profiles`` payload
+    keys the current ``ProfileConfig`` no longer declares and version 5 rebuilds the
+    ``wallet`` table into one ledger per mode.  The additive part touches no row, the
+    prune of version 4 has nothing to do on this fixture -- both deployed payloads
+    carry only declared keys -- and the rebuild of version 5 finds the fresh per-mode
+    table ``_create_schema`` just created, so every row the deployed build wrote must
+    survive byte for byte.  That is the property this test pins, and it is the reason
+    the assertion compares whole snapshots rather than a count.
     """
     write_version_1_database(db_path)
     before = table_snapshot(db_path)
@@ -1492,7 +1539,10 @@ def test_a_version_1_database_is_migrated_to_version_4_without_touching_a_row(
         assert table_snapshot(db_path) == before
         # (a2) and the payload prune of version 4 rewrote neither deployed profile
         #      row: both carry only declared keys, so payload *and* ``updated_at``
-        #      are the ones the deployed build wrote
+        #      are the ones the deployed build wrote.  Nor did the version-5 wallet
+        #      rebuild: a version-1 file had no wallet table at all, so the per-mode
+        #      table ``_create_schema`` created is already the migrated shape and the
+        #      rebuild is a no-op.
         with raw_connection(db_path) as conn:
             profiles_after = sorted(
                 tuple(row)
@@ -1502,7 +1552,7 @@ def test_a_version_1_database_is_migrated_to_version_4_without_touching_a_row(
         # (b) the stored version is now the one of this build
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [4]
+        assert versions == [SCHEMA_VERSION] == [5]
         # (c) the wallet table exists, is empty, and records no wallet at all: the
         #     engine must initialise the configured value instead of a silent 0.0
         assert "wallet" in _table_names(db_path)
@@ -1547,10 +1597,12 @@ def test_a_version_2_database_gains_the_wallet_table(db_path: Path, clock: Manua
     """Version 2 had the candles table but no wallet: reopening it only adds the wallet.
 
     The DDL is applied to a database of *any* older version, so the same additive
-    migration that carries version 1 to version 4 has to carry version 2 as well --
+    migration that carries version 1 forward has to carry version 2 as well --
     and the payload prune of version 4, which runs on the same path, has nothing to
     do here: the single profile row carries only declared keys and survives the boot
-    byte for byte.
+    byte for byte.  The version-5 wallet rebuild is a no-op for the same reason as
+    above: the dropped table is recreated by ``_create_schema`` in its per-mode shape
+    before the migration looks at it.
     """
     first = SqliteStateStore(db_path, clock=clock)
     first.initialize()
@@ -1579,7 +1631,7 @@ def test_a_version_2_database_gains_the_wallet_table(db_path: Path, clock: Manua
         assert profiles_after == sorted(before["profiles"])
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [4]
+        assert versions == [SCHEMA_VERSION] == [5]
         assert _row_counts(db_path)["wallet"] == 0
         assert store.load_wallet() is None
         assert [item.id for item in store.load_profiles()] == ["btc-paper"]
@@ -1627,7 +1679,7 @@ def test_a_broken_candles_table_is_reported_as_a_store_error(
 
 
 # ---------------------------------------------------------------------------
-# 11. the shared platform wallet (schema version 3)
+# 11. the platform wallets, one ledger per mode (schema versions 3 and 5)
 # ---------------------------------------------------------------------------
 
 
@@ -1636,20 +1688,29 @@ def test_the_wallet_table_is_created_by_the_current_schema(
 ) -> None:
     """A brand new database ships the wallet table, empty.
 
-    The stored version is the one of this build, ``4``: the wallet arrived with
-    version 3 and the profile-payload prune is version 4, which changes no table.
+    The stored version is the one of this build, ``5``: the wallet arrived with
+    version 3, the profile-payload prune is version 4 (which changes no table) and
+    version 5 rebuilds the table into one ledger per mode, still empty.
     """
     assert "wallet" in _table_names(db_path)
     assert _row_counts(db_path)["wallet"] == 0
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
 
 
 def test_load_wallet_of_an_empty_table_is_none(store: SqliteStateStore) -> None:
-    """``None`` -- never a silent ``0.0`` -- is what makes the engine initialise config."""
+    """``None`` -- never a silent ``0.0`` -- is what makes the engine initialise config.
+
+    The absence is per **mode**: an empty table answers ``None`` for the paper ledger
+    through the defaulted keyword and for the live ledger through the explicit one.
+    """
     assert store.load_wallet() is None
+    assert store.load_wallet(mode="paper") is None
+    assert store.load_wallet(mode="live") is None
+    assert store.load_wallet(mode=RunMode.LIVE) is None
 
 
 def test_wallet_round_trip(store: SqliteStateStore) -> None:
+    """The round trip of the paper ledger, through the defaulted ``mode`` keyword."""
     store.save_wallet(cash=9_750.25, initial_balance=10_000.0)
 
     row = store.load_wallet()
@@ -1666,7 +1727,7 @@ def test_wallet_round_trip(store: SqliteStateStore) -> None:
 
 
 def test_save_wallet_upserts_the_single_row(store: SqliteStateStore, db_path: Path) -> None:
-    """Saving twice updates the one row in place: the wallet can never be duplicated."""
+    """Saving twice updates the *same* row in place: a ledger can never be duplicated."""
     store.save_wallet(cash=10_000.0, initial_balance=10_000.0)
     store.save_wallet(cash=8_500.0, initial_balance=12_000.0)
 
@@ -1675,20 +1736,113 @@ def test_save_wallet_upserts_the_single_row(store: SqliteStateStore, db_path: Pa
     assert row is not None
     assert row.cash == pytest.approx(8_500.0)
     assert row.initial_balance == pytest.approx(12_000.0)
-    # the primary key is pinned to 1 by a CHECK constraint, not only by convention
+    # the paper ledger's primary key is pinned to 1 by a CHECK constraint, not only
+    # by convention: the default ``mode`` resolves to that stable id
     with raw_connection(db_path) as conn:
         wallet_ids = [row[0] for row in conn.execute("SELECT wallet_id FROM wallet")]
-    assert wallet_ids == [1]
+    assert wallet_ids == [WALLET_ID_PAPER] == [1]
 
 
-def test_a_wallet_id_other_than_one_is_refused_by_the_schema(
+def test_save_wallet_writes_the_live_ledger_as_a_second_row(
     store: SqliteStateStore, db_path: Path
 ) -> None:
-    with raw_connection(db_path) as conn, pytest.raises(sqlite3.IntegrityError):
-        conn.execute(
-            "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
-            "VALUES (2, 1.0, 1.0, '2024-01-01T00:00:00+00:00')"
-        )
+    """``mode='live'`` is a ledger of its own: it never overwrites the paper one.
+
+    The two rows are the whole per-mode contract -- ``wallet_id`` 1 is paper and 2 is
+    live -- and the two ledgers stay independent across a close and a reopen.
+    """
+    store.save_wallet(cash=10_000.0, initial_balance=10_000.0)
+    store.save_wallet(cash=640.0, initial_balance=500.0, mode="live")
+
+    assert _row_counts(db_path)["wallet"] == 2
+    with raw_connection(db_path) as conn:
+        wallet_ids = sorted(row[0] for row in conn.execute("SELECT wallet_id FROM wallet"))
+    assert wallet_ids == [WALLET_ID_PAPER, WALLET_ID_LIVE] == [1, 2]
+
+    paper = store.load_wallet()
+    live = store.load_wallet(mode="live")
+    assert paper is not None and live is not None
+    assert paper.cash == pytest.approx(10_000.0), "the paper ledger is untouched"
+    assert live.cash == pytest.approx(640.0)
+    assert live.initial_balance == pytest.approx(500.0)
+
+    # re-saving the paper ledger is an upsert of row 1 only: row 2 is not disturbed
+    store.save_wallet(cash=9_000.0, initial_balance=10_000.0)
+    assert _row_counts(db_path)["wallet"] == 2
+    live_again = store.load_wallet(mode="live")
+    assert live_again is not None
+    assert live_again.cash == pytest.approx(640.0)
+
+
+def test_the_two_ledgers_are_independent_across_a_close_and_reopen(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """Each mode keeps its own cash through a restart, and an absent one stays ``None``."""
+    from trading_platform.realtime.models import RunMode
+
+    first = SqliteStateStore(db_path, clock=clock)
+    first.initialize()
+    first.save_wallet(cash=7_500.0, initial_balance=10_000.0)
+    first.save_wallet(cash=640.0, initial_balance=500.0, mode=RunMode.LIVE)
+    first.close()
+
+    second = SqliteStateStore(db_path, clock=clock)
+    second.initialize()
+    try:
+        paper = second.load_wallet()
+        live = second.load_wallet(mode=RunMode.LIVE)
+        assert paper is not None and live is not None
+        assert paper.cash == pytest.approx(7_500.0)
+        assert live.cash == pytest.approx(640.0)
+        # a mode the store holds no row for answers None -- never an invented 0.0
+        assert second.load_wallet(mode=RunMode("paper")) is not None
+    finally:
+        second.close()
+
+    # a database that only ever held the paper ledger answers None for the live one
+    other = SqliteStateStore(db_path.parent / "paper-only.db", clock=clock)
+    other.initialize()
+    try:
+        other.save_wallet(cash=1.0, initial_balance=2.0)
+        assert other.load_wallet(mode="live") is None
+    finally:
+        other.close()
+
+
+def test_an_unknown_wallet_mode_is_refused(store: SqliteStateStore, db_path: Path) -> None:
+    """A typo'd mode raises instead of silently addressing a ledger of another mode."""
+    with pytest.raises(StateStoreError, match="unknown run mode"):
+        store.load_wallet(mode="vedette")
+    with pytest.raises(StateStoreError, match="unknown run mode"):
+        store.save_wallet(cash=1.0, initial_balance=1.0, mode="vedette")
+    assert _row_counts(db_path)["wallet"] == 0
+
+
+def test_a_wallet_id_outside_the_two_modes_is_refused_by_the_schema(
+    store: SqliteStateStore, db_path: Path
+) -> None:
+    """The ``CHECK`` accepts exactly the two documented ids and nothing else.
+
+    ``1`` (paper) and ``2`` (live) are the stable row ids of the two ledgers; a third
+    id has no mode behind it, so the schema refuses it rather than letting an
+    orphan ledger live in the table.
+    """
+    for wallet_id in (WALLET_ID_PAPER, WALLET_ID_LIVE):
+        with raw_connection(db_path) as conn:
+            conn.execute(
+                "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
+                "VALUES (?, 1.0, 1.0, '2024-01-01T00:00:00+00:00')",
+                (wallet_id,),
+            )
+
+    for wallet_id in (0, 3, -1):
+        with raw_connection(db_path) as conn, pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
+                "VALUES (?, 1.0, 1.0, '2024-01-01T00:00:00+00:00')",
+                (wallet_id,),
+            )
+    assert _row_counts(db_path)["wallet"] == 2
 
 
 def test_a_zero_cash_wallet_round_trips(store: SqliteStateStore) -> None:
@@ -1842,26 +1996,31 @@ def test_a_store_without_a_file_answers_none() -> None:
     assert InMemoryStore().state_path() is None
 
 
-def test_the_schema_version_is_four() -> None:
-    """Version 4 is the profile-payload prune, and it was required.
+def test_the_schema_version_is_five() -> None:
+    """Version 5 is the second non-additive step: the per-mode ledgers.
 
-    The settings work added no table and no column, but the release that removed the
-    ``forecast`` field from ``ProfileConfig`` (which is ``extra="forbid"``) left the
-    rows that still carried it in place.  A field *removal* is not additive, so the
-    schema moved: version 4 prunes from every ``profiles`` payload exactly the
-    top-level keys the current model does not declare.
+    Version 4 pruned from every ``profiles`` payload exactly the top-level keys the
+    current model does not declare -- a field *removal*, so not additive.  Version 5
+    is non-additive for a different reason: the single-row ``wallet`` table of version
+    3 pinned ``wallet_id`` to ``1`` with a ``CHECK``, and ``CREATE TABLE IF NOT
+    EXISTS`` cannot widen the constraint of an already-deployed file.  The table is
+    therefore **rebuilt** into one ledger per mode (row ``1`` paper, row ``2`` live),
+    which keeps the legacy row as the paper ledger.
     """
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
 
 
-def test_a_version_three_database_is_migrated_to_four(db_path: Path, clock: ManualClock) -> None:
-    """A version-3 database is carried to version 4 without losing a row.
+def test_a_version_three_database_is_migrated_to_the_current_schema(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """A version-3 database is carried to version 5 without losing a row.
 
     The ``3 -> 4`` step prunes the payload keys the current ``ProfileConfig`` does not
-    declare.  The profile below carries only declared keys, so the prune rewrites no
+    declare, and the ``4 -> 5`` step rebuilds the ``wallet`` table into one ledger per
+    mode.  The profile below carries only declared keys, so the prune rewrites no
     row at all -- payload and ``updated_at`` stay byte-for-byte what the previous
-    build wrote -- and reopening the migrated file a second time changes nothing
-    either.
+    build wrote -- the wallet rebuild is a no-op on a table this build already created
+    per-mode, and reopening the migrated file a second time changes nothing either.
     """
     first = SqliteStateStore(db_path, clock=clock)
     first.initialize()
@@ -1889,7 +2048,7 @@ def test_a_version_three_database_is_migrated_to_four(db_path: Path, clock: Manu
         assert table_snapshot(db_path) == before
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [4]
+        assert versions == [SCHEMA_VERSION] == [5]
         # the payload carried no undeclared key, so the prune left the row alone:
         # payload *and* ``updated_at`` are the ones the previous build wrote
         payload_before, updated_before = next(
@@ -1920,7 +2079,7 @@ def test_a_version_three_database_is_migrated_to_four(db_path: Path, clock: Manu
         assert table_snapshot(db_path) == before
         with raw_connection(db_path) as conn:
             versions = [row[0] for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [4]
+        assert versions == [SCHEMA_VERSION] == [5]
         assert [item.id for item in again.load_profiles()] == ["btc-paper"]
     finally:
         again.close()

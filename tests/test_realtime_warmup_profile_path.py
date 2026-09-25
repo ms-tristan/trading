@@ -41,13 +41,18 @@ from trading_platform.realtime.clock import ManualClock
 from trading_platform.realtime.control import RuntimeProfileController
 from trading_platform.realtime.observability import LOGGER_NAME
 from trading_platform.realtime.stream import PollingMarketStream
+from trading_platform.realtime.warmup import (
+    SEVERITY_ERROR,
+    WARMUP_CODE_IMPOSSIBLE,
+    profile_warmup_findings,
+)
 
 #: How long a test may wait for the engine thread.
 _WAIT = 5.0
 
 SYMBOL = "BTC/USDT"
 
-#: The defaults the incident's profile was created with.
+#: The warm-up the incident's profile was created with, as an explicit override.
 DEFAULT_WARMUP = 200
 DEFAULT_HISTORY = 300
 
@@ -58,7 +63,14 @@ REQUIRED_4H = 169
 
 
 def payload(**overrides: Any) -> dict[str, Any]:
-    """Return the create body the dashboard sends, overridable field by field."""
+    """Return the create body the dashboard sends, overridable field by field.
+
+    ``warmup_candles`` defaults to ``None`` -- **no override** -- which is the
+    shape the incident's profile was really created with: the field is optional,
+    and its absence means "the strategy's own requirement on this timeframe", not
+    "the old 200".  Pass a number explicitly to describe an operator who asks for
+    a specific warm-up.
+    """
     body: dict[str, Any] = {
         "profile_id": "momentum-1m",
         "symbol": SYMBOL,
@@ -66,7 +78,7 @@ def payload(**overrides: Any) -> dict[str, Any]:
         "strategy": "momentum",
         "mode": "paper",
         "initial_balance": 1000.0,
-        "warmup_candles": DEFAULT_WARMUP,
+        "warmup_candles": None,
     }
     body.update(overrides)
     return body
@@ -171,21 +183,55 @@ def records_of(records: list[logging.LogRecord], event: str) -> list[logging.Log
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("timeframe", ["1m", "15m", "1h"])
-def test_the_create_path_refuses_a_momentum_profile_the_default_warmup_cannot_feed(
-    tmp_path: Path, timeframe: str
+def test_the_create_path_creates_a_momentum_profile_the_default_warmup_cannot_feed(
+    tmp_path: Path,
 ) -> None:
-    """1m, 15m and 1h with 200 warm-up candles: refused, with the arithmetic.
+    """A 1m ``momentum`` with NO override is created: it is served the 40321 it needs.
 
-    Nothing is created and nothing reaches the engine loop: the refusal happens
-    in the calling thread, before the command is marshalled.
+    This inverts the old refusal.  With the field optional, an absent
+    ``warmup_candles`` no longer means "200" -- which the 1m frame could never
+    grow into -- but "the strategy's own requirement on this timeframe", so the
+    create path must *not* refuse the very profile the incident was reported on.
+    A refusal now takes an explicit override below the requirement, which the test
+    below covers.
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake)
+    with EngineThread() as engine:
+        engine.bind(control)
+        created = control.create_profile(payload(timeframe="1m", profile_id="op-profile"))
+
+    assert created == "op-profile"
+    assert fake.names() == ["profile_config", "add_profile"]
+    forwarded = fake.calls[-1][1]
+    assert isinstance(forwarded, ProfileConfig)
+    # The field stays absent: the resolution happens in the warm-up authority.
+    assert forwarded.warmup_candles is None
+
+
+@pytest.mark.parametrize("timeframe", ["1m", "15m", "1h"])
+def test_the_create_path_refuses_an_explicit_under_requirement_warmup(
+    logs: Any, timeframe: str
+) -> None:
+    """An **explicit** 200-candle warm-up on 1m, 15m and 1h: refused, with the arithmetic.
+
+    This is the shape that is still impossible -- the operator asked for fewer
+    candles than the strategy needs, so the frame can never warm up.  Nothing is
+    created and nothing reaches the engine loop: the refusal happens in the
+    calling thread, before the command is marshalled.
     """
     fake = FakeOrchestrator()
     control = controller(fake)
     with EngineThread() as engine:
         engine.bind(control)
         with pytest.raises(ConfigError) as excinfo:
-            control.create_profile(payload(timeframe=timeframe, profile_id="op-profile"))
+            control.create_profile(
+                payload(
+                    timeframe=timeframe,
+                    profile_id="op-profile",
+                    warmup_candles=DEFAULT_WARMUP,
+                )
+            )
 
     message = str(excinfo.value)
     assert "can never warm up" in message
@@ -198,10 +244,11 @@ def test_the_create_path_refuses_a_momentum_profile_the_default_warmup_cannot_fe
     expected = {"1m": REQUIRED_1M, "15m": 2689, "1h": REQUIRED_1H}[timeframe]
     assert str(expected) in message
     assert fake.names() == []
+    assert records_of(logs, "profile_warmup_coherence") == []
 
 
 def test_the_create_path_accepts_the_four_hour_grid() -> None:
-    """4h needs 169 candles: the default 200-candle warm-up feeds it."""
+    """4h needs 169 candles: an explicit 200-candle warm-up feeds it."""
     fake = FakeOrchestrator()
     control = controller(fake)
     with EngineThread() as engine:
@@ -256,12 +303,34 @@ def test_the_create_path_refuses_one_candle_short_of_the_boundary() -> None:
     assert fake.names() == []
 
 
+def test_the_refusal_message_is_the_byte_identical_frozen_sentence() -> None:
+    """The create refusal and the start refusal carry the very same sentence.
+
+    An operator who saw the message once must recognise it everywhere it is
+    produced: resolving the warm-up in one shared authority is what makes that
+    true, so the create path is compared against the authority itself rather than
+    against a copy of the wording.
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake)
+    target = profile(timeframe="1m", warmup_candles=DEFAULT_WARMUP)
+    with EngineThread() as engine:
+        engine.bind(control)
+        with pytest.raises(ConfigError) as excinfo:
+            control.create_profile(payload(timeframe="1m", warmup_candles=DEFAULT_WARMUP))
+
+    findings = profile_warmup_findings(target, history_candles=DEFAULT_HISTORY)
+    assert [finding.severity for finding in findings] == [SEVERITY_ERROR]
+    assert str(excinfo.value) == findings[0].message
+    assert findings[0].code == WARMUP_CODE_IMPOSSIBLE
+
+
 def test_a_basic_profile_keeps_being_created_exactly_as_before() -> None:
     """The regression guard: ``basic`` declares no warm-up and is never refused.
 
-    It is created on 1m with a 200-candle warm-up inside a 1-candle window --
-    the seed of the existing ``realtime check`` scenario -- and the coherence
-    mismatch must not turn a working profile into a failure.
+    It is created on 1m with an explicit 200-candle warm-up inside a 1-candle
+    window -- the seed of the existing ``realtime check`` scenario -- and the
+    coherence mismatch must not turn a working profile into a failure.
     """
     fake = FakeOrchestrator()
     control = controller(fake, history_candles=1)
@@ -275,28 +344,52 @@ def test_a_basic_profile_keeps_being_created_exactly_as_before() -> None:
     assert fake.names() == ["profile_config", "add_profile"]
 
 
-def test_an_incoherent_profile_is_reported_and_still_created(logs: Any) -> None:
-    """``warmup_candles`` 40321 inside a 300-candle window: a warning, not a refusal.
+def test_a_default_profile_wider_than_the_window_is_reported_and_still_created(
+    logs: Any,
+) -> None:
+    """``momentum``/``1m`` with NO override inside a 300-candle window: warning, created.
 
-    The frame the strategy receives is bounded by ``warmup_candles``, so a
-    smaller stream window does not by itself silence the profile -- and the
-    operator's fix (the per-profile ``history_candles`` override) is named in the
-    log record.
+    The coherence finding now fires on the **resolved** warm-up (40321), which is
+    the number the runner will really ask the stream for -- so the operator is
+    told about the incident's misconfiguration at create time, and the profile is
+    still created, because the frame the strategy receives is bounded by
+    ``warmup_candles`` and the log record names the fix (the per-profile
+    ``history_candles`` override).
     """
     fake = FakeOrchestrator()
     control = controller(fake, history_candles=DEFAULT_HISTORY)
     with EngineThread() as engine:
         engine.bind(control)
-        created = control.create_profile(payload(warmup_candles=REQUIRED_1M))
+        created = control.create_profile(payload(warmup_candles=None))
 
     assert created == "momentum-1m"
     reported = records_of(logs, "profile_warmup_coherence")
     assert len(reported) == 1
     assert reported[0].levelno == logging.WARNING
     context = dict(reported[0].context)
+    # The resolved value, not the absent field: ``int(None)`` used to be a crash.
     assert context["warmup_candles"] == REQUIRED_1M
     assert context["history_candles"] == DEFAULT_HISTORY
     assert "history_candles" in context["message"]
+
+
+def test_the_coherence_report_carries_the_resolved_warmup_not_the_raw_field(logs: Any) -> None:
+    """An explicit override is still reported verbatim -- the resolution is the rule.
+
+    Same warning, two shapes: a profile that declares nothing is reported with the
+    40321 its strategy needs, and one that declares 5000 is reported with 5000.
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake, history_candles=DEFAULT_HISTORY)
+    with EngineThread() as engine:
+        engine.bind(control)
+        control.create_profile(
+            payload(profile_id="declared", timeframe="1m", warmup_candles=REQUIRED_1M + 1)
+        )
+
+    reported = records_of(logs, "profile_warmup_coherence")
+    assert len(reported) == 1
+    assert dict(reported[0].context)["warmup_candles"] == REQUIRED_1M + 1
 
 
 def test_the_create_payload_carries_both_fields_into_the_profile() -> None:
@@ -315,13 +408,20 @@ def test_the_create_payload_carries_both_fields_into_the_profile() -> None:
 
 
 def test_an_absent_override_is_not_invented_from_the_payload() -> None:
-    """An omitted ``history_candles`` stays ``None``: the schema decides, not the path."""
+    """An omitted field stays ``None``: the schema decides, not the path.
+
+    Neither override is written into the profile by the create path -- not even a
+    "sensible default" -- because resolving either one here would be a second
+    authority beside the warm-up resolution and
+    ``ProfileConfig.effective_history_candles``.
+    """
     fake = FakeOrchestrator()
     control = controller(fake)
     with EngineThread() as engine:
         engine.bind(control)
         control.create_profile(payload(timeframe="4h"))
     forwarded = fake.calls[-1][1]
+    assert forwarded.warmup_candles is None
     assert forwarded.history_candles is None
     assert forwarded.effective_history_candles(DEFAULT_HISTORY) == DEFAULT_HISTORY
 
@@ -347,6 +447,29 @@ def test_the_controller_falls_back_to_the_realtime_history_setting(logs: Any) ->
     assert dict(reported[0].context)["warmup_candles"] == 400
 
 
+def test_a_default_profile_is_never_refused_whatever_the_stream_window(logs: Any) -> None:
+    """With no override the ERROR branch is unreachable: 4h, 1h and 1m are all created.
+
+    The resolution makes the refusal structural rather than a matter of the window
+    the engine happens to be configured with: a profile that overrides nothing is
+    served its requirement, so it can never be "wider than what it is served".
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake, history_candles=1)
+    with EngineThread() as engine:
+        engine.bind(control)
+        for identifier, timeframe in (("p-1m", "1m"), ("p-1h", "1h"), ("p-4h", "4h")):
+            assert (
+                control.create_profile(
+                    payload(profile_id=identifier, timeframe=timeframe, warmup_candles=None)
+                )
+                == identifier
+            )
+
+    assert fake.names().count("add_profile") == 3
+    assert len(records_of(logs, "profile_warmup_coherence")) == 3
+
+
 def test_a_duplicate_identifier_is_still_a_profile_error() -> None:
     """The warm-up check does not shadow the existing duplicate check.
 
@@ -367,12 +490,12 @@ def test_a_duplicate_identifier_is_still_a_profile_error() -> None:
 
 def test_the_warm_up_refusal_runs_before_the_engine_is_consulted() -> None:
     """An impossible profile never reaches the orchestrator, duplicate or not."""
-    fake = FakeOrchestrator(declared={"momentum-1m": profile()})
+    fake = FakeOrchestrator(declared={"momentum-1m": profile(warmup_candles=DEFAULT_WARMUP)})
     control = controller(fake)
     with EngineThread() as engine:
         engine.bind(control)
         with pytest.raises(ConfigError) as excinfo:
-            control.create_profile(payload(profile_id="momentum-1m"))
+            control.create_profile(payload(profile_id="momentum-1m", warmup_candles=DEFAULT_WARMUP))
 
     assert "can never warm up" in str(excinfo.value)
     assert fake.names() == []

@@ -3,21 +3,30 @@
 A strategy declares how many candles a frame must hold before it can emit **any**
 signal (:meth:`trading_platform.strategy.base.Strategy.required_candles`).  A
 profile declares how many candles it asks the stream for
-(``ProfileConfig.warmup_candles``) and how long a window the engine serves
-(``realtime.history_candles``, or the profile's own ``history_candles`` override).
-Those three numbers are the whole contract, and this module is the **only** place
-that compares them:
+(``ProfileConfig.warmup_candles``, an **optional override**) and how long a window
+the engine serves (``realtime.history_candles``, or the profile's own
+``history_candles`` override).  Those three numbers are the whole contract, and
+this module is the **only** place that compares them:
 
 * :func:`candles_per_day` -- the candle grid of a timeframe;
 * :func:`required_candles_for` -- what a profile's strategy needs on that grid;
+* :func:`effective_warmup_candles` -- the warm-up a profile is *actually* served:
+  its explicit override, or -- the default -- the strategy's own requirement, so
+  "no override" can never mean "warm up for ever";
 * :func:`profile_warmup_findings` -- the impossible profile (``required >
-  warmup_candles``: it can **never** warm up, the silent no-op of the incident)
-  and the incoherent one (``warmup_candles > history_candles``: it asks for more
-  than the stream is configured to serve);
+  warmup``: it can **never** warm up, the silent no-op of the incident) and the
+  incoherent one (``warmup > history_candles``: it asks for more than the stream
+  is configured to serve);
 * :func:`warmup_report` -- the same numbers and findings as a JSON-ready mapping,
   consumed by ``realtime check``;
 * :func:`working_timeframes` -- the timeframes that *would* work with the same
   parameters, so a refusal can tell the operator what to do instead.
+
+Every comparison below is made on the **resolved** warm-up
+(:func:`effective_warmup_candles`), never on the raw field: a profile that
+overrides nothing is coherent by construction, and
+:data:`WARMUP_CODE_IMPOSSIBLE` stays reachable **only** when an operator
+explicitly asks for fewer candles than the strategy needs.
 
 Layer direction (frozen)
 ------------------------
@@ -28,12 +37,26 @@ and ``strategy`` -- and the realtime strategy bridge
 module, never the other way round.  It imports no I/O, no clock and no network,
 so every value it returns is a pure function of its arguments.
 
+Ownership arbitration (binding)
+-------------------------------
+``cli.py`` is owned by the **wallet/mode** work package, not by this one: it is
+needed by both the warm-up report and the wallet view, and a file may have only
+one owner.  To make that split possible this module exposes the warm-up API in a
+shape ``cli.py`` can use **without any change**: :func:`profile_warmup_findings`
+and :func:`warmup_report` take a :class:`ProfileConfig` and ``history_candles``
+only -- no new argument, no new import.  A caller that already imports them picks
+the optional-override semantics up for free, because the resolution happens
+*inside* these two functions (:func:`effective_warmup_candles`).  Nothing here may
+be moved into ``cli.py``.
+
 Severity semantics (frozen)
 ---------------------------
 ``error``
     The profile can **never** warm up: its strategy needs more candles than the
     profile ever asks the stream for.  This is the silent no-op -- refused where
-    the profile is created and an ``ERROR`` at start.
+    the profile is created and an ``ERROR`` at start.  It requires an **explicit**
+    ``warmup_candles`` override below the requirement: without one, the profile is
+    served the requirement itself and this severity is unreachable.
 ``warning``
     The profile asks for more candles than the stream window holds.  It is a
     real misconfiguration worth naming, but not a refusal: the frame the strategy
@@ -59,17 +82,32 @@ from trading_platform.realtime.strategies import resolve_strategy
 from trading_platform.strategy.registry import get_strategy
 
 __all__ = [
+    "DEFAULT_WARMUP_CANDLES",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
     "WARMUP_CODE_COHERENCE",
     "WARMUP_CODE_IMPOSSIBLE",
     "WarmupFinding",
     "candles_per_day",
+    "effective_warmup_candles",
     "profile_warmup_findings",
     "required_candles_for",
     "warmup_report",
     "working_timeframes",
 ]
+
+#: Warm-up the contract falls back to when the strategy cannot be built at all.
+#:
+#: ``200`` is not an arbitrary number: it is the value
+#: ``ProfileConfig.warmup_candles`` used to default to before it became optional,
+#: and the value :data:`~trading_platform.config.models.MAX_ENTRY_LOOKBACK_CANDLES`
+#: was pinned to for exactly that reason -- the maximum catch-up window a profile
+#: may declare is satisfiable by this warm-up out of the box.  It is reached only
+#: by :func:`effective_warmup_candles`, and only for a profile whose strategy
+#: cannot be built (unknown name, rejected parameters, unsupported timeframe): a
+#: validation path must answer *something* usable rather than raise a second
+#: failure mode of its own.
+DEFAULT_WARMUP_CANDLES: int = 200
 
 #: Severity of a finding that must stop the profile (it can never warm up).
 SEVERITY_ERROR = "error"
@@ -155,6 +193,39 @@ def required_candles_for(profile: ProfileConfig) -> int:
     return int(strategy.required_candles(candles_per_day(str(profile.timeframe))))
 
 
+def effective_warmup_candles(profile: ProfileConfig) -> int:
+    """Return the warm-up ``profile`` is **actually** served, as a plain ``int >= 1``.
+
+    ``ProfileConfig.warmup_candles`` is optional, exactly like its sibling
+    ``history_candles``, and this is its resolution helper -- the mirror of
+    :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`.
+    The rule is the whole point of the field being optional:
+
+    * an **explicit** value is a deliberate override and is returned as-is;
+    * ``None`` -- "not overridden" -- resolves to the strategy's **own**
+      requirement on the profile's timeframe (:func:`required_candles_for`), so a
+      profile can never be created with a frame that silently never warms up.
+
+    The function is **total**, unlike :func:`required_candles_for`: when the
+    strategy cannot be built (unknown name, rejected parameters, unsupported
+    timeframe) it answers :data:`DEFAULT_WARMUP_CANDLES` instead of raising,
+    because a validation path must never gain a second failure mode -- the
+    unbuildable strategy is already reported by ``resolve_strategy`` where the
+    profile is resolved.  The same ``(ConfigError, StrategyError)`` pair is
+    swallowed as in :func:`profile_warmup_findings`, and deliberately so: the two
+    must agree on what "unbuildable" means.
+    """
+    if profile.warmup_candles is not None:
+        return int(profile.warmup_candles)
+    try:
+        required = required_candles_for(profile)
+    except (ConfigError, StrategyError):
+        return DEFAULT_WARMUP_CANDLES
+    # A strategy may legitimately declare no warm-up at all (``basic`` answers
+    # ``0``); the warm-up the engine is asked for is never below one candle.
+    return max(1, int(required))
+
+
 def profile_warmup_findings(profile: ProfileConfig, *, history_candles: int) -> list[WarmupFinding]:
     """Return the warm-up verdicts about ``profile`` -- at most one per severity.
 
@@ -163,15 +234,19 @@ def profile_warmup_findings(profile: ProfileConfig, *, history_candles: int) -> 
     ``history_candles`` override -- see
     :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`).
 
-    The two rules, and there are exactly two:
+    The two rules, and there are exactly two -- both stated on the **resolved**
+    warm-up (``warmup = effective_warmup_candles(profile)``, never the raw optional
+    field):
 
     * :data:`WARMUP_CODE_IMPOSSIBLE` (**error**) iff
-      ``required_candles_for(profile) > profile.warmup_candles``: the frame the
-      runner builds can never reach the strategy's warm-up, so the profile would
-      run for ever with zero signals;
-    * :data:`WARMUP_CODE_COHERENCE` (**warning**) iff
-      ``profile.warmup_candles > history_candles``: the profile asks the stream
-      for more candles than the engine is configured to serve.
+      ``required_candles_for(profile) > warmup``: the frame the runner builds can
+      never reach the strategy's warm-up, so the profile would run for ever with
+      zero signals.  With no explicit override ``warmup`` **is** the requirement,
+      so this is false by construction: the finding stays reachable only when an
+      operator deliberately sets ``warmup_candles`` below it;
+    * :data:`WARMUP_CODE_COHERENCE` (**warning**) iff ``warmup > history_candles``:
+      the profile asks the stream for more candles than the engine is configured
+      to serve.
 
     Both can hold at once, and each is reported at most once.  The function is
     **total and never raises**: a profile whose strategy cannot be built (unknown
@@ -185,7 +260,7 @@ def profile_warmup_findings(profile: ProfileConfig, *, history_candles: int) -> 
     except (ConfigError, StrategyError):
         return []
 
-    warmup = _as_int(profile.warmup_candles)
+    warmup = effective_warmup_candles(profile)
     window = _as_int(history_candles)
     findings: list[WarmupFinding] = []
     if required > warmup:
@@ -215,6 +290,11 @@ def warmup_report(profile: ProfileConfig, *, history_candles: int) -> dict[str, 
     -- so ``realtime check`` can publish it under its additive ``warmup`` key
     without inventing a second vocabulary.
 
+    ``warmup_candles`` is the **resolved** warm-up
+    (:func:`effective_warmup_candles`): a plain ``int >= 1``, never ``None``, so a
+    consumer that reads the key directly (the CLI report, the dashboard) sees the
+    number the engine really asks the stream for instead of an absent override.
+
     The function is **total and never raises**: when the strategy cannot be built,
     ``required_candles`` is ``0`` and ``findings`` is ``[]`` (the strategy failure
     is reported by the profile resolution, not here), and the same holds for a
@@ -233,7 +313,7 @@ def warmup_report(profile: ProfileConfig, *, history_candles: int) -> dict[str, 
     return {
         "candles_per_day": per_day,
         "required_candles": required,
-        "warmup_candles": _as_int(profile.warmup_candles),
+        "warmup_candles": effective_warmup_candles(profile),
         "history_candles": window,
         "findings": [
             finding.to_dict()

@@ -94,6 +94,7 @@ HEALTH_KEYS = [
     "uptime_seconds",
     "version",
     "wallet",
+    "wallets",
 ]
 
 #: Exact keys of the orphan-sweep payload carried by ``/api/health`` and
@@ -139,7 +140,11 @@ ORPHAN_PAYLOAD: dict[str, Any] = {
     "swept_at": "2024-01-01T06:00:00+00:00",
 }
 
-#: Exact keys of the shared-platform-wallet object (additive, §5 of the docs).
+#: Exact keys of one ledger view (the ``wallet`` key and either entry of ``wallets``).
+#:
+#: The twelve historical keys keep their names, their types and their order; the
+#: three totals of the per-mode ledgers are **appended**, which is what makes the
+#: ``wallet`` key byte-identical to what it always was, plus three ignorable keys.
 WALLET_KEYS = sorted(
     [
         "cash",
@@ -154,8 +159,24 @@ WALLET_KEYS = sorted(
         "total_exposure",
         "unrealized_pnl",
         "updated_at",
+        "total_cash",
+        "positions_value",
+        "total_portfolio_value",
     ]
 )
+
+#: The twelve historical keys of a ledger view, without the three appended totals.
+HISTORICAL_WALLET_KEYS = sorted(
+    key
+    for key in WALLET_KEYS
+    if key not in {"total_cash", "positions_value", "total_portfolio_value"}
+)
+
+#: The exact keys of the additive per-mode mapping on both read routes.
+WALLETS_KEYS = ["live", "paper"]
+
+#: What an ABSENT ``wallets`` answer is normalised to: both modes, explicit nulls.
+WALLETS_EMPTY = {"paper": None, "live": None}
 
 #: Exact keys of the five attributed figures a ``ProfileSnapshot`` gained.
 ATTRIBUTED_PROFILE_KEYS = [
@@ -172,7 +193,7 @@ TRADES_KEYS = ["count", "trades"]
 ORDERS_KEYS = ["orders"]
 POSITIONS_KEYS = ["positions"]
 METRICS_KEYS = ["benchmark", "generated_at", "metrics"]
-PROFILES_KEYS = ["generated_at", "profiles", "wallet"]
+PROFILES_KEYS = ["generated_at", "profiles", "wallet", "wallets"]
 PROFILE_KEYS = sorted(
     [
         "cash",
@@ -370,6 +391,11 @@ class FakeProvider:
     orphan_error: Exception | None = None
     profile_failures_map: Mapping[str, str] = field(default_factory=dict)
     profile_failures_error: Exception | None = None
+    #: The per-mode ledger mapping.  The default mirrors what a provider written
+    #: before the second ledger existed would answer if it had the member at all:
+    #: the paper ledger beside the live one, which is explicitly ``None``.
+    wallets_map: Any = None
+    wallets_error: Exception | None = None
 
     def snapshot(self) -> PlatformSnapshot:
         if self.snapshot_error is not None:
@@ -390,7 +416,28 @@ class FakeProvider:
             body.setdefault(
                 "wallet", self.wallet.to_dict() if hasattr(self.wallet, "to_dict") else self.wallet
             )
+        # The real orchestrator builds its health body once and cannot fail here; a
+        # broken ledger read is exercised through :meth:`wallets`, which the router
+        # asks with its own defensive seam.
+        if self.wallets_error is None:
+            body.setdefault(
+                "wallets", self.wallets_map if self.wallets_map is not None else self.wallets()
+            )
         return body
+
+    def wallets(self) -> Mapping[str, Any]:
+        """Return one ledger view per run mode, keyed by mode name.
+
+        The default answers the paper ledger under ``paper`` -- the very object the
+        snapshot carries -- and an explicit ``None`` for ``live``, which is what a
+        platform whose store holds no live row publishes.  A test that wants another
+        shape sets :attr:`wallets_map` (or :attr:`wallets_error`).
+        """
+        if self.wallets_error is not None:
+            raise self.wallets_error
+        if self.wallets_map is not None:
+            return self.wallets_map
+        return {"paper": self.wallet, "live": None}
 
     def profile_snapshot(self, profile_id: str) -> ProfileSnapshot | None:
         for profile in self.profiles:
@@ -452,7 +499,9 @@ class LegacySnapshot:
 
     It deliberately carries no ``wallet`` attribute at all, which is the shape the
     router must survive: the additive key is then rendered ``null`` instead of
-    crashing the route or silently disappearing from the payload.
+    crashing the route or silently disappearing from the payload.  It carries no
+    ``wallets`` surface either -- the second ledger is newer still -- so the router's
+    normalisation of *both* keys is exercised against one legacy shape.
     """
 
     profiles: tuple[ProfileSnapshot, ...]
@@ -461,7 +510,21 @@ class LegacySnapshot:
 
 
 class LegacyProvider(FakeProvider):
-    """Provider whose platform snapshot predates the one shared wallet."""
+    """Provider whose platform snapshot predates the ledger views.
+
+    It answers neither the ``wallet`` attribute on its snapshot nor a ``wallets``
+    accessor, and its health body carries neither key.  Both additive keys must still
+    be **present** in the rendered payload -- as explicit ``null`` and as the explicit
+    ``{"paper": null, "live": null}`` -- because a missing key is exactly what a
+    consumer cannot tell apart from an empty platform.
+    """
+
+    wallets = None  # type: ignore[assignment]
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "wallets":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
 
     def snapshot(self) -> Any:
         return LegacySnapshot(
@@ -469,6 +532,13 @@ class LegacyProvider(FakeProvider):
             generated_at=pd.Timestamp(START + timedelta(seconds=10)),
             uptime_seconds=self.uptime_seconds,
         )
+
+    def health(self) -> dict[str, Any]:
+        """Answer the legacy health body: no ``wallet`` and no ``wallets`` key at all."""
+        body = dict(self.health_body)
+        body.pop("wallet", None)
+        body.pop("wallets", None)
+        return body
 
 
 class UncensusedProvider(FakeProvider):
@@ -1076,7 +1146,14 @@ def test_a_provider_without_a_wallet_answers_null_never_a_missing_key(
 def test_a_legacy_snapshot_without_the_wallet_attribute_answers_null(
     monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
 ) -> None:
-    """A provider written before the wallet existed has no ``wallet`` on its snapshot."""
+    """A provider written before the ledger views has no ``wallet`` and no ``wallets``.
+
+    Both additive keys are still **present** in the rendered payload, normalised the
+    same way: ``wallet`` to an explicit ``null``, ``wallets`` to the explicit
+    ``{"paper": null, "live": null}``.  A missing key is what a consumer cannot tell
+    apart from an empty platform, and that is the whole reason the normalisation
+    exists.
+    """
     legacy = LegacyProvider(profiles=provider.profiles, health_body={"status": "ok"})
     router = build_router(legacy, monitor, manual_clock)
 
@@ -1085,13 +1162,135 @@ def test_a_legacy_snapshot_without_the_wallet_attribute_answers_null(
 
     assert sorted(profiles) == PROFILES_KEYS
     assert profiles["wallet"] is None
+    assert profiles["wallets"] == WALLETS_EMPTY
     assert [item["profile_id"] for item in profiles["profiles"]] == [PROFILE_A, PROFILE_B]
     assert sorted(health) == HEALTH_KEYS
     assert health["wallet"] is None
+    assert health["wallets"] == WALLETS_EMPTY
     # ... and the counters still fall back to that legacy snapshot
     assert health["profiles_total"] == 2
     assert health["profiles_running"] == 1
     assert health["uptime_seconds"] == 42.5
+
+
+# ---------------------------------------------------------------------------
+# one ledger per mode: the additive ``wallets`` key of both read routes
+# ---------------------------------------------------------------------------
+
+
+def test_health_payload_carries_the_per_mode_ledgers(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """``GET /api/health`` renders both modes from the provider's own answer."""
+    paper = make_wallet_snapshot()
+    live = make_wallet_snapshot(
+        mode=RunMode.LIVE, source="venue", cash=1200.0, initial_balance=1000.0
+    )
+    provider.wallet = paper
+    provider.wallets_map = {"paper": paper, "live": live}
+    router = build_router(provider, monitor, manual_clock)
+
+    body = payload_of(router.handle("GET", "/api/health"))
+
+    assert sorted(body) == HEALTH_KEYS
+    assert sorted(body["wallets"]) == WALLETS_KEYS
+    assert body["wallets"]["paper"] == paper.to_dict()
+    assert body["wallets"]["live"] == live.to_dict()
+    # the existing ``wallet`` key is the paper ledger, byte for byte
+    assert body["wallet"] == paper.to_dict()
+    assert sorted(body["wallet"]) == WALLET_KEYS
+    # the twelve historical keys are all still there: the three totals are APPENDED
+    assert set(HISTORICAL_WALLET_KEYS) < set(body["wallet"])
+
+
+def test_profiles_payload_carries_the_per_mode_ledgers(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """``GET /api/profiles`` carries the same additive key, asked of the accessor."""
+    paper = make_wallet_snapshot()
+    live = make_wallet_snapshot(mode=RunMode.LIVE, source="venue", cash=1200.0)
+    provider.wallet = paper
+    provider.wallets_map = {"paper": paper, "live": live}
+    router = build_router(provider, monitor, manual_clock)
+
+    body = payload_of(router.handle("GET", "/api/profiles"))
+
+    assert sorted(body) == PROFILES_KEYS
+    assert sorted(body["wallets"]) == WALLETS_KEYS
+    assert body["wallets"]["paper"] == paper.to_dict()
+    assert body["wallets"]["live"] == live.to_dict()
+    assert body["wallet"] == paper.to_dict()
+    assert [item["profile_id"] for item in body["profiles"]] == [PROFILE_A, PROFILE_B]
+
+
+def test_a_mode_with_no_ledger_is_an_explicit_null_never_an_invented_ledger(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """The paper ledger exists and the live one does not: the payload says exactly that."""
+    paper = make_wallet_snapshot()
+    provider.wallet = paper
+    provider.wallets_map = {"paper": paper, "live": None}
+    router = build_router(provider, monitor, manual_clock)
+
+    for route in ("/api/health", "/api/profiles"):
+        body = payload_of(router.handle("GET", route))
+        assert body["wallets"]["live"] is None, route
+        assert body["wallets"]["paper"] == paper.to_dict(), route
+        # never a zero-valued placeholder: the absence is the answer
+        assert not isinstance(body["wallets"]["live"], dict), route
+
+
+def test_health_renders_mapping_shaped_ledgers_as_is(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A provider handing plain mappings (the CLI adapter) is rendered unchanged."""
+    payload = {"paper": {"name": "platform", "mode": "paper", "cash": None}, "live": None}
+    provider.health_body = {
+        "status": "ok",
+        "profiles_total": 0,
+        "profiles_running": 0,
+        "uptime_seconds": 0.0,
+        "wallet": payload["paper"],
+        "wallets": payload,
+    }
+    router = build_router(provider, monitor, manual_clock)
+
+    assert payload_of(router.handle("GET", "/api/health"))["wallets"] == payload
+
+
+def test_a_broken_ledger_read_never_breaks_the_health_route(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """An accessor that raises answers the documented empty mapping, never a ``500``."""
+    provider.wallet = make_wallet_snapshot()
+    # A plain exception rather than ``MonitoringError``: the router deliberately
+    # re-raises that one (it is the engine's own "the read could not be served"
+    # signal), exactly like the orphan read.  Any other failure is caught.
+    provider.wallets_error = RuntimeError("ledger read is unavailable")
+    router = build_router(provider, monitor, manual_clock)
+
+    health = payload_of(router.handle("GET", "/api/health"))
+    assert health["status"] == "ok"
+    assert health["wallets"] == WALLETS_EMPTY
+    # the snapshot path is equally defensive
+    profiles = payload_of(router.handle("GET", "/api/profiles"))
+    assert profiles["wallets"] == WALLETS_EMPTY
+    assert profiles["wallet"] is not None, "the existing key is unaffected"
+
+
+def test_a_non_mapping_ledger_read_answers_the_empty_mapping(
+    monitor: Monitor, manual_clock: ManualClock, provider: FakeProvider
+) -> None:
+    """A provider answering a list (or a scalar) is normalised, not echoed."""
+    provider.wallet = make_wallet_snapshot()
+    provider.wallets_map = ["paper"]
+    router = build_router(provider, monitor, manual_clock)
+
+    assert payload_of(router.handle("GET", "/api/health"))["wallets"] == WALLETS_EMPTY
+    profile_body = payload_of(router.handle("GET", "/api/profiles"))
+    assert profile_body["wallets"] == WALLETS_EMPTY
+    # the existing key still renders the ledger it always rendered
+    assert profile_body["wallet"] == provider.wallet.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -1453,12 +1652,15 @@ def test_empty_provider_still_answers_every_platform_route(
         "profiles": [],
         "generated_at": pd.Timestamp(START + timedelta(seconds=10)).isoformat(),
         "wallet": None,
+        # a provider with no ledger at all still renders BOTH modes, explicitly null
+        "wallets": dict(WALLETS_EMPTY),
     }
     health = payload_of(router.handle("GET", "/api/health"))
     assert sorted(health) == HEALTH_KEYS
     assert health["profiles_total"] == 0
     assert health["profiles_running"] == 0
     assert health["wallet"] is None
+    assert health["wallets"] == WALLETS_EMPTY
     assert payload_of(router.handle("GET", "/")) == {"error": "not found: /"}
     assert router.handle("GET", "/api/profiles/" + PROFILE_A).status == 404
 

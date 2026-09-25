@@ -902,7 +902,7 @@ def test_a_sweep_on_a_store_with_positions_but_no_profile_is_a_clean_no_op(
 
 
 def test_the_paper_orphan_closure_spends_the_platform_wallet(tmp_path: Path) -> None:
-    """The default factory builds a real paper venue: the fill moves real cash."""
+    """The default factory builds a real paper venue: the fill moves the paper ledger."""
     clock = clock_at()
     store = make_store(tmp_path, clock)
     position = seed_position(store, GHOST, quantity=1.0, average_price=100.0)
@@ -1086,3 +1086,35 @@ def test_the_boot_records_the_exchange_of_every_loaded_profile(tmp_path: Path) -
         await asyncio.wait_for(orchestrator.stop(), timeout=20)
 
     asyncio.run(shutdown())
+
+
+def test_the_booted_platform_publishes_one_ledger_per_mode(tmp_path: Path) -> None:
+    """The sweep spends the **paper** ledger, and the health body says which is which.
+
+    A sweep is engine work like any other, so it runs on a platform whose health
+    payload carries the additive ``wallets`` key: the paper ledger the closing order
+    was funded from, and an explicit ``None`` for a live mode the store holds no row
+    for.  The existing ``wallet`` key is untouched -- it is that same paper ledger.
+    """
+    import asyncio
+
+    clock = clock_at()
+    store = make_store(tmp_path, clock)
+    orchestrator = build_orchestrator(tmp_path, clock, store)
+
+    asyncio.run(orchestrator.run_once())
+
+    health = orchestrator.health()
+    assert set(health["wallets"]) == {"paper", "live"}
+    assert health["wallets"]["live"] is None, "no live ledger row exists here"
+    assert health["wallets"]["paper"] == health["wallet"], (
+        "the paper entry of ``wallets`` is the very ledger ``wallet`` publishes"
+    )
+    assert health["wallet"]["mode"] == "paper"
+    # a mode with no row has no in-memory ledger either: the absence is not fabricated
+    from trading_platform.realtime.models import RunMode
+
+    assert orchestrator.wallet_for(RunMode.LIVE) is None
+    assert orchestrator.wallet_for(RunMode.PAPER) is orchestrator.wallet
+    assert orchestrator.wallet.mode is RunMode.PAPER
+    store.close()

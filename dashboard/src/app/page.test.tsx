@@ -110,6 +110,9 @@ const profiles: ProfilesPayload = {
     profiles: 1,
     source: 'local',
     updated_at: '2024-01-01T00:00:00+00:00',
+    total_cash: 21500,
+    positions_value: 4250,
+    total_portfolio_value: 25750,
   } satisfies WalletSnapshot,
 };
 
@@ -186,14 +189,15 @@ describe('OverviewPage', () => {
 
     // Exactly one panel: the shared ledger is rendered once, from the wallet of
     // the server-rendered payload — the browser issues no request for it.
-    const panels = screen.getAllByRole('region', { name: 'Platform wallet' });
+    const panels = screen.getAllByRole('region', { name: 'Platform wallet — paper trading' });
     expect(panels).toHaveLength(1);
 
+    // The three totals are the panel; the detailed values are folded away.
     const tiles = screen.getByTestId('wallet-tiles');
     expect(within(tiles).getByText('$21,500.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('$4,250.00')).toBeInTheDocument();
     expect(within(tiles).getByText('$25,750.00')).toBeInTheDocument();
-    expect(within(tiles).getByText('+$1,000.00')).toBeInTheDocument();
-    expect(within(tiles).getByText('-$250.00')).toBeInTheDocument();
+    expect(screen.getByTestId('wallet-details')).not.toBeVisible();
 
     // The panel says what the wallet is, and where the cash lives.
     expect(
@@ -218,11 +222,13 @@ describe('OverviewPage', () => {
     render(await OverviewPage());
 
     // The panel is not blank and the page does not crash: it shows the em dash
-    // state of every wallet value, with a note saying why.
-    expect(screen.getByRole('region', { name: 'Platform wallet' })).toBeInTheDocument();
-    expect(screen.getByText('No shared wallet reported')).toBeInTheDocument();
+    // totals, with a note scoped to the mode that holds no ledger row.
+    expect(
+      screen.getByRole('region', { name: 'Platform wallet — paper trading' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('No paper trading ledger reported')).toBeInTheDocument();
     expect(within(screen.getByTestId('wallet-tiles')).getAllByText(EMPTY_PLACEHOLDER)).toHaveLength(
-      8,
+      3,
     );
     expect(screen.getByText('$10,450.50')).toBeInTheDocument();
     expect(screen.queryByText('NaN')).not.toBeInTheDocument();
@@ -239,6 +245,65 @@ describe('OverviewPage', () => {
     expect(fetchKillSwitch).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
     expect(fetchOrphans).toHaveBeenCalledTimes(1);
     expect(fetchOrphans).toHaveBeenCalledWith({ baseUrl: API_ORIGIN });
+  });
+
+  it('renders the PAPER view on the first paint, with no hydration-time mode change', async () => {
+    // Two profiles, one per mode, and two distinct ledgers: the first paint must
+    // be the paper side and nothing of the real side.
+    vi.mocked(fetchProfiles).mockResolvedValue({
+      profiles: [profile, { ...profile, profile_id: 'live-1', mode: 'live', equity: 7777 }],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: profiles.wallet,
+      wallets: {
+        paper: profiles.wallet ?? null,
+        live: {
+          name: 'binance',
+          mode: 'live',
+          initial_balance: 5000,
+          cash: 4900,
+          equity: 5200,
+          deployed: 300,
+          realized_pnl: 0,
+          unrealized_pnl: 200,
+          total_exposure: 300,
+          profiles: 1,
+          source: 'venue',
+          updated_at: '2024-01-01T00:00:00+00:00',
+          total_cash: 4900,
+          positions_value: 300,
+          total_portfolio_value: 5200,
+        },
+      },
+    });
+
+    render(await OverviewPage());
+
+    // The toggle starts checked on paper: the server render and the client's
+    // initial state are the same view, so hydration cannot flash or mismatch.
+    expect(screen.getByRole('radio', { name: /Paper trading/i })).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+    expect(screen.getByRole('radio', { name: /Real trading/i })).toHaveAttribute(
+      'aria-checked',
+      'false',
+    );
+
+    // The paper ledger totals, and only the paper profile.
+    const tiles = screen.getByTestId('wallet-tiles');
+    expect(within(tiles).getByText('$21,500.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('$25,750.00')).toBeInTheDocument();
+    expect(within(tiles).queryByText('$5,200.00')).not.toBeInTheDocument();
+
+    expect(screen.getByRole('article', { name: 'alpha' })).toBeInTheDocument();
+    expect(screen.queryByRole('article', { name: 'live-1' })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'Profiles — paper trading' }),
+    ).toBeInTheDocument();
+
+    // The details are collapsed on the very first render.
+    expect(screen.getByText('Show details')).toBeVisible();
+    expect(screen.getByTestId('wallet-details')).not.toBeVisible();
   });
 
   it('renders the empty state when the platform has no profile', async () => {
@@ -279,8 +344,8 @@ describe('OverviewPage', () => {
     // wallet panel is absent too — there is no payload to render it from.
     expect(screen.queryByText(/checked at/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /live updates/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('heading', { level: 2, name: 'Profiles' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'Platform wallet' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { level: 2, name: 'Profiles — paper trading' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Platform wallet — paper trading' })).not.toBeInTheDocument();
 
     expect(fetchHealth).toHaveBeenCalledTimes(1);
     expect(fetchProfiles).toHaveBeenCalledTimes(1);
@@ -335,7 +400,7 @@ describe('OverviewPage', () => {
     expect(screen.queryByText(/No payload was returned by/)).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
     expect(screen.getByText('$10,450.50')).toBeInTheDocument();
-    expect(screen.getByRole('region', { name: 'Platform wallet' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Platform wallet — paper trading' })).toBeInTheDocument();
     expect(screen.getByText(/checked at/i)).toHaveTextContent('2024-01-01 00:00:00 UTC');
 
     // And there is simply no warning banner to show.

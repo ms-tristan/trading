@@ -75,7 +75,7 @@ REALTIME_SECTIONS = (
     "## 6. The three commands",
     "## 7. What is NOT proven",
     "## 8. Profile lifecycle and candle history",
-    "## 9. The shared platform wallet",
+    "## 9. One ledger per mode",
 )
 
 #: A leading section number, e.g. ``4.1 `` in ``### 4.1 Orphaned positions ...``.
@@ -984,3 +984,100 @@ def test_realtime_page_documents_the_idle_poll_bound() -> None:
     assert "market_data.candles_skipped" in flattened
     # ... and the workaround the operator had to apply is no longer needed
     assert "no longer" in flattened
+
+
+# ---------------------------------------------------------------------------
+# one ledger per mode: §9, its Web-API key and the warm-up handover of §8
+# ---------------------------------------------------------------------------
+
+#: The two stable row ids of the ledger table, as §9 must spell them out.
+LEDGER_IDS = {"paper": "1", "live": "2"}
+
+
+def test_realtime_page_documents_one_ledger_per_mode() -> None:
+    """§9 states the per-mode rule, the stable row ids and the migration.
+
+    The section is the contract an operator reads before trusting a cash figure,
+    so it has to name the two ledgers, the row id of each, the migration that keeps
+    a legacy row as the paper one and the two properties that make the numbers
+    readable: the three totals and their formulas.
+    """
+    text = read(REALTIME)
+    section = text.split("## 9. One ledger per mode", 1)[1]
+    flattened = " ".join(section.split())
+
+    # the two ledgers and the modes they belong to
+    assert "RunMode.PAPER" in section
+    assert "RunMode.LIVE" in section
+    assert "paper" in section and "live" in section
+    # what each one is
+    assert "local simulated cash" in flattened
+    assert "read-only" in flattened and '"venue"' in section
+    # the id mapping table: 1 is paper, 2 is live, written down once
+    for label, identifier in LEDGER_IDS.items():
+        assert identifier in section, f"§9 does not name the {label} row id {identifier!r}"
+    assert "wallet_id" in section
+    # the migration, and what it preserves
+    assert "4 -> 5" in flattened or "4 -> 5" in section
+    assert "legacy row" in flattened
+    assert "as the paper ledger" in flattened
+    assert "no row" in flattened
+
+    # the three totals and their exact formulas
+    assert "total_cash" in section
+    assert "positions_value" in section
+    assert "total_portfolio_value" in section
+    assert "sum(profile.cash)" in flattened
+    assert "sum(profile.position_value)" in flattened
+    assert "sum(profile.equity)" in flattened
+    assert "total_cash + positions_value" in flattened
+    # ... and WHY the platform total equals the sum of the parts
+    assert "sum of the attributed per-profile figures" in flattened
+
+    # the caveat that must stay: the durable cash differs by the entry fees
+    assert "entry" in flattened and "fee" in flattened
+    assert "not a bug" in flattened or "It is not one" in flattened
+
+
+def test_realtime_page_documents_the_per_mode_web_api_key() -> None:
+    """§5 documents the additive ``wallets`` key of both read routes."""
+    text = read(REALTIME)
+    section = text.split("## 5. Web API reference", 1)[1].split("## 6.", 1)[0]
+
+    # the key is named, on both routes that carry it
+    assert "wallets" in section
+    assert "GET /api/health" in section
+    assert "GET /api/profiles" in section
+    assert "| `GET /api/profiles` |" in text
+    # its exact shape, and the explicit null of an absent mode
+    flattened = " ".join(section.split())
+    assert '"paper"' in section and '"live"' in section
+    assert "null" in section
+    # one request renders either mode, no second round trip
+    assert "no second round trip" in flattened
+    # ``wallet`` is unchanged and is the paper/default ledger
+    assert "paper/default ledger" in flattened
+    assert "always present" in flattened
+
+
+def test_realtime_page_documents_the_optional_warmup_override() -> None:
+    """§8 hands the warm-up semantics over: omitted means the requirement.
+
+    The three assertions that matter are the three rules of the new contract: an
+    omitted ``warmup_candles`` means "the strategy's own requirement", an explicit
+    value is an override, and an override below the requirement is refused.
+    """
+    text = read(REALTIME)
+    section = text.split("## 8. Profile lifecycle and candle history", 1)[1].split("## 9.", 1)[0]
+    flattened = " ".join(section.split())
+
+    assert "the strategy" in flattened and "requirement" in flattened
+    assert "override" in flattened
+    assert "resolved" in flattened
+    # an override below the requirement is still refused, and persists ERROR at start
+    assert "strategy-warmup-impossible" in section
+    assert "400" in section
+    assert "ERROR" in section
+    # ``realtime check`` reports the RESOLVED value now
+    assert "RESOLVED value" in flattened
+    assert "realtime check" in section

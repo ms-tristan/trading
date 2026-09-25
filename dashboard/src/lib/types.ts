@@ -72,6 +72,17 @@ export interface ProfileHealth {
  * the cash actually lives: `'local'` is the persisted paper ledger the platform
  * debits itself, `'venue'` is the account of the exchange in live mode, which
  * the platform mirrors **read-only** and never debits locally.
+ *
+ * `cash` is the **durable ledger** cash — what the engine can still fund orders
+ * with — and is *not* the sum of the attributed per-profile `cash`: the two
+ * differ by the entry fees of the open positions, and that difference is
+ * intentional. The summed figure is {@link WalletSnapshot.total_cash}.
+ * `total_portfolio_value` *is* exactly the sum of the per-profile equity.
+ *
+ * The three `total_*` fields below are optional for the same backward-compatible
+ * reason as every other late-added field of this contract: a server that does
+ * not emit them yet stays a valid producer and the UI renders the em dash
+ * placeholder.
  */
 export interface WalletSnapshot {
   /** Display name of the wallet (`platform` for the shared ledger). */
@@ -98,6 +109,24 @@ export interface WalletSnapshot {
   source: 'local' | 'venue';
   /** ISO-8601 stamp of the last wallet update. */
   updated_at: string | null;
+  /** Sum of the profiles' attributed cash: what is free to deploy across the mode. */
+  total_cash?: number | null;
+  /** Sum of the profiles' position value: the mark-to-market of their open positions. */
+  positions_value?: number | null;
+  /** `total_cash + positions_value`: exactly `sum(profile.equity)`. */
+  total_portfolio_value?: number | null;
+}
+
+/**
+ * The per-mode ledgers of `GET /api/profiles` and `GET /api/health` (`wallets`).
+ *
+ * `paper` is the simulated ledger the broker mutates; `live` mirrors the venue account and is
+ * `null` until that ledger holds a row. The key is additive: `wallet` above stays the
+ * paper/default ledger and is byte-identical to what it always was.
+ */
+export interface WalletLedgers {
+  paper: WalletSnapshot | null;
+  live: WalletSnapshot | null;
 }
 
 /**
@@ -150,11 +179,17 @@ export interface ProfileSnapshot {
  * `wallet` is the shared platform wallet; it is optional here because a server
  * that does not emit it yet stays a valid producer, and the read routes
  * normalise that absence to an explicit `null`.
+ *
+ * `wallets` is the mode-keyed view of the same ledgers ({@link WalletLedgers}),
+ * optional for that very same backward-compatible reason: an older server does
+ * not emit the key at all, and the read routes then normalise it to an explicit
+ * `null`.
  */
 export interface ProfilesPayload {
   profiles: ProfileSnapshot[];
   generated_at: string | null;
   wallet?: WalletSnapshot | null;
+  wallets?: WalletLedgers | null;
 }
 
 /**
@@ -226,6 +261,11 @@ export interface OrphanReport {
  * `wallet` is the shared platform wallet (same value as the one of
  * `GET /api/profiles`), optional for the same backward-compatible reason.
  *
+ * `wallets` is the mode-keyed view of the same ledgers ({@link WalletLedgers}),
+ * optional for that very same reason: a server that does not emit the key stays
+ * a valid producer, and the read routes normalise the absence to an explicit
+ * `null`.
+ *
  * `orphaned_positions` is the report of the startup safety sweep, optional for
  * that same reason: a server that does not emit the key stays a valid producer,
  * and the dashboard then renders no warning.
@@ -239,6 +279,7 @@ export interface HealthPayload {
   kill_switch: boolean;
   checked_at: string | null;
   wallet?: WalletSnapshot | null;
+  wallets?: WalletLedgers | null;
   orphaned_positions?: OrphanReport | null;
 }
 

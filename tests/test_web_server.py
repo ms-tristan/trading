@@ -365,6 +365,7 @@ def test_real_round_trip_on_health_and_profiles(server: MonitoringServer) -> Non
         "uptime_seconds",
         "version",
         "wallet",
+        "wallets",
     ]
     # The shared platform wallet is **additive**: the key is always present, and a
     # provider that reports no wallet answers an explicit ``null`` instead of
@@ -380,7 +381,7 @@ def test_real_round_trip_on_health_and_profiles(server: MonitoringServer) -> Non
     status, _, payload = http_request(server, "GET", "/api/profiles")
     assert status == 200
     profiles = decode(payload)
-    assert sorted(profiles) == ["generated_at", "profiles", "wallet"]
+    assert sorted(profiles) == ["generated_at", "profiles", "wallet", "wallets"]
     assert profiles["wallet"] is None
     assert [item["profile_id"] for item in profiles["profiles"]] == [PROFILE_A]
 
@@ -715,7 +716,7 @@ def test_serve_can_handle_exactly_one_request(provider: FakeProvider, monitor: M
     try:
         status, _, payload = http_request(built, "GET", "/api/profiles")
         assert status == 200
-        assert sorted(decode(payload)) == ["generated_at", "profiles", "wallet"]
+        assert sorted(decode(payload)) == ["generated_at", "profiles", "wallet", "wallets"]
         worker.join(timeout=SHUTDOWN_TIMEOUT)
         assert not worker.is_alive()
     finally:
