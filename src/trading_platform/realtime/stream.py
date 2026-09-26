@@ -33,8 +33,10 @@ Contract shared by every implementation
   strategy a truncated window -- and, on a live venue, would trade a past signal
   at the present price.  A deliberate replay of a past window is
   :class:`ReplayMarketStream`'s job, never the live streams'.
-* every ``await`` on a wait of our own is bounded by ``asyncio.wait_for`` with an
-  explicit timeout; a retry loop is bounded by ``max_reconnects`` and ends in a
+* every wait of this layer goes through :mod:`trading_platform.realtime.waits`: a
+  *pacing* wait (an idle poll, a retry backoff) can never raise -- a delayed loop is
+  survivable by construction -- and a *read* that must answer is bounded and names
+  itself if it gives up.  A retry loop is bounded by ``max_reconnects`` and ends in a
   :class:`~trading_platform.core.errors.MarketStreamError`.
 
 Declared wait and the caller's bound
@@ -49,7 +51,11 @@ ones and the 30 s / 10 s pair the Docker deployment ships.  Deriving that bound 
 stream timeout alone is what crash-looped the platform: the polling stream idled for the
 profile's 30 s poll interval while the caller's bound wrapped only the 10 s stream
 timeout, so every profile died with a ``TimeoutError`` on its first idle poll.  The
-declared wait is what keeps an idle poll from being cut.
+declared wait is what keeps the caller's bound from being derived too narrowly; it is
+not what keeps a delayed idle poll alive -- no finite bound survives a frozen loop.
+That second guarantee is behavioural: an expired *pacing* wait is abandoned and
+reported and never raises (see :func:`~trading_platform.realtime.waits.paced_wait`),
+so an idle poll that overran its bound is a delay, never a dead profile.
 
 Time-free replay vs wall-clock time
 -----------------------------------
@@ -60,9 +66,36 @@ whatever the machine does.  The polling and ``ccxt.pro`` streams take a
 so that no module of the realtime layer ever calls ``datetime.now()`` or
 ``time.time()`` directly.
 
-The synchronous provider call of :class:`PollingMarketStream` is *not* wrapped in
-``asyncio.wait_for``: it is a blocking call, and it is the provider's own HTTP
-timeout (``requests``/``ccxt``) that bounds it.  Every wait *we* own is bounded.
+The provider read of :class:`PollingMarketStream` runs off the event loop
+-------------------------------------------------------------------------
+:class:`~trading_platform.data.loader.MarketDataProvider` is synchronous by
+contract, and calling it straight from a coroutine froze the one event loop every
+profile of a process shares: for the whole HTTP round trip no other profile's timer
+could fire, and any profile whose deadline the freeze crossed was then reported as a
+failed one.  The polling stream therefore hands the call to
+:func:`asyncio.to_thread` (the default executor): a worker thread performs the
+blocking read while the loop keeps firing every other profile's deadlines.
+
+Two properties of that seam are load-bearing, and the code around it assumes them:
+
+* a worker thread cannot be cancelled.  Abandoning a tick -- a bound that expired, a
+  stopped profile -- abandons the *answer*, never the call: the thread runs to
+  completion in the background and its result is dropped;
+* moving the read off the loop does not make it free.  A provider that burns CPU --
+  decoding a large payload, :func:`~trading_platform.data.validation.ensure_ohlcv`
+  over a wide frame -- still competes for the GIL with the loop.  The off-loop read
+  removes the dominant freeze; what makes a remaining delay survivable for any
+  configuration is the pacing rule stated next.
+
+A bound is head-room, never a guarantee: a shared loop frozen by anything can push a
+healthy wait past its bound, and no finite margin survives that.  What this module
+delivers instead is that a bound expiring can no longer be *reported as a failure*.
+A pacing wait is abandoned quietly by
+:func:`~trading_platform.realtime.waits.paced_wait` (it reports the delay and returns,
+it never raises), while a read that must answer goes through
+:func:`~trading_platform.realtime.waits.awaited_within`, which returns an answer that
+arrived late and, when it really gives up, raises a ``TimeoutError`` naming the call
+and its budget -- never the empty message of a crashed profile.
 """
 
 from __future__ import annotations
@@ -70,7 +103,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 import pandas as pd
@@ -84,6 +117,7 @@ from trading_platform.core.constants import (
 from trading_platform.core.errors import DataValidationError, MarketStreamError
 from trading_platform.data.loader import MarketDataProvider
 from trading_platform.data.validation import ensure_ohlcv
+from trading_platform.realtime import waits
 from trading_platform.realtime.clock import Clock
 from trading_platform.realtime.models import CandleEvent
 
@@ -107,14 +141,63 @@ LOGGER = logging.getLogger(__name__)
 _FAN_OUT_TIMEOUT_SECONDS = 10.0
 
 
-#: Message raised when the optional ``exchange`` extra (ccxt/ccxt.pro) is missing.
-def _wait_bound(delay: float) -> float:
-    """Return a bound strictly greater than the pacing wait it wraps.
+#: Event name of the one WARNING a delayed pacing wait reports.
+#:
+#: A pacing wait that the loop could not honour in time is not a failure, so it is
+#: reported once -- with what was expected and what it really took -- and never
+#: recorded as a failed poll.  Duplicated nowhere: both retrying streams log this
+#: exact event through :func:`_pacing_wait_observer`.
+_PACING_WAIT_DELAYED_EVENT = "market_data.pacing_wait_delayed"
 
-    See :data:`_WAIT_MARGIN_RATIO`: the bound must never equal the wait, or the
-    two deadlines collide and a healthy idle poll is reported as a timeout.
+
+def _pacing_wait_observer(
+    exchange: str,
+    *,
+    attempt: int | None = None,
+) -> Callable[[float, float], None]:
+    """Return the observer a pacing wait reports a delay through.
+
+    Parameters
+    ----------
+    exchange:
+        Venue the delayed wait belongs to, carried for observability.
+    attempt:
+        Retry attempt the wait belongs to, when it is a backoff; the idle poll of a
+        stream has no attempt to name and leaves it out.
     """
-    return max(0.0, float(delay)) * (1.0 + _WAIT_MARGIN_RATIO) + _WAIT_MARGIN_FLOOR_SECONDS
+
+    def observe(expected_seconds: float, elapsed_seconds: float) -> None:
+        extra: dict[str, Any] = {
+            "event": _PACING_WAIT_DELAYED_EVENT,
+            "exchange": exchange,
+            "expected_seconds": expected_seconds,
+            "bound_seconds": waits.wait_bound(expected_seconds),
+            "elapsed_seconds": elapsed_seconds,
+        }
+        if attempt is not None:
+            extra["attempt"] = attempt
+        LOGGER.warning(f"realtime.{_PACING_WAIT_DELAYED_EVENT}", extra=extra)
+
+    return observe
+
+
+def _wait_bound(delay: float) -> float:
+    """Return the bound this module applies around a pacing wait of ``delay``.
+
+    One line of delegation, on purpose: the arithmetic (5 % plus a 50 ms floor) lives
+    in :func:`trading_platform.realtime.waits.wait_bound` and nowhere else, so the
+    stream, the runner and the orchestrator cannot drift apart on the same
+    configuration again.
+
+    That head-room is not a guarantee -- a loop frozen by a blocking call can push a
+    healthy wait past it, and no finite margin survives that.  What holds is that the
+    bound of a *pacing* wait can never turn into a failure
+    (:func:`~trading_platform.realtime.waits.paced_wait` abandons a delayed sleeper
+    and returns), and that a bound applied to a *read* never cuts a call that
+    answered, however late it was
+    (:func:`~trading_platform.realtime.waits.awaited_within`).
+    """
+    return waits.wait_bound(delay)
 
 
 def max_backoff_seconds(base: float, max_reconnects: int) -> float:
@@ -143,24 +226,7 @@ def max_backoff_seconds(base: float, max_reconnects: int) -> float:
     return max(0.0, float(base)) * float(2 ** (int(max_reconnects) - 1) - 1)
 
 
-_MISSING_CCXT_PRO = "ccxt.pro is not installed: pip install -e '.[exchange]'"
-
-#: Head-room added to the bound of every pacing wait this module owns.
-#:
-#: Every wait of the layer is bounded (that is the rule), but a bound *equal to the
-#: wait it wraps* is a race, not a bound: the idle wait used the profile's poll
-#: interval while the bound used the stream timeout, so an operator configuring
-#: both to the same value -- the natural thing to do, and the shape the Docker
-#: deployment ships -- got a ``TimeoutError`` on the first idle poll, which killed
-#: every profile and crash-looped the container.  A pacing wait is also not a read:
-#: its duration is the poll interval (or a retry backoff), never the stream
-#: timeout, so its bound is derived from the wait itself -- proportional, plus a
-#: small floor -- which keeps every configured delay intact and can never be the
-#: cause of its own timeout.
-_WAIT_MARGIN_RATIO = 0.05
-_WAIT_MARGIN_FLOOR_SECONDS = 0.05
-
-
+#: Message raised when the optional ``exchange`` extra (ccxt/ccxt.pro) is missing.
 _MISSING_CCXT_PRO = "ccxt.pro is not installed: pip install -e '.[exchange]'"
 
 
@@ -310,6 +376,14 @@ class MarketStream(Protocol):
         STRICTLY GREATER than the longest wait that call can take, for ANY
         (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
         equal ones and the deployment's 30 s / 10 s.
+
+        That ordering keeps a healthy wait from being cut; it is not what makes the
+        stream survive a delayed loop.  What makes it survive is that a pacing wait
+        cannot fail: when this declared wait is exceeded anyway -- the loop was frozen
+        by a blocking call, a collection, a slow disk -- the wait is abandoned and
+        reported, and **a delayed wait is never recorded as a failure**: the stream
+        stays connected, its ``last_error`` stays ``None`` and its
+        ``reconnect_count`` does not move.
         """
         ...  # pragma: no cover - protocol definition
 
@@ -525,6 +599,17 @@ class PollingMarketStream:
     behave exactly like the backtest engine: the signal is evaluated at the close
     of candle ``t`` and filled at the open of ``t + 1``.
 
+    The provider read runs **off the event loop**: ``fetch_ohlcv`` is synchronous by
+    contract, so the stream calls it through :func:`asyncio.to_thread` (the default
+    executor) in :meth:`next_candle` and in :meth:`history`.  A profile's HTTP round
+    trip therefore occupies a worker thread instead of freezing the one loop every
+    profile of the process shares -- the freeze that turned other profiles' idle
+    polls into fatal ``TimeoutError`` records.  Two properties of that seam matter:
+    a worker thread cannot be cancelled (abandoning a tick abandons the *answer*,
+    the call finishes on its own), and a provider that burns CPU still competes for
+    the GIL with the loop -- which is why the pacing waits below are built so that a
+    delayed one can never be reported as a failure.
+
     Parameters
     ----------
     provider:
@@ -540,7 +625,11 @@ class PollingMarketStream:
         poll interval before returning ``None``, so a runner looping on
         ``next_candle`` is paced instead of busy-waiting on the provider.
     timeout_seconds:
-        Explicit bound of every wait this class owns.
+        Explicit bound of a single provider read; a read that does not answer inside
+        it (plus the late grace window of
+        :func:`~trading_platform.realtime.waits.awaited_within`) is a failed poll.
+        The pacing waits are not bounded by it: they are bounded by their own
+        configured duration, see :meth:`_bounded_sleep`.
     max_reconnects:
         Number of consecutive failed polls tolerated before giving up with
         :class:`MarketStreamError`.
@@ -623,8 +712,9 @@ class PollingMarketStream:
         ``stamp``, which is only a complete window when ``stamp`` is the latest
         closed candle.
 
-        When the provider fails (or answers an empty/invalid frame) the stream
-        records the error, backs off for a bounded delay and retries, up to
+        When the provider fails, answers an empty/invalid frame, or does not answer
+        inside ``timeout_seconds`` (plus one late grace window), the stream records
+        the error, backs off for a bounded pacing delay and retries, up to
         ``max_reconnects`` consecutive attempts.
 
         Raises
@@ -644,9 +734,17 @@ class PollingMarketStream:
             frame: pd.DataFrame | None = None
             cause: BaseException | None = None
             try:
-                # The provider call is synchronous by contract: it is bounded by
-                # the provider's own HTTP timeout, not by asyncio.wait_for.
-                raw = self._provider.fetch_ohlcv(symbol, timeframe, since, until)
+                # The provider is synchronous by contract: it is called on a worker
+                # thread, so its HTTP round trip cannot freeze the loop every profile
+                # of this process shares, and the read stays bounded here -- a read
+                # that never answers becomes an ordinary poll failure of this stream
+                # (with a message that names it) instead of an empty TimeoutError
+                # escaping into the runner's fatal path.
+                raw = await waits.awaited_within(
+                    asyncio.to_thread(self._provider.fetch_ohlcv, symbol, timeframe, since, until),
+                    bound=self._timeout_seconds,
+                    label=f"the provider read for {symbol} {timeframe}",
+                )
                 frame = ensure_ohlcv(raw, name=f"{symbol} {timeframe}")
             except Exception as exc:  # any provider failure is a stream failure
                 cause = exc
@@ -706,6 +804,11 @@ class PollingMarketStream:
         failure, an unknown symbol or an invalid frame yields an empty OHLCV
         frame -- this method never raises and never changes the health state.
 
+        The provider read is off the loop here too (see the class docstring), so a
+        slow warm-up fetch delays no other profile; it is bounded by
+        ``timeout_seconds`` plus the late grace window, and a read that never answers
+        is reported through ``market_data.history_failed`` like any other failure.
+
         See Also
         --------
         MarketStream.history
@@ -716,7 +819,11 @@ class PollingMarketStream:
             delta = candle_delta(timeframe)
             until = pd.Timestamp(self._clock.now())
             since = until - int(count) * delta
-            raw = self._provider.fetch_ohlcv(symbol, timeframe, since, until)
+            raw = await waits.awaited_within(
+                asyncio.to_thread(self._provider.fetch_ohlcv, symbol, timeframe, since, until),
+                bound=self._timeout_seconds,
+                label=f"the provider history read for {symbol} {timeframe}",
+            )
             return ensure_ohlcv(raw, name=f"{symbol} {timeframe}")
         except Exception as exc:  # history is a best-effort read model
             LOGGER.warning(
@@ -725,7 +832,7 @@ class PollingMarketStream:
                     "event": "market_data.history_failed",
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "error": str(exc),
+                    "error": _failure_message(exc),
                 },
             )
             return _empty_frame()
@@ -733,26 +840,42 @@ class PollingMarketStream:
     # -- internals ---------------------------------------------------------
 
     async def _idle(self) -> None:
-        """Wait one poll interval (bounded) before reporting "nothing new"."""
+        """Wait one poll interval (paced) before reporting "nothing new"."""
         await self._bounded_sleep(self._poll_interval_seconds)
 
     async def _bounded_sleep(self, seconds: float) -> None:
-        """Sleep ``seconds`` under a bound that can never cut the sleep itself.
+        """Wait ``seconds`` of pacing time; **never raises ``TimeoutError``**.
 
-        A *pacing* wait is not a stream read: its nominal duration is the poll
-        interval (or a retry backoff), not the stream timeout, so bounding it by
-        ``timeout_seconds`` made the bound equal to the wait whenever an operator
-        configured the two to the same value -- and the two deadlines then
-        collided on the first idle poll, raising ``TimeoutError`` and crash-looping
-        the deployment.  The bound is now derived from the wait itself, which keeps
-        every configured delay intact and can never be the cause of its own
-        timeout.
+        A *pacing* wait is not a read: its nominal duration is the poll interval (or a
+        retry backoff), never the stream timeout, so bounding it by
+        ``timeout_seconds`` was a category error -- and bounding it by anything at all
+        was a crash waiting to happen, because a shared loop frozen by another
+        profile's blocking call pushes a healthy sleep past any finite bound.
+
+        The wait is therefore handed to :func:`~trading_platform.realtime.waits.paced_wait`:
+        it runs under :func:`~trading_platform.realtime.waits.wait_bound` (the same
+        arithmetic :func:`_wait_bound` delegates to), and when that bound expires the
+        sleeper is abandoned quietly and the call returns normally, reporting the delay
+        through exactly one ``market_data.pacing_wait_delayed`` WARNING.  Nothing here
+        can raise: whatever the configured poll interval, stream timeout, reconnect
+        budget and number of profiles sharing the loop, and however long another
+        coroutine froze that loop, a delayed idle poll is a delay -- not a failure.
         """
         delay = max(0.0, float(seconds))
-        await asyncio.wait_for(self._clock.sleep(delay), timeout=_wait_bound(delay))
+        await waits.paced_wait(
+            self._clock,
+            delay,
+            on_delayed=_pacing_wait_observer(self._exchange),
+        )
 
     async def _backoff(self, attempt: int) -> None:
-        """Sleep the bounded exponential backoff of failed attempt ``attempt``."""
+        """Sleep the paced exponential backoff of failed attempt ``attempt``.
+
+        The delay grows with the attempt (1 s, 2 s, 4 s …) and may pass the stream
+        timeout: it is a pacing wait, so it goes through :meth:`_bounded_sleep` and an
+        expired bound is a reported delay, never a ``TimeoutError`` that would kill a
+        profile over a failure the stream is designed to ride out.
+        """
         await self._bounded_sleep(self._reconnect_backoff_seconds * 2 ** (attempt - 1))
 
     def _record_failure(self, message: str) -> None:
@@ -805,6 +928,10 @@ class PollingMarketStream:
         backoff series of :meth:`_backoff`.  Whichever is longer is what a caller has
         to accommodate: bounding this call by ``timeout_seconds`` alone cut a healthy
         idle poll into a ``TimeoutError`` and crash-looped the deployment.
+
+        Exceeding this declared wait anyway is survivable and is not a failure: the
+        pacing wait is abandoned, the delay is reported once and the stream stays
+        connected with ``last_error is None``.
         """
         return max(
             self._poll_interval_seconds,
@@ -832,7 +959,8 @@ class CcxtProMarketStream:
     exchange:
         ``ccxt.pro`` exchange id (``binance``, ``kraken``, ...).
     timeout_seconds:
-        Explicit bound of every wait this class owns.
+        Explicit bound of a single venue read (``watch_ohlcv``/``fetch_ohlcv``) and of
+        the teardown; the pacing backoff is bounded by its own configured delay.
     history_candles:
         Default depth of :meth:`history`.
     max_reconnects:
@@ -897,7 +1025,15 @@ class CcxtProMarketStream:
         self._last_error = None
 
     async def stop(self) -> None:
-        """Close the exchange handle; never raises."""
+        """Close the exchange handle; never raises.
+
+        ``ccxt.pro`` closes asynchronously, but the seam also accepts a handle whose
+        teardown is a plain synchronous function -- which used to run on the shared
+        event loop for the whole teardown.  A coroutine teardown is bounded by
+        ``timeout_seconds`` (plus one late grace window), a synchronous one runs on a
+        worker thread; either way a failing close is reported through
+        ``market_data.close_failed`` and never propagates.
+        """
         exchange = self._exchange
         self._exchange = None
         self._connected = False
@@ -906,20 +1042,33 @@ class CcxtProMarketStream:
         close = getattr(exchange, "close", None)
         if close is None:
             return
+        label = f"closing the {self._exchange_name} exchange"
         try:
-            result = close()
-            if inspect.isawaitable(result):
-                await asyncio.wait_for(result, timeout=self._timeout_seconds)
+            if inspect.iscoroutinefunction(close):
+                await waits.awaited_within(close(), bound=self._timeout_seconds, label=label)
+            else:
+                # A synchronous teardown is blocking I/O of the venue: run it on a
+                # worker thread so it cannot freeze the loop every profile shares.
+                result = await asyncio.to_thread(close)
+                if inspect.isawaitable(result):
+                    # A hand-rolled handle may expose a plain function that returns
+                    # an awaitable; it is still bounded, and still always awaited.
+                    await waits.awaited_within(result, bound=self._timeout_seconds, label=label)
         except Exception as exc:  # a failing close must not break the shutdown
             LOGGER.warning(
                 "realtime.market_data.close_failed",
-                extra={"event": "market_data.close_failed", "error": str(exc)},
+                extra={"event": "market_data.close_failed", "error": _failure_message(exc)},
             )
 
     # -- data --------------------------------------------------------------
 
     async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
         """Read the venue stream and return the next closed candle, or ``None``.
+
+        The venue read is bounded by ``timeout_seconds`` plus one late grace window: an
+        answer that arrived late because the shared loop was busy is returned instead
+        of being cut, and a read that never answers is a failed attempt whose error
+        names it -- never the empty ``TimeoutError`` of a crashed profile.
 
         Raises
         ------
@@ -937,9 +1086,10 @@ class CcxtProMarketStream:
             frame: pd.DataFrame | None = None
             cause: BaseException | None = None
             try:
-                rows = await asyncio.wait_for(
+                rows = await waits.awaited_within(
                     self._exchange.watch_ohlcv(symbol, timeframe),
-                    timeout=self._timeout_seconds,
+                    bound=self._timeout_seconds,
+                    label=f"the venue read for {symbol} {timeframe}",
                 )
                 frame = _rows_to_frame(rows, name=f"{symbol} {timeframe}")
             except Exception as exc:  # venue error, bounded timeout or invalid payload
@@ -978,7 +1128,9 @@ class CcxtProMarketStream:
         """Fetch up to ``count`` recent candles; empty frame on failure.
 
         Never raises: a venue failure, an unknown symbol or an invalid payload
-        yields an empty OHLCV frame.
+        yields an empty OHLCV frame.  The read is bounded like the one of
+        :meth:`next_candle` (bound plus one late grace window), so a late answer is
+        still returned instead of being turned into a failure.
         """
         if count <= 0:
             return _empty_frame()
@@ -986,9 +1138,10 @@ class CcxtProMarketStream:
         if exchange is None:
             return _empty_frame()
         try:
-            rows = await asyncio.wait_for(
+            rows = await waits.awaited_within(
                 exchange.fetch_ohlcv(symbol, timeframe, None, int(count)),
-                timeout=self._timeout_seconds,
+                bound=self._timeout_seconds,
+                label=f"the venue history read for {symbol} {timeframe}",
             )
             return _rows_to_frame(rows, name=f"{symbol} {timeframe}")
         except Exception as exc:  # history is a best-effort read model
@@ -998,7 +1151,7 @@ class CcxtProMarketStream:
                     "event": "market_data.history_failed",
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "error": str(exc),
+                    "error": _failure_message(exc),
                 },
             )
             return _empty_frame()
@@ -1006,15 +1159,20 @@ class CcxtProMarketStream:
     # -- internals ---------------------------------------------------------
 
     async def _backoff(self, attempt: int) -> None:
-        """Sleep the bounded exponential backoff of failed attempt ``attempt``.
+        """Sleep the paced exponential backoff of failed attempt ``attempt``.
 
         The delay grows with the attempt (2 s, 4 s, 8 s …) and may pass the stream
         timeout: it is a pacing wait, so it is bounded by its own duration plus a
-        proportional margin rather than by the read timeout, which used to cut a
-        retryable venue failure short with a ``TimeoutError``.
+        proportional margin rather than by the read timeout, and an expired bound is
+        a reported delay -- never a ``TimeoutError`` that would cut a retryable venue
+        failure short and kill the profile.
         """
         delay = self._reconnect_backoff_seconds * 2 ** (attempt - 1)
-        await asyncio.wait_for(self._clock.sleep(delay), timeout=_wait_bound(delay))
+        await waits.paced_wait(
+            self._clock,
+            delay,
+            on_delayed=_pacing_wait_observer(self._exchange_name, attempt=attempt),
+        )
 
     def _record_failure(self, message: str) -> None:
         """Record a failed read: health, counter and one structured warning."""
@@ -1061,11 +1219,13 @@ class CcxtProMarketStream:
     def max_wait_seconds(self) -> float:
         """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
 
-        The ``watch_ohlcv`` read is already bounded by :attr:`timeout_seconds`, and a
-        failed read may then sleep the whole bounded backoff series of
-        :meth:`_backoff`, so the longest legitimate wait is the longer of the two --
-        a caller bound by the read timeout alone would cut a retry the stream is
-        entitled to take.
+        The ``watch_ohlcv`` read is bounded by :attr:`timeout_seconds`, and a failed
+        read may then sleep the whole bounded backoff series of :meth:`_backoff`, so
+        the longest legitimate wait is the longer of the two -- a caller bound by the
+        read timeout alone would cut a retry the stream is entitled to take.
+
+        Exceeding this declared wait anyway is survivable and is not a failure: the
+        pacing wait is abandoned, the delay is reported once and the stream stays up.
         """
         return max(
             self._timeout_seconds,
@@ -1165,15 +1325,20 @@ class CompositeMarketStream:
     async def _fan_out(self, method: str, *, record: bool = True) -> None:
         """Call ``method`` on every child concurrently, bounded by a timeout.
 
-        The fan-out is bounded by :data:`_FAN_OUT_TIMEOUT_SECONDS`, so a hung
-        child can never hang the composite (and therefore never the event loop).
+        The fan-out goes through
+        :func:`~trading_platform.realtime.waits.awaited_within`, so it is bounded by
+        :data:`_FAN_OUT_TIMEOUT_SECONDS` plus one late grace window and a hung child
+        can never hang the composite (and therefore never the event loop).  A
+        fan-out that *finished* late still returns its results: only a child that
+        never answers at all is given up on.
         """
         keys = self.keys()
         coroutines = [getattr(self._streams[key], method)() for key in keys]
         try:
-            results = await asyncio.wait_for(
+            results = await waits.awaited_within(
                 asyncio.gather(*coroutines, return_exceptions=True),
-                timeout=_FAN_OUT_TIMEOUT_SECONDS,
+                bound=_FAN_OUT_TIMEOUT_SECONDS,
+                label=f"the {method} fan-out of the composite stream",
             )
         except TimeoutError as exc:
             if record:

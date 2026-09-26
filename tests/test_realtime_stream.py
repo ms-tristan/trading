@@ -13,22 +13,44 @@ Covers, offline and deterministically:
 * :class:`CompositeMarketStream` -- routing, isolation of a failing child,
   aggregate health and the timeout of its fan-out;
 * structural conformance of the four classes to the documented
-  :class:`MarketStream` member set.
+  :class:`MarketStream` member set;
+* the shared event loop (section 8): the provider read no longer runs on the loop
+  (a blocking read delays no peer), a *deterministic* freeze past the bound of an
+  idle poll leaves the stream healthy instead of raising ``TimeoutError``, a
+  provider slower than the stream timeout is an ordinary retried poll failure, and
+  a synchronous ``close()`` runs off the loop.  That section is the stream-level
+  half of the failing-first regression of the ``TimeoutError: `` profile crash.
 
 Every coroutine of this module is awaited through :func:`run`, which wraps it in
 ``asyncio.wait_for(..., timeout=1)``: a hung implementation fails the suite
-instead of hanging it.  No socket, no network, no wall-clock dependency, no
-fixed TCP port, no import of any other realtime work package (local fakes only).
+instead of hanging it.  No socket, no network, no fixed TCP port, and -- apart from
+:mod:`trading_platform.realtime.waits`, whose arithmetic the delegation of
+``_wait_bound`` is pinned against -- no import of another realtime work package
+(local fakes only).
+
+The freeze scenarios are *driven*, never waited for: :class:`FreezingClock` blocks
+the loop from inside the pacing sleep itself, with the bound already registered and
+the sleeper not yet started, so the delayed idle poll is deterministic rather than
+lucky.  The three off-loop tests do measure real durations, and their tolerance is
+one order of magnitude below the blocking call they discriminate against (a 0.05 s
+peer against a 0.4 s freeze): a slow machine cannot turn a free loop into a frozen
+one, and a frozen loop cannot pass as a free one.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import contextlib
 import json
+import logging
 import sys
+import threading
 import time
 import types
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -38,6 +60,7 @@ import pytest
 from trading_platform.core.constants import REQUIRED_OHLCV_COLUMNS, candle_delta
 from trading_platform.core.errors import MarketStreamError
 from trading_platform.realtime import stream as stream_module
+from trading_platform.realtime import waits
 from trading_platform.realtime.clock import ManualClock, SystemClock
 from trading_platform.realtime.models import CandleEvent
 from trading_platform.realtime.stream import (
@@ -73,9 +96,14 @@ ETH = "ETH/USDT"
 HOUR = "1h"
 
 
-def run(coro: Any) -> Any:
-    """Run one coroutine under an explicit bound so nothing can hang the suite."""
-    return asyncio.run(asyncio.wait_for(coro, timeout=TIMEOUT))
+def run(coro: Any, *, timeout: float = TIMEOUT) -> Any:
+    """Run one coroutine under an explicit bound so nothing can hang the suite.
+
+    A scenario that deliberately waits out several real deadlines (a slow provider
+    read, a bounded close) raises its own ``timeout``; every other scenario keeps
+    the module default.
+    """
+    return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
 
 
 # ---------------------------------------------------------------------------
@@ -1548,3 +1576,442 @@ def test_the_harness_bounds_a_hung_implementation() -> None:
 
     with pytest.raises(TimeoutError):
         run(hangs())
+
+
+# ---------------------------------------------------------------------------
+# 8. the shared event loop: off-loop reads and a never-fatal pacing wait
+# ---------------------------------------------------------------------------
+
+#: How long the blocking provider of the off-loop tests freezes its calling thread.
+BLOCKING_FETCH_SECONDS = 0.4
+
+#: How long a provider slower than the stream timeout blocks, per attempt.
+SLOW_READ_SECONDS = 0.5
+
+#: How long the synchronous venue teardown of the off-loop ``stop`` test blocks.
+CLOSE_SECONDS = 0.4
+
+#: Delay of the peer wait that shares the loop with a read or a teardown.
+PEER_DELAY_SECONDS = 0.05
+
+#: Late limit of that peer.  Strictly below the blocking durations above, so the two
+#: cases these tests tell apart can never overlap: a peer of a *frozen* loop cannot
+#: answer before the freeze that held it ended, while a peer of a free loop answers
+#: at its own delay.
+PEER_LATE_LIMIT_SECONDS = 0.3
+
+#: The equal pair of the incident: the idle wait and the stream timeout are the same.
+IDLE_POLL_SECONDS = 0.2
+
+#: How long :class:`FreezingClock` freezes the loop from inside the pacing sleep.
+#: Longer than the bound of that wait (``0.2 * 1.05 + 0.05 = 0.26 s``), so the bound
+#: is already overdue when the loop resumes: the outage's mechanism, driven by the
+#: harness instead of by luck.
+FREEZE_SECONDS = 0.3
+
+#: A scenario that waits out several abandoned reads needs more than the default.
+SLOW_READ_SCENARIO_TIMEOUT = 5.0
+
+
+async def observe_peer_delay(delay: float = PEER_DELAY_SECONDS) -> float:
+    """Wait ``delay`` on an event nobody sets; return how long the wait really took.
+
+    The peer of the shared-loop tests: it performs no I/O of its own, so the only
+    thing that can make it late is the event loop being busy -- another profile's
+    blocking call.  The event is never set, so the built-in ``TimeoutError`` is this
+    helper's normal ending, and the elapsed time is what the caller asserts on.
+    """
+    event = asyncio.Event()
+    started = time.monotonic()
+    with contextlib.suppress(TimeoutError):  # the normal ending: nothing sets the event
+        await asyncio.wait_for(event.wait(), timeout=delay)
+    return time.monotonic() - started
+
+
+class BlockingProvider:
+    """Provider whose synchronous fetch freezes its calling thread.
+
+    A real provider is synchronous by contract and its HTTP round trip is the freeze
+    the incident came from; here the freeze is a known ``time.sleep``.  The call is
+    recorded **before** the sleep, so a test can count the attempts even when the
+    stream abandoned an answer that was still being computed.
+    """
+
+    def __init__(self, *, block_seconds: float, count: int = 2) -> None:
+        self.block_seconds = float(block_seconds)
+        self.count = int(count)
+        self.calls: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        since: pd.Timestamp,
+        until: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Freeze the calling thread, then answer the usual hourly grid."""
+        self.calls.append((symbol, timeframe, pd.Timestamp(since), pd.Timestamp(until)))
+        time.sleep(self.block_seconds)
+        delta = candle_delta(timeframe)
+        last = pd.Timestamp(until).floor(delta)
+        index = pd.date_range(end=last, periods=self.count, freq=delta, tz="UTC", name="timestamp")
+        return frame_for(index)
+
+
+class FormingCandleProvider:
+    """Provider whose only candle is still forming when the stream reads it.
+
+    The row is stamped exactly at ``until``, so it closes one candle delta later and
+    :meth:`PollingMarketStream.next_candle` finds nothing *closed*: it takes its idle
+    poll and answers ``None``.  That branch is where the incident's ``TimeoutError``
+    escaped the stream.
+    """
+
+    def __init__(self, *, on_fetch: Callable[[], None] | None = None) -> None:
+        self.calls = 0
+        self._on_fetch = on_fetch
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        since: pd.Timestamp,
+        until: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Answer one still-forming candle, whatever window was asked for."""
+        self.calls += 1
+        if self._on_fetch is not None:
+            self._on_fetch()
+        index = pd.DatetimeIndex([pd.Timestamp(until)], name="timestamp")
+        return frame_for(index)
+
+
+class FreezingClock(SystemClock):
+    """A system clock that freezes the whole loop once, inside its first sleep.
+
+    The freeze lands in the *bound-registration window* of a pacing wait, and that is
+    what makes it deterministic rather than lucky: the wait has already registered the
+    deadline of its bound, the sleeper coroutine it just scheduled has not run yet,
+    and ``time.sleep`` blocks the only thread that could run it.  When the loop
+    resumes, that bound is overdue -- exactly the state a freeze left the shared loop
+    in during the outage.  Every later sleep is an ordinary one.
+    """
+
+    def __init__(self, *, freeze_seconds: float) -> None:
+        self.freeze_seconds = float(freeze_seconds)
+        self.freezes = 0
+
+    async def sleep(self, seconds: float) -> None:
+        """Freeze the loop once (before sleeping), then sleep ``seconds``."""
+        if self.freezes == 0:
+            self.freezes += 1
+            time.sleep(self.freeze_seconds)
+        await super().sleep(seconds)
+
+
+class SyncCloseExchange:
+    """Fake ``ccxt.pro`` handle whose teardown is a plain synchronous function.
+
+    ``ccxt.pro`` closes asynchronously, but the seam accepts a handle whose teardown
+    blocks; that one used to run on the shared loop for the whole teardown.
+    """
+
+    def __init__(self, *, block_seconds: float = 0.0, fail: bool = False) -> None:
+        self.block_seconds = float(block_seconds)
+        self.fail = fail
+        self.config: Any = None
+        self.closed = False
+        self.close_thread: int | None = None
+
+    async def watch_ohlcv(self, symbol: str, timeframe: str, *args: Any) -> Any:
+        """Answer an empty payload: this fake exists for its teardown."""
+        return []
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, *args: Any) -> Any:
+        """Answer an empty payload: this fake exists for its teardown."""
+        return []
+
+    def close(self) -> None:
+        """Block the calling thread, then mark the handle closed."""
+        self.close_thread = threading.get_ident()
+        time.sleep(self.block_seconds)
+        if self.fail:
+            raise RuntimeError("close exploded")
+        self.closed = True
+
+
+def test_a_blocking_provider_read_no_longer_delays_a_peer_on_the_shared_loop() -> None:
+    """One profile's blocking fetch must not freeze every other profile's deadlines.
+
+    Pre-fix the read ran on the loop, so the peer's 0.05 s wait could not answer
+    before the 0.4 s fetch had returned -- the shared-loop freeze that killed the
+    three live profiles.  With the read on a worker thread the loop keeps firing
+    every other profile's timers, so the peer answers at its own delay.
+    """
+    clock = SystemClock()
+    provider = BlockingProvider(block_seconds=BLOCKING_FETCH_SECONDS)
+    stream = PollingMarketStream(
+        provider, clock=clock, timeout_seconds=BLOCKING_FETCH_SECONDS + 0.5
+    )
+
+    async def scenario() -> tuple[float, Any, float]:
+        await stream.start()
+        started = time.monotonic()
+        # The peer is queued FIRST: its deadline is registered before the read has any
+        # chance to block the loop, which is the ordering the freeze needs.
+        peer_task = asyncio.ensure_future(observe_peer_delay())
+        read_task = asyncio.ensure_future(stream.next_candle(BTC, HOUR))
+        await asyncio.sleep(0)  # one step each: the peer waits, the read starts
+        peer_elapsed = await peer_task
+        outcome = (await asyncio.gather(read_task, return_exceptions=True))[0]
+        return peer_elapsed, outcome, time.monotonic() - started
+
+    peer_elapsed, outcome, read_elapsed = run(scenario())
+
+    assert read_elapsed >= BLOCKING_FETCH_SECONDS, (
+        "the provider never blocked: the harness never armed"
+    )
+    assert isinstance(outcome, CandleEvent), outcome
+    assert stream.last_error is None
+    assert peer_elapsed >= PEER_DELAY_SECONDS * 0.9
+    assert peer_elapsed < PEER_LATE_LIMIT_SECONDS, (
+        f"the peer waited {peer_elapsed:.3f} s: the provider read froze the shared loop"
+    )
+
+
+def test_a_delayed_idle_poll_is_not_reported_as_a_failure() -> None:
+    """The failing-first regression at the stream level: a frozen loop kills nobody.
+
+    The freeze is deterministic rather than lucky (:class:`FreezingClock` blocks the
+    loop from inside the idle sleep, with the bound of the pacing wait registered and
+    its sleeper not yet running).  The poll itself succeeded -- the provider answered
+    a still-forming candle -- so the answer is ``None`` ("nothing new") and the stream
+    must stay healthy whatever the loop did.
+
+    Pre-fix this very scenario raised ``TimeoutError('')`` out of ``next_candle``: the
+    empty message of the ``profile_crashed error="TimeoutError: "`` records and of the
+    ``health.last_error = "TimeoutError"`` the three dead profiles were persisted with.
+    """
+    clock = FreezingClock(freeze_seconds=FREEZE_SECONDS)
+    provider = FormingCandleProvider()
+    stream = PollingMarketStream(
+        provider,
+        clock=clock,
+        poll_interval_seconds=IDLE_POLL_SECONDS,
+        timeout_seconds=IDLE_POLL_SECONDS,
+    )
+
+    async def scenario() -> Any:
+        await stream.start()
+        return await stream.next_candle(BTC, HOUR)
+
+    try:
+        outcome = run(scenario())
+    except TimeoutError as exc:  # the pre-fix signature: a bare, empty timeout
+        pytest.fail(f"a delayed idle poll killed the stream: TimeoutError({str(exc)!r})")
+
+    assert clock.freezes == 1, "the freeze never happened: the harness never armed"
+    assert provider.calls == 1
+    assert outcome is None, "an idle poll reports 'nothing new', it does not fail"
+    assert stream.last_error is None
+    assert stream.connected is True
+    assert stream.reconnect_count == 0
+
+
+def test_pacing_waits_are_never_fatal_and_report_the_delay_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_bounded_sleep`` and ``_backoff`` cannot raise, whatever the loop did.
+
+    Both bounded waits of the polling stream are driven past their bound by
+    :class:`FreezingClock` -- the idle wait of a profile whose poll interval equals
+    its stream timeout, and a retry backoff larger than the stream timeout.  Reaching
+    the end of the scenario is the contract: a delayed pacing wait is abandoned
+    quietly, reported exactly once through ``market_data.pacing_wait_delayed``, and
+    never surfaces as a ``TimeoutError``.
+    """
+    caplog.set_level(logging.WARNING, logger=stream_module.LOGGER.name)
+    idle_clock = FreezingClock(freeze_seconds=FREEZE_SECONDS)
+    idle_stream, _idle_provider = make_polling(
+        clock=idle_clock,
+        poll_interval_seconds=IDLE_POLL_SECONDS,
+        timeout_seconds=IDLE_POLL_SECONDS,
+        reconnect_backoff_seconds=0.0,
+    )
+    retry_clock = FreezingClock(freeze_seconds=FREEZE_SECONDS)
+    retry_stream, _retry_provider = make_polling(
+        clock=retry_clock,
+        timeout_seconds=0.01,
+        reconnect_backoff_seconds=IDLE_POLL_SECONDS,
+    )
+
+    async def scenario() -> None:
+        await idle_stream.start()
+        await idle_stream._bounded_sleep(IDLE_POLL_SECONDS)
+        await retry_stream.start()
+        await retry_stream._backoff(1)
+
+    run(scenario())
+
+    reported = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "market_data.pacing_wait_delayed"
+    ]
+    assert [record.expected_seconds for record in reported] == [
+        IDLE_POLL_SECONDS,
+        IDLE_POLL_SECONDS,
+    ]
+    for record in reported:
+        assert record.exchange == "binance"
+        assert record.bound_seconds == pytest.approx(waits.wait_bound(IDLE_POLL_SECONDS))
+        assert record.elapsed_seconds >= FREEZE_SECONDS
+    assert idle_stream.connected is True and retry_stream.connected is True
+    assert idle_stream.last_error is None and retry_stream.last_error is None
+    assert idle_stream.reconnect_count == 0 and retry_stream.reconnect_count == 0
+
+
+def test_a_provider_slower_than_the_timeout_is_a_retried_poll_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A slow read is an ordinary poll failure: named, retried, and never a bare timeout.
+
+    The read is abandoned by its bound plus one late grace window, the failure is
+    recorded with a NON-EMPTY message -- the empty ``TimeoutError`` is what persisted
+    ``health.last_error = "TimeoutError"`` on the dead profiles -- and the stream
+    retries until its reconnect budget is exhausted.  A peer sharing the loop answers
+    on time throughout: a slow read is not a frozen loop.
+    """
+    caplog.set_level(logging.WARNING, logger=stream_module.LOGGER.name)
+    clock = SystemClock()
+    provider = BlockingProvider(block_seconds=SLOW_READ_SECONDS)
+    stream = PollingMarketStream(
+        provider,
+        clock=clock,
+        timeout_seconds=0.05,
+        max_reconnects=2,
+        reconnect_backoff_seconds=0.0,
+    )
+
+    async def scenario() -> tuple[Any, float]:
+        await stream.start()
+        peer_task = asyncio.ensure_future(observe_peer_delay())
+        read_task = asyncio.ensure_future(stream.next_candle(BTC, HOUR))
+        await asyncio.sleep(0)
+        peer_elapsed = await peer_task
+        outcome = (await asyncio.gather(read_task, return_exceptions=True))[0]
+        return outcome, peer_elapsed
+
+    outcome, peer_elapsed = run(scenario(), timeout=SLOW_READ_SCENARIO_TIMEOUT)
+
+    assert isinstance(outcome, MarketStreamError), outcome
+    assert "gave up after 2 attempts" in str(outcome)
+    assert isinstance(outcome.__cause__, TimeoutError)
+    assert str(outcome.__cause__).strip(), "a timeout must name what it could not get"
+    assert "the provider read for BTC/USDT 1h" in str(outcome.__cause__)
+
+    failures = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "market_data.poll_failed"
+    ]
+    assert len(failures) == 2, "every attempt is reported as a failed poll"
+    for record in failures:
+        assert str(record.error).strip(), "a failed poll must never carry an empty message"
+    assert len(provider.calls) == 2, "the read must be retried, not given up on"
+    assert stream.reconnect_count == 2
+    assert stream.connected is False
+    assert peer_elapsed < PEER_LATE_LIMIT_SECONDS, (
+        f"the peer waited {peer_elapsed:.3f} s: a slow read froze the shared loop"
+    )
+
+
+def test_ccxt_pro_stop_runs_a_synchronous_close_off_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocking venue teardown is another shared-loop freeze, and it is off-loop too.
+
+    The handle's ``close`` is a plain function: it is handed to a worker thread, so a
+    slow teardown delays no other profile, while ``stop`` keeps its never-raises
+    contract and its ``market_data.close_failed`` warning.
+    """
+    exchange = SyncCloseExchange(block_seconds=CLOSE_SECONDS)
+    install_fake_ccxt_pro(monkeypatch, exchange)
+    stream = make_ccxt(exchange, clock=ManualClock())
+    loop_thread = threading.get_ident()
+
+    async def scenario() -> tuple[float, float]:
+        await stream.start()
+        started = time.monotonic()
+        stop_task = asyncio.ensure_future(stream.stop())
+        peer_task = asyncio.ensure_future(observe_peer_delay())
+        await asyncio.sleep(0)
+        peer_elapsed = await peer_task
+        await stop_task
+        return peer_elapsed, time.monotonic() - started
+
+    peer_elapsed, stop_elapsed = run(scenario())
+
+    assert exchange.closed is True
+    assert exchange.close_thread is not None
+    assert exchange.close_thread != loop_thread, "the synchronous close ran on the event loop"
+    assert stop_elapsed >= CLOSE_SECONDS, "the close never blocked: the harness never armed"
+    assert peer_elapsed < PEER_LATE_LIMIT_SECONDS, (
+        f"the peer waited {peer_elapsed:.3f} s: the synchronous close froze the shared loop"
+    )
+    assert stream.connected is False
+
+
+def test_ccxt_pro_stop_swallows_a_failing_synchronous_close(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The never-raises contract of ``stop`` holds for the off-loop teardown too."""
+    caplog.set_level(logging.WARNING, logger=stream_module.LOGGER.name)
+    exchange = SyncCloseExchange(fail=True)
+    install_fake_ccxt_pro(monkeypatch, exchange)
+    stream = make_ccxt(exchange, clock=ManualClock())
+
+    async def scenario() -> None:
+        await stream.start()
+        await stream.stop()
+
+    run(scenario())
+
+    assert stream.connected is False
+    failed = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "market_data.close_failed"
+    ]
+    assert [record.error for record in failed] == ["close exploded"]
+
+
+@pytest.mark.parametrize("delay", [0.0, 0.05, 0.2, 5.0, 30.0])
+def test_wait_bound_delegates_to_the_shared_arithmetic(delay: float) -> None:
+    """One arithmetic authority: the module keeps no second copy of the margin.
+
+    The head-room of every bound of the layer lives in
+    :mod:`trading_platform.realtime.waits`; a local copy is what let the stream, the
+    runner and the orchestrator drift apart, so the delegation itself is pinned.
+    """
+    assert stream_module._wait_bound(delay) == waits.wait_bound(delay)
+    assert stream_module._wait_bound(delay) > delay
+
+
+def test_the_missing_ccxt_pro_message_is_defined_once() -> None:
+    """One constant, one definition: the module used to carry the same literal twice."""
+    source = Path(stream_module.__file__).read_text(encoding="utf-8")
+    definitions = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_MISSING_CCXT_PRO"
+            for target in node.targets
+        )
+    ]
+    assert len(definitions) == 1, "the missing-ccxt.pro message is defined twice"
+    assert stream_module._MISSING_CCXT_PRO == (
+        "ccxt.pro is not installed: pip install -e '.[exchange]'"
+    )

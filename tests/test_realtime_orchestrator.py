@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -2401,4 +2402,444 @@ def test_the_boot_stays_silent_when_only_the_declared_backoff_exceeds_the_timeou
     assert IDLE_BOUND_EVENT not in events(logs)
     assert orchestrator.runner("btc-paper") is not None
     assert streams[0].started == 1
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# 16. supervision under a shared loop delayed by a peer
+# ---------------------------------------------------------------------------
+
+#: How long the delayed profile is given to ride out its peer's freeze before the
+#: status is read.  The freeze itself is driven by the delayed profile's own poll
+#: (see :class:`DelayedIdleStream`), never by this delay: it is only the guard that
+#: keeps a profile which *did* die from hanging the suite, and it comfortably exceeds
+#: the freeze plus one idle poll.
+_DELAYED_SETTLE = 0.6
+
+#: Idle wait of the delayed profile in the supervision scenario: shorter than the
+#: runner's late-answer grace window, so a tick that was merely *delayed* by the
+#: peer's freeze can still be answered instead of being cancelled.
+_DELAYED_IDLE = 0.05
+
+#: How long the peer's synchronous fetch freezes the shared loop.
+_PEER_FREEZE = 0.3
+
+
+class DelayedIdleStream(FakeStream):
+    """A stream that arms its idle poll only after its peer has been released.
+
+    ``parked`` is set from inside ``next_candle`` -- that is, *after* the runner
+    registered the bound of the tick and *before* the idle wait is armed, which is
+    the bound-registration window of the production race.  The handshake with
+    :class:`BlockingPeerStream` makes that window deterministic: this profile waits
+    for its peer to be inside its own tick before it releases it, so the peer's freeze
+    is already queued in front of the idle sleep when the sleep would have been armed.
+    ``rode_out`` is set once the idle wait really completed, so the test waits for the
+    delayed tick itself instead of sleeping and hoping.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        peer_waiting: asyncio.Event,
+        parked: asyncio.Event,
+        rode_out: asyncio.Event,
+        idle_seconds: float = _DELAYED_IDLE,
+    ) -> None:
+        super().__init__(symbol)
+        self._peer_waiting = peer_waiting
+        self._parked = parked
+        self._rode_out = rode_out
+        self._idle_seconds = float(idle_seconds)
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        """Wait for the peer's tick, release it, yield, then take the idle poll."""
+        self.calls += 1
+        await self._peer_waiting.wait()
+        self._parked.set()
+        # The yield is what puts the peer's blocking call *between* the bound the
+        # runner just registered and the idle sleep of this profile.
+        await asyncio.sleep(0)
+        await asyncio.sleep(self._idle_seconds)
+        self._rode_out.set()
+        return None
+
+
+class BlockingPeerStream(FakeStream):
+    """A peer stream whose first synchronous fetch freezes the shared event loop.
+
+    ``max_wait_seconds`` is declared long (the peer legitimately waits on its own
+    market data), so the freeze does not overrun the peer's own tick bound: the victim
+    of the freeze is the *other* profile, exactly like the live incident.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        peer_waiting: asyncio.Event,
+        parked: asyncio.Event,
+        block_seconds: float,
+    ) -> None:
+        super().__init__(symbol, max_wait_seconds=5.0)
+        self._peer_waiting = peer_waiting
+        self._parked = parked
+        self._block_seconds = float(block_seconds)
+        self.blocks = 0
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        """Freeze the loop once -- the synchronous provider call of the incident."""
+        self.calls += 1
+        if self.blocks == 0:
+            self.blocks += 1
+            self._peer_waiting.set()
+            await self._parked.wait()
+            time.sleep(self._block_seconds)
+        return None
+
+
+def test_a_delayed_idle_poll_never_ends_as_an_error(
+    tmp_path: Path, logs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer's blocking fetch delays a profile; it must stay RUNNING, never ERROR.
+
+    This is the orchestrator-level shape of the live incident: two profiles share the
+    one event loop, one of them freezes it inside its synchronous ``fetch_ohlcv``
+    while the other sits inside the idle poll of a quiet market.  The delayed profile
+    must ride the freeze out -- persisted ``RUNNING``, no ``profile_crashed``, no
+    ``profile_error`` and not one call to the runner's error recorder -- because a
+    healthy wait the loop could not honour in time is not a failure of the profile.
+    """
+    peer_waiting = asyncio.Event()
+    parked = asyncio.Event()
+    rode_out = asyncio.Event()
+    victim: DelayedIdleStream | None = None
+    peer: BlockingPeerStream | None = None
+
+    def factory(target: ProfileConfig) -> FakeStream:
+        nonlocal victim, peer
+        if str(target.id) == "aaa-victim":
+            victim = DelayedIdleStream(
+                str(target.symbol),
+                peer_waiting=peer_waiting,
+                parked=parked,
+                rode_out=rode_out,
+            )
+            return victim
+        peer = BlockingPeerStream(
+            str(target.symbol),
+            peer_waiting=peer_waiting,
+            parked=parked,
+            block_seconds=_PEER_FREEZE,
+        )
+        return peer
+
+    profiles = [profile("aaa-victim", SYMBOL_BTC), profile("zzz-peer", SYMBOL_ETH)]
+    orchestrator, _store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        profiles,
+        stream_factory=factory,
+        realtime=realtime_config(tmp_path, stream_poll_timeout_seconds=0.2),
+    )
+
+    recorded: list[str] = []
+    original_record = runner_module.ProfileRunner._record_error
+
+    def spy_record(self: Any, exc: BaseException) -> None:
+        recorded.append(f"{self.profile_id}: {type(exc).__name__}: {exc}")
+        original_record(self, exc)
+
+    monkeypatch.setattr(runner_module.ProfileRunner, "_record_error", spy_record)
+
+    async def scenario() -> tuple[dict[str, Any], bool]:
+        await orchestrator.start()
+        try:
+            await asyncio.wait_for(rode_out.wait(), timeout=_DELAYED_SETTLE)
+            delayed_tick_completed = True
+        except TimeoutError:
+            delayed_tick_completed = False
+        snapshots = {
+            profile_id: orchestrator.profile_snapshot(profile_id)
+            for profile_id in ("aaa-victim", "zzz-peer")
+        }
+        await orchestrator.stop()
+        return snapshots, delayed_tick_completed
+
+    snapshots, delayed_tick_completed = run(scenario())
+
+    assert victim is not None and peer is not None
+    assert peer.blocks == 1, "the peer never froze the shared loop"
+    for profile_id in ("aaa-victim", "zzz-peer"):
+        snapshot = snapshots[profile_id]
+        assert snapshot is not None
+        assert snapshot.status is ProfileStatus.RUNNING, (
+            f"{profile_id} was persisted {snapshot.status.value} after a delayed idle poll"
+        )
+    assert delayed_tick_completed, "the delayed profile never finished its idle poll"
+    assert victim.calls >= 1
+    # There was no failure at all: the idle poll the freeze delayed is not an error of
+    # the profile, so nothing may be recorded as one.
+    assert recorded == []
+    assert "profile_crashed" not in events(logs)
+    assert "profile_stopped_on_error" not in events(logs)
+    assert "profile_error" not in events(logs)
+
+
+def test_one_failing_tick_is_recorded_once_by_the_loop_and_the_supervision(
+    tmp_path: Path, logs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failure leaves one ``profile_error``, one ``ERROR`` row, one supervision record.
+
+    Two records are written for a profile that left its loop and they are not
+    collapsed: the tick loop records what failed inside the tick (``profile_error``)
+    and the supervision records that the profile is no longer running
+    (``profile_stopped_on_error``).  What must **not** happen twice is the *same*
+    failure: the tick loop records it once, and the supervision's ``mark_crashed``
+    must recognise that it was already recorded instead of writing a second ``ERROR``
+    row and logging a second ``profile_error``.
+    """
+
+    class FailingStream(FakeStream):
+        async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+            raise MarketStreamError("the venue closed the stream")
+
+    profiles = [profile("btc-paper", SYMBOL_BTC)]
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, stream_factory=lambda target: FailingStream(str(target.symbol))
+    )
+
+    recorded: list[str] = []
+    persisted: list[str] = []
+    supervised: list[Any] = []
+    original_record = runner_module.ProfileRunner._record_error
+    original_save = store.save_status
+    original_crashed = runner_module.ProfileRunner.mark_crashed
+
+    def spy_record(self: Any, exc: BaseException) -> None:
+        recorded.append(f"{type(exc).__name__}: {exc}")
+        original_record(self, exc)
+
+    def spy_save(profile_id: str, status: Any, **kwargs: Any) -> Any:
+        if ProfileStatus(status) is ProfileStatus.ERROR:
+            persisted.append(str(profile_id))
+        return original_save(profile_id, status, **kwargs)
+
+    def spy_crashed(self: Any, exc: BaseException) -> Any:
+        answer = original_crashed(self, exc)
+        supervised.append(answer)
+        return answer
+
+    monkeypatch.setattr(runner_module.ProfileRunner, "_record_error", spy_record)
+    monkeypatch.setattr(store, "save_status", spy_save)
+    monkeypatch.setattr(runner_module.ProfileRunner, "mark_crashed", spy_crashed)
+
+    async def scenario() -> None:
+        await orchestrator.start()
+        await asyncio.sleep(_SETTLE)
+        await orchestrator.stop()
+
+    run(scenario())
+
+    error_records = [record for record in logs if getattr(record, "event", "") == "profile_error"]
+    supervision_records = [
+        record for record in logs if getattr(record, "event", "") == "profile_stopped_on_error"
+    ]
+    assert len(error_records) == 1, "the tick-level record must be written exactly once"
+    assert len(supervision_records) == 1, "the supervision record is the second, distinct one"
+    assert "profile_crashed" not in events(logs)
+    # ... and the very same failure is neither recorded, nor persisted, nor asked for
+    # a second time: one failing tick, one error of the profile.
+    assert len(recorded) == 1, f"the failure was recorded {len(recorded)} times: {recorded}"
+    assert persisted == ["btc-paper"], f"persisted ERROR rows: {persisted}"
+    assert len(supervised) == 1, f"mark_crashed calls: {len(supervised)}"
+
+    reopened = SqliteStateStore(tmp_path / "state.db")
+    reopened.initialize()
+    try:
+        stored = reopened.load_status("btc-paper")
+        assert stored is not None
+        assert stored.status is ProfileStatus.STOPPED
+        assert "the venue closed the stream" in (stored.last_error or "")
+    finally:
+        reopened.close()
+
+
+def test_a_bare_timeout_is_never_logged_as_an_empty_failure(tmp_path: Path, logs: Any) -> None:
+    """A failure that carries no message must still name its type in the log.
+
+    ``str(TimeoutError())`` is the empty string, so the live incident logged
+    ``profile_crashed error="TimeoutError: "`` -- an operator could not tell what had
+    timed out, nor even that the exception carried no detail.  Every record the
+    supervision writes now renders its exception through
+    :func:`~trading_platform.realtime.observability.failure_text`, so the type is
+    always present.
+    """
+
+    class BareTimeoutStream(FakeStream):
+        async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+            raise TimeoutError()
+
+    profiles = [profile("btc-paper", SYMBOL_BTC)]
+    orchestrator, _store, _clock, _streams = build_orchestrator(
+        tmp_path, profiles, stream_factory=lambda target: BareTimeoutStream(str(target.symbol))
+    )
+
+    async def scenario() -> None:
+        await orchestrator.start()
+        await asyncio.sleep(_SETTLE)
+        await orchestrator.stop()
+
+    run(scenario())
+
+    crashers = [record for record in logs if getattr(record, "event", "") == "profile_crashed"]
+    assert len(crashers) == 1
+    message = str(crashers[0].context["error"])
+    assert message.strip() != "", "a failure record must never carry an empty message"
+    assert message == "TimeoutError (no message)"
+
+    reopened = SqliteStateStore(tmp_path / "state.db")
+    reopened.initialize()
+    try:
+        stored = reopened.load_status("btc-paper")
+        assert stored is not None
+        assert stored.status is ProfileStatus.STOPPED
+        assert (stored.last_error or "").strip() != ""
+        assert "TimeoutError" in (stored.last_error or "")
+    finally:
+        reopened.close()
+
+
+# ---------------------------------------------------------------------------
+# 17. the boot bound under a shared loop
+# ---------------------------------------------------------------------------
+
+#: Boot bound the regressions below configure: ``stream_poll_timeout_seconds`` is
+#: what the orchestrator bounds ``stream.start()`` with.
+_BOOT_BOUND = 0.1
+
+#: How long a blocking call of *another* profile freezes the shared loop during the
+#: boot.  Longer than the boot bound and well inside the late-answer grace window, so
+#: the delayed start is *late*, never lost: that is exactly the distinction the boot
+#: bound must now make.
+_BOOT_FREEZE = 0.25
+
+
+class NeverAnsweringStartStream(FakeStream):
+    """A stream whose ``start()`` never answers: the venue is unreachable."""
+
+    async def start(self) -> None:
+        self.started += 1
+        await asyncio.Event().wait()
+
+
+def test_a_stream_that_never_answers_at_boot_quarantines_only_its_own_profile(
+    tmp_path: Path, logs: Any
+) -> None:
+    """One unreachable venue costs one profile, never the platform boot.
+
+    The boot applies its own bound around ``stream.start()``.  That bound used to be
+    an ``asyncio.wait_for`` whose ``TimeoutError`` was **not** part of
+    :data:`_PROFILE_BOOT_ERRORS`, so a venue that never answered escaped the
+    quarantine of :meth:`RealtimeOrchestrator._record_profile_failure` and aborted the
+    whole boot: no other profile ran and the monitoring API never bound.  A bound the
+    platform itself applied says nothing about the profile's code, so its expiry is
+    quarantined like any other boot failure and the log names the profile it belonged
+    to.
+    """
+    healthy = profile("btc-paper", SYMBOL_BTC)
+    stuck = profile("zzz-unreachable", SYMBOL_ETH)
+    streams: list[FakeStream] = []
+
+    def factory(target: ProfileConfig) -> FakeStream:
+        stream: FakeStream = (
+            NeverAnsweringStartStream(str(target.symbol))
+            if target.id == "zzz-unreachable"
+            else FakeStream(str(target.symbol))
+        )
+        streams.append(stream)
+        return stream
+
+    orchestrator, store, _clock, _streams = build_orchestrator(
+        tmp_path,
+        [healthy, stuck],
+        stream_factory=factory,
+        realtime=realtime_config(tmp_path, stream_poll_timeout_seconds=_BOOT_BOUND),
+    )
+
+    async def scenario() -> tuple[dict[str, Any], ProfileSnapshot | None, dict[str, str], int]:
+        await orchestrator.start()
+        await asyncio.sleep(_SETTLE)
+        result = (
+            orchestrator.health(),
+            orchestrator.profile_snapshot("zzz-unreachable"),
+            orchestrator.profile_failures(),
+            streams[0].calls,
+        )
+        await orchestrator.stop()
+        return result
+
+    health, failed, failures, healthy_calls = run(scenario())
+
+    # the platform booted: the healthy profile ran for real
+    assert health["profiles_total"] == 2
+    assert health["profiles_running"] == 1
+    assert health["status"] == "degraded"
+    assert healthy_calls >= 1
+    # ... and the unreachable one was quarantined, with a reason that names the wait
+    assert list(failures) == ["zzz-unreachable"]
+    assert "the stream start of profile zzz-unreachable" in failures["zzz-unreachable"]
+    assert "did not answer within" in failures["zzz-unreachable"]
+    assert failed is not None
+    assert failed.status is ProfileStatus.ERROR
+    boot = [record for record in logs if getattr(record, "event", None) == "profile_boot_failed"]
+    assert len(boot) == 1
+    assert boot[0].profile_id == "zzz-unreachable"
+    assert str(boot[0].context["error"]).strip() != "", "a boot failure must never be empty"
+    store.close()
+
+
+def test_a_stream_start_delayed_past_its_boot_bound_is_not_cut(tmp_path: Path) -> None:
+    """A boot the loop delayed past its bound still starts: "late" is not "lost".
+
+    The freeze is driven through the ready queue, never waited for: the blocking call
+    of another profile is queued *before* the boot registers its bound, so the loop is
+    frozen with the bound armed and ``stream.start()`` still only scheduled -- the
+    bound-registration window of the live incident.  The old ``asyncio.wait_for``
+    raised the empty ``TimeoutError`` of the outage there; the boot bound must instead
+    return the start that answered late, so a healthy profile is never refused its
+    start because a peer blocked the loop.
+    """
+    orchestrator, store, _clock, streams = build_orchestrator(
+        tmp_path,
+        [profile("btc-paper", SYMBOL_BTC)],
+        realtime=realtime_config(tmp_path, stream_poll_timeout_seconds=_BOOT_BOUND),
+    )
+
+    async def scenario() -> tuple[dict[str, Any], ProfileSnapshot | None, dict[str, str]]:
+        # The aggressor of the harness: a blocking call queued ahead of the boot, so
+        # it freezes the loop from inside the bound-registration window.
+        asyncio.get_running_loop().call_soon(time.sleep, _BOOT_FREEZE)
+        await orchestrator.start()
+        result = (
+            orchestrator.health(),
+            orchestrator.profile_snapshot("btc-paper"),
+            orchestrator.profile_failures(),
+        )
+        await orchestrator.stop()
+        return result
+
+    started = time.monotonic()
+    health, snapshot, failures = run(scenario())
+    elapsed = time.monotonic() - started
+
+    # the freeze really happened, and it really overran the boot bound
+    assert elapsed >= _BOOT_FREEZE, f"the freeze never happened: {elapsed:.3f} s"
+    assert _BOOT_FREEZE > _BOOT_BOUND
+    assert streams[0].started == 1, "the delayed stream was never started"
+    assert failures == {}, "a start that answered late was reported as a boot failure"
+    assert health["profiles_running"] == 1
+    assert health["status"] == "ok"
+    assert snapshot is not None
+    assert snapshot.status is ProfileStatus.RUNNING
     store.close()

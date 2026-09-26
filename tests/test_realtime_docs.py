@@ -987,6 +987,140 @@ def test_realtime_page_documents_the_idle_poll_bound() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 12. the blocking-call audit: §3.2, its evidence commands and its verdicts
+# ---------------------------------------------------------------------------
+
+#: The subsection of ``docs/realtime.md`` that carries the defect-class audit.
+BLOCKING_AUDIT_HEADING = "### 3.2 Blocking calls on the shared event loop: audit"
+
+#: Every path the audit must name, one row of its table per defect class.
+AUDITED_PATHS = (
+    "src/trading_platform/realtime/stream.py",
+    "src/trading_platform/realtime/runner.py",
+    "src/trading_platform/realtime/waits.py",
+    "src/trading_platform/realtime/orchestrator.py",
+    "src/trading_platform/realtime/gateway.py",
+    "src/trading_platform/realtime/broker.py",
+    "src/trading_platform/realtime/store.py",
+    "dashboard/src/lib/use-polling.ts",
+    "dashboard/src/lib/use-profile-control.ts",
+)
+
+#: The verdict vocabulary of the audit table: every finding carries one, and a
+#: finding left unfixed says so together with its reason.
+AUDIT_VERDICTS = ("FIXED", "REPORTED, deliberately left", "NO DEFECT")
+
+#: The evidence commands the audit section publishes, verbatim.
+AUDIT_EVIDENCE_COMMANDS = (
+    'grep -rn "time\\.sleep\\|requests\\.\\|subprocess\\." src/trading_platform/',
+    'grep -rn "asyncio.wait_for\\|to_thread" src/trading_platform/',
+    'grep -rn "setInterval\\|setTimeout" dashboard/src',
+)
+
+#: The per-profile tick bound the page derives for the default profile from the
+#: single arithmetic authority: ``max(10 s timeout, 5 s poll, 15 s backoff)``.
+DEFAULT_PROFILE_TICK_BOUND = "~15.8 s"
+
+
+def test_realtime_page_documents_the_blocking_call_audit() -> None:
+    """§3.2 audits the defect class, names its sites and gives every verdict.
+
+    The audit is evidence-driven: it names the files it inspected, publishes the
+    commands that produced the findings, and gives each finding one of three
+    verdicts -- fixed, reported with its reason, or cleared.  A finding without a
+    verdict, or an audited path that does not exist, is the drift this test exists
+    to catch.
+    """
+    text = read(REALTIME)
+
+    assert BLOCKING_AUDIT_HEADING in text
+    # §3.2 sits between §3.1 and §4: no section is displaced or renumbered
+    assert text.index(IDLE_BOUND_HEADING) < text.index(BLOCKING_AUDIT_HEADING)
+    assert text.index(BLOCKING_AUDIT_HEADING) < text.index(
+        "## 4. Persistence, restart and reconciliation"
+    )
+    section = text.split(BLOCKING_AUDIT_HEADING, 1)[1].split("\n## 4.", 1)[0]
+
+    # every audited path is named *and* exists: the table points at real files
+    for path in AUDITED_PATHS:
+        assert path in section, f"§3.2 does not name the audited path {path!r}"
+        assert (REPO_ROOT / path).is_file(), f"§3.2 audits a path that does not exist: {path!r}"
+    # ... and the findings are rendered as a table, one verdict per row
+    assert "| `path:line` | defect class | verdict |" in section
+    assert "| --- | --- | --- |" in section
+
+    # the verdict vocabulary: fixed, reported with a reason, or cleared
+    for verdict in AUDIT_VERDICTS:
+        assert verdict in section, f"§3.2 does not use the verdict {verdict!r}"
+
+    # the evidence commands themselves are part of the deliverable
+    for command in AUDIT_EVIDENCE_COMMANDS:
+        assert command in section, f"§3.2 does not publish the evidence command {command!r}"
+
+    # waits.py is named as the single arithmetic authority of the layer
+    assert "waits.py" in section
+    assert "single arithmetic authority" in " ".join(section.split())
+
+    # the fixed mechanism, part by part: the off-loop read, the pacing wait that
+    # cannot fail, and the bound that names itself when it does expire
+    assert "asyncio.to_thread" in section
+    assert "paced_wait" in section
+    assert "awaited_within" in section
+    assert "failure_text" in section
+
+    # the sites deliberately left, each with its file:line and its reason
+    assert "gateway.poll()" in section
+    assert "gateway.py:520" in section
+    assert "broker.py:886" in section
+    assert "CcxtBroker.poll" in section
+    assert "fetch_my_trades" in section
+    assert "_strategy_run" in section
+    assert "GIL" in section
+    assert "store.py:1047" in section
+    assert "check_same_thread=False" in section
+
+    # the dashboard was audited, not rewritten, and its verdict is explicit
+    assert "audited, not rewritten" in section
+    assert "use-polling.ts" in section
+    assert "setInterval" in section
+
+
+def test_realtime_page_no_longer_sells_the_margin_as_the_guarantee() -> None:
+    """The margin story is replaced by the mechanism the code really delivers.
+
+    The previous page let a reader believe that a wider bound is what keeps an
+    idle poll alive.  It is not: a loop frozen by another profile's synchronous
+    provider call cuts the wait whatever the margin is.  The page must say that,
+    describe the three changes that do fix it, and keep the invariant binding.
+    """
+    text = read(REALTIME)
+    flattened = " ".join(text.split())
+
+    # the invariant is still the contract, verbatim
+    assert IDLE_BOUND_INVARIANT in flattened
+    # ... and the page says out loud what the margin really is
+    assert "Head-room is not a guarantee" in flattened
+    # the overclaim of the previous page is gone
+    assert "so it cannot cut an idle poll either" not in flattened
+    # §3.1 states the contract: the old "the bound can never be the cause of its
+    # own timeout" claim is gone from it (§3.2 may still *quote* it as the drift it
+    # recorded, which is evidence, not a claim)
+    assert IDLE_BOUND_HEADING in text
+    section = text.split(IDLE_BOUND_HEADING, 1)[1].split("\n### 3.2", 1)[0]
+    assert "can never be the cause of its own timeout" not in section
+    assert "margin" in section, "§3.1 must state what the margin is and is not"
+    # the real mechanism is described, all three parts of it
+    assert "asyncio.to_thread" in flattened
+    assert "never raises `TimeoutError`" in flattened
+    assert "names the call and its budget" in flattened
+    # ... with the deterministic reproduction that proves the mechanism
+    assert "TimeoutError('')" in flattened
+    # the declared wait still derives the tick budget, and its value is pinned
+    assert DEFAULT_PROFILE_TICK_BOUND in flattened
+    assert "stream_max_wait_seconds" in flattened
+
+
+# ---------------------------------------------------------------------------
 # one ledger per mode: §9, its Web-API key and the warm-up handover of §8
 # ---------------------------------------------------------------------------
 
