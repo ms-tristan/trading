@@ -39,11 +39,23 @@ a test can serve a local fake.
 Shared wallet (additive)
 ------------------------
 ``GET /api/health`` and ``GET /api/profiles`` carry one extra key, ``wallet``:
-the platform-wide view of the **one** shared USDT wallet every profile funds its
-orders from (``null`` when the provider reports none).  Nothing else changes:
-every pre-existing key keeps its name and its type, and the per-profile payloads
-gain the *attributed* figures (``allocation``, ``deployed``, ``realized_pnl``,
-``unrealized_pnl`` and ``last_block_reason``) beside the ones they already had.
+the platform-wide view of the **paper** shared USDT wallet every paper profile
+funds its orders from (``null`` when the provider reports none).  Nothing else
+changes: every pre-existing key keeps its name and its type, and the per-profile
+payloads gain the *attributed* figures (``allocation``, ``deployed``,
+``realized_pnl``, ``unrealized_pnl`` and ``last_block_reason``) beside the ones
+they already had.
+
+One ledger per mode (additive)
+------------------------------
+The same two routes carry a second extra key, ``wallets``, shaped
+``{"paper": <wallet>, "live": <wallet or null>}``: both ledgers of the platform in
+one payload, so a dashboard renders either mode with no second round trip.  The
+existing ``wallet`` key is untouched -- it **is** the paper ledger -- and a mode
+whose store holds no row is an explicit ``null``, never an invented zero-valued
+ledger.  A provider written before the second ledger existed answers nothing at
+all, which the router normalises to ``{"paper": null, "live": null}``: the key is
+always present, exactly like ``wallet``.
 
 Orphaned positions (additive)
 -----------------------------
@@ -250,6 +262,22 @@ class SnapshotProvider(Protocol):
 
     def health(self) -> dict[str, Any]:
         """Return the health body of the orchestrator."""
+        ...
+
+    def wallets(self) -> Mapping[str, Any]:
+        """Return one ledger view per run mode, keyed by mode name.
+
+        The mapping is ``{"paper": <view or None>, "live": <view or None>}``: both
+        keys are always present, and a mode whose store holds no ledger row answers
+        an explicit ``None`` -- never an invented zero-valued ledger.  A view is a
+        ``WalletSnapshot`` (an object carrying ``to_dict()``) or an equivalent
+        mapping.
+
+        The router reads it through ``getattr`` so a provider written before the
+        second ledger existed keeps working: it answers the explicit
+        ``{"paper": null, "live": null}`` instead of a missing key, exactly like the
+        existing ``wallet`` key.
+        """
         ...
 
     def profile_snapshot(self, profile_id: str) -> ProfileSnapshot | None:
@@ -792,6 +820,11 @@ class Router:
                     "profiles": [profile.to_dict() for profile in snapshot.profiles],
                     "generated_at": _iso(snapshot.generated_at),
                     "wallet": None if wallet is None else _snapshot_payload(wallet),
+                    # The per-mode ledgers, read from the provider itself (the
+                    # snapshot model is frozen and carries one ``wallet`` only):
+                    # both modes are rendered from one payload, and a mode with no
+                    # row is an explicit ``null``.
+                    "wallets": self._wallets_payload(),
                 },
             )
         if route == "profile":
@@ -1161,9 +1194,58 @@ class Router:
             "kill_switch": kill_switch,
             "checked_at": _iso(self._clock.now()),
             "wallet": _snapshot_payload(reported.get("wallet")),
+            "wallets": self._wallets_payload(reported),
             "orphaned_positions": orphans,
             "profile_failures": self._profile_failures_payload(reported),
         }
+
+    # -- one ledger per mode -------------------------------------------------
+
+    def _wallets_payload(self, reported: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return the per-mode ledgers as the documented ``wallets`` object.
+
+        The shape is exactly ``{"paper": <WalletSnapshot or null>, "live":
+        <WalletSnapshot or null>}`` on **both** routes that publish it, so one
+        request renders either mode with no second round trip:
+
+        * ``/api/health`` prefers the ``wallets`` key of the provider's own health
+          body -- the orchestrator publishes the very object it computed -- and falls
+          back to the provider's ``wallets()`` accessor (the read-only adapter of
+          ``realtime serve`` answers it from the store);
+        * ``/api/profiles`` has no health body to read, so it always asks the
+          accessor.
+
+        The normalisation mirrors :meth:`_snapshot_payload` exactly.  A provider
+        written **before** the second ledger existed answers nothing at all: the read
+        is defensive (``getattr``) and the answer is the explicit
+        ``{"paper": null, "live": null}`` rather than a missing key -- the same rule
+        the existing ``wallet`` key follows.  A mode whose ledger holds no row is
+        likewise an explicit ``null``, never an invented zero-valued object, so a
+        consumer can always tell "no ledger yet" from "a ledger of zeroes".
+
+        The reader may be a **method or an attribute**: the orchestrator declares
+        ``wallets()`` and the CLI adapter mirrors it, but nothing in the contract
+        forbids a property, and the shape of the payload -- not the calling
+        convention -- is what this seam pins.  A reader that raises is logged and
+        rendered as the empty mapping: a broken ledger read must never turn into a
+        ``500`` on the health route.
+        """
+        empty = {"paper": None, "live": None}
+        if reported is not None:
+            candidate = reported.get("wallets")
+            if isinstance(candidate, Mapping):
+                return {mode: _snapshot_payload(candidate.get(mode)) for mode in empty}
+        reader = getattr(self._provider, "wallets", None)
+        if reader is None:
+            return dict(empty)
+        try:
+            answered = reader() if callable(reader) else reader
+        except Exception as exc:  # a ledger read must never break a read route
+            _LOGGER.warning("platform wallets unavailable: %s", exc)
+            return dict(empty)
+        if not isinstance(answered, Mapping):
+            return dict(empty)
+        return {mode: _snapshot_payload(answered.get(mode)) for mode in empty}
 
     # -- unreadable profiles ------------------------------------------------
 

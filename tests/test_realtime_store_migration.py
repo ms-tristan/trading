@@ -1,4 +1,4 @@
-"""Tests of the ``v3 -> v4`` profile-payload migration and of the quarantine contract.
+"""Tests of the two non-additive migrations of the store and of the quarantine contract.
 
 Schema version ``4`` exists because a field *removal* is not an additive change.  The
 release that dropped the forecast subsystem removed ``forecast`` from
@@ -8,17 +8,28 @@ already persisted in SQLite -- and SQLite is the single source of truth of the r
 platform.  The next boot therefore read a row the model refuses, ``load_profiles()``
 aborted on the *first* such row, and one stale key took the whole platform down.
 
+Schema version ``5`` exists for a different reason: a ``CHECK`` constraint cannot be
+widened in place.  The single-row ``wallet`` table of version ``3`` pinned
+``wallet_id`` to ``1``, and one ledger per mode needs ``2`` as well, so the table is
+**rebuilt** rather than redeclared -- and the legacy row is *migrated*, not dropped:
+its id ``1`` is the paper id, so the ledger the previous build held survives as the
+paper ledger.
+
 Two properties are pinned here, and neither of them needs a binary fixture: every
 database is built from the store's public API plus raw ``sqlite3`` writes on a
 ``tmp_path`` file.
 
-1. **the forward migration** -- opening a version-3 database rewrites every ``profiles``
-   row so that it carries exactly the keys the *current* ``ProfileConfig`` declares.
+1. **the forward migrations** -- opening a version-3 database rewrites every
+   ``profiles`` row so that it carries exactly the keys the *current*
+   ``ProfileConfig`` declares, and opening a version-4 database rebuilds the
+   ``wallet`` table so that it accepts both ledger ids while keeping the row it
+   already held.
    The prune is driven off ``ProfileConfig.model_fields`` and not off a hard-coded list
    of removed names, so the next removed field is handled by the same code; it is
    top-level only, it never touches ``updated_at``, it never rewrites a row that has
    nothing to prune, and it leaves a payload it cannot read as a JSON object alone (the
-   quarantine below reports that row instead of mangling it);
+   quarantine below reports that row instead of mangling it).  Both steps are
+   idempotent, and both are no-ops on a clean database;
 2. **the quarantine** -- a read of the profile table skips an unreadable row, logs it
    loudly with a *sanitised* reason and keeps loading every other profile, while
    ``load_profiles(strict=True)`` keeps the previous raising behaviour for the callers
@@ -51,12 +62,21 @@ START = pd.Timestamp("2024-01-01T00:00:00Z")
 #: The version the migration starts from (the last schema shipped before the prune).
 VERSION_THREE = 3
 
-#: The version this build writes: the profile-payload prune.
+#: The version the ``profiles`` payload prune introduced.
 VERSION_FOUR = 4
+
+#: The version this build writes: one ledger per mode.
+VERSION_FIVE = 5
 
 #: The instant a legacy row carries in ``updated_at``.  Distinctive on purpose: the
 #: migration must never touch it, so any rewrite is visible at a glance.
 LEGACY_UPDATED_AT = "2023-12-31T23:59:59+00:00"
+
+#: The two ledger amounts of the hand-written legacy ``wallet`` row.  They are kept as
+#: Python floats and bound as parameters rather than inlined in the SQL text, so the
+#: statement stays valid on every SQLite build the test suite runs against.
+LEGACY_CASH = 4_242.0
+LEGACY_INITIAL_BALANCE = 10_000.0
 
 #: The profile whose row is unreadable in the quarantine fixtures.
 BROKEN_PROFILE_ID = "bbb-paper"
@@ -205,6 +225,56 @@ def schema_versions(db_path: Path) -> list[int]:
         ]
 
 
+def wallet_rows(db_path: Path) -> list[tuple[int, float, float, str]]:
+    """Return ``(wallet_id, cash, initial_balance, updated_at)`` of every ledger row."""
+    with raw_connection(db_path) as conn:
+        return [
+            (int(row[0]), float(row[1]), float(row[2]), str(row[3]))
+            for row in conn.execute(
+                "SELECT wallet_id, cash, initial_balance, updated_at FROM wallet ORDER BY wallet_id"
+            )
+        ]
+
+
+def wallet_table_sql(db_path: Path) -> str:
+    """Return the DDL SQLite stores for the ``wallet`` table."""
+    with raw_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wallet'"
+        ).fetchone()
+    assert row is not None, "the database has no wallet table at all"
+    return str(row[0])
+
+
+def seed_version_four_database(db_path: Path, clock: ManualClock, cash: float = 7_500.0) -> None:
+    """Rebuild the **previous build's** ``wallet`` table, and stamp the file version 4.
+
+    Schema version ``4`` is the last release before the per-mode ledgers, and its
+    ``wallet`` table pinned ``wallet_id`` to ``1`` with a ``CHECK``.  That exact shape
+    is reproduced here -- DDL included -- because it is the one
+    ``CREATE TABLE IF NOT EXISTS`` cannot widen and the one the ``4 -> 5`` migration
+    has to rebuild.  A legacy ledger row is written through it, so a test can prove
+    the row survives as the paper ledger.
+    """
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    store.save_wallet(cash=cash, initial_balance=10_000.0)
+    store.close()
+    with raw_connection(db_path) as conn:
+        conn.execute("DROP TABLE wallet")
+        conn.execute(
+            "CREATE TABLE wallet ("
+            "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id = 1), cash REAL NOT NULL, "
+            "initial_balance REAL NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) "
+            "VALUES (1, ?, 10000.0, ?)",
+            (cash, LEGACY_UPDATED_AT),
+        )
+    force_schema_version(db_path, VERSION_FOUR)
+
+
 def seed_quarantined_database(db_path: Path, clock: ManualClock) -> None:
     """Build a version-3 database with two readable rows and one unreadable row.
 
@@ -296,7 +366,7 @@ def test_a_version_three_row_with_an_undeclared_key_is_pruned_on_open(
         assert profile_row(db_path, "eth-paper") == clean_before
         assert len(all_profile_rows(db_path)) == len(rows_before)
         # the stored version is the one of this build
-        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
         # and both profiles load, readable again, in profile_id order
         loaded = store.load_profiles()
         assert [item.id for item in loaded] == ["btc-paper", "eth-paper"]
@@ -348,7 +418,7 @@ def test_a_payload_that_is_not_json_is_left_untouched_and_quarantined(
     try:
         # the migration left the unreadable row byte-for-byte as it found it
         assert profile_row(db_path, BROKEN_PROFILE_ID) == (BROKEN_PAYLOAD, LEGACY_UPDATED_AT)
-        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
 
         with caplog.at_level(logging.WARNING, logger=STORE_LOGGER):
             loaded = store.load_profiles()
@@ -508,7 +578,7 @@ def test_running_the_payload_migration_twice_changes_nothing(
     first.initialize()
     migrated = all_profile_rows(db_path)
     first.close()
-    assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+    assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
 
     # a second pass over the payload path finds nothing left to prune
     for _profile_id, payload, _updated_at in migrated:
@@ -517,7 +587,7 @@ def test_running_the_payload_migration_twice_changes_nothing(
     second = SqliteStateStore(db_path, clock=clock)
     second.initialize()
     try:
-        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
         assert all_profile_rows(db_path) == migrated
         assert [item.id for item in second.load_profiles()] == ["btc-paper", "eth-paper"]
         assert second.load_profile_failures() == {}
@@ -526,28 +596,33 @@ def test_running_the_payload_migration_twice_changes_nothing(
 
 
 # ---------------------------------------------------------------------------
-# (f) a database already at version 4 is opened as-is
+# (f) a database written by this build is opened as-is
 # ---------------------------------------------------------------------------
 
 
-def test_a_version_four_database_written_by_this_build_opens_with_no_migration(
+def test_a_database_written_by_this_build_opens_with_no_migration(
     db_path: Path, clock: ManualClock
 ) -> None:
-    """Nothing to migrate, so not a single row is touched."""
+    """Nothing to migrate -- neither payload nor wallet table -- so no row is touched."""
     first = SqliteStateStore(db_path, clock=clock)
     first.initialize()
     first.save_profile(make_profile("btc-paper", params={"forecast": 1.5}))
     first.save_profile(make_profile("eth-paper", symbol="ETH/USDT"))
+    first.save_wallet(cash=7_500.0, initial_balance=10_000.0)
     first.close()
 
     before = all_profile_rows(db_path)
-    assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+    wallet_before = wallet_rows(db_path)
+    assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
 
     reopened = SqliteStateStore(db_path, clock=clock)
     reopened.initialize()
     try:
-        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
         assert all_profile_rows(db_path) == before
+        # the wallet table this build created already carries the per-mode CHECK, so
+        # the 4 -> 5 rebuild is a no-op and its row is byte-for-byte the one written
+        assert wallet_rows(db_path) == wallet_before
         # ``before`` is ordered by profile_id, so its first row is ``btc-paper``: the
         # payload and the ``updated_at`` of that row are byte-for-byte the ones written
         assert profile_row(db_path, "btc-paper") == before[0][1:]
@@ -581,8 +656,199 @@ def test_a_valid_json_payload_that_is_not_an_object_is_left_untouched(
     store.initialize()
     try:
         assert profile_row(db_path, BROKEN_PROFILE_ID) == (array_payload, LEGACY_UPDATED_AT)
-        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FOUR]
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
         assert [item.id for item in store.load_profiles()] == ["aaa-paper"]
         assert set(store.load_profile_failures()) == {BROKEN_PROFILE_ID}
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# (h) the 4 -> 5 step: the wallet table becomes one ledger per mode
+# ---------------------------------------------------------------------------
+
+
+def test_a_version_four_ledger_row_survives_the_rebuild_as_the_paper_ledger(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """The legacy single row is MIGRATED, never lost: it becomes the paper ledger.
+
+    A version-4 database carries the narrow ``CHECK (wallet_id = 1)`` that
+    ``CREATE TABLE IF NOT EXISTS`` cannot widen, so the ``4 -> 5`` step rebuilds the
+    table.  The rebuild copies the row instead of dropping it, and the row's
+    ``wallet_id`` -- ``1`` -- *is* the paper id, so the ledger the previous build held
+    is the paper ledger of this build, byte for byte: same cash, same initial balance,
+    same ``updated_at``.  And the rebuilt table accepts a second ledger, which is the
+    whole reason the step exists.
+    """
+    seed_version_four_database(db_path, clock, cash=7_500.0)
+    assert "wallet_id = 1" in wallet_table_sql(db_path), "the fixture must be the v4 table"
+    assert wallet_rows(db_path) == [(1, 7_500.0, 10_000.0, LEGACY_UPDATED_AT)]
+    assert schema_versions(db_path) == [VERSION_FOUR]
+
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    try:
+        # (a) the table now accepts both documented ids ...
+        table_sql = wallet_table_sql(db_path)
+        assert "wallet_id IN (1, 2)" in table_sql
+        assert "wallet_id = 1" not in table_sql.replace("wallet_id IN (1, 2)", "")
+        # (b) ... the stored version is the one of this build ...
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
+        # (c) ... and the legacy row is STILL THERE, as the paper ledger
+        assert wallet_rows(db_path) == [(1, 7_500.0, 10_000.0, LEGACY_UPDATED_AT)]
+        paper = store.load_wallet()
+        assert paper is not None
+        assert paper.cash == pytest.approx(7_500.0)
+        assert paper.initial_balance == pytest.approx(10_000.0)
+        assert paper.updated_at == pd.Timestamp(LEGACY_UPDATED_AT)
+        assert store.load_wallet(mode="paper") == paper
+        # (d) ... the live ledger simply has no row yet
+        assert store.load_wallet(mode="live") is None
+        # (e) ... and a live row can now be written as ``wallet_id = 2``
+        store.save_wallet(cash=640.0, initial_balance=500.0, mode="live")
+        assert wallet_rows(db_path) == [
+            (1, 7_500.0, 10_000.0, LEGACY_UPDATED_AT),
+            (2, 640.0, 500.0, START.isoformat()),
+        ]
+        assert store.load_wallet().cash == pytest.approx(7_500.0)  # type: ignore[union-attr]
+        live = store.load_wallet(mode="live")
+        assert live is not None and live.cash == pytest.approx(640.0)
+    finally:
+        store.close()
+
+
+def test_the_wallet_mode_migration_is_idempotent(db_path: Path, clock: ManualClock) -> None:
+    """A second open finds the table already correct and rewrites nothing.
+
+    The rebuild is driven by the shape of the table on disk -- its ``CHECK`` -- and
+    not by the stored version, so an already-migrated file (and a file whose version
+    row was hand-edited) is left byte for byte alone.
+    """
+    seed_version_four_database(db_path, clock, cash=3_210.5)
+
+    first = SqliteStateStore(db_path, clock=clock)
+    first.initialize()
+    migrated_rows = wallet_rows(db_path)
+    migrated_sql = wallet_table_sql(db_path)
+    first.close()
+    assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
+
+    second = SqliteStateStore(db_path, clock=clock)
+    second.initialize()
+    try:
+        assert wallet_rows(db_path) == migrated_rows
+        assert wallet_table_sql(db_path) == migrated_sql
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
+        assert second.load_wallet(mode="live") is None
+    finally:
+        second.close()
+
+
+def test_a_version_four_database_with_no_ledger_row_still_gains_the_per_mode_table(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """An empty legacy wallet table is rebuilt too: the shape, not the row, is migrated.
+
+    The previous build could legitimately ship the table empty (the engine writes its
+    first row at boot), and that file still has to accept the live ledger afterwards.
+    """
+    seed_version_four_database(db_path, clock)
+    with raw_connection(db_path) as conn:
+        conn.execute("DELETE FROM wallet")
+    assert wallet_rows(db_path) == []
+
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    try:
+        assert "wallet_id IN (1, 2)" in wallet_table_sql(db_path)
+        assert wallet_rows(db_path) == []
+        assert store.load_wallet() is None
+        assert store.load_wallet(mode="live") is None
+        # both ledgers can be written afterwards, and only the addressed one changes
+        store.save_wallet(cash=1.0, initial_balance=2.0)
+        store.save_wallet(cash=3.0, initial_balance=4.0, mode="live")
+        assert wallet_rows(db_path) == [
+            (1, 1.0, 2.0, START.isoformat()),
+            (2, 3.0, 4.0, START.isoformat()),
+        ]
+    finally:
+        store.close()
+
+
+def test_the_wallet_rebuild_keeps_the_document_version_bump_in_one_transaction(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """The rebuild and the version bump commit together, as the prune does.
+
+    A file whose version row is hand-edited **down** to ``4`` while its table is
+    already per-mode must reopen cleanly: the rebuild is a no-op, the version is
+    corrected, and no ledger row is touched.  That is the observable half of "one
+    transaction" a test can pin without instrumenting SQLite.
+    """
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    store.save_wallet(cash=9_000.0, initial_balance=10_000.0)
+    store.close()
+    before = wallet_rows(db_path)
+    force_schema_version(db_path, VERSION_FOUR)
+
+    reopened = SqliteStateStore(db_path, clock=clock)
+    reopened.initialize()
+    try:
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
+        assert wallet_rows(db_path) == before
+        assert reopened.load_wallet() is not None
+        assert reopened.load_wallet().cash == pytest.approx(9_000.0)  # type: ignore[union-attr]
+    finally:
+        reopened.close()
+
+
+def test_the_two_non_additive_steps_run_together_on_a_version_three_database(
+    db_path: Path, clock: ManualClock
+) -> None:
+    """A version-3 file crosses both steps -- payload prune and wallet rebuild -- at once.
+
+    Version ``3`` predates both: its ``profiles`` rows may carry an undeclared key and
+    its ``wallet`` table is the narrow single-row one.  One boot has to fix both, and
+    the ledger row must come out the other side as the paper ledger.
+    """
+    btc = make_profile("btc-paper")
+    seed_version_three_database(db_path, clock, btc)
+    stored = json.loads(profile_row(db_path, "btc-paper")[0])
+    stored["forecast"] = None
+    set_profile_row(db_path, "btc-paper", json.dumps(stored, sort_keys=True))
+    # rebuild the v3 single-row wallet table with a legacy ledger
+    with raw_connection(db_path) as conn:
+        conn.execute("DROP TABLE wallet")
+        conn.execute(
+            "CREATE TABLE wallet ("
+            "wallet_id INTEGER PRIMARY KEY CHECK (wallet_id = 1), cash REAL NOT NULL, "
+            "initial_balance REAL NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        # The two amounts are bound parameters, never spelled out in the SQL
+        # text: the underscore digit separators of a Python float literal
+        # (``10_000.0``) are not valid SQL on the SQLite builds older than
+        # 3.46 that the CI runner ships, so an inlined literal would make this
+        # test pass on a developer machine and fail on the runner.
+        conn.execute(
+            "INSERT INTO wallet (wallet_id, cash, initial_balance, updated_at) VALUES (1, ?, ?, ?)",
+            (LEGACY_CASH, LEGACY_INITIAL_BALANCE, LEGACY_UPDATED_AT),
+        )
+
+    store = SqliteStateStore(db_path, clock=clock)
+    store.initialize()
+    try:
+        # both rewrites happened in the one migration transaction
+        assert set(json.loads(profile_row(db_path, "btc-paper")[0])) == set(
+            ProfileConfig.model_fields
+        )
+        assert "wallet_id IN (1, 2)" in wallet_table_sql(db_path)
+        assert wallet_rows(db_path) == [(1, LEGACY_CASH, LEGACY_INITIAL_BALANCE, LEGACY_UPDATED_AT)]
+        assert schema_versions(db_path) == [SCHEMA_VERSION] == [VERSION_FIVE]
+        assert [item.id for item in store.load_profiles()] == ["btc-paper"]
+        paper = store.load_wallet()
+        assert paper is not None and paper.cash == pytest.approx(LEGACY_CASH)
+        assert store.load_wallet(mode="live") is None
     finally:
         store.close()

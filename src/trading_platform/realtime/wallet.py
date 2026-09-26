@@ -129,6 +129,19 @@ class WalletSnapshot:
     platform-wide P&L figures and ``total_exposure`` is the notional the profiles
     hold right now.  ``source`` says where the cash comes from: ``"local"`` for the
     simulated ledger, ``"venue"`` when the wallet mirrors a real account.
+
+    The three **appended** totals refine that picture without changing any of it.
+    ``cash`` stays the durable ledger -- what the engine can still fund orders
+    with -- while ``total_cash`` is the sum of the per-profile attributed ``cash``
+    the report shows, so the two differ by the ENTRY FEES of the open positions
+    and that difference is intentional, not a bug.  ``positions_value`` is the
+    summed mark-to-market of the open positions, and ``total_portfolio_value`` is
+    ``total_cash + positions_value`` -- exactly ``sum(profile.cash +
+    profile.position_value)``, i.e. the sum of the per-profile equities.
+
+    ``updated_at`` is deliberately **not** last: it keeps its position so no
+    positional construction written before the totals existed moves, and the three
+    new fields are keyword-with-default like it.
     """
 
     name: str
@@ -143,6 +156,9 @@ class WalletSnapshot:
     profiles: int
     source: str
     updated_at: pd.Timestamp | None = None
+    total_cash: float = 0.0
+    positions_value: float = 0.0
+    total_portfolio_value: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable mapping with exactly the documented keys.
@@ -150,6 +166,11 @@ class WalletSnapshot:
         Every float is routed through a finite-or-``None`` guard: a ``NaN`` or an
         ``Infinity`` can never reach the JSON encoder, it becomes ``None`` (the
         dashboard renders it as an em dash).
+
+        The twelve historical keys keep their names, their types, their order and
+        their semantics; the three totals are **appended**, so a consumer that
+        reads the payload positionally or by name sees the same thing it always
+        did, plus three keys it can ignore.
         """
         return {
             "name": str(self.name),
@@ -164,6 +185,9 @@ class WalletSnapshot:
             "profiles": int(self.profiles),
             "source": str(self.source),
             "updated_at": _timestamp_or_none(self.updated_at),
+            "total_cash": _finite_or_none(self.total_cash),
+            "positions_value": _finite_or_none(self.positions_value),
+            "total_portfolio_value": _finite_or_none(self.total_portfolio_value),
         }
 
 
@@ -490,6 +514,9 @@ class PlatformWallet:
         total_exposure: float = 0.0,
         profiles: int = 0,
         updated_at: pd.Timestamp | None = None,
+        total_cash: float = 0.0,
+        positions_value_total: float = 0.0,
+        total_portfolio_value: float = 0.0,
     ) -> WalletSnapshot:
         """Return the immutable view of the wallet the reporting layer publishes.
 
@@ -498,6 +525,15 @@ class PlatformWallet:
         is ``"local"`` for the simulated ledger and ``"venue"`` for a live mirror.
         ``updated_at`` falls back to the injected clock (never to the wall clock);
         without a clock it stays ``None``.
+
+        The three totals are forwarded into the ``total_cash``, ``positions_value``
+        and ``total_portfolio_value`` **fields** of the snapshot, so the JSON keys
+        keep their mandated names.  Note the deliberate naming asymmetry: the
+        existing ``positions_value`` keyword already means "the summed
+        mark-to-market of the open positions" and is what feeds ``equity``, so the
+        new total is passed through the distinct ``positions_value_total`` keyword
+        rather than overloading the old one.  All three default to ``0.0``, so
+        every call written before the totals existed behaves exactly as it did.
         """
         with self._lock:
             cash = self._cash
@@ -518,6 +554,9 @@ class PlatformWallet:
             profiles=int(profiles),
             source=SOURCE_LOCAL if self.is_authoritative else SOURCE_VENUE,
             updated_at=self._resolve_updated_at(updated_at),
+            total_cash=float(total_cash),
+            positions_value=float(positions_value_total),
+            total_portfolio_value=float(total_portfolio_value),
         )
 
     # -- internals ---------------------------------------------------------

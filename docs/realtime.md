@@ -129,21 +129,23 @@ The gateway contains **no** "if paper / if live" branch: it routes to the
 injected `Broker`. The paper broker is therefore exercised by exactly the same
 tests as the shared life cycle.
 
-### 2.1 One shared wallet for every profile
+### 2.1 One ledger per mode, shared by every profile of that mode
 
 The broker owns **no** cash any more. `PaperBroker` **delegates** every cash
 movement to the one `PlatformWallet` injected into it (§9), and reaches it
 through that injected seam only — never through a module-level global. A paper
-venue therefore spends the same USDT ledger as every other profile of the
-process, and the platform — not the profile — is the accounting entity.
+venue therefore spends the same USDT ledger as every other **paper** profile of the
+process, and the platform — not the profile — is the accounting entity. The live
+mirror is a ledger of its own and is never the object a paper venue spends from.
 
 The wallet is thread-safe: the profiles run in **separate threads** and every
 read-modify-write of the cash (`cash = cash - notional - fee`) happens under one
 re-entrant lock, so two fills can neither lose an update nor spend the same unit
 twice, and the durable write happens inside the same critical section.
 
-In **live** mode the wallet *is* the venue's account: `CcxtBroker` already
-fetches that balance, the wallet **mirrors** it, and it is **read-only** — it is
+In **live** mode a ledger *is* the venue's account: `CcxtBroker` already
+fetches that balance, the **live** ledger **mirrors** it, and it is **read-only** —
+it is
 never debited locally, and a local debit is refused with `WalletError` instead of
 inventing a balance. `source: "venue"` in the API payload says so (§5, §9).
 
@@ -233,11 +235,11 @@ The real-time engine **implements no formula**. It assembles:
    `max_drawdown_pct`, `max_daily_trades`. The evaluation order is frozen and the
    **first** failure wins; every rejection is logged with its reason, and the
    profile is not watermarked (a rejection is a decision, not a crash).
-4. **The shared-wallet funding check, then the optional platform-wide caps.**
-   Every entry is funded from the one shared wallet (§9) and the risk manager
-   verifies the ledger **before** the broker is called. The check **always**
+4. **The per-mode funding check, then the optional platform-wide caps.**
+   Every entry is funded from the ledger of its mode (§9) and the risk manager
+   verifies that ledger **before** the broker is called. The check **always**
    applies — even on a configuration that declares no platform cap at all — and
-   it refuses an order the wallet cannot fund, with the limit name
+   it refuses an order the ledger cannot fund, with the limit name
    `platform_wallet` and the reason
    `platform wallet cannot fund order: requires 12.50 USDT, available 3.00 USDT`.
    On top of it, two **optional** keys of the `realtime` block cap the whole
@@ -324,7 +326,7 @@ the warning no longer announces a crash: lowering `poll_interval_seconds` is
   calling thread, **every write inside a transaction**. That one file is the
   whole durable state of the platform: the profile set, the engine settings
   (§1.1), the positions, the orders, the fills, the equity curve, the candle
-  history and the shared wallet.
+  history and the two mode ledgers.
 - Every write is **idempotent**: UPSERT on the natural key, and the order
   identifier is **deterministic** — `new_client_order_id(profile_id, symbol,
   candle_timestamp, sequence)` — so the same decision always produces the same
@@ -404,28 +406,35 @@ the warning no longer announces a crash: lowering `poll_interval_seconds` is
   the orchestrator never started, the monitoring API never bound, and the
   dashboard showed `The monitoring API is unreachable`: one row, the whole
   platform.
-- **One** shared wallet holds the USDT cash, and it is the only thing that can
-  fund an order (§9). It is a single row of the `wallet` table — added by schema
-  version **3**, with `wallet_id = 1` enforced by a `CHECK` — written through
-  `StateStore.save_wallet` after every accepted fill and restored **once** at
+- **One ledger per mode** holds the USDT cash of that mode, and a ledger is the only
+  thing that can
+  fund an order (§9). Each is a row of the `wallet` table — added by schema
+  version **3**, rebuilt by version **5** into one row per mode with
+  `wallet_id IN (1, 2)` enforced by a `CHECK` (`1` paper, `2` live) — written
+  through
+  `StateStore.save_wallet` after every accepted fill and restored **once per mode**
+  at
   startup (`PlatformWallet.restore`), before the first candle of the first
   profile. A restart therefore **never** resets the cash. When the store holds no
-  row yet, the wallet starts from `realtime.platform_initial_balance`, or, when
+  row yet, a ledger starts from `realtime.platform_initial_balance`, or, when
   that optional key is absent, from the **sum of the profiles' allocations**
-  (§9), which is exactly the total cash the profiles used to own separately.
-  Opening an older database simply migrates it: schema version `2` gains the
-  empty `wallet` table and **keeps every row** it already had, and the wallet is
-  then initialised as above — a deployed database opens, migrates and loses
-  nothing.
+  (§9), which is exactly the total cash the profiles used to own separately. The
+  `4 -> 5` step is a **migration, not a reset**: a legacy `wallet_id = 1` row is
+  the paper ledger, so it survives with its cash, its initial balance and its
+  `updated_at`, and the live ledger simply has no row until a venue balance is
+  mirrored into it. Opening an older database is equally lossless: schema version
+  `2` gains the
+  empty `wallet` table and **keeps every row** it already had, and the ledgers are
+  then initialised as above.
 - The old **per-profile reseed is gone**: `PaperBroker` no longer owns a balance
   of its own, so there is no simulated cash to reseed from the last equity point.
-  The broker debits and credits the injected wallet, and the wallet is the
-  persisted truth. A **real** venue is never reseeded locally either: the wallet
-  *mirrors* the account the venue publishes (`CcxtBroker.fetch_balance`,
+  The broker debits and credits the injected ledger, and the ledger is the
+  persisted truth. A **real** venue is never reseeded locally either: the live
+  ledger *mirrors* the account the venue publishes (`CcxtBroker.fetch_balance`,
   best-effort, once at startup) and stays read-only (§9).
 - **An empty platform is a legal platform.** With the profile set living in the
   state store, the engine boots with **zero** profiles: it opens the store, seeds
-  or adopts the settings, restores the wallet, opens the monitoring API and idles.
+  or adopts the settings, restores the ledgers, opens the monitoring API and idles.
   `GET /api/profiles` answers `[]`, `GET /api/health` reports
   `profiles_total: 0`, `realtime check` exits `0`, and `POST /api/profiles`
   creates the first profile and **starts it immediately**, without a restart. The
@@ -458,9 +467,9 @@ an **orphan**, and the platform sweeps it.
 **The sweep.** It runs at engine boot, from `_prepare_runners`, at the one point
 where the whole durable position set and the whole loaded profile set are visible
 together — after the store is opened, the settings adopted and the profiles
-loaded, and after the shared wallet is restored, but **before any runner exists**.
-That ordering is the safety property: nothing can be trading while the sweep
-closes a position.
+loaded, and after the paper ledger — the wallet of §9 — is restored, but
+**before any runner exists**. That ordering is the safety property: nothing can be
+trading while the sweep closes a position.
 
 **What it does.** Every position whose `profile_id` matches **no** loaded profile
 is orphaned, and is **closed at the venue through the execution gateway**, in
@@ -524,8 +533,8 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 
 | Method and route | 200 response | Errors |
 | --- | --- | --- |
-| `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at, wallet, orphaned_positions, profile_failures}` | — |
-| `GET /api/profiles` | `{profiles: [ProfileSnapshot…], generated_at, wallet}` | — |
+| `GET /api/health` | `{status, version, uptime_seconds, profiles_total, profiles_running, kill_switch, checked_at, wallet, wallets, orphaned_positions, profile_failures}` | — |
+| `GET /api/profiles` | `{profiles: [ProfileSnapshot…], generated_at, wallet, wallets}` | — |
 | `GET /api/profiles/{id}` | `ProfileSnapshot` | 404 `{error}` |
 | `GET /api/profiles/{id}/equity` | `{points: [{timestamp, equity, cash, position_value}…]}` | 404 |
 | `GET /api/profiles/{id}/trades` | `{trades: [...], count}` | 404 |
@@ -544,25 +553,45 @@ and `GET /static/{asset}` included — answers the documented JSON 404
 | `DELETE /api/profiles/{id}` | `{profile_id, deleted: true}` | 400, 403, 404, 409, 503 |
 | `POST /api/profiles` | body `{profile_id, symbol, timeframe, strategy, mode, initial_balance?, params?, warmup_candles?, history_candles?}` → `201 {profile: ProfileSnapshot}` | 400 malformed body / unknown strategy / unsupported timeframe / a profile that can never warm up, 403, 409 duplicate |
 
-`wallet` is the **additive** platform-wide view of the one shared wallet (§9):
+`wallet` is the **additive** platform-wide view of the **paper** ledger (§9):
 
 ```
 {"name": str, "mode": "paper"|"live", "initial_balance": num|null, "cash": num|null,
  "equity": num|null, "deployed": num|null, "realized_pnl": num|null,
  "unrealized_pnl": num|null, "total_exposure": num|null, "profiles": int,
- "source": "local"|"venue", "updated_at": str|null}
+ "source": "local"|"venue", "updated_at": str|null,
+ "total_cash": num|null, "positions_value": num|null, "total_portfolio_value": num|null}
 ```
 
-`source` is `"local"` for the simulated ledger and `"venue"` when the wallet
+`source` is `"local"` for the simulated ledger and `"venue"` when the ledger
 mirrors a real account (live mode, read-only). `profiles` counts the profiles
 aggregated into the view. Both providers publish it: the engine reports the
-in-process wallet, and the read-only adapter of `realtime serve` rebuilds it from
-the persisted `wallet` row (§4), so the read-only surface shows the durable cash
-and the attributed per-profile figures too. A provider whose store holds **no**
-wallet row yet answers `"wallet": null`: the key is
+in-process paper ledger, and the read-only adapter of `realtime serve` rebuilds it
+from the persisted row of the paper ledger (§4, §9), so the read-only surface shows
+the durable cash and the attributed per-profile figures too. A provider whose store
+holds **no** paper row yet answers `"wallet": null`: the key is
 always present, so a consumer never has to guess whether the wallet is missing or
 simply empty, and no payload ever carries `NaN` or `Infinity` — a non-finite
-number is rendered `null`.
+number is rendered `null`. `wallet` keeps its name, its type and its value: it is
+**unchanged** by the per-mode ledgers and it is always the paper/default ledger.
+
+`wallets` is the second **additive** key of the same two routes (and the only key
+the per-mode ledgers added to them):
+
+```
+{"paper": <WalletSnapshot>, "live": <WalletSnapshot or null>}
+```
+
+Both ledgers of the platform in **one** request, so a dashboard renders either mode
+with **no second round trip**: `paper` is the ledger `wallet` carries — it is the
+same object, rendered twice under two documented names — and `live` is the venue
+mirror of §9. A mode whose store holds **no row** is an explicit `null`, never an
+invented zero-valued ledger, so a consumer always tells "this ledger does not exist
+yet" from "this ledger is empty". Both entries are aggregated with the three totals
+below, over the profiles of **their own** mode only. The normalisation mirrors the
+one of `wallet` exactly: a provider written before the second ledger existed answers
+nothing at all, which is rendered `{"paper": null, "live": null}` — the key is
+**always present**, never missing.
 
 `orphaned_positions` is the **additive** report of the startup safety sweep of
 §4.1, present on `GET /api/health` and served on its own by `GET /api/orphans`:
@@ -607,7 +636,7 @@ A `ProfileSnapshot` carries every key it always carried — `profile_id`, `symbo
 `allocation`, `deployed`, `realized_pnl`, `unrealized_pnl` (numbers or `null`) and
 `last_block_reason` (a string or `null`). No existing key changes its name or its
 type: `initial_balance` stays the configured capital of the profile, while
-`allocation` is the share of the shared wallet its figures are attributed to, so
+`allocation` is the share of the ledger of its mode its figures are attributed to, so
 `cash` can never be read as "this profile's own pot" (§9). `last_block_reason` is
 the reason of the **last refused order** of the profile — the exact message of
 §3, `null` when no order was ever refused or the profile is not running.
@@ -838,9 +867,24 @@ the `profiles` table and **started immediately** in the running engine, and the
 `201` body carries its `ProfileSnapshot`, so the dashboard refreshes without
 guessing. It is the supported way to create the profiles of a freshly deployed,
 empty host. The two warm-up keys are optional and purely additive: an absent
-`warmup_candles` keeps the model default and an absent `history_candles` keeps the
-realtime-level window, so a body written before this delivery behaves exactly as
-it did.
+`warmup_candles` **is not** the model default any more — it means *"whatever the
+strategy itself requires on this profile's timeframe"* — and an absent
+`history_candles` keeps the realtime-level window, so a body written before this
+delivery behaves exactly as it did.
+
+**`warmup_candles` omitted means "the strategy's own requirement", never `200`.**
+An **explicit** `warmup_candles` is an **override** of that requirement, and this
+is the whole point of the change: before it, a profile that declared nothing was
+served a fixed default that could be *below* what its strategy needs, so it ran for
+ever with zero signals and nothing said so. Today the warm-up a profile is really
+served is the *resolved* one — `effective_warmup_candles`, the explicit override
+when there is one, else the strategy's requirement on the profile's timeframe — and
+that resolved value is the **one** number every surface reports. An override
+**below** the requirement is still refused, and the refusal is unchanged: it is the
+documented `400` of the frozen sentence below, and a profile that reaches start in
+that state is persisted as `ERROR` (§4, start-time semantics). The coherence warning
+(`warmup_candles > history_candles`) is likewise computed on the resolved value, so
+a profile that overrides nothing is coherent by construction.
 
 **The warm-up contract is enforced, never silent.** A strategy declares how many
 candles a frame must hold before it can emit **any** signal
@@ -854,9 +898,12 @@ setting or the profile's own override). Two findings come out of it, and they ar
 not the same thing:
 
 * **`strategy-warmup-impossible` (`error`)** — `required_candles >
-  warmup_candles`: the frame can *never* grow to the strategy's warm-up, so the
-  profile would run for ever with zero signals. It is **refused where the profile
-  is created**: `POST /api/profiles` answers the documented `400` with a message
+  warmup_candles`, read on the **resolved** warm-up: the frame can *never* grow to
+  the strategy's warm-up, so the profile would run for ever with zero signals. It is
+  reachable **only** through an explicit `warmup_candles` override below the
+  requirement — with no override the profile is served the requirement itself — and
+  it is **refused where the profile is created**: `POST /api/profiles` answers the
+  documented `400` with a message
   that names the strategy, the timeframe, the candles required (and the day
   lookback behind them), the candles the profile only ever asks the stream for,
   and the timeframes that **would** work with those parameters, cheapest grid
@@ -890,7 +937,13 @@ their positions:
 `candles_per_day` is the profile's grid (1440 on `1m`, 288 on `5m`, 24 on `1h`,
 1 on `1d`), `history_candles` is the window the profile is effectively served
 (its own override, or `realtime.history_candles`), and `findings` is `[]` for a
-coherent profile. An **error** finding is also appended to that profile's
+coherent profile. **`warmup_candles` is the RESOLVED value** — the profile's
+explicit override when it declares one, else the strategy's own requirement on that
+timeframe (§8) — so the field reports the number the engine really asks the stream
+for. It is a plain `int` (`>= 1`), never `null`, and `required_candles` is the
+requirement the resolved value is compared against: the two are equal for a profile
+that overrides nothing, which is exactly the configuration that used to be reported
+as impossible. An **error** finding is also appended to that profile's
 `issues`, and that is what keeps the documented semantics unchanged rather than
 bending them: the profile reports `ok: false`, the payload reports `ok: false`
 and `realtime check` exits `1`, exactly as for any other profile that cannot
@@ -939,24 +992,44 @@ not running, a refused flattening), `ConfigError` (`400`: an unknown strategy, a
 unsupported timeframe, an unsupported value, a profile the store refuses) and --
 for anything else -- the existing `500` boundary.
 
-## 9. The shared platform wallet
+## 9. One ledger per mode
 
-There is **one** wallet and it is the **only** thing that can fund an order. It
-holds the USDT cash of the whole platform, it is persisted as the single row of
-the `wallet` table (§4) and it is restored **once**, so a restart never
-resets it. The engine restores it at startup, before the first candle of the
-first profile; a process that only **reads** the platform (the monitoring API
-answers before the engine loop has booted, and a read-only composition never
-boots at all) restores it on its first read instead, so the cash it reports is
-always the durable one and never the configured initial balance. `PaperBroker`
-owns no cash any more: it is **injected** with the
-wallet and delegates every movement to it (never through a global, exactly like
+There is **one ledger per run mode** and a ledger is the **only** thing that can
+fund an order. Schema version **5** of the state store (§4) rebuilt the `wallet`
+table so it holds one row per mode, and the mapping from a mode to its row id is
+written down once, in `trading_platform.realtime.store`:
+
+| ledger | `RunMode` | `wallet_id` | what it is |
+| --- | --- | --- | --- |
+| **paper** | `RunMode.PAPER` | `1` | the local simulated cash — the paper broker debits and credits it |
+| **live** | `RunMode.LIVE` | `2` | a **read-only** mirror of a real venue account — `source` is `"venue"` |
+
+The ids are **stable**, and that is not a detail: `1` is the id the single-row
+table of schema version `3` already used, so the `4 -> 5` migration keeps a legacy
+row **as the paper ledger** — its cash, its initial balance and its `updated_at`
+survive — instead of losing it. `CREATE TABLE IF NOT EXISTS` cannot widen the old
+`CHECK (wallet_id = 1)` constraint, which is why that step rebuilds the table
+(`wallet_new` -> copy -> drop -> rename) rather than declaring it. A mode whose
+ledger holds **no row** has no ledger at all: `load_wallet(mode=...)` answers
+`None`, and both API surfaces render that as an explicit `null` (§5), never as a
+ledger of zeroes.
+
+Each ledger holds the USDT cash of the profiles that run in **its** mode, it is
+persisted as a row of the `wallet` table (§4) and it is restored **once per mode**,
+so a restart never resets it. The engine restores them at startup, before the first
+candle of the first profile; a process that only **reads** the platform (the
+monitoring API answers before the engine loop has booted, and a read-only
+composition never boots at all) restores them on its first read instead, so the cash
+it reports is always the durable one and never the configured initial balance.
+`PaperBroker` owns no cash any more: it is **injected** with the paper
+ledger and delegates every movement to it (never through a global, exactly like
 the clock and the store). Two profiles entering at the same instant therefore
 spend the same ledger, and the second one can be refused for lack of cash that
 the first one just spent (§3).
 
 **Per-profile figures are ATTRIBUTED, never the venue's.** A profile does not own
-a pot: it is attributed a share of the shared wallet, its `allocation` (its own
+a pot: it is attributed a share of the ledger **of its own mode**, its `allocation`
+(its own
 `initial_balance` when the optional `allocation` key is absent, §1). Every
 per-profile number the API publishes is that share, with `allocation` as the
 capital base of the metrics and the reports:
@@ -972,39 +1045,67 @@ price** (`|quantity x average_price|`, summed over the profile's positions), and
 existing keys keep their names and their types — `equity`, `cash`,
 `position_value`, `total_return`, `initial_balance` — and only their meaning is
 refined: `initial_balance` is still the configured capital of the profile, while
-`cash` is the profile's own view of the shared ledger. That is why the dashboard
+`cash` is the profile's own view of its mode's ledger. That is why the dashboard
 labels it *attributed* and shows the allocation beside it: reading `cash` as
 "this profile's own pot" would be wrong, and the payload says which share it is.
 
-**What is reported versus what the wallet holds.** The wallet object of §5 is the
-platform-wide truth: `cash` is what is left to deploy, `equity` is `cash` plus the
-mark-to-market value of everything the profiles hold, `deployed`, `realized_pnl`
+**The three totals, and their exact formulas.** Each ledger view of §5 carries
+three totals, aggregated over the profiles that **belong to that mode** and over no
+other, from the very same per-profile payload the response publishes:
+
+```
+total_cash            = sum(profile.cash)
+positions_value       = sum(profile.position_value)
+total_portfolio_value = total_cash + positions_value = sum(profile.equity)
+```
+
+The third equality is the point. `profile.equity` is exactly
+`allocation + realized_pnl + unrealized_pnl`, i.e. the profile's attributed cash
+plus the mark-to-market value of what it holds, so **the platform total now equals
+the sum of the attributed per-profile figures** — the sum of the parts — instead of
+being smaller than them. Publishing the three totals is what makes that second
+number readable: a consumer no longer has to add `sum(profile.equity)` itself to
+discover that the platform total agreed with it all along.
+
+**What is reported versus what the ledger holds.** Each ledger object of §5 is the
+platform-wide truth of its mode: `cash` is what is left to deploy, `equity` is
+`cash` plus the
+mark-to-market value of everything the profiles of that mode hold, `deployed`,
+`realized_pnl`
 and `unrealized_pnl` are the sums of the attributed per-profile figures, and
 `total_exposure` is the summed notional the profiles hold right now (the absolute
 mark-to-market value of every open position). One caveat is worth stating rather
 than hiding: the attributed `cash` of a profile does not subtract the **entry
-fee** of its still-open positions, while the wallet really paid it. So the sum of
-the attributed cash of every profile equals the shared wallet cash **plus the
+fee** of its still-open positions, while the ledger really paid it. So the sum of
+the attributed cash of every profile of a mode equals that mode's durable ledger
+cash **plus the
 entry fees of the positions that are still open** — they meet again, to the cent,
-once every position is closed.
+once every position is closed. This caveat **stays** documented now that the three
+totals exist, and precisely because they exist: `cash` and `total_cash` are two
+different, both-correct numbers, and deleting the sentence would hide *why* they
+differ while making the difference look like a bug. It is not one: `total_cash` is
+the attributed view, `cash` is the durable ledger, and the gap is the fee the venue
+already charged.
 
-**Live mode.** There, the wallet **is** the venue's account: `CcxtBroker` already
-fetches that balance, the wallet mirrors it best-effort once at startup, and
-`source` is `"venue"` in the payload. It is **read-only**: the venue account is
-the source of truth, the wallet is never debited locally, and a local debit is
+**Live mode.** There, a ledger **is** the venue's account: `CcxtBroker` already
+fetches that balance, the **live** ledger mirrors it best-effort once at startup (and
+only when the platform runs an enabled live profile), and `source` is `"venue"` in
+the payload. The paper ledger is a different ledger of a different mode and a venue
+reading never lands in it. The mirror is **read-only**: the venue account is
+the source of truth, the live ledger is never debited locally, and a local debit is
 refused with `WalletError` instead of inventing a balance. Funding checks and
 platform caps still read it — they are the same checks — but nothing is ever
 written back to it. While the venue has reported nothing, the mirror falls back
 to the configured initial balance, never to an invented `0.0`.
 
 **Platform caps are optional; the funding check is not.** Absent
-`realtime.platform_initial_balance`, the wallet starts at the **sum of the
-allocations**, so a configuration written before the shared wallet existed keeps
+`realtime.platform_initial_balance`, a ledger starts at the **sum of the
+allocations**, so a configuration written before the shared ledger existed keeps
 its total cash; absent `realtime.platform_max_total_notional` and
 `realtime.platform_max_daily_loss`, no platform-wide cap is enforced and the
 per-profile limits stay the only ceilings. The **funding check is always
-enforced**, on every configuration, because no order may spend cash the one
-wallet does not hold — a refusal names its limit and its reason (§3) and is
+enforced**, on every configuration, because no order may spend cash the ledger of
+its mode does not hold — a refusal names its limit and its reason (§3) and is
 published as the `last_block_reason` of the profile (§5). Nothing is
 half-applied: a refused order leaves no order row, no fill, no position and no
 cash movement behind.

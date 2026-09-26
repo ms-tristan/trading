@@ -258,6 +258,17 @@ class ProfileConfig(BaseModel):
     a much longer window than the others.  A strategy whose warm-up needs tens of
     thousands of candles on an intraday grid (``momentum`` on ``1m``) can therefore
     be served without forcing every other profile to pay for that window.
+
+    ``warmup_candles`` is the optional per-profile warm-up override, and it follows
+    the very shape of its sibling ``history_candles`` above: ``None`` -- the default
+    -- means "not overridden", and the profile is then served the strategy's **own**
+    requirement on the profile's timeframe
+    (:func:`trading_platform.realtime.warmup.effective_warmup_candles`), so a
+    strategy that declares a warm-up can never be configured with a frame that
+    silently never warms up.  An explicit value is a deliberate override and keeps
+    the ``ge=1`` bound, but an override **below** the strategy's requirement is
+    refused where the profile is created: that would re-introduce, on purpose, the
+    silent no-op the default exists to prevent.
     """
 
     model_config = {"extra": "forbid"}
@@ -273,7 +284,7 @@ class ProfileConfig(BaseModel):
     stake_amount: float | None = Field(default=None, gt=0)
     exchange: str = "binance"
     enabled: bool = True
-    warmup_candles: int = Field(default=200, ge=1)
+    warmup_candles: int | None = Field(default=None, ge=1)
     poll_interval_seconds: float = Field(default=5.0, gt=0)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     entry_lookback_candles: int = Field(default=0, ge=0, le=MAX_ENTRY_LOOKBACK_CANDLES)

@@ -48,6 +48,9 @@ START = datetime(2024, 1, 1, tzinfo=UTC)
 INITIAL = 1_000.0
 
 #: Every key ``WalletSnapshot.to_dict()`` must emit, exactly.
+#:
+#: The twelve historical keys keep their names, their types and their order; the
+#: three totals are appended after ``updated_at`` and are purely additive.
 SNAPSHOT_KEYS = {
     "name",
     "mode",
@@ -61,7 +64,29 @@ SNAPSHOT_KEYS = {
     "profiles",
     "source",
     "updated_at",
+    "total_cash",
+    "positions_value",
+    "total_portfolio_value",
 }
+
+#: The keys that existed before the totals, in their frozen order.
+HISTORICAL_SNAPSHOT_KEYS = (
+    "name",
+    "mode",
+    "initial_balance",
+    "cash",
+    "equity",
+    "deployed",
+    "realized_pnl",
+    "unrealized_pnl",
+    "total_exposure",
+    "profiles",
+    "source",
+    "updated_at",
+)
+
+#: The three appended totals, in their frozen order.
+TOTAL_SNAPSHOT_KEYS = ("total_cash", "positions_value", "total_portfolio_value")
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +714,10 @@ def test_the_snapshot_payload_carries_exactly_the_documented_keys() -> None:
     payload = wallet.snapshot(updated_at=pd.Timestamp(START)).to_dict()
 
     assert set(payload) == SNAPSHOT_KEYS
+    assert len(payload) == len(HISTORICAL_SNAPSHOT_KEYS) + len(TOTAL_SNAPSHOT_KEYS)
+    # the twelve historical keys keep their order -- the totals are appended
+    assert tuple(payload)[: len(HISTORICAL_SNAPSHOT_KEYS)] == HISTORICAL_SNAPSHOT_KEYS
+    assert tuple(payload)[len(HISTORICAL_SNAPSHOT_KEYS) :] == TOTAL_SNAPSHOT_KEYS
     assert payload["name"] == "platform"
     assert payload["mode"] == "paper"
     assert payload["initial_balance"] == pytest.approx(INITIAL)
@@ -701,6 +730,147 @@ def test_the_snapshot_payload_carries_exactly_the_documented_keys() -> None:
     assert payload["profiles"] == 0
     assert payload["source"] == "local"
     assert payload["updated_at"] == pd.Timestamp(START).isoformat()
+
+
+def test_the_snapshot_totals_are_reported_from_the_constructor_arguments() -> None:
+    """The three totals are attributes of the snapshot, emitted as-is."""
+    wallet = make_wallet()
+
+    snapshot = wallet.snapshot(
+        positions_value=300.0,
+        total_cash=950.0,
+        positions_value_total=300.0,
+        total_portfolio_value=1_250.0,
+    )
+
+    assert snapshot.total_cash == pytest.approx(950.0)
+    assert snapshot.positions_value == pytest.approx(300.0)
+    assert snapshot.total_portfolio_value == pytest.approx(1_250.0)
+    # the EXISTING keyword keeps its meaning: it is what feeds ``equity``
+    assert snapshot.equity == pytest.approx(INITIAL + 300.0)
+    assert snapshot.positions_value == pytest.approx(300.0)
+
+
+def test_the_snapshot_totals_are_additive_in_the_payload() -> None:
+    """The twelve historical keys are untouched by the three appended ones."""
+    wallet = make_wallet()
+    bare = wallet.snapshot(positions_value=300.0).to_dict()
+    enriched = wallet.snapshot(
+        positions_value=300.0,
+        total_cash=950.0,
+        positions_value_total=300.0,
+        total_portfolio_value=1_250.0,
+    ).to_dict()
+
+    assert {key: enriched[key] for key in HISTORICAL_SNAPSHOT_KEYS} == {
+        key: bare[key] for key in HISTORICAL_SNAPSHOT_KEYS
+    }
+    assert enriched["total_cash"] == pytest.approx(950.0)
+    assert enriched["positions_value"] == pytest.approx(300.0)
+    assert enriched["total_portfolio_value"] == pytest.approx(1_250.0)
+    # and a wallet with no totals reports zeros, never ``None``
+    assert bare["total_cash"] == 0.0
+    assert bare["positions_value"] == 0.0
+    assert bare["total_portfolio_value"] == 0.0
+
+
+def test_the_total_portfolio_value_is_the_sum_of_cash_and_positions() -> None:
+    """``total_portfolio_value == total_cash + positions_value``, by construction.
+
+    This is the identity the reporting layer relies on: it is exactly
+    ``sum(profile.cash + profile.position_value)``, i.e. ``sum(profile.equity)``.
+    """
+    for cash, positions in ((950.0, 300.0), (0.0, 0.0), (1.0, 0.5), (12.25, -2.25)):
+        snapshot = make_wallet().snapshot(
+            total_cash=cash,
+            positions_value_total=positions,
+            total_portfolio_value=cash + positions,
+        )
+        payload = snapshot.to_dict()
+        assert payload["total_cash"] == pytest.approx(cash)
+        assert payload["positions_value"] == pytest.approx(positions)
+        assert payload["total_portfolio_value"] == pytest.approx(
+            payload["total_cash"] + payload["positions_value"]
+        )
+
+
+def test_the_ledger_cash_and_the_total_cash_are_distinct_figures() -> None:
+    """``cash`` is the durable ledger, ``total_cash`` the attributed per-profile sum.
+
+    They differ by the ENTRY FEES of the open positions: that is intentional and
+    documented, not a bug -- which is exactly why the key was not renamed.
+    """
+    wallet = make_wallet()
+
+    payload = wallet.snapshot(total_cash=INITIAL - 3.0, positions_value_total=200.0).to_dict()
+
+    assert payload["cash"] == pytest.approx(INITIAL)
+    assert payload["total_cash"] == pytest.approx(INITIAL - 3.0)
+
+
+def test_a_non_finite_total_collapses_to_none() -> None:
+    """The totals go through the very same finite guard as every other float."""
+    snapshot = make_wallet().snapshot(
+        total_cash=float("nan"),
+        positions_value_total=float("inf"),
+        total_portfolio_value=float("-inf"),
+    )
+
+    payload = snapshot.to_dict()
+
+    assert payload["total_cash"] is None
+    assert payload["positions_value"] is None
+    assert payload["total_portfolio_value"] is None
+
+
+def test_a_positional_snapshot_construction_written_before_the_totals_still_works() -> None:
+    """The three totals are keyword-with-default: nothing before them moved."""
+    historic = WalletSnapshot(
+        "platform",
+        RunMode.PAPER,
+        INITIAL,
+        INITIAL,
+        INITIAL,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        "local",
+        pd.Timestamp(START),
+    )
+
+    assert historic.updated_at == pd.Timestamp(START)
+    assert historic.total_cash == 0.0
+    assert historic.positions_value == 0.0
+    assert historic.total_portfolio_value == 0.0
+    assert set(historic.to_dict()) == SNAPSHOT_KEYS
+
+
+def test_a_keyword_snapshot_construction_written_before_the_totals_still_works() -> None:
+    """A snapshot built with the historical keyword set keeps its exact values."""
+    historic = WalletSnapshot(
+        name="platform",
+        mode=RunMode.PAPER,
+        initial_balance=INITIAL,
+        cash=INITIAL,
+        equity=INITIAL,
+        deployed=0.0,
+        realized_pnl=0.0,
+        unrealized_pnl=0.0,
+        total_exposure=0.0,
+        profiles=0,
+        source="local",
+        updated_at=pd.Timestamp(START),
+    )
+
+    payload = historic.to_dict()
+
+    assert payload["cash"] == pytest.approx(INITIAL)
+    assert payload["updated_at"] == pd.Timestamp(START).isoformat()
+    assert payload["total_cash"] == 0.0
+    assert payload["positions_value"] == 0.0
+    assert payload["total_portfolio_value"] == 0.0
 
 
 def test_the_snapshot_payload_never_carries_a_non_finite_number() -> None:
@@ -717,6 +887,9 @@ def test_the_snapshot_payload_never_carries_a_non_finite_number() -> None:
         profiles=2,
         source="local",
         updated_at=None,
+        total_cash=float("nan"),
+        positions_value=float("inf"),
+        total_portfolio_value=float("-inf"),
     )
 
     payload = snapshot.to_dict()
@@ -730,6 +903,9 @@ def test_the_snapshot_payload_never_carries_a_non_finite_number() -> None:
         "realized_pnl",
         "unrealized_pnl",
         "total_exposure",
+        "total_cash",
+        "positions_value",
+        "total_portfolio_value",
     ):
         assert payload[key] is None, key
     assert payload["updated_at"] is None
@@ -744,6 +920,8 @@ def test_a_non_finite_mark_to_market_cannot_poison_the_payload() -> None:
 
     assert payload["cash"] == pytest.approx(INITIAL)
     assert payload["equity"] is None
+    assert payload["total_cash"] == 0.0
+    assert payload["total_portfolio_value"] == 0.0
 
 
 def test_a_non_numeric_snapshot_field_collapses_to_none() -> None:

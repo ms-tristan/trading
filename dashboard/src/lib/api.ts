@@ -41,6 +41,7 @@ import type {
   ProfilesPayload,
   ProfileSnapshot,
   TradesPayload,
+  WalletLedgers,
   WalletSnapshot,
 } from './types';
 
@@ -287,6 +288,11 @@ function isArrayOf(value: unknown, item: (entry: unknown) => boolean): boolean {
  * `source` is one of the two documented origins and `mode` one of the two run
  * modes: anything else is not a wallet snapshot, so the body is refused as
  * `'malformed'` instead of being rendered as a half-known wallet.
+ *
+ * The three appended totals (`total_cash`, `positions_value`,
+ * `total_portfolio_value`) are validated through the same optional-number guard
+ * as every other late-added key of this contract: absent is accepted, because a
+ * server that does not emit them yet stays a valid producer.
  */
 export function isWalletSnapshot(value: unknown): value is WalletSnapshot {
   return (
@@ -302,8 +308,37 @@ export function isWalletSnapshot(value: unknown): value is WalletSnapshot {
     isNumberOrNull(value.total_exposure) &&
     isNumber(value.profiles) &&
     (value.source === 'local' || value.source === 'venue') &&
-    isStringOrNull(value.updated_at)
+    isStringOrNull(value.updated_at) &&
+    isOptionalNumberOrNull(value.total_cash) &&
+    isOptionalNumberOrNull(value.positions_value) &&
+    isOptionalNumberOrNull(value.total_portfolio_value)
   );
+}
+
+/**
+ * The mode-keyed ledgers of `GET /api/profiles` and `GET /api/health`.
+ *
+ * BOTH keys are **required** here, unlike the `wallets` object itself: the
+ * server always emits the pair, using an explicit `null` for a ledger that holds
+ * no row yet, so a `wallets` object carrying only one of them is genuinely
+ * truncated and is refused as `'malformed'` rather than half-rendered. An absent
+ * ledger is an explicit `null`, never an invented zero-value wallet.
+ */
+export function isWalletLedgers(value: unknown): value is WalletLedgers {
+  return (
+    isRecord(value) &&
+    (value.paper === null || isWalletSnapshot(value.paper)) &&
+    (value.live === null || isWalletSnapshot(value.live))
+  );
+}
+
+/**
+ * The optional `wallets` key of a payload: absent (`undefined`) and explicit
+ * `null` both mean "no mode-keyed ledger view reported", anything else must be
+ * a valid pair of ledgers.
+ */
+function isOptionalWalletLedgers(value: unknown): boolean {
+  return value === undefined || value === null || isWalletLedgers(value);
 }
 
 /**
@@ -326,6 +361,22 @@ function withWallet<T extends { wallet?: WalletSnapshot | null }>(payload: T): T
     return payload;
   }
   return { ...payload, wallet: null };
+}
+
+/**
+ * Default the mode-keyed-ledger key to `null` when the producer did not emit it.
+ *
+ * The exact mirror of {@link withWallet}, and for the same reason: an absent
+ * `wallets` key (an older server) is normalised to an explicit `null`, while a
+ * `wallets` object whose mode is `null` means "that ledger holds no row yet".
+ * A ledger that was never reported is never turned into an invented zero-value
+ * wallet.
+ */
+function withWalletLedgers<T extends { wallets?: WalletLedgers | null }>(payload: T): T {
+  if (payload.wallets !== undefined) {
+    return payload;
+  }
+  return { ...payload, wallets: null };
 }
 
 /** One closure entry of the startup safety sweep report. */
@@ -393,6 +444,7 @@ function isHealthPayload(value: unknown): boolean {
     isBoolean(value.kill_switch) &&
     isStringOrNull(value.checked_at) &&
     isOptionalWallet(value.wallet) &&
+    isOptionalWalletLedgers(value.wallets) &&
     isOptionalOrphanReport(value.orphaned_positions)
   );
 }
@@ -458,7 +510,8 @@ function isProfilesPayload(value: unknown): boolean {
     isRecord(value) &&
     isArrayOf(value.profiles, isProfileSnapshot) &&
     isStringOrNull(value.generated_at) &&
-    isOptionalWallet(value.wallet)
+    isOptionalWallet(value.wallet) &&
+    isOptionalWalletLedgers(value.wallets)
   );
 }
 
@@ -695,7 +748,7 @@ function expectShape<T>(
 export async function fetchHealth(options: RequestOptions = {}): Promise<HealthPayload> {
   const path = '/api/health';
   const payload = await requestJson<unknown>(path, options);
-  return withWallet(expectShape<HealthPayload>(payload, isHealthPayload, path));
+  return withWalletLedgers(withWallet(expectShape<HealthPayload>(payload, isHealthPayload, path)));
 }
 
 /**
@@ -716,7 +769,7 @@ export async function fetchOrphans(options: RequestOptions = {}): Promise<Orphan
 export async function fetchProfiles(options: RequestOptions = {}): Promise<ProfilesPayload> {
   const path = '/api/profiles';
   const payload = await requestJson<unknown>(path, options);
-  return withWallet(expectShape<ProfilesPayload>(payload, isProfilesPayload, path));
+  return withWalletLedgers(withWallet(expectShape<ProfilesPayload>(payload, isProfilesPayload, path)));
 }
 
 /** `GET /api/profiles/{id}` — one profile. */

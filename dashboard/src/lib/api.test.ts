@@ -21,6 +21,7 @@ import {
   fetchProfiles,
   fetchTrades,
   isOrphanReport,
+  isWalletLedgers,
   isWalletSnapshot,
   pauseProfile,
   postKillSwitch,
@@ -46,6 +47,7 @@ import type {
   ProfilesPayload,
   ProfileSnapshot,
   TradesPayload,
+  WalletLedgers,
   WalletSnapshot,
 } from './types';
 
@@ -105,6 +107,9 @@ const health: HealthPayload = {
  * The one shared USDT wallet of the platform, as `GET /api/profiles` and
  * `GET /api/health` emit it (`source` is `'local'` for the paper ledger and
  * `'venue'` for the exchange account of live mode).
+ *
+ * This fixture predates the three appended totals: a server that does not emit
+ * them has to stay a valid producer, so it is the backward-compatible case.
  */
 const wallet: WalletSnapshot = {
   name: 'usdt',
@@ -120,6 +125,50 @@ const wallet: WalletSnapshot = {
   source: 'local',
   updated_at: '2024-01-01T00:00:00+00:00',
 };
+
+/**
+ * The same paper wallet as a server that does emit the three appended totals.
+ *
+ * `total_portfolio_value` is exactly `total_cash + positions_value`, so this
+ * fixture is the arithmetic the contract promises and the UI renders.
+ */
+const walletWithTotals: WalletSnapshot = {
+  ...wallet,
+  total_cash: 20964.75,
+  positions_value: 4415.75,
+  total_portfolio_value: 25380.5,
+};
+
+/** The venue mirror of live mode, as the `live` half of `wallets` carries it. */
+const liveWallet: WalletSnapshot = {
+  name: 'binance',
+  mode: 'live',
+  initial_balance: 1000,
+  cash: 1000,
+  equity: 1000,
+  deployed: 0,
+  realized_pnl: 0,
+  unrealized_pnl: 0,
+  total_exposure: 0,
+  profiles: 1,
+  source: 'venue',
+  updated_at: '2024-01-01T00:00:00+00:00',
+};
+
+/**
+ * The mode-keyed ledgers of `GET /api/profiles` and `GET /api/health`.
+ *
+ * `paper` is the simulated ledger the broker mutates; `live` is `null` until
+ * that ledger holds a row, which is why the pair is always emitted in full.
+ */
+const wallets: WalletLedgers = { paper: walletWithTotals, live: null };
+
+/** A payload of an older server: the mode-keyed-ledger key removed. */
+function withoutWalletsKey<T extends { wallets?: unknown }>(payload: T): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...payload };
+  delete copy.wallets;
+  return copy;
+}
 
 const profiles: ProfilesPayload = {
   profiles: [profile],
@@ -307,14 +356,42 @@ function failingFetch(error: unknown): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+/**
+ * Add the keys a read route defaults when the fixture omits them.
+ *
+ * The fixtures are typed `unknown` in the table, so the spread lives here rather
+ * than at the call site.
+ */
+function withDefaults(payload: unknown, defaults?: Record<string, unknown>): unknown {
+  const copy: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  return { ...copy, ...defaults };
+}
+
 const readCases: Array<{
   name: string;
   call: (options: RequestOptions) => Promise<unknown>;
   path: string;
   payload: unknown;
+  /**
+   * Keys the route normalises to an explicit `null` when the payload omits them.
+   * Only the two wallet-carrying routes (`fetchHealth`, `fetchProfiles`) do this.
+   */
+  defaults?: Record<string, unknown>;
 }> = [
-  { name: 'fetchHealth', call: (o) => fetchHealth(o), path: '/api/health', payload: health },
-  { name: 'fetchProfiles', call: (o) => fetchProfiles(o), path: '/api/profiles', payload: profiles },
+  {
+    name: 'fetchHealth',
+    call: (o) => fetchHealth(o),
+    path: '/api/health',
+    payload: health,
+    defaults: { wallets: null },
+  },
+  {
+    name: 'fetchProfiles',
+    call: (o) => fetchProfiles(o),
+    path: '/api/profiles',
+    payload: profiles,
+    defaults: { wallets: null },
+  },
   {
     name: 'fetchProfile',
     call: (o) => fetchProfile('alpha', o),
@@ -365,10 +442,12 @@ const readCases: Array<{
 // ---------------------------------------------------------------------------
 
 describe('read routes', () => {
-  it.each(readCases)('$name requests $path and returns the payload', async ({ call, path, payload }) => {
+  it.each(readCases)('$name requests $path and returns the payload', async ({ call, path, payload, defaults }) => {
     const { impl, calls } = recordingFetch(jsonResponse(payload));
 
-    await expect(call({ fetchImpl: impl })).resolves.toEqual(payload);
+    // `fetchHealth` and `fetchProfiles` normalise the optional additive `wallets`
+    // key to an explicit `null`; every other route returns the body verbatim.
+    await expect(call({ fetchImpl: impl })).resolves.toEqual(withDefaults(payload, defaults));
 
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe(path);
@@ -500,6 +579,9 @@ describe('malformed responses', () => {
 describe('the shared platform wallet', () => {
   it('accepts a wallet snapshot and refuses a half-known one', () => {
     expect(isWalletSnapshot(wallet)).toBe(true);
+    // The three appended totals are optional: a wallet of a server that does not
+    // emit them yet is still a wallet, and so is one that carries them.
+    expect(isWalletSnapshot(walletWithTotals)).toBe(true);
 
     // A snapshot missing a documented key, or carrying an undocumented source
     // or mode, is not a wallet: it is refused instead of half-rendered.
@@ -513,13 +595,46 @@ describe('the shared platform wallet', () => {
     expect(isWalletSnapshot('usdt')).toBe(false);
   });
 
+  it('accepts an appended total that is null and refuses one of the wrong type', () => {
+    // `null` is a documented value of every total: the Python side routes every
+    // float through its finite-or-None guard, so a non-finite sum arrives as
+    // `null` and the UI renders the em dash placeholder.
+    expect(isWalletSnapshot({ ...wallet, total_cash: null })).toBe(true);
+    expect(isWalletSnapshot({ ...wallet, positions_value: null })).toBe(true);
+    expect(isWalletSnapshot({ ...wallet, total_portfolio_value: null })).toBe(true);
+
+    // A present key of the wrong type is not tolerated: it is refused rather
+    // than rendered as a half-known total.
+    expect(isWalletSnapshot({ ...wallet, total_cash: '20964.75' })).toBe(false);
+    expect(isWalletSnapshot({ ...wallet, positions_value: '4415.75' })).toBe(false);
+    expect(isWalletSnapshot({ ...wallet, total_portfolio_value: '25380.5' })).toBe(false);
+  });
+
+  it('accepts the mode-keyed ledgers and refuses a truncated or malformed pair', () => {
+    expect(isWalletLedgers(wallets)).toBe(true);
+    expect(isWalletLedgers({ paper: null, live: null })).toBe(true);
+    expect(isWalletLedgers({ paper: walletWithTotals, live: liveWallet })).toBe(true);
+
+    // BOTH keys are required on the wire: the server always emits the pair, so a
+    // `wallets` object carrying only one of them is genuinely truncated.
+    expect(isWalletLedgers({ paper: walletWithTotals })).toBe(false);
+    expect(isWalletLedgers({ live: liveWallet })).toBe(false);
+    expect(isWalletLedgers({})).toBe(false);
+    // A malformed half refuses the whole object instead of half-rendering it.
+    expect(isWalletLedgers({ paper: { name: 'usdt' }, live: null })).toBe(false);
+    expect(isWalletLedgers({ paper: null, live: { ...liveWallet, cash: 'lots' } })).toBe(false);
+    expect(isWalletLedgers(null)).toBe(false);
+    expect(isWalletLedgers([])).toBe(false);
+    expect(isWalletLedgers('usdt')).toBe(false);
+  });
+
   it('returns the shared wallet of the profiles payload verbatim', async () => {
     const { impl } = recordingFetch(jsonResponse(profiles));
 
     const result = await fetchProfiles({ fetchImpl: impl });
 
     expect(result.wallet).toEqual(wallet);
-    expect(result).toEqual(profiles);
+    expect(result).toEqual({ ...profiles, wallets: null });
   });
 
   it('defaults the wallet to null for a payload of an older server', async () => {
@@ -538,6 +653,100 @@ describe('the shared platform wallet', () => {
 
     expect(healthResult.wallet).toBeNull();
     expect(healthResult.version).toBe(health.version);
+  });
+
+  it('defaults the mode-keyed ledgers to null for a payload of an older server', async () => {
+    const { impl } = recordingFetch(jsonResponse(withoutWalletsKey(profiles)));
+
+    const result = await fetchProfiles({ fetchImpl: impl });
+
+    // The exact mirror of the `wallet` treatment: the absence of the key is
+    // normalised to an explicit `null`, never to an invented zero-value ledger.
+    expect(result.wallets).toBeNull();
+    expect(result.wallet).toEqual(wallet);
+
+    const healthImpl = recordingFetch(jsonResponse(withoutWalletsKey(health))).impl;
+    const healthResult = await fetchHealth({ fetchImpl: healthImpl });
+
+    expect(healthResult.wallets).toBeNull();
+    expect(healthResult.version).toBe(health.version);
+  });
+
+  it('returns the mode-keyed ledgers of the payload, and their explicit nulls', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...profiles, wallets }));
+
+    const result = await fetchProfiles({ fetchImpl: impl });
+
+    expect(result.wallets).toEqual(wallets);
+    // `live: null` means "that ledger holds no row yet" -- it round-trips as an
+    // explicit null, never as a synthesised zero-value wallet.
+    expect(result.wallets?.live).toBeNull();
+    expect(result.wallets?.paper).toEqual(walletWithTotals);
+    expect(result.wallets?.paper?.total_portfolio_value).toBe(
+      (walletWithTotals.total_cash ?? 0) + (walletWithTotals.positions_value ?? 0),
+    );
+
+    const healthImpl = recordingFetch(jsonResponse({ ...health, wallets })).impl;
+    const healthResult = await fetchHealth({ fetchImpl: healthImpl });
+
+    expect(healthResult.wallets).toEqual(wallets);
+  });
+
+  it('accepts an explicit null wallets', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...profiles, wallets: null }));
+
+    await expect(fetchProfiles({ fetchImpl: impl })).resolves.toMatchObject({ wallets: null });
+
+    const healthImpl = recordingFetch(jsonResponse({ ...health, wallets: null })).impl;
+
+    await expect(fetchHealth({ fetchImpl: healthImpl })).resolves.toMatchObject({ wallets: null });
+  });
+
+  it('carries the three appended totals through both read routes', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...profiles, wallet: walletWithTotals }));
+
+    const result = await fetchProfiles({ fetchImpl: impl });
+
+    expect(result.wallet).toEqual(walletWithTotals);
+    expect(result.wallet?.positions_value).toBe(4415.75);
+
+    const healthImpl = recordingFetch(
+      jsonResponse({ ...health, wallet: walletWithTotals }),
+    ).impl;
+    const healthResult = await fetchHealth({ fetchImpl: healthImpl });
+
+    expect(healthResult.wallet).toEqual(walletWithTotals);
+    expect(healthResult.wallet?.total_cash).toBe(20964.75);
+    expect(healthResult.wallet?.total_portfolio_value).toBe(25380.5);
+  });
+
+  it('refuses a malformed wallets value instead of rendering it', async () => {
+    // A `wallets` object missing `live`, and one whose `live` half is not a
+    // wallet snapshot: both are refused as 'malformed'.
+    const truncated = recordingFetch(
+      jsonResponse({ ...profiles, wallets: { paper: walletWithTotals } }),
+    ).impl;
+
+    await expect(fetchProfiles({ fetchImpl: truncated })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/profiles',
+    });
+
+    const brokenHalf = recordingFetch(
+      jsonResponse({ ...health, wallets: { paper: null, live: { name: 'binance' } } }),
+    ).impl;
+
+    await expect(fetchHealth({ fetchImpl: brokenHalf })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/health',
+    });
+
+    const notLedgers = recordingFetch(jsonResponse({ ...health, wallets: 'paper' })).impl;
+
+    await expect(fetchHealth({ fetchImpl: notLedgers })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/health',
+    });
   });
 
   it('accepts an explicit null wallet', async () => {

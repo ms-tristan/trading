@@ -43,7 +43,11 @@ from trading_platform.core.constants import SUPPORTED_TIMEFRAMES, timeframe_minu
 from trading_platform.core.errors import ConfigError, MonitoringError, ProfileError
 from trading_platform.realtime.models import ProfileSnapshot, RunMode
 from trading_platform.realtime.observability import LOGGER_NAME, log_event
-from trading_platform.realtime.warmup import SEVERITY_ERROR, profile_warmup_findings
+from trading_platform.realtime.warmup import (
+    SEVERITY_ERROR,
+    effective_warmup_candles,
+    profile_warmup_findings,
+)
 from trading_platform.strategy.registry import strategy_names
 
 if TYPE_CHECKING:
@@ -196,10 +200,14 @@ class RuntimeProfileController:
         never warm up is refused at the very place it is created, with the message
         the API documents:
 
-        * an **error** finding (``required_candles > warmup_candles``) raises
+        * an **error** finding (``required_candles > warmup_candles``, both compared
+          on the **resolved** warm-up) raises
           :class:`~trading_platform.core.errors.ConfigError`, which
           ``web/routes.py::_failed_mutation`` maps onto the documented ``400``:
-          the profile is never created and never started;
+          the profile is never created and never started.  A profile that overrides
+          nothing is served its strategy's own requirement and this branch is
+          unreachable for it: it is reached **only** by an explicit
+          ``warmup_candles`` below the requirement;
         * a **warning** finding (``warmup_candles > history_candles``) is logged
           and the profile *is* created: the frame the strategy receives is bounded
           by ``warmup_candles``, so a smaller stream window does not by itself
@@ -215,7 +223,7 @@ class RuntimeProfileController:
                 profile_id=str(profile.id),
                 symbol=str(profile.symbol),
                 timeframe=str(profile.timeframe),
-                warmup_candles=int(profile.warmup_candles),
+                warmup_candles=effective_warmup_candles(profile),
                 history_candles=self._history_candles,
                 message=finding.message,
             )
@@ -233,8 +241,13 @@ class RuntimeProfileController:
         Only the fields the API documents are read; ``mode`` defaults to ``paper``
         and the balance to the model default when the body omits them.
         ``warmup_candles`` and ``history_candles`` are forwarded only when the body
-        carries them, so an absent override keeps the model default (and therefore
-        the realtime-level behaviour) byte-for-byte.
+        carries them, so an absent override is left **absent**: ``warmup_candles``
+        then means "the strategy's own requirement on the profile's timeframe" and
+        ``history_candles`` "the realtime-level window".  Resolving either one here
+        would create a second authority beside
+        :func:`~trading_platform.realtime.warmup.effective_warmup_candles` and
+        ``ProfileConfig.effective_history_candles`` -- the create-time verdict and
+        the start-time verdict must be taken from the same rule.
         """
         fields: dict[str, Any] = {
             "id": identifier,

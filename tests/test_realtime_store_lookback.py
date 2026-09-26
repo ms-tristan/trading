@@ -21,8 +21,8 @@ The key properties, and the guard each test fails without:
 6. independence from the candle watermark -- the two keys are never collapsed;
 7. the entry watermark itself needs no DDL change and no migration of its own: it
    reuses the ``meta`` table that already backs the kill switch and the candle
-   watermark (the stored schema version of this build is ``4``, raised by the
-   profile-payload prune shipped in the same delivery);
+   watermark (the stored schema version of this build is ``5``, raised by the
+   per-mode wallet migration shipped in the same delivery);
 8. a corrupted row degrades to ``None`` instead of killing a tick;
 9. both names are part of the documented :class:`StateStore` protocol.
 """
@@ -286,11 +286,12 @@ def test_the_entry_watermark_needs_no_table_and_no_migration(
     watermark and the kill switch, so ``_DDL`` is untouched by it: a database written
     by the previous build -- here one holding a ``meta`` row written by the frozen
     code path -- is opened as-is and still reports the schema version of this build.
-    That version is ``4``, raised by the profile-payload prune shipped in the same
-    delivery (see ``tests/test_realtime_store_migration.py``), which neither adds nor
-    moves anything the entry watermark relies on.
+    That version is ``5``, raised by the per-mode wallet migration shipped in the same
+    delivery (see ``tests/test_realtime_store_migration.py``), which rebuilds the
+    ``wallet`` table into one ledger per mode and neither adds nor moves anything the
+    entry watermark relies on.
     """
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
 
     first = SqliteStateStore(db_path, clock=clock)
     first.initialize()
@@ -305,7 +306,7 @@ def test_the_entry_watermark_needs_no_table_and_no_migration(
     try:
         with raw_connection(db_path) as conn:
             versions = [int(row[0]) for row in conn.execute("SELECT version FROM schema_version")]
-        assert versions == [SCHEMA_VERSION] == [4]
+        assert versions == [SCHEMA_VERSION] == [5]
         # the pre-existing rows are untouched by the boot
         assert stored_meta(db_path, "last_candle:btc-paper") == before
         assert stored_meta(db_path, "kill_switch") == "false"

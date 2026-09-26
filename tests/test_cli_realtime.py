@@ -1070,12 +1070,12 @@ def test_serve_is_read_only_over_the_persisted_state(
     assert snapshot["btc-paper"]["health"]["last_candle_at"] == "2024-01-05T23:00:00+00:00"
 
 
-def test_serve_publishes_the_persisted_shared_wallet(tmp_path: Path) -> None:
+def test_serve_publishes_the_persisted_paper_ledger(tmp_path: Path) -> None:
     """The read-only surface reports the durable ledger, never a configured guess.
 
-    ``realtime serve`` runs no engine, but the shared wallet **is** persisted: the
-    snapshot it rebuilds therefore carries the stored cash of the one ledger, and
-    every profile carries the share *attributed* to it (its allocation, its
+    ``realtime serve`` runs no engine, but the ledgers **are** persisted: the
+    snapshot it rebuilds therefore carries the stored cash of the **paper** ledger,
+    and every profile carries the share *attributed* to it (its allocation, its
     deployed capital and its own P&L) instead of defaulting to zero.
     """
     from trading_platform.cli import _PersistedSnapshotProvider
@@ -1118,6 +1118,34 @@ def test_serve_publishes_the_persisted_shared_wallet(tmp_path: Path) -> None:
         assert attributed["eth-paper"]["deployed"] == pytest.approx(0.0)
         # the cash of a profile is its attributed share, never the whole wallet
         assert attributed["eth-paper"]["cash"] == pytest.approx(5_000.0)
+
+        # --- the three totals of the DEFECT: the platform total is the sum of the
+        #     attributed per-profile figures, no longer smaller than them -----------
+        per_profile_cash = sum(float(item.cash or 0.0) for item in snapshot.profiles)
+        per_profile_positions = sum(float(item.position_value or 0.0) for item in snapshot.profiles)
+        per_profile_equity = sum(float(item.equity or 0.0) for item in snapshot.profiles)
+        assert wallet.total_cash == pytest.approx(per_profile_cash)
+        assert wallet.positions_value == pytest.approx(per_profile_positions)
+        assert wallet.total_portfolio_value == pytest.approx(per_profile_equity)
+        assert wallet.total_portfolio_value == pytest.approx(
+            wallet.total_cash + wallet.positions_value
+        )
+        # ... and the durable ledger cash is a DIFFERENT, equally-correct number:
+        #     the entry fee of the still-open position is attributed to no profile
+        fees = sum(float(item.deployed) for item in snapshot.profiles) * 0.001
+        assert fees > 0.0
+        assert wallet.cash == pytest.approx(wallet.total_cash - fees)
+
+        # --- one ledger per mode, with the live one an EXPLICIT None --------------
+        wallets = provider.wallets()
+        assert set(wallets) == {"paper", "live"}
+        assert wallets["paper"] is not None
+        assert wallets["paper"].mode == RunMode.PAPER
+        assert wallets["paper"].cash == pytest.approx(wallet.cash)
+        assert wallets["live"] is None, "no live row exists, so there is no live ledger"
+        health = provider.health()
+        assert health["wallet"] == wallet.to_dict(), "the existing key is byte-identical"
+        assert health["wallets"] == {"paper": wallets["paper"].to_dict(), "live": None}
     finally:
         store.close()
 
@@ -1128,6 +1156,10 @@ def test_serve_publishes_the_persisted_shared_wallet(tmp_path: Path) -> None:
         provider = _PersistedSnapshotProvider(empty, clock=clock, realtime=realtime)
         assert provider.snapshot().wallet is None
         assert provider.health()["wallet"] is None
+        # both modes are present and explicitly absent: the read-only surface and the
+        # engine publish IDENTICAL semantics for the same empty state
+        assert provider.wallets() == {"paper": None, "live": None}
+        assert provider.health()["wallets"] == {"paper": None, "live": None}
     finally:
         empty.close()
 
@@ -1502,3 +1534,150 @@ def test_host_and_port_override_the_invocation_only(tmp_path: Path) -> None:
 
     assert table_rows(database, "meta") == before
     assert SETTINGS_META_KEY in {row[0] for row in before}
+
+
+# ---------------------------------------------------------------------------
+# the warm-up contract of ``realtime check``: the RESOLVED value, and the
+# per-mode ledgers of the read-only ``realtime serve`` surface
+# ---------------------------------------------------------------------------
+
+
+def test_check_reports_the_resolved_warm_up_when_no_override_is_declared(
+    tmp_path: Path,
+) -> None:
+    """An omitted ``warmup_candles`` reports the strategy's own requirement.
+
+    The field used to report the model default whatever the strategy needed, so a
+    profile that declared nothing could be reported as impossible while it was in
+    fact served exactly what it needs.  It now reports the **resolved** warm-up:
+    ``required_candles`` and ``warmup_candles`` are the same number, and neither the
+    error finding nor an entry in ``issues`` can be produced by an omission.
+    """
+    database = seed_profiles(
+        tmp_path,
+        profiles=[momentum_profile("momentum-1m", "1m", warmup_candles=40321)],
+        realtime={"history_candles": 50000},
+    )
+    # the same profile, this time declaring nothing at all
+    document = momentum_profile("momentum-omitted", "1m", 40321)
+    document.pop("warmup_candles")
+    store_raw_profile(database, document)
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+    by_id = {entry["id"]: entry for entry in payload["profiles"]}
+    omitted = by_id["momentum-omitted"]
+    assert set(omitted["warmup"]) == WARMUP_KEYS, "the block keeps its exact five keys"
+    assert omitted["ok"] is True
+    assert omitted["issues"] == [], "an omission is never an issue"
+    assert omitted["warmup"]["warmup_candles"] == omitted["warmup"]["required_candles"]
+    assert omitted["warmup"]["warmup_candles"] == 40321, "the RESOLVED requirement"
+    assert omitted["warmup"]["findings"] == []
+    # ... and the explicit override of the very same profile is unchanged
+    declared = by_id["momentum-1m"]
+    assert declared["warmup"]["warmup_candles"] == 40321
+    assert declared["warmup"]["findings"] == []
+
+
+def test_check_reports_an_explicit_under_requirement_override_as_impossible(
+    tmp_path: Path,
+) -> None:
+    """The incident is now reachable ONLY through an explicit, too-low override.
+
+    ``strategy-warmup-impossible`` is a real finding -- it is what stops a profile
+    that can never warm up -- but with the resolved semantics it can no longer be
+    produced by *omitting* the field.  This is that same finding, re-pointed onto the
+    configuration that really triggers it: an operator overriding the warm-up below
+    what the strategy needs.
+    """
+    database = seed_profiles(
+        tmp_path, profiles=[momentum_profile("momentum-1m", "1m", warmup_candles=200)]
+    )
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+
+    assert result.exit_code == 1
+    assert payload["ok"] is False
+    entry = payload["profiles"][0]
+    assert entry["ok"] is False
+    assert entry["warmup"]["warmup_candles"] == 200, "the explicit override is the resolved value"
+    assert entry["warmup"]["required_candles"] == 40321
+    assert [finding["code"] for finding in entry["warmup"]["findings"]] == [
+        "strategy-warmup-impossible",
+        "warmup-exceeds-history",
+    ]
+    # the error finding is repeated verbatim in ``issues``, the warning is not
+    assert entry["issues"] == [
+        finding["message"]
+        for finding in entry["warmup"]["findings"]
+        if finding["severity"] == "error"
+    ]
+
+
+def test_serve_reads_each_mode_ledger_independently(tmp_path: Path) -> None:
+    """The read-only adapter publishes both ledgers, each from its own store row.
+
+    ``realtime serve`` runs no engine, so the only honest source of a ledger is the
+    durable row: the adapter reads the paper one through the defaulted ``load_wallet()``
+    and the live one through ``load_wallet(mode='live')``, and a mode with no row is an
+    explicit ``None``.  The two surfaces must agree, so the shapes are compared with
+    the orchestrator's own contract (``{"paper": ..., "live": ...}``, both keys always
+    present).
+    """
+    from trading_platform.cli import _PersistedSnapshotProvider
+    from trading_platform.realtime.models import RunMode
+    from trading_platform.realtime.settings import PlatformSettings, settings_from_store
+
+    database = seed_profiles(tmp_path)
+    assert invoke("realtime", "run", "--state-db", str(database), "--once").exit_code == 0
+
+    clock = ManualClock(datetime.fromisoformat(ANCHOR))
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+    try:
+        realtime = settings_from_store(
+            store,
+            bootstrap=PlatformSettings(
+                realtime=RealtimeConfig(state_db=database),
+                monitoring=MonitoringConfig(),
+            ),
+        ).realtime
+        provider = _PersistedSnapshotProvider(store, clock=clock, realtime=realtime)
+
+        # (a) the engine has left the paper ledger on disk and nothing for live
+        assert store.load_wallet() is not None
+        assert store.load_wallet(mode="live") is None
+        paper_only = provider.wallets()
+        assert paper_only["live"] is None
+
+        # (b) a live row of its own is published, and never merged into the paper one
+        store.save_wallet(cash=640.0, initial_balance=500.0, mode=RunMode.LIVE)
+        both = provider.wallets()
+        assert set(both) == {"paper", "live"}
+        assert both["paper"] is not None and both["live"] is not None
+        assert both["paper"].mode == RunMode.PAPER
+        assert both["live"].mode == RunMode.LIVE
+        assert both["live"].source == "venue"
+        assert both["live"].cash == pytest.approx(640.0)
+        assert both["live"].initial_balance == pytest.approx(500.0)
+        # the paper ledger is untouched by the live write
+        assert both["paper"].cash == pytest.approx(paper_only["paper"].cash)  # type: ignore[union-attr]
+        # no profile of this platform belongs to the live mode, so its totals are zero
+        assert both["live"].profiles == 0
+        assert both["live"].total_portfolio_value == pytest.approx(0.0)
+
+        # (c) the health body carries the same mapping, normalised the same way
+        health = provider.health()
+        assert health["wallets"] == {
+            "paper": both["paper"].to_dict(),
+            "live": both["live"].to_dict(),
+        }
+        # ... and the snapshot's ``wallet`` key stays the paper ledger
+        assert provider.snapshot().wallet is not None
+        assert provider.snapshot().wallet.mode == RunMode.PAPER  # type: ignore[union-attr]
+    finally:
+        store.close()

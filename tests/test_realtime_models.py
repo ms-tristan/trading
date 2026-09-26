@@ -806,6 +806,49 @@ def test_platform_snapshot_carries_the_shared_wallet_view() -> None:
     assert_json_native(payload)
 
 
+def test_platform_snapshot_wallet_carries_the_additive_totals() -> None:
+    """The wallet view serialises its three totals, and nothing else moved.
+
+    The historical keys keep their names, their types and their order; the totals
+    are appended after ``updated_at``, so a consumer that reads the wallet payload
+    by name sees the same thing plus three keys it may ignore.
+    """
+    from trading_platform.realtime.wallet import PlatformWallet
+
+    wallet = PlatformWallet(initial_balance=15_000.0, name="platform")
+    view = wallet.snapshot(
+        positions_value=275.0,
+        total_cash=14_975.0,
+        positions_value_total=275.0,
+        total_portfolio_value=15_250.0,
+        profiles=2,
+    )
+    payload = PlatformSnapshot(
+        profiles=(),
+        generated_at=TS,
+        kill_switch=False,
+        wallet=view,
+    ).to_dict()
+    wallet_payload = payload["wallet"]
+
+    assert wallet_payload["total_cash"] == 14_975.0
+    assert wallet_payload["positions_value"] == 275.0
+    assert wallet_payload["total_portfolio_value"] == 15_250.0
+    assert (
+        wallet_payload["total_portfolio_value"]
+        == wallet_payload["total_cash"] + wallet_payload["positions_value"]
+    )
+    # the existing keys are untouched by the addition
+    assert wallet_payload["cash"] == 15_000.0  # the durable ledger, not ``total_cash``
+    assert wallet_payload["equity"] == 15_275.0
+    assert tuple(wallet_payload)[-3:] == (
+        "total_cash",
+        "positions_value",
+        "total_portfolio_value",
+    )
+    assert_json_native(payload)
+
+
 def test_platform_snapshot_wallet_is_null_when_absent() -> None:
     """A platform read model built without a wallet serialises ``null``, never a gap."""
     payload = PlatformSnapshot(profiles=(), generated_at=TS, kill_switch=True).to_dict()
@@ -997,9 +1040,34 @@ def test_profile_config_round_trips_and_defaults() -> None:
     assert default.strategy == "basic"
     assert default.mode == "paper"
     assert default.enabled is True
-    assert default.warmup_candles == 200
+    # The warm-up is now an OPTIONAL override: ``None`` means "not overridden", and
+    # the profile is then served its strategy's own requirement.
+    assert default.warmup_candles is None
     assert default.risk == RiskLimitsConfig()
     assert default.initial_balance > 0
+
+
+def test_profile_config_warmup_candles_is_an_optional_override() -> None:
+    """``None`` is the default; an explicit value round-trips unchanged.
+
+    ``0`` is still refused: an override of zero candles is not a configuration,
+    it is the silent no-op the ``ge=1`` bound exists to prevent.
+    """
+    assert ProfileConfig(id="x", symbol="BTC/USDT").warmup_candles is None
+
+    explicit = ProfileConfig(id="x", symbol="BTC/USDT", warmup_candles=40321)
+    assert explicit.warmup_candles == 40321
+    payload = explicit.model_dump(mode="json")
+    assert payload["warmup_candles"] == 40321
+    assert ProfileConfig.model_validate(payload).warmup_candles == 40321
+    assert ProfileConfig.model_validate_json(explicit.model_dump_json()).warmup_candles == 40321
+    # the omitted override survives a round trip as ``None``, never as a number
+    omitted = ProfileConfig(id="x", symbol="BTC/USDT").model_dump(mode="json")
+    assert omitted["warmup_candles"] is None
+    assert ProfileConfig.model_validate(omitted).warmup_candles is None
+
+    with pytest.raises(ValidationError):
+        ProfileConfig(id="x", symbol="BTC/USDT", warmup_candles=0)
 
 
 def test_profile_config_forbids_a_credential_field() -> None:

@@ -7,6 +7,13 @@ running, log a warning and start trading as soon as the candles have accumulated
 Both sides are tested here, through the real :class:`ProfileRunner` and the real
 ``momentum`` strategy -- the strategy the incident was reported on.
 
+The third case is the incident itself, and it is the one this module exists to
+pin: a profile that overrides **nothing** is served its strategy's own
+requirement, so ``momentum`` on ``1m`` asks the stream for 40321 candles and
+runs.  It used to ask for 200, which the frame could never grow into -- no
+refusal and no warning, just a profile that polled for ever with zero signals.
+A refusal now requires an **explicit** ``warmup_candles`` below the requirement.
+
 Everything is offline and deterministic: the four foreign seams (stream, gateway,
 store, clock) are local fakes, the frames are hand-built from an explicit
 arithmetic series, and time is a :class:`ManualClock`.
@@ -38,6 +45,7 @@ from trading_platform.realtime.models import (
 )
 from trading_platform.realtime.observability import LOGGER_NAME
 from trading_platform.realtime.runner import ProfileRunner
+from trading_platform.realtime.warmup import required_candles_for
 
 TIMEOUT = 5.0
 SYMBOL = "BTC/USDT"
@@ -53,6 +61,9 @@ INCOMPLETE_EVENT = "warmup_incomplete"
 REQUIRED_1H = 673
 REQUIRED_1M = 40321
 REQUIRED_1D = 29
+
+#: The warm-up the incident's profile was created with, as an explicit override.
+LEGACY_OVERRIDE = 200
 
 
 def run(coro: Any) -> Any:
@@ -100,7 +111,13 @@ def candle_at(frame: pd.DataFrame, position: int) -> CandleEvent:
 
 
 def profile(**overrides: Any) -> ProfileConfig:
-    """Return the incident's momentum profile, overridable field by field."""
+    """Return the incident's momentum profile, overridable field by field.
+
+    ``warmup_candles`` defaults to ``None`` -- **no override** -- so the profile
+    is served the strategy's own requirement on its own timeframe, which is the
+    resolution this module pins.  Pass ``warmup_candles=...`` explicitly to
+    describe an operator who deliberately asks for a specific number.
+    """
     payload: dict[str, Any] = {
         "id": "momentum-1m",
         "symbol": SYMBOL,
@@ -108,7 +125,7 @@ def profile(**overrides: Any) -> ProfileConfig:
         "strategy": "momentum",
         "mode": "paper",
         "initial_balance": 1000.0,
-        "warmup_candles": 200,
+        "warmup_candles": None,
         "poll_interval_seconds": 5.0,
         "risk": RiskLimitsConfig(max_open_positions=1),
     }
@@ -352,12 +369,15 @@ def build(
 def test_a_profile_that_can_never_warm_up_ends_in_error_with_an_actionable_message(
     logs: Any,
 ) -> None:
-    """1m + 200 warm-up candles + 40321 needed: ``ERROR``, never an endless poll.
+    """``1m`` + an explicit 200-candle override + 40321 needed: ``ERROR``, no endless poll.
 
-    The message must name the strategy, the timeframe, the candles required and
-    the candles available, and tell the operator which timeframes would work.
+    The refusal now requires the operator to have **asked** for a warm-up below
+    the requirement: with no override the profile would be served the 40321
+    candles its strategy needs and would run (see the incident test below).  The
+    message must name the strategy, the timeframe, the candles required and the
+    candles available, and tell the operator which timeframes would work.
     """
-    target = profile()
+    target = profile(warmup_candles=LEGACY_OVERRIDE)
     stream = FrameStream(rising_frame(10, freq="min"))
     runner, gateway, store = build(stream=stream, profile_config=target, history_candles=300)
 
@@ -369,7 +389,7 @@ def test_a_profile_that_can_never_warm_up_ends_in_error_with_an_actionable_messa
     assert "'momentum'" in message
     assert "'1m'" in message
     assert str(REQUIRED_1M) in message
-    assert "200" in message
+    assert str(LEGACY_OVERRIDE) in message
     assert "4h" in message and "1d" in message
 
     # The verdict is loud and structured.
@@ -377,7 +397,7 @@ def test_a_profile_that_can_never_warm_up_ends_in_error_with_an_actionable_messa
     assert len(verdicts) == 1
     assert verdicts[0].levelno == logging.ERROR
     assert context_of(verdicts[0])["required_candles"] == REQUIRED_1M
-    assert context_of(verdicts[0])["warmup_candles"] == 200
+    assert context_of(verdicts[0])["warmup_candles"] == LEGACY_OVERRIDE
 
     # It is persisted: the dashboard shows ERROR, with the reason, not "running".
     assert store.status_values() == [ProfileStatus.ERROR.value]
@@ -395,7 +415,9 @@ def test_a_profile_that_can_never_warm_up_ends_in_error_with_an_actionable_messa
 def test_the_refusal_is_idempotent_and_never_turns_into_a_silent_start(logs: Any) -> None:
     """A runner that refused once refuses again -- through ``run_once`` too."""
     stream = FrameStream(rising_frame(10, freq="min"))
-    runner, _gateway, store = build(stream=stream, profile_config=profile(), history_candles=300)
+    runner, _gateway, store = build(
+        stream=stream, profile_config=profile(warmup_candles=LEGACY_OVERRIDE), history_candles=300
+    )
 
     for _attempt in range(2):
         with pytest.raises(RealtimeError):
@@ -418,6 +440,80 @@ def test_a_profile_that_can_never_warm_up_is_refused_even_at_the_exact_boundary(
         run(runner.start())
     assert store.last_status is ProfileStatus.ERROR
     assert len(records_of(logs, IMPOSSIBLE_EVENT)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 1b. THE INCIDENT: a profile that overrides nothing is served its requirement
+# ---------------------------------------------------------------------------
+
+
+def test_the_incident_profile_runs_and_reports_the_coherence_warning(logs: Any) -> None:
+    """``momentum``/``1m`` with NO override: 40321 candles asked for, and it runs.
+
+    This is the end-to-end pin of the reported incident and it asserts both halves
+    at once.  The profile is *created* with no ``warmup_candles`` at all, so the
+    runner must resolve the requirement itself (40321 on the ``1m`` grid) instead
+    of asking the stream for the 200 candles the frame could never grow into --
+    and the start must **not** raise.  The profile is only misconfigured with
+    respect to the stream window (40321 > 300), which is a coherence WARNING: it
+    is reported, and the profile keeps running.
+    """
+    target = profile(warmup_candles=None)
+    assert target.warmup_candles is None
+    stream = FrameStream(rising_frame(10, freq="min"))
+    runner, _gateway, store = build(stream=stream, profile_config=target, history_candles=300)
+
+    run(runner.start())
+
+    # The stream really is asked for the resolved requirement, not for 200.
+    run(runner.run_once())
+    assert stream.history_calls == [REQUIRED_1M]
+
+    reported = records_of(logs, COHERENCE_EVENT)
+    assert len(reported) == 1
+    assert reported[0].levelno == logging.WARNING
+    assert context_of(reported[0])["warmup_candles"] == REQUIRED_1M
+    assert context_of(reported[0])["history_candles"] == 300
+
+    # Reported, never fatal: no refusal, no ERROR, the profile is running.
+    assert records_of(logs, IMPOSSIBLE_EVENT) == []
+    assert ProfileStatus.ERROR.value not in store.status_values()
+    assert store.last_status is ProfileStatus.RUNNING
+    assert runner.health().status is ProfileStatus.RUNNING
+
+
+def test_no_tick_ever_asks_for_fewer_candles_than_the_strategy_needs(logs: Any) -> None:
+    """The silent no-op is gone: below the requirement is always accompanied by a finding.
+
+    The invariant is checked on the two shapes that can produce a short window --
+    an explicit override below the requirement (refused at start, before any tick)
+    and no override at all (served the requirement itself) -- so there is no
+    configuration left in which the stream is asked for fewer candles than
+    :func:`~trading_platform.realtime.warmup.required_candles_for` reports without
+    a finding being logged for the operator.
+    """
+    # -- an explicit under-requirement override: refused, and nothing is asked ----
+    target = profile(warmup_candles=LEGACY_OVERRIDE)
+    required = required_candles_for(target)
+    assert required == REQUIRED_1M
+    refused_stream = FrameStream(rising_frame(10, freq="min"))
+    refused, _gateway, _store = build(
+        stream=refused_stream, profile_config=target, history_candles=300
+    )
+    with pytest.raises(RealtimeError):
+        run(refused.start())
+    assert refused_stream.history_calls == []
+    assert len(records_of(logs, IMPOSSIBLE_EVENT)) == 1
+
+    # -- no override: the requirement itself is asked for -------------------------
+    served_stream = FrameStream(rising_frame(10, freq="min"))
+    served, _gateway, _store = build(
+        stream=served_stream, profile_config=profile(warmup_candles=None), history_candles=300
+    )
+    run(served.run_once())
+    assert served_stream.history_calls == [required]
+    assert all(count >= required for count in served_stream.history_calls)
+    assert len(records_of(logs, COHERENCE_EVENT)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -528,30 +624,75 @@ def test_a_warmup_wider_than_the_stream_window_only_warns(logs: Any) -> None:
     assert ProfileStatus.ERROR.value not in store.status_values()
 
 
-def test_an_absent_stream_window_falls_back_to_the_profile_warmup(logs: Any) -> None:
-    """``history_candles=None`` means "no window resolved": the old behaviour.
+def test_an_absent_stream_window_falls_back_to_the_resolved_warmup(logs: Any) -> None:
+    """``history_candles=None`` means "no window resolved": compared against the resolution.
 
-    Without a resolved window the coherence rule cannot fire -- ``warmup_candles``
-    is compared against itself -- and the runner behaves exactly as it did before
-    the override existed.
+    Without a resolved window the coherence rule cannot fire -- the resolved
+    warm-up is compared against itself -- and the runner behaves exactly as it did
+    before the override existed.  The profile here has **no** override at all, so
+    what is compared against itself is the 40321 candles its strategy needs, not
+    the ``None`` the field holds.
     """
-    target = profile(timeframe="1h", warmup_candles=1000)
-    runner, _gateway, _store = build(
-        stream=FrameStream(rising_frame(800), cursor=REQUIRED_1H - 1), profile_config=target
-    )
+    target = profile(warmup_candles=None)
+    stream = FrameStream(rising_frame(10, freq="min"))
+    runner, _gateway, _store = build(stream=stream, profile_config=target)
 
     run(runner.start())
 
     assert records_of(logs, COHERENCE_EVENT) == []
     assert runner.health().status is ProfileStatus.RUNNING
 
+    # The fallback really is the resolved value: it is what the stream is asked for.
+    run(runner.run_once())
+    assert stream.history_calls == [REQUIRED_1M]
 
-def test_the_window_the_stream_is_asked_for_is_the_profile_warmup() -> None:
-    """The tick asks the stream for ``warmup_candles`` candles, unchanged."""
-    target = profile(timeframe="1h", warmup_candles=700)
-    stream = FrameStream(rising_frame(800), cursor=REQUIRED_1H - 1)
+
+def test_the_window_the_stream_is_asked_for_is_the_resolved_warmup() -> None:
+    """A profile with NO override asks the stream for its strategy's requirement.
+
+    ``momentum`` on ``1m`` needs 40321 candles; the field itself holds ``None``.
+    Asking for the raw field (or for the 200 it used to default to) is exactly the
+    silent no-op this pins against: the frame could never reach the requirement, so
+    the profile would poll for ever and emit nothing.
+    """
+    target = profile(warmup_candles=None)
+    assert target.warmup_candles is None
+    stream = FrameStream(rising_frame(10, freq="min"), cursor=1)
     runner, _gateway, _store = build(stream=stream, profile_config=target, history_candles=42000)
 
     run(runner.run_once())
 
+    assert stream.history_calls == [REQUIRED_1M]
+
+
+def test_an_explicit_warmup_candles_still_wins_verbatim() -> None:
+    """A caller that passes its own ``warmup_candles=`` overrides the resolution.
+
+    The constructor argument is the seam the orchestrator and the tests drive the
+    runner through, so it keeps its historical meaning: the value handed in is the
+    value asked for -- clamped to at least one candle -- whatever the profile
+    declares or would resolve to.
+    """
+    target = profile(timeframe="1h", warmup_candles=None)
+    stream = FrameStream(rising_frame(800), cursor=REQUIRED_1H - 1)
+    runner, _gateway, _store = build(
+        stream=stream, profile_config=target, history_candles=42000, warmup_candles=700
+    )
+
+    run(runner.run_once())
+
     assert stream.history_calls == [700]
+    assert REQUIRED_1H != 700
+
+
+def test_an_explicit_zero_candle_argument_is_still_clamped_to_one() -> None:
+    """The clamp is part of the unchanged seam: ``>= 1``, never an empty window."""
+    target = profile(timeframe="1h", warmup_candles=None)
+    stream = FrameStream(rising_frame(800), cursor=2)
+    runner, _gateway, _store = build(
+        stream=stream, profile_config=target, history_candles=42000, warmup_candles=0
+    )
+
+    run(runner.run_once())
+
+    assert stream.history_calls == [1]

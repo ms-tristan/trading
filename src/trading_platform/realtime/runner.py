@@ -116,6 +116,7 @@ from trading_platform.realtime.strategies import resolve_strategy
 from trading_platform.realtime.warmup import (
     SEVERITY_ERROR,
     candles_per_day,
+    effective_warmup_candles,
     profile_warmup_findings,
 )
 from trading_platform.strategy.base import Strategy
@@ -320,8 +321,13 @@ class ProfileRunner:
     clock:
         Time seam.  Every duration and timestamp of the runner goes through it.
     warmup_candles:
-        How many candles :meth:`run_once` asks the stream for; defaults to the
-        profile's own ``warmup_candles``.
+        How many candles :meth:`run_once` asks the stream for.  When omitted, the
+        profile's **resolved** warm-up is used
+        (:func:`~trading_platform.realtime.warmup.effective_warmup_candles`): its
+        explicit ``warmup_candles`` override when it declares one, and otherwise
+        the strategy's own requirement on the profile's timeframe -- so "no
+        override" can never mean "warm up for ever".  An explicit argument wins
+        verbatim (clamped to at least one candle).
     counters:
         Optional shared counters; a private one is created when omitted.
     timeout_seconds:
@@ -360,8 +366,20 @@ class ProfileRunner:
         self._gateway = gateway
         self._store = store
         self._clock = clock
+        # The warm-up this runner *really* serves, and the ONE value every
+        # consumer below reads: the ``profile_starting`` context, the step-3
+        # history call, the incomplete-frame counter, ``_check_warmup`` and
+        # ``_required_candles``.  It is resolved through the single arithmetic
+        # authority (:func:`effective_warmup_candles`) rather than read off the
+        # raw optional field, because ``warmup_candles`` being optional means
+        # "not overridden" resolves to the strategy's own requirement -- reading
+        # the raw field here asked the stream for ``None``-turned-``200`` while
+        # the strategy needed 40321, which is exactly the silent no-op of the
+        # incident.  An explicit ``warmup_candles=`` argument still wins verbatim.
         self._warmup = int(
-            profile.warmup_candles if warmup_candles is None else max(1, int(warmup_candles))
+            effective_warmup_candles(profile)
+            if warmup_candles is None
+            else max(1, int(warmup_candles))
         )
         self._history = None if history_candles is None else max(1, int(history_candles))
         self._timeout = float(

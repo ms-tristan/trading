@@ -99,7 +99,7 @@ START = pd.Timestamp("2024-01-01T00:00:00Z")
 SYMBOL_BTC = "BTC/USDT"
 SYMBOL_ETH = "ETH/USDT"
 
-#: The exact key set of the ``/api/health`` body (the shared wallet view, the
+#: The exact key set of the ``/api/health`` body (the per-mode ledger views, the
 #: orphan-sweep report and the profile-failure report included).
 HEALTH_KEYS = frozenset(
     {
@@ -111,6 +111,7 @@ HEALTH_KEYS = frozenset(
         "kill_switch",
         "checked_at",
         "wallet",
+        "wallets",
         "orphaned_positions",
         "profile_failures",
     }
@@ -326,7 +327,9 @@ def build_orchestrator(
     The venues share **one** :class:`PlatformWallet` built exactly like the
     orchestrator builds its own -- the platform initial balance, or the sum of the
     profiles' allocations -- because that is what the production wiring does: every
-    simulated profile spends the same USDT ledger.  An explicit ``wallet`` is used
+    simulated profile spends the same USDT ledger.  That ledger is the **paper** one
+    whatever mode the profiles declare: one ledger per mode means a venue reading
+    never flips the ledger a paper venue spends from.  An explicit ``wallet`` is used
     as-is, which is how a test pins one identity across the whole platform.
     """
     resolved_clock = (
@@ -338,7 +341,6 @@ def build_orchestrator(
     resolved_realtime = realtime_config(tmp_path) if realtime is None else realtime
     shared = wallet
     if shared is None:
-        live = any(str(item.mode) == RunMode.LIVE.value for item in profiles if item.enabled)
         # A platform with no profile has nothing to fund, and the shared ledger
         # refuses a non-positive starting balance: the empty-platform tests hand
         # in a positive one explicitly, exactly like an operator who configured
@@ -347,7 +349,7 @@ def build_orchestrator(
             initial_balance=(
                 resolve_platform_initial_balance(resolved_realtime, profiles) or 1000.0
             ),
-            mode=RunMode.LIVE if live else RunMode.PAPER,
+            mode=RunMode.PAPER,
             store=resolved_store,
             clock=resolved_clock,
             name="platform",
@@ -972,10 +974,10 @@ def test_the_orchestrator_builds_its_wallet_from_the_platform_configuration(
     store.close()
 
 
-def test_the_snapshot_and_health_expose_the_shared_wallet_view(
+def test_the_snapshot_and_health_expose_the_wallet_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The platform payload carries the wallet, aggregated from the profile figures."""
+    """The platform payload carries the paper ledger, aggregated from the profile figures."""
     flag: dict[str, Any] = {"mode": "entry_long"}
     scripted(monkeypatch, flag)
     profiles = [
@@ -993,6 +995,7 @@ def test_the_snapshot_and_health_expose_the_shared_wallet_view(
     assert wallet is not None
     assert wallet.name == "platform"
     assert wallet.source == "local"
+    assert wallet.mode is RunMode.PAPER, "the snapshot wallet stays the paper ledger"
     assert wallet.profiles == 2
     assert wallet.initial_balance == pytest.approx(2000.0)
     assert [item.open_positions for item in snapshot.profiles] == [1, 1]
@@ -1023,6 +1026,102 @@ def test_the_snapshot_and_health_expose_the_shared_wallet_view(
     health = orchestrator.health()
     assert set(health) == HEALTH_KEYS
     assert health["wallet"] == payload["wallet"]
+    assert json.dumps(health, allow_nan=False)
+    store.close()
+
+
+def test_the_three_totals_reconcile_on_a_platform_holding_an_open_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE DEFECT ITSELF: the platform total is no longer smaller than the sum of its parts.
+
+    With one open position per profile the platform used to report an ``equity`` that
+    was the durable cash plus the positions -- a number **below** ``sum(profile.equity)``,
+    because the entry fees the venue had already charged were attributed to no profile.
+    The three totals fix the read model rather than the arithmetic: ``total_portfolio_value``
+    is exactly ``sum(profile.equity)``, and exactly ``total_cash + positions_value``.
+    The durable ``cash`` key is untouched and still differs from ``total_cash`` by those
+    fees -- the caveat that must stay documented, not a bug.
+    """
+    flag: dict[str, Any] = {"mode": "entry_long"}
+    scripted(monkeypatch, flag)
+    profiles = [
+        profile("btc-paper", SYMBOL_BTC, stake_amount=250.0),
+        profile("eth-paper", SYMBOL_ETH, stake_amount=250.0),
+    ]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+
+    async def scenario() -> tuple[PlatformSnapshot, dict[str, Any]]:
+        await orchestrator.run_once()
+        return orchestrator.snapshot(), orchestrator.health()
+
+    snapshot, health = run(scenario())
+    wallet = snapshot.wallet
+    assert wallet is not None
+    assert [item.open_positions for item in snapshot.profiles] == [1, 1], "two open positions"
+
+    per_profile = sum(float(item.equity or 0.0) for item in snapshot.profiles)
+    per_profile_cash = sum(float(item.cash or 0.0) for item in snapshot.profiles)
+    per_profile_positions = sum(float(item.position_value or 0.0) for item in snapshot.profiles)
+
+    # (a) the identity the contract states, asserted rather than trusted
+    assert wallet.total_portfolio_value == pytest.approx(wallet.total_cash + wallet.positions_value)
+    # (b) the total IS the sum of the attributed per-profile figures
+    assert wallet.total_portfolio_value == pytest.approx(per_profile)
+    assert wallet.total_cash == pytest.approx(per_profile_cash)
+    assert wallet.positions_value == pytest.approx(per_profile_positions)
+    # (c) ... and it is not smaller than that sum, which is the defect
+    assert wallet.total_portfolio_value >= per_profile - 1e-9
+
+    # (d) the durable ledger cash is a DIFFERENT number, for the documented reason:
+    #     the entry fees of the still-open positions are attributed to no profile
+    fees = sum(item.deployed for item in snapshot.profiles) * 0.001
+    assert fees > 0.0
+    assert wallet.cash == pytest.approx(wallet.total_cash - fees)
+    assert wallet.cash != pytest.approx(wallet.total_cash)
+    assert sum(item.cash for item in snapshot.profiles) - wallet.cash == pytest.approx(fees)
+    # (e) the older keys keep their exact meaning
+    assert wallet.equity == pytest.approx(
+        wallet.cash + sum(item.position_value for item in snapshot.profiles)
+    )
+
+    # the health body carries the very same totals, under the additive key
+    assert health["wallets"]["paper"] == wallet.to_dict()
+    assert health["wallets"]["paper"]["total_portfolio_value"] == pytest.approx(per_profile)
+    assert json.dumps(health, allow_nan=False)
+    store.close()
+
+
+def test_the_wallets_mapping_is_an_explicit_none_for_a_mode_with_no_row(
+    tmp_path: Path,
+) -> None:
+    """A paper-only platform publishes no live ledger, and says so with ``None``.
+
+    The mapping always carries **both** keys: ``live`` is ``None`` -- never an
+    invented ledger of zeroes -- while ``paper`` is the ledger the platform really
+    holds.  The snapshot and the health body agree on it, and the two read paths (the
+    orchestrator and the read-only ``realtime serve`` adapter, pinned in
+    ``tests/test_cli_realtime.py``) publish identical semantics for the same state.
+    """
+    profiles = [profile("btc-paper", SYMBOL_BTC, stake_amount=250.0)]
+    orchestrator, store, _clock, _streams = build_orchestrator(tmp_path, profiles)
+
+    wallets = orchestrator.wallets()
+    assert set(wallets) == {"paper", "live"}
+    assert wallets["paper"] is not None
+    assert wallets["paper"].mode is RunMode.PAPER
+    assert wallets["live"] is None, "no live row exists, so there is no live ledger"
+    # the live ledger has no in-memory object either: the absence is not fabricated
+    assert orchestrator.wallet_for(RunMode.LIVE) is None
+    assert orchestrator.wallet_for(RunMode.PAPER) is orchestrator.wallet
+
+    health = orchestrator.health()
+    assert set(health) == HEALTH_KEYS
+    assert health["wallets"] == {
+        "paper": wallets["paper"].to_dict(),
+        "live": None,
+    }
+    assert health["wallets"]["live"] is None
     assert json.dumps(health, allow_nan=False)
     store.close()
 
@@ -1089,10 +1188,16 @@ def test_a_deleted_profile_is_forgotten_by_the_platform_risk_state(
     store.close()
 
 
-def test_a_live_platform_mirrors_the_venue_balance_into_a_read_only_wallet(
+def test_a_live_platform_mirrors_the_venue_balance_into_a_read_only_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """In live mode the wallet *is* the venue account: mirrored, never debited."""
+    """Live mode gets a ledger of its own: mirrored, never debited, never the paper one.
+
+    The legacy rule -- "any enabled live profile flips *the* wallet to a venue mirror"
+    -- is gone.  :attr:`RealtimeOrchestrator.wallet` stays the **paper** ledger however
+    live the platform is, and the venue account is mirrored into the **live** ledger,
+    which is what :meth:`wallet_for` and :meth:`wallets` publish.
+    """
     flag: dict[str, Any] = {"mode": "hold"}
     scripted(monkeypatch, flag)
     venues = [LiveVenueBroker(balance=640.0)]
@@ -1106,16 +1211,49 @@ def test_a_live_platform_mirrors_the_venue_balance_into_a_read_only_wallet(
 
     run(orchestrator.run_once())
 
-    wallet = orchestrator.wallet
-    assert wallet.mode is RunMode.LIVE
-    assert wallet.is_authoritative is False
-    assert wallet.spendable() == pytest.approx(640.0), "the venue account is the truth"
-    assert wallet.cash == pytest.approx(1000.0), "the local ledger is never moved"
+    # the paper ledger is untouched by a venue reading
+    paper = orchestrator.wallet
+    assert paper.mode is RunMode.PAPER
+    assert paper.is_authoritative is True
+
+    live = orchestrator.wallet_for(RunMode.LIVE)
+    assert live is not None
+    assert live.mode is RunMode.LIVE
+    assert live.is_authoritative is False
+    assert live is not paper
+    assert live.spendable() == pytest.approx(640.0), "the venue account is the truth"
+    assert live.cash == pytest.approx(640.0), "the mirror holds the venue reading"
     assert venues[0].calls == 1, "exactly one best-effort reading at boot"
+
+    # the live ledger has a row of its own now, so the mapping publishes it
+    assert store.load_wallet(mode="live") is not None
+    assert store.load_wallet() is not None, "the paper ledger kept its own row"
+
+    # ``wallet_for`` is stable and cached: one object per mode, for ever
+    assert orchestrator.wallet_for(RunMode.LIVE) is live
+    assert orchestrator.wallet_for(RunMode.PAPER) is paper
+    assert orchestrator.wallet_for("live") is live
+
     snapshot = orchestrator.snapshot()
     assert snapshot.wallet is not None
-    assert snapshot.wallet.source == "venue"
-    assert snapshot.wallet.cash == pytest.approx(1000.0)
+    assert snapshot.wallet.mode is RunMode.PAPER, "the snapshot wallet stays the paper ledger"
+    assert snapshot.wallet.source == "local"
+    assert snapshot.wallet.profiles == 0, "no profile belongs to the paper mode here"
+
+    wallets = orchestrator.wallets()
+    assert set(wallets) == {"paper", "live"}
+    assert wallets["paper"] is not None
+    assert wallets["paper"].mode is RunMode.PAPER
+    assert wallets["live"] is not None
+    assert wallets["live"].mode is RunMode.LIVE
+    assert wallets["live"].source == "venue"
+    # the live entry reports the durable row the venue reading created, so the
+    # headline cash of a live platform is what the venue reported
+    assert wallets["live"].cash == pytest.approx(640.0)
+    health = orchestrator.health()
+    assert set(health) == HEALTH_KEYS
+    assert health["wallets"]["live"] == wallets["live"].to_dict()
+    assert health["wallets"]["paper"] == wallets["paper"].to_dict()
     store.close()
 
 

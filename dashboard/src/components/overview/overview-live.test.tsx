@@ -106,12 +106,14 @@ const noOrphans: OrphanReport = {
 };
 
 /**
- * The shared platform wallet of the fixtures.
+ * The shared platform wallet of the fixtures, as the PAPER ledger.
  *
  * `cash = initial_balance - deployed + realized_pnl`
  * (21,500 = 25,000 - 4,500 + 1,000) and
  * `equity = initial_balance + realized_pnl + unrealized_pnl`
- * (25,750 = 25,000 + 1,000 - 250).
+ * (25,750 = 25,000 + 1,000 - 250). The three totals are coherent:
+ * `total_portfolio_value = total_cash + positions_value`
+ * (25,750 = 21,500 + 4,250).
  */
 const wallet: WalletSnapshot = {
   name: 'usdt',
@@ -126,6 +128,28 @@ const wallet: WalletSnapshot = {
   profiles: 2,
   source: 'local',
   updated_at: '2024-01-01T00:00:00+00:00',
+  total_cash: 21500,
+  positions_value: 4250,
+  total_portfolio_value: 25750,
+};
+
+/** The REAL ledger: a different ledger, with clearly different totals. */
+const liveWallet: WalletSnapshot = {
+  name: 'binance',
+  mode: 'live',
+  initial_balance: 5000,
+  cash: 4900,
+  equity: 5120,
+  deployed: 220,
+  realized_pnl: 20,
+  unrealized_pnl: 100,
+  total_exposure: 220,
+  profiles: 1,
+  source: 'venue',
+  updated_at: '2024-01-01T00:00:00+00:00',
+  total_cash: 4900,
+  positions_value: 300,
+  total_portfolio_value: 5200,
 };
 
 /** The wallet after one refresh: cash and equity have moved. */
@@ -137,6 +161,9 @@ const refreshedWallet: WalletSnapshot = {
   realized_pnl: 1400.25,
   unrealized_pnl: 550.75,
   total_exposure: 2600,
+  total_cash: 23800.25,
+  positions_value: 3150.75,
+  total_portfolio_value: 26951,
   updated_at: '2024-06-01T12:00:02+00:00',
 };
 
@@ -179,6 +206,7 @@ function startServer(): StubServer {
       profiles: [makeProfile('alpha'), makeProfile('beta')],
       generated_at: '2024-01-01T00:00:00+00:00',
       wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
     },
     killSwitch: { ...killSwitch },
     orphans: { ...orphans },
@@ -338,7 +366,7 @@ describe('OverviewLive', () => {
     // Scoped on purpose: the page carries more than one `role="status"` now
     // that the sweep warning is a notice of its own; this test is about the
     // polling failure of the toolbar.
-    const banner = within(screen.getByRole('region', { name: 'Profiles' })).getByRole('status');
+    const banner = within(screen.getByRole('region', { name: 'Profiles — paper trading' })).getByRole('status');
     // The operator reads the mapped headline, never the bare transport message.
     expect(within(banner).getByText('The monitoring API is unreachable')).toBeInTheDocument();
     // The raw cause stays visible, verbatim, as the detail line.
@@ -396,7 +424,7 @@ describe('OverviewLive', () => {
     // inside the region labelled by the 'Profiles' heading.
     const refresh = screen.getByRole('button', { name: 'Refresh now' });
     expect(refresh.parentElement).toContainElement(links[0]);
-    expect(screen.getByRole('region', { name: 'Profiles' })).toContainElement(links[0]);
+    expect(screen.getByRole('region', { name: 'Profiles — paper trading' })).toContainElement(links[0]);
 
     // The affordances of the action are unchanged by the move.
     expect(links[0]).toHaveClass(
@@ -442,14 +470,20 @@ describe('OverviewLive', () => {
 
     // One panel, seeded from the server payload: mounting issues no request.
     expect(server.calls).toEqual([]);
-    const panel = screen.getByRole('region', { name: 'Platform wallet' });
-    expect(within(panel).getAllByText('Platform wallet')).toHaveLength(1);
-    expect(
-      within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00'),
-    ).toBeInTheDocument();
+    const panel = screen.getByRole('region', { name: 'Platform wallet — paper trading' });
+    expect(within(panel).getAllByText('Platform wallet — paper trading')).toHaveLength(1);
+
+    // The three totals of the paper ledger, straight out of the payload.
+    const tiles = screen.getByTestId('wallet-tiles');
+    expect(within(tiles).getByText('$21,500.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('$4,250.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('$25,750.00')).toBeInTheDocument();
+
     expect(screen.getByText('Local ledger')).toBeInTheDocument();
     // And it is the *only* wallet panel of the page.
-    expect(screen.getAllByRole('region', { name: 'Platform wallet' })).toHaveLength(1);
+    expect(
+      screen.getAllByRole('region', { name: 'Platform wallet — paper trading' }),
+    ).toHaveLength(1);
   });
 
   it('refreshes the shared wallet with the polling cycle', async () => {
@@ -464,6 +498,7 @@ describe('OverviewLive', () => {
       profiles: [makeProfile('alpha'), makeProfile('beta')],
       generated_at: '2024-06-01T12:00:02+00:00',
       wallet: { ...refreshedWallet },
+      wallets: { paper: { ...refreshedWallet }, live: { ...liveWallet } },
     };
     server.health = { ...server.health, wallet: { ...refreshedWallet } };
     await advance(2000);
@@ -492,7 +527,7 @@ describe('OverviewLive', () => {
     // The failure is announced by the toolbar, and the wallet of the last good
     // payload stays on screen instead of collapsing to em dashes.
     expect(
-      within(screen.getByRole('region', { name: 'Profiles' })).getByRole('status'),
+      within(screen.getByRole('region', { name: 'Profiles — paper trading' })).getByRole('status'),
     ).toHaveTextContent('The monitoring API is unreachable');
     expect(within(screen.getByTestId('wallet-tiles')).getByText('$21,500.00')).toBeInTheDocument();
     expect(screen.getByText('Local ledger')).toBeInTheDocument();
@@ -500,23 +535,26 @@ describe('OverviewLive', () => {
 
   it('renders the em dash state of a payload without a wallet key', async () => {
     const server = startServer();
-    // An older monitoring server: the payload carries no wallet key at all.
+    // An older monitoring server: the payload carries neither `wallet` nor the
+    // mode-keyed `wallets` object.
     server.profiles = {
       profiles: [makeProfile('alpha'), makeProfile('beta')],
       generated_at: '2024-01-01T00:00:00+00:00',
     };
     renderLive(server);
 
-    expect(screen.getByText('No shared wallet reported')).toBeInTheDocument();
+    // The note is scoped to the selected mode: the platform has not been proven
+    // to lack a wallet, only this mode's ledger row is missing.
+    expect(screen.getByText('No paper trading ledger reported')).toBeInTheDocument();
     expect(within(screen.getByTestId('wallet-tiles')).getAllByText(EMPTY_PLACEHOLDER)).toHaveLength(
-      8,
+      3,
     );
     // The cards of the profiles keep rendering, and nothing crashed.
     expect(screen.getAllByRole('article')).toHaveLength(2);
 
     await advance(2000);
     expect(screen.getAllByRole('article')).toHaveLength(2);
-    expect(screen.getByText('No shared wallet reported')).toBeInTheDocument();
+    expect(screen.getByText('No paper trading ledger reported')).toBeInTheDocument();
   });
 
   it('surfaces a kill switch engaged while the page is open', async () => {
@@ -564,7 +602,7 @@ describe('OverviewLive', () => {
 
     // Placement: the warning is rendered above the profiles section, so a
     // safety notice is never pushed below the fold by the list it is about.
-    const section = screen.getByRole('region', { name: 'Profiles' });
+    const section = screen.getByRole('region', { name: 'Profiles — paper trading' });
     expect(notice).not.toBeNull();
     expect(
       (notice as HTMLElement).compareDocumentPosition(section) &
@@ -612,5 +650,237 @@ describe('OverviewLive', () => {
     expect(screen.queryByText('The monitoring API is unreachable')).not.toBeInTheDocument();
 
     view.unmount();
+  });
+
+  // -------------------------------------------------------------------------
+  // the Paper / Real toggle: the whole page follows it, with no request
+  // -------------------------------------------------------------------------
+
+  it('defaults to paper and names the mode in the profiles heading and the toggle', () => {
+    const server = startServer();
+    renderLive(server);
+
+    // The default is paper, and both the list and the panel say so in words.
+    expect(screen.getByRole('radio', { name: /Paper trading/i })).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'Profiles — paper trading' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'Platform wallet — paper trading' }),
+    ).toBeInTheDocument();
+  });
+
+  it('shows what each mode holds before it is switched to', () => {
+    const server = startServer();
+    server.profiles = {
+      profiles: [makeProfile('alpha'), makeProfile('live-1', { mode: 'live' })],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    const toggle = screen.getByTestId('mode-toggle');
+    expect(within(toggle).getByRole('radio', { name: /Paper trading/i })).toHaveTextContent(
+      '1 profile',
+    );
+    expect(within(toggle).getByRole('radio', { name: /Real trading/i })).toHaveTextContent(
+      '1 profile',
+    );
+  });
+
+  it('switches the list AND the ledger to the real mode WITHOUT issuing a request', async () => {
+    const server = startServer();
+    // Two profiles, one per mode: the two lists must never share an entry.
+    server.profiles = {
+      profiles: [
+        makeProfile('alpha'),
+        makeProfile('live-1', { mode: 'live', equity: 7777 }),
+      ],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    // The paper view holds the paper profile and the paper ledger.
+    expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'live-1' })).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$25,750.00')).toBeInTheDocument();
+
+    const callsBefore = [...server.calls];
+
+    fireEvent.click(screen.getByRole('radio', { name: /Real trading/i }));
+    await settle();
+
+    // THE point of the switch: no request was issued for it at all.
+    expect(server.calls).toEqual(callsBefore);
+    expect(server.calls).toEqual([]);
+
+    // The list follows the toggle: only the live profile is rendered now.
+    expect(screen.getByRole('link', { name: 'live-1' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'alpha' })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'Profiles — real trading' }),
+    ).toBeInTheDocument();
+
+    // And so does the ledger: the REAL totals, never the paper ones.
+    const tiles = screen.getByTestId('wallet-tiles');
+    expect(within(tiles).getByText('$4,900.00')).toBeInTheDocument();
+    expect(within(tiles).getByText('$5,200.00')).toBeInTheDocument();
+    expect(within(tiles).queryByText('$25,750.00')).not.toBeInTheDocument();
+    expect(screen.getByText('Venue account')).toBeInTheDocument();
+    expect(screen.getByText('Real mode')).toBeInTheDocument();
+  });
+
+  it('restores the paper list and totals when the toggle goes back', async () => {
+    const server = startServer();
+    server.profiles = {
+      profiles: [makeProfile('alpha'), makeProfile('live-1', { mode: 'live' })],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    fireEvent.click(screen.getByRole('radio', { name: /Real trading/i }));
+    await settle();
+    expect(screen.getByRole('link', { name: 'live-1' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('radio', { name: /Paper trading/i }));
+    await settle();
+
+    expect(screen.getByRole('link', { name: 'alpha' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'live-1' })).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$25,750.00')).toBeInTheDocument();
+    expect(screen.getByText('Local ledger')).toBeInTheDocument();
+    // Still nothing was requested: both directions read the same payload.
+    expect(server.calls).toEqual([]);
+  });
+
+  it('never mixes two modes in one list', () => {
+    const server = startServer();
+    server.profiles = {
+      profiles: [
+        makeProfile('alpha'),
+        makeProfile('beta'),
+        makeProfile('live-1', { mode: 'live' }),
+        makeProfile('live-2', { mode: 'live' }),
+      ],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    const paperCards = screen.getAllByRole('article');
+    expect(paperCards).toHaveLength(2);
+    // Scoping by the accessible name of each card: the two live profiles are
+    // simply not there, so the two lists can never share an entry.
+    expect(screen.getByRole('article', { name: 'alpha' })).toBeInTheDocument();
+    expect(screen.getByRole('article', { name: 'beta' })).toBeInTheDocument();
+    expect(screen.queryByRole('article', { name: 'live-1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('article', { name: 'live-2' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'live-1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'live-2' })).not.toBeInTheDocument();
+  });
+
+  it('distinguishes "no profile for this mode" from "no profile configured"', async () => {
+    const server = startServer();
+    // The platform holds profiles, but only on the real side.
+    server.profiles = {
+      profiles: [makeProfile('alpha', { mode: 'live' }), makeProfile('beta', { mode: 'live' })],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: null, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    // The paper side: profiles exist elsewhere, so the copy must NOT claim the
+    // platform is unconfigured.
+    expect(screen.getByText('No profile for this mode')).toBeInTheDocument();
+    expect(screen.getByText(/none of them in paper trading/i)).toBeInTheDocument();
+    expect(screen.queryByText('No profile configured')).not.toBeInTheDocument();
+
+    // An empty paper ledger is a ledger that was never traded: em dash totals,
+    // and the note says so for the mode rather than for the whole platform.
+    expect(within(screen.getByTestId('wallet-tiles')).getAllByText(EMPTY_PLACEHOLDER)).toHaveLength(
+      3,
+    );
+    expect(screen.getByText('No paper trading ledger reported')).toBeInTheDocument();
+
+    // Switching to the side that DOES hold profiles restores a real list.
+    fireEvent.click(screen.getByRole('radio', { name: /Real trading/i }));
+    await settle();
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+    expect(screen.queryByText('No profile for this mode')).not.toBeInTheDocument();
+  });
+
+  it('still reads "no profile configured" when the platform holds none at all', () => {
+    const server = startServer();
+    server.profiles = { profiles: [], generated_at: null, wallet: { ...wallet } };
+    server.health = { ...health, profiles_total: 0, profiles_running: 0 };
+    renderLive(server);
+
+    expect(screen.getByText('No profile configured')).toBeInTheDocument();
+    expect(screen.queryByText('No profile for this mode')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the paper ledger when an older server emits no `wallets` key', () => {
+    const server = startServer();
+    // An older server: `wallets` is absent entirely, `wallet` is the paper ledger.
+    server.profiles = {
+      profiles: [makeProfile('alpha'), makeProfile('beta')],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+    };
+    renderLive(server);
+
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$25,750.00')).toBeInTheDocument();
+
+    // The fallback is for paper ONLY: `wallet` is the paper ledger by contract,
+    // so the real side must never show paper money under a real heading.
+    fireEvent.click(screen.getByRole('radio', { name: /Real trading/i }));
+    expect(screen.getByText('No real trading ledger reported')).toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getAllByText(EMPTY_PLACEHOLDER)).toHaveLength(
+      3,
+    );
+  });
+
+  it('keeps the mode across polling cycles and follows a refreshed payload', async () => {
+    const server = startServer();
+    server.profiles = {
+      profiles: [makeProfile('alpha'), makeProfile('live-1', { mode: 'live' })],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    fireEvent.click(screen.getByRole('radio', { name: /Real trading/i }));
+    await settle();
+    expect(screen.getByRole('link', { name: 'live-1' })).toBeInTheDocument();
+
+    // A cycle refreshes the payload: the selection is page state, so it stays.
+    server.profiles = {
+      profiles: [
+        makeProfile('alpha', { equity: 11111 }),
+        makeProfile('live-1', { mode: 'live', equity: 22222 }),
+      ],
+      generated_at: '2024-06-01T12:00:02+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet, total_portfolio_value: 6000 } },
+    };
+    await advance(2000);
+
+    expect(screen.getByRole('radio', { name: /Real trading/i })).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+    expect(screen.getByRole('link', { name: 'live-1' })).toBeInTheDocument();
+    expect(within(screen.getByTestId('wallet-tiles')).getByText('$6,000.00')).toBeInTheDocument();
   });
 });

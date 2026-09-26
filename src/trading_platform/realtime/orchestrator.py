@@ -184,7 +184,7 @@ if TYPE_CHECKING:
     from trading_platform.realtime.settings import PlatformSettings
     from trading_platform.realtime.store import CandleRow, StateStore
     from trading_platform.realtime.stream import MarketStream
-    from trading_platform.realtime.wallet import PlatformWallet
+    from trading_platform.realtime.wallet import PlatformWallet, WalletSnapshot
 
 __all__ = [
     "BrokerFactory",
@@ -481,12 +481,23 @@ class RealtimeOrchestrator:
         self._boot_failures: dict[str, str] = {}
         self._kill_switch: KillSwitch | None = None
         self._wallet = wallet
-        #: Guards the one-shot restore of the shared wallet: the boot runs on the
+        #: Guards the one-shot restore of the ledgers: the boot runs on the
         #: engine thread while the monitoring API answers on its own thread, and
         #: "restored once" is a contract, not an approximation.
         self._wallet_lock = threading.Lock()
-        self._wallet_restored = False
+        #: The ledgers whose restore already ran, keyed by :class:`RunMode`.  One
+        #: flag per mode -- and not one global flag -- because each mode has its own
+        #: row in the store: restoring the paper ledger must never mark the live one
+        #: as adopted.
+        self._wallet_restored: dict[RunMode, bool] = {}
+        #: The restored cash of the **paper** ledger, published by :meth:`health` and
+        #: by the boot report.  ``None`` means "the store held no paper row", which is
+        #: the signal the configured balance is the truth for this run.
         self._restored_cash: float | None = None
+        #: Lazily built ledger of each non-paper mode.  Paper is deliberately absent:
+        #: it *is* :attr:`wallet`, the object the paper venues spend from, so building
+        #: a second one for paper would publish two different ledgers for one mode.
+        self._mode_wallets: dict[RunMode, PlatformWallet] = {}
         self._platform_state: PlatformRiskState | None = None
         self._monotonic_start: float | None = None
         self._started_at: pd.Timestamp | None = None
@@ -508,15 +519,21 @@ class RealtimeOrchestrator:
 
     @property
     def wallet(self) -> PlatformWallet:
-        """Return the one shared wallet every profile funds its orders from.
+        """Return the **paper** ledger every profile funds its orders from.
 
         The wallet is built **once** per orchestrator instance, lazily, and never
         resolved through a module-level global: it is the same object the paper
         venues spend from, the same one the risk managers check before an order and
-        the same one the snapshot reports.  Its mode follows the profiles -- a
-        platform that runs any enabled ``live`` profile has a wallet that *mirrors*
-        the venue account (read-only, never locally debited), every other platform
-        has the local simulated ledger.
+        the same one the snapshot reports.  It is *always* the local simulated
+        ledger -- ``mode`` is :attr:`RunMode.PAPER` and ``is_authoritative`` is
+        ``True`` -- because it is the ledger a paper venue really debits.
+
+        This property used to flip to :attr:`RunMode.LIVE` as soon as the platform
+        ran any enabled ``live`` profile, turning the one wallet into a read-only
+        mirror of a venue account.  That behaviour is **gone**, replaced by the
+        per-mode rule: the venue mirror is a ledger of its own, reachable through
+        :meth:`wallet_for` and published by :meth:`wallets`, while this property
+        stays the paper ledger for every consumer that already reads it.
 
         The starting cash is :func:`resolve_platform_initial_balance`: the
         configured ``realtime.platform_initial_balance`` when there is one, else the
@@ -536,12 +553,43 @@ class RealtimeOrchestrator:
             resolved = float(resolve_platform_initial_balance(self._realtime, self._profiles))
             self._wallet = PlatformWallet(
                 initial_balance=resolved if resolved > 0.0 else _MINIMUM_WALLET_BALANCE,
-                mode=RunMode.LIVE if self._has_enabled_live_profile() else RunMode.PAPER,
+                mode=RunMode.PAPER,
                 store=self._store,
                 clock=self._clock,
                 name="platform",
             )
         return self._wallet
+
+    def wallet_for(self, mode: str | RunMode) -> PlatformWallet | None:
+        """Return the ledger of ``mode``, or ``None`` when that mode holds no row.
+
+        One ledger per mode, and the two are independent objects over the **same**
+        store and the **same** clock:
+
+        * :attr:`RunMode.PAPER` answers :attr:`wallet` -- the very ledger the paper
+          venues spend from, never a copy of it;
+        * :attr:`RunMode.LIVE` answers the lazily built, cached
+          :class:`~trading_platform.realtime.wallet.PlatformWallet` of that mode: the
+          read-only mirror of the venue account, built and adopted through the same
+          one-shot discipline as the paper ledger (see
+          :meth:`_ensure_wallet_restored`).
+
+        ``None`` is an **explicit** answer, not an error and never an invented
+        ledger: a mode whose store holds no row has no ledger object at all, and the
+        caller renders that absence as a JSON ``null``.  The gate is the durable row
+        -- :meth:`_live_ledger_row` -- because a ledger that exists only in memory
+        would be a number the platform cannot prove after a restart.
+
+        Raises
+        ------
+        RealtimeError
+            If ``mode`` is not a known run mode.
+        """
+        resolved = RunMode(mode)
+        self._ensure_wallet_restored()
+        if resolved is RunMode.PAPER:
+            return self.wallet
+        return self._mode_wallets.get(resolved)
 
     @property
     def monitoring(self) -> MonitoringConfig | None:
@@ -710,17 +758,29 @@ class RealtimeOrchestrator:
     def snapshot(self) -> PlatformSnapshot:
         """Return the whole platform as the monitoring layer sees it.
 
-        The shared wallet view is aggregated from the profile snapshots collected
-        here -- their position values, their deployed capital and their P&L -- so
-        the platform-wide cash, equity and exposure are always the exact sum of the
-        attributed per-profile figures the same payload carries.  The ledger is
-        restored first, so the reported cash is the durable one even when this
-        process never booted the engine (see :meth:`_ensure_wallet_restored`).
+        ``wallet`` is the **paper** ledger's view, aggregated from the profile
+        snapshots collected here -- their position values, their deployed capital and
+        their P&L -- so the platform-wide cash, equity and exposure are always the
+        exact sum of the attributed per-profile figures the same payload carries.  It
+        is aggregated over the profiles that **belong to that mode** and over no
+        other, so a platform that runs both a paper and a live profile never mixes
+        one mode's cash into the other's report; the live ledger of the same state is
+        published by :meth:`wallets`.  The ledger is restored first, so the reported
+        cash is the durable one even when this process never booted the engine (see
+        :meth:`_ensure_wallet_restored`).
+
+        The three totals the snapshot carries come from the **same** per-profile
+        payload as the rest: ``total_cash`` is the sum of the attributed
+        ``profile.cash``, ``positions_value`` the sum of the ``profile.position_value``
+        and ``total_portfolio_value`` the sum of the ``profile.equity`` -- which is
+        exactly ``total_cash + positions_value``, so the platform total can no longer
+        be smaller than the sum of its parts.
         """
         self._ensure_wallet_restored()
         collected = tuple(self.profile_snapshot(profile_id) for profile_id in self.profile_ids())
         state = self.kill_switch_state()
         profiles = tuple(item for item in collected if item is not None)
+        paper = tuple(item for item in profiles if RunMode(item.mode) is RunMode.PAPER)
         return PlatformSnapshot(
             profiles=profiles,
             generated_at=pd.Timestamp(self._clock.now()),
@@ -731,13 +791,67 @@ class RealtimeOrchestrator:
             started_at=self._started_at,
             uptime_seconds=self._uptime(),
             wallet=self.wallet.snapshot(
-                positions_value=sum(item.position_value for item in profiles),
-                deployed=sum(item.deployed for item in profiles),
-                realized_pnl=sum(item.realized_pnl for item in profiles),
-                unrealized_pnl=sum(item.unrealized_pnl for item in profiles),
-                total_exposure=sum(abs(item.position_value) for item in profiles),
-                profiles=len(collected),
+                positions_value=sum(item.position_value for item in paper),
+                deployed=sum(item.deployed for item in paper),
+                realized_pnl=sum(item.realized_pnl for item in paper),
+                unrealized_pnl=sum(item.unrealized_pnl for item in paper),
+                total_exposure=sum(abs(item.position_value) for item in paper),
+                profiles=len(paper),
+                total_cash=sum(float(item.cash or 0.0) for item in paper),
+                positions_value_total=sum(float(item.position_value or 0.0) for item in paper),
+                total_portfolio_value=sum(float(item.equity or 0.0) for item in paper),
             ),
+        )
+
+    def wallets(self) -> dict[str, WalletSnapshot | None]:
+        """Return the platform-wide view of **each** ledger, keyed by mode.
+
+        The mapping is exactly ``{"paper": <snapshot>, "live": <snapshot or None>}``,
+        so a consumer reads both modes from one payload with no second round trip and
+        no guessing about which key is which:
+
+        * ``"paper"`` is the ledger :attr:`wallet` holds -- always present, because
+          the paper ledger is the one this process builds for itself;
+        * ``"live"`` is the venue mirror, or an explicit ``None`` when that ledger
+          holds **no row** yet.  ``None`` is a real answer, never an invented ledger
+          of zeroes: the monitoring payload renders it as a JSON ``null``.
+
+        Each entry is aggregated with the same per-mode arithmetic as
+        :meth:`snapshot`: the totals of an entry are the sums over the profiles of
+        *that* mode, never over the whole platform, so the two ledgers can never
+        borrow each other's figures.
+        """
+        self._ensure_wallet_restored()
+        collected = tuple(self.profile_snapshot(profile_id) for profile_id in self.profile_ids())
+        profiles = tuple(item for item in collected if item is not None)
+        return {
+            RunMode.PAPER.value: self._mode_wallet_snapshot(RunMode.PAPER, profiles),
+            RunMode.LIVE.value: self._mode_wallet_snapshot(RunMode.LIVE, profiles),
+        }
+
+    def _mode_wallet_snapshot(
+        self, mode: RunMode, profiles: tuple[ProfileSnapshot, ...]
+    ) -> WalletSnapshot | None:
+        """Return one mode's aggregated ledger view, or ``None`` when it has no row.
+
+        The ledger object is asked for through :meth:`wallet_for`, which answers
+        ``None`` for a mode the store holds no row for; that absence is passed
+        straight through instead of being flattened into a zero-valued ledger.
+        """
+        wallet = self.wallet_for(mode)
+        if wallet is None:
+            return None
+        of_mode = tuple(item for item in profiles if RunMode(item.mode) is mode)
+        return wallet.snapshot(
+            positions_value=sum(item.position_value for item in of_mode),
+            deployed=sum(item.deployed for item in of_mode),
+            realized_pnl=sum(item.realized_pnl for item in of_mode),
+            unrealized_pnl=sum(item.unrealized_pnl for item in of_mode),
+            total_exposure=sum(abs(item.position_value) for item in of_mode),
+            profiles=len(of_mode),
+            total_cash=sum(float(item.cash or 0.0) for item in of_mode),
+            positions_value_total=sum(float(item.position_value or 0.0) for item in of_mode),
+            total_portfolio_value=sum(float(item.equity or 0.0) for item in of_mode),
         )
 
     def profile_failures(self) -> dict[str, str]:
@@ -792,6 +906,13 @@ class RealtimeOrchestrator:
         the keys beside it: ``status`` is still degraded by a profile status and by
         the kill switch, and a failed profile is persisted as ``ERROR``, which is
         what makes it degrade.
+
+        ``wallets`` is the second additive key, and the only one the per-mode ledgers
+        added here: ``{mode: <ledger> or None}`` for **each** mode, always present,
+        with an explicit ``None`` for a mode whose store holds no row.  The existing
+        ``wallet`` key is untouched -- same name, same type, same value: the paper
+        ledger -- because every consumer written before the second ledger existed
+        reads exactly it.
         """
         snapshot = self.snapshot()
         profiles = snapshot.profiles
@@ -807,6 +928,13 @@ class RealtimeOrchestrator:
             "kill_switch": bool(engaged),
             "checked_at": self._clock.now().isoformat(),
             "wallet": None if wallet is None else wallet.to_dict(),
+            # Every ledger of the platform, by mode: the paper one repeats
+            # ``wallet`` above, the live one is an explicit ``None`` until that
+            # ledger holds a row.
+            "wallets": {
+                mode: None if view is None else view.to_dict()
+                for mode, view in self.wallets().items()
+            },
             # --- ORPHAN SWEEP WIRING (WP3) ---------------------------------
             # The last orphan sweep, always present: ``None`` means "never
             # swept", an explicit ``null`` a consumer can tell apart from "swept
@@ -1283,7 +1411,7 @@ class RealtimeOrchestrator:
     # --- END ORPHAN SWEEP WIRING (WP3) -------------------------------------
 
     def _ensure_wallet_restored(self) -> None:
-        """Adopt the persisted ledger, exactly once, before anything reports it.
+        """Adopt the persisted ledgers, exactly once **each**, before anything reports.
 
         :meth:`_prepare_runners` calls this at boot; the read model calls it too,
         because a process that only *reads* the platform -- the monitoring API of
@@ -1292,28 +1420,120 @@ class RealtimeOrchestrator:
         the configured initial balance while the store holds a different row would
         be a lie about the platform's money.
 
-        The call is idempotent (a lock and a flag make "once" exact across the
-        engine thread and the API thread) and best-effort: a store that cannot be
+        Every mode is restored on its own, under the one :attr:`_wallet_lock`, and
+        :attr:`_wallet_restored` remembers **which** modes are done: the paper ledger
+        is adopted from the row the previous build already wrote as
+        ``wallet_id = 1``, and the live ledger is built and adopted only when the
+        store holds a row for it -- a mode with no row has **no ledger object at
+        all**, which is what :meth:`wallet_for` reports as ``None`` instead of an
+        invented ``0.0``.  The durable **row** draws that line -- the paper one through
+        ``restore()``'s own return value (``None`` exactly when it found no row) and
+        the live one through :meth:`_live_ledger_row` -- because a ledger that exists
+        only in memory would be a number the platform cannot prove after a restart.
+
+        The call is idempotent (a lock and a per-mode flag make "once" exact across
+        the engine thread and the API thread) and best-effort: a store that cannot be
         read logs ``platform_wallet_restore_failed`` and leaves the configured
         balance in place, and the restore is retried on the next boot.  A store that
         has not been initialized yet is left to its owner: initializing it here
         would race the boot that opens it.
         """
         with self._wallet_lock:
-            if self._wallet_restored or not self._store_ready():
+            if not self._store_ready():
                 return
-            wallet = self.wallet
-            try:
-                restored_cash = wallet.restore()
-            except RealtimeError as exc:
-                log_event(
-                    _LOGGER,
-                    "platform_wallet_restore_failed",
-                    level=logging.WARNING,
-                    error=str(exc),
-                )
+            paper_done = self._wallet_restored.get(RunMode.PAPER, False)
+            if not paper_done:
+                if not self._restore_wallet(self.wallet):
+                    return
+                self._wallet_restored[RunMode.PAPER] = True
+            if self._wallet_restored.get(RunMode.LIVE, False):
                 return
-            self._wallet_restored = True
+            row = self._live_ledger_row()
+            if row is None:
+                # No row for the live mode: there is nothing to adopt and no ledger to
+                # build.  The mode stays *unrestored* on purpose, so a later venue sync
+                # can still create its ledger, and every reader keeps answering
+                # ``None`` until one really exists.
+                return
+            self._mode_wallets[RunMode.LIVE] = self._build_live_ledger(
+                cash=float(row.cash), initial_balance=float(row.initial_balance)
+            )
+            log_event(
+                _LOGGER,
+                "platform_wallet_restored",
+                cash=float(row.cash),
+                restored=True,
+                mode=RunMode.LIVE.value,
+            )
+            self._wallet_restored[RunMode.LIVE] = True
+
+    def _build_live_ledger(self, *, cash: float, initial_balance: float) -> PlatformWallet:
+        """Build the in-memory live mirror of a durable live row.
+
+        The mirror carries **no store seam**, and that is a deliberate seam decision
+        rather than an omission: :class:`PlatformWallet` persists through
+        ``save_wallet(cash=..., initial_balance=...)`` -- the call its own ``persist``
+        and ``restore``/``_load_row`` make, with **no** ``mode`` -- so a store wired
+        here would read and write the *paper* row whatever ``mode`` the wallet
+        declares, and a venue reading would silently overwrite the paper ledger.
+
+        This orchestrator therefore owns the live ledger's durability: it writes the
+        row itself (``save_wallet(..., mode=RunMode.LIVE)``), reads it back through
+        :meth:`_live_ledger_row`, and hands the values to the mirror below.  The mirror
+        is a faithful in-memory view of what that row holds -- ``cash`` and
+        ``initial_balance`` included -- and is read-only by construction
+        (:attr:`PlatformWallet.is_authoritative` is ``False`` in live mode).
+        """
+        from trading_platform.realtime.wallet import PlatformWallet
+
+        wallet = PlatformWallet(
+            initial_balance=initial_balance,
+            mode=RunMode.LIVE,
+            store=None,
+            clock=self._clock,
+            name="platform",
+        )
+        wallet.restore_cash(cash)
+        return wallet
+
+    def _live_ledger_row(self) -> Any:
+        """Return the durable live ledger row, or ``None`` when the mode has none.
+
+        Read through the store's own ``mode`` keyword and defensively: a store written
+        before the per-mode ledgers existed takes no ``mode`` at all, and its single
+        ledger is the paper one -- never a live mirror -- so the live mode stays
+        correctly absent for it.  A store that raises while answering is treated as
+        "no row", which is the honest answer for an unreadable ledger.
+        """
+        loader = getattr(self._store, "load_wallet", None)
+        if not callable(loader):
+            return None
+        try:
+            return loader(mode=RunMode.LIVE)
+        except TypeError:  # pragma: no cover - a store predating the mode keyword
+            return None
+        except RealtimeError:
+            return None
+
+    def _restore_wallet(self, wallet: PlatformWallet) -> bool:
+        """Restore one ledger and log its outcome; answer whether the mode is done.
+
+        ``False`` means the store could not be read: the mode stays unrestored so a
+        later boot retries it, exactly as the single-ledger version did.  The caller
+        holds :attr:`_wallet_lock`.
+        """
+        try:
+            restored_cash = wallet.restore()
+        except RealtimeError as exc:
+            log_event(
+                _LOGGER,
+                "platform_wallet_restore_failed",
+                level=logging.WARNING,
+                mode=wallet.mode.value,
+                error=str(exc),
+            )
+            return False
+        if wallet.mode is RunMode.PAPER:
             self._restored_cash = restored_cash
         log_event(
             _LOGGER,
@@ -1322,6 +1542,7 @@ class RealtimeOrchestrator:
             restored=restored_cash is not None,
             mode=wallet.mode.value,
         )
+        return True
 
     def _build_runner(self, profile: ProfileConfig, factory: StreamFactory) -> None:
         """Build the gateway and the runner of one profile, then reconcile it."""
@@ -1443,23 +1664,31 @@ class RealtimeOrchestrator:
         )
 
     def _sync_live_wallet(self) -> None:
-        """Mirror the venue account into the shared wallet once, best-effort.
+        """Mirror the venue account into the **live** ledger once, best-effort.
 
-        In live mode the wallet **is** the venue's account: the local ledger is
-        never debited, and the only honest thing the boot can do is ask the venue
-        what it holds.  The balance of the first enabled live profile answers for
-        the whole platform, exactly like the mode itself does.  The call is
-        best-effort by contract: any :class:`~trading_platform.core.errors.RealtimeError`
-        (an unreachable venue, a missing credential) is logged and the platform
-        starts anyway -- the wallet then falls back to its configured initial
-        balance rather than inventing a ``0.0``.
+        In live mode the venue account is the truth: the live ledger is never
+        debited locally, and the only honest thing the boot can do is ask the venue
+        what it holds.  The balance of the first enabled live profile answers for the
+        live ledger only -- the paper ledger is a different ledger of a different
+        mode, and a venue reading must never land in it.
 
-        A paper platform has nothing to mirror and returns immediately, so no test
-        and no simulated run ever reaches a venue here.
+        The mirror is what **creates** the live ledger: the reading is recorded
+        durably first (``save_wallet(mode='live')``), and the row that write leaves
+        behind is what :meth:`wallet_for` and :meth:`wallets` publish from then on.  A
+        platform whose venue reported nothing therefore keeps ``wallets()["live"]`` an
+        explicit ``None`` -- the ledger does not exist rather than existing at an
+        invented ``0.0``.
+
+        The call is best-effort by contract: any
+        :class:`~trading_platform.core.errors.RealtimeError` (an unreachable venue, a
+        missing credential) is logged as ``platform_wallet_venue_sync_failed`` and the
+        platform starts anyway.  A record failure is equally best-effort and logged as
+        ``platform_wallet_venue_sync_failed``: the in-memory mirror still carries the
+        reading, so the funding check of this run uses the true venue balance.
+
+        A platform with no enabled live profile has nothing to mirror and returns
+        immediately, so no test and no simulated run ever reaches a venue here.
         """
-        wallet = self.wallet
-        if wallet.is_authoritative:
-            return
         for profile_id in self._enabled_ids():
             profile = self._by_id[profile_id]
             runner = self._runners.get(profile_id)
@@ -1468,7 +1697,7 @@ class RealtimeOrchestrator:
             try:
                 balance = runner.gateway.balance()
                 if balance is not None:
-                    wallet.sync_from_venue(balance, at=pd.Timestamp(self._clock.now()))
+                    self._record_venue_balance(profile_id, float(balance))
             except RealtimeError as exc:
                 log_event(
                     _LOGGER,
@@ -1479,11 +1708,45 @@ class RealtimeOrchestrator:
                 )
             return
 
-    def _has_enabled_live_profile(self) -> bool:
-        """Return whether any enabled profile runs against a real venue."""
-        return any(
-            str(profile.mode) == RunMode.LIVE.value for profile in self._profiles if profile.enabled
-        )
+    def _record_venue_balance(self, profile_id: str, balance: float) -> None:
+        """Persist one venue reading as the live ledger, then mirror it in memory.
+
+        The durable write comes first on purpose: it is what makes the live ledger
+        **exist** for every reader of this process (an explicit ``None`` before it is
+        exactly the "no row yet" answer the API documents), and the in-memory mirror
+        built from that row is the object the funding checks spend against.  The
+        mirror is adopted through :meth:`PlatformWallet.restore`, so its ``cash`` is
+        the reading that was just written and not the configured fallback of a ledger
+        that has never been funded.
+        """
+        resolved = float(resolve_platform_initial_balance(self._realtime, self._profiles))
+        initial_balance = resolved if resolved > 0.0 else _MINIMUM_WALLET_BALANCE
+        try:
+            self._store.save_wallet(
+                cash=balance,
+                initial_balance=initial_balance,
+                mode=RunMode.LIVE,
+            )
+        except (RealtimeError, TypeError) as exc:
+            # A store predating the ``mode`` keyword (``TypeError``) or one that
+            # refuses the write: the mirror below still carries the reading, so the
+            # funding check of this run is honest even though nothing is durable.
+            log_event(
+                _LOGGER,
+                "platform_wallet_venue_sync_failed",
+                level=logging.WARNING,
+                profile_id=profile_id,
+                error=str(exc),
+            )
+        with self._wallet_lock:
+            wallet = self._mode_wallets.get(RunMode.LIVE)
+            if wallet is None:
+                wallet = self._build_live_ledger(cash=balance, initial_balance=initial_balance)
+                self._mode_wallets[RunMode.LIVE] = wallet
+            else:
+                wallet.restore_cash(balance)
+            wallet.sync_from_venue(balance, at=pd.Timestamp(self._clock.now()))
+            self._wallet_restored[RunMode.LIVE] = True
 
     def _risk_state(self) -> PlatformRiskState:
         """Return the platform-wide aggregation of the profiles' figures (one per run).

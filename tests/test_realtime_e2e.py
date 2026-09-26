@@ -68,6 +68,11 @@ LAST_CANDLE = "2024-01-05T23:00:00+00:00"
 #: from: it is **additive**, always present, and ``null`` when the provider reports
 #: none.  ``profile_failures`` is the second additive key: what could not be
 #: loaded, built or started, always present and ``{}`` when everything is fine.
+#: ``wallets`` is the third: the per-mode ledgers, one entry per
+#: :class:`~trading_platform.config.models.RunMode`, always present, each view
+#: ``null`` when its ledger reported nothing.  It rides beside ``wallet`` -- the
+#: single platform-wide view the read-only surface has always served -- rather
+#: than replacing it, so a consumer of the old key is never broken by it.
 HEALTH_KEYS = frozenset(
     {
         "status",
@@ -78,6 +83,7 @@ HEALTH_KEYS = frozenset(
         "kill_switch",
         "checked_at",
         "wallet",
+        "wallets",
         "orphaned_positions",
         "profile_failures",
     }
@@ -367,7 +373,10 @@ def test_deterministic_tick_twice_then_the_read_only_monitoring_api(tmp_path: Pa
 
         status, payload = get(port, "/api/profiles")
         assert status == 200
-        assert set(payload) == {"profiles", "generated_at", "wallet"}
+        # ``wallets`` is additive here exactly as it is on ``/api/health``: the
+        # per-mode ledgers ride beside the single ``wallet`` view, so the served
+        # body carries one key more than it used to and no key fewer.
+        assert set(payload) == {"profiles", "generated_at", "wallet", "wallets"}
         assert [item["profile_id"] for item in payload["profiles"]] == [
             "btc-paper",
             "eth-paper",

@@ -89,6 +89,12 @@ function ApiUnreachable({ failure, baseUrl }: { failure: unknown; baseUrl: strin
  * Component already fetched, so the first paint carries the wallet values and
  * the same polling bundle refreshes them. Exactly one wallet panel is rendered
  * — a second, page-level copy would show the same ledger twice.
+ *
+ * The Paper / Real toggle is owned by that live region, and this component
+ * renders the **paper** view for the first paint: the client's initial mode is
+ * `paper` too, so hydration neither flashes the other mode nor mismatches the
+ * server markup. Nothing extra is fetched for it — the mode-keyed `wallets`
+ * object already travels inside the `profiles` payload passed above.
  */
 export default async function OverviewPage() {
   const baseUrl = serverApiBaseUrl();

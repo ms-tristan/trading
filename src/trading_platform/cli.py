@@ -2510,13 +2510,34 @@ class _PersistedSnapshotProvider:
         )
 
     def _wallet_view(self, specs: Any, profiles: list[Any]) -> Any:
-        """Return the persisted shared wallet, or ``None`` when no row was written.
+        """Return the persisted **paper** ledger, or ``None`` when no row was written.
 
-        ``realtime serve`` runs no engine, but the wallet **is** persisted: the
+        ``specs`` is the loaded profile set the caller already read: it is kept in the
+        signature because it is what the platform-wide read is resolved against (the
+        store is the source of truth for both), and the ledger's own mode -- not the
+        profiles' -- is what now decides which row this view reports.
+
+        ``realtime serve`` runs no engine, but the ledgers **are** persisted: the
         read-only surface therefore reports the durable ledger -- its cash, its
-        initial balance, the equity of the whole platform and the attributed P&L
-        sums -- instead of a configured guess.  A store that never saw a wallet
-        answers ``None``, which the API renders as an explicit ``null``.
+        initial balance, the equity of the platform and the attributed P&L sums --
+        instead of a configured guess.  The read is the store's own paper read
+        (``load_wallet()``, whose ``mode`` keyword defaults to paper), so this
+        surface publishes the paper ledger of exactly the same state the engine
+        does.  A store that never saw a paper row answers ``None``, which the API
+        renders as an explicit ``null``.
+
+        The figures are aggregated over the profiles that belong to **that** mode,
+        never over the whole platform, and the three totals are computed from the
+        same per-profile payload as the rest:
+
+        ``total_cash = sum(profile.cash)``,
+        ``positions_value = sum(profile.position_value)`` and
+        ``total_portfolio_value = sum(profile.equity)`` -- which _is_
+        ``total_cash + positions_value``.
+
+        The legacy behaviour of reporting the ledger in the mode of the *profiles*
+        (a live platform published a ``"venue"`` wallet) is gone: the ledger's mode
+        is a property of the ledger, not of the profile set.
         """
         from trading_platform.realtime.models import RunMode
         from trading_platform.realtime.wallet import WalletSnapshot
@@ -2524,33 +2545,90 @@ class _PersistedSnapshotProvider:
         row = self._store.load_wallet()
         if row is None:
             return None
-        mode = (
-            RunMode.LIVE
-            if any(RunMode(str(spec.mode)) is RunMode.LIVE for spec in specs)
-            else RunMode.PAPER
-        )
-        positions_value = sum(float(item.position_value) for item in profiles)
+        mode = RunMode.PAPER
+        attributed = [item for item in profiles if RunMode(item.mode) is RunMode.PAPER]
+        positions_value = sum(float(item.position_value) for item in attributed)
         return WalletSnapshot(
             name="platform",
             mode=mode,
             initial_balance=float(row.initial_balance),
             cash=float(row.cash),
             equity=float(row.cash) + positions_value,
-            deployed=sum(float(item.deployed) for item in profiles),
-            realized_pnl=sum(float(item.realized_pnl) for item in profiles),
-            unrealized_pnl=sum(float(item.unrealized_pnl) for item in profiles),
-            total_exposure=sum(abs(float(item.position_value)) for item in profiles),
-            profiles=len(profiles),
+            deployed=sum(float(item.deployed) for item in attributed),
+            realized_pnl=sum(float(item.realized_pnl) for item in attributed),
+            unrealized_pnl=sum(float(item.unrealized_pnl) for item in attributed),
+            total_exposure=sum(abs(float(item.position_value)) for item in attributed),
+            profiles=len(attributed),
+            source="local",
+            updated_at=row.updated_at,
+            total_cash=sum(float(item.cash or 0.0) for item in attributed),
+            positions_value=positions_value,
+            total_portfolio_value=sum(float(item.equity or 0.0) for item in attributed),
+        )
+
+    def wallets(self) -> dict[str, Any]:
+        """Return the persisted ledger of **each** mode, keyed by mode name.
+
+        Mirror of :meth:`trading_platform.realtime.orchestrator.RealtimeOrchestrator.wallets`:
+        the mapping is exactly ``{"paper": <WalletSnapshot|None>, "live":
+        <WalletSnapshot|None>}``, each entry read through the store's own
+        ``load_wallet(mode=...)`` and aggregated over the profiles of that mode.  A
+        mode the store holds no row for is an explicit ``None`` -- never a
+        zero-valued ledger -- so the read-only surface and the engine publish
+        **identical** semantics for the same durable state.
+        """
+        from trading_platform.realtime.models import RunMode
+
+        specs = self._store.load_profiles()
+        profiles = [
+            item
+            for item in (self.profile_snapshot(str(profile.id)) for profile in specs)
+            if item is not None
+        ]
+        return {
+            mode.value: self._mode_wallet_view(mode, specs, profiles)
+            for mode in (RunMode.PAPER, RunMode.LIVE)
+        }
+
+    def _mode_wallet_view(self, mode: Any, specs: Any, profiles: list[Any]) -> Any:
+        """Return one mode's persisted ledger view, or ``None`` when it has no row."""
+        from trading_platform.realtime.models import RunMode
+        from trading_platform.realtime.wallet import WalletSnapshot
+
+        row = self._store.load_wallet(mode=mode)
+        if row is None:
+            return None
+        attributed = [item for item in profiles if RunMode(item.mode) is mode]
+        positions_value = sum(float(item.position_value) for item in attributed)
+        return WalletSnapshot(
+            name="platform",
+            mode=mode,
+            initial_balance=float(row.initial_balance),
+            cash=float(row.cash),
+            equity=float(row.cash) + positions_value,
+            deployed=sum(float(item.deployed) for item in attributed),
+            realized_pnl=sum(float(item.realized_pnl) for item in attributed),
+            unrealized_pnl=sum(float(item.unrealized_pnl) for item in attributed),
+            total_exposure=sum(abs(float(item.position_value)) for item in attributed),
+            profiles=len(attributed),
             source="local" if mode is RunMode.PAPER else "venue",
             updated_at=row.updated_at,
+            total_cash=sum(float(item.cash or 0.0) for item in attributed),
+            positions_value=positions_value,
+            total_portfolio_value=sum(float(item.equity or 0.0) for item in attributed),
         )
 
     def health(self) -> dict[str, Any]:
         """Return the ``/api/health`` body of the persisted platform (no engine).
 
-        ``wallet`` is the persisted shared wallet (the very same object the
-        snapshot publishes); it is ``None`` only when the store holds no wallet row
-        yet, which the API renders as an explicit ``null``.
+        ``wallet`` is the persisted paper ledger (the very same object the snapshot
+        publishes); it is ``None`` only when the store holds no paper row yet, which
+        the API renders as an explicit ``null``.
+
+        ``wallets`` is the additive per-mode mapping of :meth:`wallets`, always
+        present and carrying an explicit ``None`` for a mode with no row -- the same
+        shape the orchestrator publishes, so a consumer reads one contract whichever
+        surface answers.
         """
         snapshot = self.snapshot()
         wallet = snapshot.wallet
@@ -2563,6 +2641,10 @@ class _PersistedSnapshotProvider:
             "kill_switch": snapshot.kill_switch,
             "checked_at": self._clock.now().isoformat(),
             "wallet": None if wallet is None else wallet.to_dict(),
+            "wallets": {
+                mode: None if view is None else view.to_dict()
+                for mode, view in self.wallets().items()
+            },
         }
 
     def orphan_report(self) -> Any:
