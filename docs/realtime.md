@@ -284,6 +284,73 @@ not a bound — it is a **race**: it killed every profile on its first idle poll
 (`profile_crashed error="TimeoutError"`) and crash-looped the container (79
 restarts of the shipped 30 s / 10 s configuration).
 
+**Head-room is not a guarantee, and the margin was never the fix.** The previous
+delivery answered that crash by adding 5 % plus 50 ms of head-room around the
+bound and left the blocking call where it was. It did not stop the crash, because
+the mechanism is not arithmetic:
+
+- `asyncio.wait_for(coro, timeout=T)` registers its timeout callback and then runs
+  `coro` until it suspends: **two deadlines are armed on the loop at once** — the
+  wait taken *inside* `coro`, and the bound that wraps it;
+- every profile of the platform shares **one** event loop, and until this delivery
+  `PollingMarketStream` called `provider.fetch_ohlcv(...)` **synchronously**, so
+  one profile's venue read froze every other profile's timers for the whole
+  duration of an HTTP round trip;
+- when the loop resumes, both deadlines are already overdue, and the timeout
+  callback sits **ahead of the task's own resumption step** in the ready queue, so
+  `asyncio.wait_for` raises a bare `TimeoutError` — the empty message an operator
+  read as `profile_crashed error="TimeoutError: "` — even though the wrapped wait
+  had already elapsed.
+
+The reproduction is deterministic, and it has nothing to do with 5 %:
+
+```python
+task = asyncio.create_task(asyncio.wait_for(asyncio.sleep(0.5), timeout=0.55))
+await asyncio.sleep(0.40)
+time.sleep(0.30)  # one profile's synchronous provider read
+await task  # raises TimeoutError('') -- the 0.5 s sleep was already over
+```
+
+No finite margin survives that: the freeze is *at least* as long as the blocking
+call, and the blocking call **is** the freeze. In production the frozen loop was a
+profile's `fetch_ohlcv`, `_idle()` waited the profile's poll interval under a
+bound that ended 300 ms later, and `_idle()` sat **outside** the `try/except` of
+`next_candle` (the `if closed.empty:` branch): the empty `TimeoutError` escaped the
+stream, `ProfileRunner.run()` recorded it through `_record_error` as a fatal
+`ERROR`, and `orchestrator._supervise` then logged `profile_crashed` and persisted
+`ERROR`. A delayed idle poll was therefore indistinguishable from a broken
+profile — which is exactly the observed symptom: 3 of 5 config-identical live
+profiles persisted `ERROR` with `health.last_error = "TimeoutError"` tens of
+seconds after start, while their two siblings (same strategy, timeframe, risk and
+poll interval; only the symbol differed) kept running. Which profiles die is a
+race: the ones whose idle deadline the freeze crosses.
+
+**What the code delivers now.** Three changes, none of them a wider number:
+
+1. **the provider read no longer runs on the loop.** `PollingMarketStream` reads
+   `provider.fetch_ohlcv(...)` — in `next_candle` and in `history` — inside
+   `asyncio.to_thread(...)`, so a slow venue read occupies a worker thread while
+   the shared loop keeps firing every other profile's timers;
+2. **a pacing wait is never fatal.** The bound around `_idle`, `_bounded_sleep`
+   and `_backoff` is applied by `waits.paced_wait`, which abandons a delayed
+   sleeper quietly — it returns how long the wait really took, reports it through
+   an optional observer and **never raises `TimeoutError`** — so a loop frozen by
+   anything at all (another profile, a collection, a slow disk) can no longer
+   turn a healthy idle poll into a fatal status. Only a cancelled caller
+   propagates, so a stopped profile still stops;
+3. **a bound that really does expire is named.** A call that must answer (a
+   provider poll, a history fetch) is bounded by `waits.awaited_within`, which
+   grants one late grace window and, when it finally gives up, raises a
+   `TimeoutError` that **names the call and its budget** — never the empty message
+   a crashed profile used to persist.
+
+That is the guarantee this page documents, and `src/trading_platform/realtime/waits.py`
+is its single arithmetic authority: `wait_bound`, `paced_wait`, `awaited_within`
+and the margin constants `PACING_MARGIN_RATIO` / `PACING_MARGIN_FLOOR_SECONDS`
+live there and nowhere else, so the stream, the runner and the orchestrator can no
+longer derive three slightly different margins from the same configuration — the
+drift that produced the crash this section exists for.
+
 A stream declares its longest legitimate wait through the read-only member
 `MarketStream.max_wait_seconds` (`realtime/stream.py`):
 
@@ -301,8 +368,12 @@ margin and a small floor, so the shipped pair — profile
 by ~31.6 s instead of ~10.55 s, and the 30 s idle wait completes. A single
 `realtime run --once` tick budgets, per profile, the same bound that profile's
 runner applies — the stream's declared wait included, the retry backoff series
-and all — plus one stream timeout for the shutdown, so it cannot cut an idle poll
-either.
+and all — plus one stream timeout for the shutdown: the budget is derived from the
+same declared waits as the bound itself, never from `stream_poll_timeout_seconds`
+alone; on the default profile that per-profile budget is ~15.8 s, because the
+15 s retry backoff series (`max_stream_reconnects = 5`,
+`reconnect_backoff_seconds = 1.0`) dominates both the 5 s poll interval and the
+10 s stream timeout.
 
 Because the two values meet at boot, the platform checks the pair when the
 profiles are wired to the realtime settings and logs a **WARNING** — event
@@ -318,6 +389,73 @@ misconfiguration into an outage. The 30 s / 10 s pair legitimately fires it, a
 profile whose poll interval is not longer stays silent, and with the bound above
 the warning no longer announces a crash: lowering `poll_interval_seconds` is
 **not** needed to keep the platform up.
+
+### 3.2 Blocking calls on the shared event loop: audit
+
+The crash of §3.1 is one instance of a class, not a one-off: **a synchronous call
+made from async code, on the one event loop every profile shares**. One such call
+is everybody's latency and — through the deadline race above — everybody's risk,
+so the class was audited across `src/trading_platform/` and `dashboard/src/` with
+these commands, whose output is the evidence behind the table:
+
+```bash
+grep -rn "time\.sleep\|requests\.\|subprocess\." src/trading_platform/
+grep -rn "asyncio.wait_for\|to_thread" src/trading_platform/
+grep -rn "setInterval\|setTimeout" dashboard/src
+```
+
+The first two answer "is anything sleeping or shelling out synchronously, and
+which awaits are bounded?"; the third asks the same question of the browser side,
+where a delayed cycle is a display nuisance rather than a crash. The first command
+answers **no `time.sleep` call and no `subprocess.` call**, and its only
+`requests` matches are prose (`store.py`, `stream.py`): the blocking reads of this
+layer do not show up as imports, they enter through two seams — `requests`/`ccxt`
+**inside** the market-data provider, `ccxt` **inside** the broker — which is why
+the audit below is a table of call sites rather than a table of imports.
+
+| `path:line` | defect class | verdict |
+| --- | --- | --- |
+| `src/trading_platform/realtime/stream.py` — `PollingMarketStream.next_candle` / `.history` (the `fetch_ohlcv` calls) | synchronous provider read on the shared loop: the HTTP round trip that **is** the defect of §3.1 | **FIXED** — the read runs in `asyncio.to_thread`, so the loop is not frozen for its duration, and the call stays bounded through `waits.awaited_within` |
+| `src/trading_platform/realtime/stream.py` — `_idle`, `_bounded_sleep`, `_backoff` | a pacing wait bounded by `asyncio.wait_for` and called from the `if closed.empty:` branch of `next_candle`, outside its `try/except`: a delayed loop turned a healthy idle poll into a fatal `TimeoutError` | **FIXED** — all three go through `waits.paced_wait`, which **never raises `TimeoutError`**: a delayed sleeper is abandoned quietly, the elapsed time is returned and reported through the observer |
+| `src/trading_platform/realtime/stream.py` — `CcxtProMarketStream` (`watch_ohlcv`, the `fetch_ohlcv` history read, `_backoff`, `close()`) | the `ccxt.pro` reads are awaited but were bounded ad hoc, and `close()` is a **synchronous** teardown call made from async code | **FIXED** — the reads and the backoff use the same `waits` primitives as the polling stream, and the synchronous `close()` runs in `asyncio.to_thread` |
+| `src/trading_platform/realtime/runner.py` — the tick bound (`stream_wait_bound`), the pacing sleep of `run` and the failure text of `_record_error` | three local margin constants, a pacing sleep bounded by `asyncio.wait_for`, and a failure rendered as `f"{type(exc).__name__}: {exc}"` — the string that persisted `"TimeoutError: "` | **FIXED** — the bound is `waits.wait_bound`, the pacing sleep is `waits.paced_wait` (never fatal) and the failure text is `observability.failure_text`, which renders an empty exception as `"TimeoutError (no message)"` |
+| `src/trading_platform/realtime/orchestrator.py` — `_supervise` | a profile crash logged with the empty-message text, and then persisted a second time by `mark_crashed` even when the tick loop had already recorded that very failure | **FIXED** — the two records stay distinct (they answer two different questions: "which tick broke?" and "is this profile still supervised?") but `mark_crashed` refuses to write a failure the tick loop already recorded, so one crash never leaves two `ERROR` rows; both render the exception through `observability.failure_text`, so a bare `TimeoutError` reads as `TimeoutError (no message)` instead of `TimeoutError: ` |
+| `src/trading_platform/realtime/runner.py` (module docstring, `_bound`) and `src/trading_platform/realtime/stream.py` (module docstring, `_bounded_sleep`, `max_wait_seconds`) | docstring-vs-code drift: the prose asserted a guarantee a margin cannot deliver ("no wait the stream is entitled to take is ever cut", "can never be the cause of its own timeout") | **FIXED** — the prose is reconciled with the code: a bound is head-room, and what keeps a healthy idle poll from dying is that a pacing wait never raises when it expires — the guarantee §3.1 states, and the one these docstrings now carry |
+| `src/trading_platform/realtime/stream.py` — the `_MISSING_CCXT_PRO` message | dead code: the constant was defined twice, identically, in the same module | **FIXED** — one definition, and a test pins the count so the duplicate cannot come back |
+| `src/trading_platform/realtime/orchestrator.py` — `_start_runner` (the bound around `stream.start()`) | a boot bounded by `asyncio.wait_for` whose `TimeoutError` was **not** part of `_PROFILE_BOOT_ERRORS`: a venue that never answered escaped the per-profile quarantine and aborted the whole boot, so one slow profile took every other profile down with it | **FIXED** — the boot wait goes through `waits.awaited_within`, so a start that answers late because another profile froze the shared loop is started rather than cut, and a start that never answers is quarantined like any other boot failure. Two regressions pin it (`tests/test_realtime_orchestrator.py` section 17), and both are red on the pre-fix tree with the empty `TimeoutError` of the incident |
+| `src/trading_platform/realtime/waits.py` | the duplicated, drifting margin constants (`_WAIT_MARGIN_RATIO`/`_WAIT_MARGIN_FLOOR_SECONDS` in `stream.py`, `_BOUND_MARGIN_RATIO`/`_BOUND_MARGIN_FLOOR_SECONDS` in `runner.py`) | **FIXED** — the single arithmetic authority of the layer: `wait_bound`, `paced_wait`, `awaited_within`, `PACING_MARGIN_RATIO`, `PACING_MARGIN_FLOOR_SECONDS`, `LATE_GRACE_SECONDS`; the two former constant pairs are gone |
+| `src/trading_platform/realtime/runner.py:798` — `run_once` step 9 `self._gateway.poll()`, and the same seam on the shutdown paths (`src/trading_platform/realtime/orchestrator.py:1930` in `_flatten_profile`, `src/trading_platform/realtime/orphans.py:612` in the startup sweep) → `src/trading_platform/realtime/gateway.py:520` `ExecutionGateway.poll` → `src/trading_platform/realtime/broker.py:886` `CcxtBroker.poll` (`fetch_open_orders`, `fetch_my_trades`) | synchronous `ccxt` HTTP on the shared loop, once per tick of every live profile | **REPORTED, deliberately left** — the whole gateway poll would have to move to a worker thread, where it would race the gateway's in-memory orders and fills against the loop (`_apply_event`, `closed_trade`, the risk path all read them on the loop); it needs a broker-side async seam of its own, which is a larger change than this delivery |
+| `src/trading_platform/realtime/runner.py:1046` — `_strategy_run` (`Strategy.run`: pandas over a frame of up to `warmup_candles` rows) | CPU-bound compute on the loop | **REPORTED, deliberately left** — moving it off-loop needs thread-safe strategy and gateway seams; it is bounded by `warmup_candles` (the frame budget of §2.2), but it stays a **residual risk**: under the GIL a long `Strategy.run` still delays every other profile's timers, and a delay is survivable (§3.1) rather than free |
+| `src/trading_platform/realtime/store.py:1047` — `_new_connection` and every `sqlite3` statement executed on it | local synchronous I/O on the loop | **REPORTED, deliberately left** — `sqlite3` with `check_same_thread=False` and the store's internal lock; every write is a small local transaction against the durable state the platform exists to keep, and moving them off-loop would require a per-thread connection discipline on every write path. Accepted local I/O, not a network read |
+| `dashboard/src/lib/use-polling.ts:96` (abort-supersede) and `:150` (`setInterval`) | a delayed or superseded polling cycle surfacing as an error | **NO DEFECT** — a new cycle aborts the previous controller (`:96-98`), and a superseded or disposed cycle returns early on `disposedRef.current \|\| controller.signal.aborted` (`:102-104`, `:110-112`), so a late answer is dropped and produces no error, no failure and no status change |
+| `dashboard/src/lib/use-profile-control.ts:281` (`setInterval`, superseded by `:241`, guarded at `:251`/`:256`) | the same delayed-cycle question, in the profile control hook | **NO DEFECT** — the same abort-supersede and dispose guards: a delayed cycle is discarded instead of reported |
+
+**The dashboard was audited, not rewritten.** No file under `dashboard/` changes:
+the third evidence command answers six matches, and all six are accounted for —
+the two abort-supersede pollers (`use-polling.ts:150`,
+`use-profile-control.ts:281`), the notice auto-dismiss timer and its ref
+(`use-profile-control.ts:190`, `:211`), and two prose mentions
+(`use-polling.ts:9`, a test comment in `profile-actions.test.tsx:214`). None of
+them is a bounded wait whose expiry is recorded as a failure. The browser side has
+no shared event loop with the engine at all: it is a separate Next.js application
+that polls the JSON API (§5), so the defect class of §3.1 cannot cross that
+boundary.
+
+**What is claimed, and what is not.** With the provider read off the loop and a
+pacing wait that cannot fail, a delayed idle poll can no longer kill a live
+profile: the two remaining on-loop calls above can still *delay* another profile's
+timers, they can no longer turn that delay into a persisted `ERROR`, because the
+wait that would have been cut is no longer a fatal one and the bound that does
+expire names itself. The same rule covers the boot: the bound the platform applies
+around `stream.start()` returns a start that answered late and quarantines one that
+never answered, so a delayed boot is neither a lost profile nor a lost platform.
+That is the difference between "delayed" and "dead", and it is the only claim here:
+the delay itself is reported as residual risk, not removed.
+
+An audit is a snapshot, not a promise: each row names a site in the tree this
+delivery ships, and a site that moves, changes class or disappears must change its
+row with it. The two verdicts that leave work behind — `REPORTED, deliberately
+left` — are the ones to re-read first.
 
 ## 4. Persistence, restart and reconciliation
 

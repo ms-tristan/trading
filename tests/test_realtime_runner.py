@@ -55,6 +55,7 @@ from trading_platform.realtime.models import (
 from trading_platform.realtime.observability import LOGGER_NAME, Counters
 from trading_platform.realtime.runner import ProfileRunner
 from trading_platform.realtime.store import SqliteStateStore
+from trading_platform.realtime.waits import LATE_GRACE_SECONDS, wait_bound
 from trading_platform.strategy.base import Strategy, StrategyParams, ensure_signal_frame
 
 TIMEOUT = 5.0
@@ -218,6 +219,65 @@ class IdleWaitStream(FakeStream):
         self.calls += 1
         await self._clock.sleep(self.max_wait_seconds)
         return None
+
+
+#: Pacing delay of the shared-loop regression (seconds): small enough that the whole
+#: test costs a third of a second, long enough that its budget is a real deadline.
+SHARED_LOOP_IDLE_SECONDS = 0.05
+
+#: How long one profile's provider read freezes the loop every profile shares.
+#:
+#: Longer than the neighbour's idle poll (0.05 s) *and* than that poll's budget
+#: (``stream_wait_bound(0.05, 0.05) = 0.1025 s``), so the neighbour's deadlines are
+#: already overdue when the loop resumes -- the freeze of the incident, scaled down.
+SHARED_LOOP_FREEZE_SECONDS = 0.3
+
+
+class BlockingFetchStream(FakeStream):
+    """A stream whose provider read freezes the whole shared event loop.
+
+    ``PollingMarketStream`` used to call ``provider.fetch_ohlcv(...)``
+    **synchronously** inside ``next_candle``, so while one profile's read ran, no
+    coroutine sharing the event loop took a single step -- no other profile's idle
+    poll, no other profile's timer.  :meth:`fetch_synchronously` is that read, with
+    ``time.sleep``, the blocking call of the incident; :meth:`next_candle` performs
+    it exactly like the polling stream did and answers ``None`` like a poll that
+    found no new candle.  Because a *synchronous* call can also be driven from the
+    loop itself, the read can be placed precisely where the live race placed it.
+    """
+
+    def __init__(self, *, freeze_seconds: float) -> None:
+        super().__init__()
+        self.freeze_seconds = float(freeze_seconds)
+        self.freezes = 0
+
+    def fetch_synchronously(self) -> None:
+        """Run one provider read on the event loop, freezing it for its duration."""
+        self.freezes += 1
+        time.sleep(self.freeze_seconds)
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        self.calls += 1
+        self.fetch_synchronously()
+        return None
+
+
+class OverrunningClock(SystemClock):
+    """A clock whose sleep really takes four times what it was asked for.
+
+    The deterministic model of a pacing wait under a loop frozen by another profile:
+    the delay of this profile runs far past its own budget.  A real freeze would be a
+    race -- whether the sleeper's deadline is reached before the loop resumes depends
+    on where the freeze lands -- so the overrun is expressed by the clock itself,
+    where it is exact and repeatable.  The pacing wait must absorb it and report it,
+    never fail the profile.
+    """
+
+    #: How much longer than requested one ``sleep`` really takes.
+    OVERRUN = 4.0
+
+    async def sleep(self, seconds: float) -> None:
+        await super().sleep(float(seconds) * self.OVERRUN)
 
 
 class FakeStore:
@@ -1386,7 +1446,15 @@ def test_the_frame_ends_at_the_emitted_candle(install: Any) -> None:
 
 
 def test_a_stream_that_never_answers_times_out_fast(install: Any) -> None:
-    """A blocked ``next_candle`` raises ``TimeoutError`` well under a second."""
+    """A blocked ``next_candle`` raises a *named* ``TimeoutError`` well under a second.
+
+    The hang detector is intact: a stream implementation that never answers still
+    fails the tick.  What changed is the message.  The budget is
+    ``stream_wait_bound(0.05, 0.0) = 0.1025 s`` and the call is then granted one
+    ``LATE_GRACE_SECONDS`` window (0.25 s) before it is abandoned, so the failure
+    lands around 0.35 s -- and it names the call and its budget instead of raising
+    the bare ``TimeoutError('')`` the incident persisted as ``"TimeoutError: "``.
+    """
     install(mode="hold")
     runner, _stream, _gateway, _store, _clock = build(
         stream=FakeStream(block=True), timeout_seconds=0.05
@@ -1397,15 +1465,43 @@ def test_a_stream_that_never_answers_times_out_fast(install: Any) -> None:
         return await runner.run_once()
 
     started = time.monotonic()
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError) as failure:
         run(scenario())
     assert time.monotonic() - started < 1.0
+    assert str(failure.value).strip(), "a bounded timeout must never carry an empty message"
+    assert "next_candle" in str(failure.value)
+    assert "btc-paper" in str(failure.value)
 
 
 def test_a_non_positive_timeout_is_refused() -> None:
     """A bound of zero would be no bound at all: the constructor refuses it."""
     with pytest.raises(ValueError, match="timeout_seconds"):
         build(timeout_seconds=0.0)
+
+
+def test_the_stream_wait_bound_is_the_shared_head_room_over_the_declared_wait() -> None:
+    """``stream_wait_bound`` keeps its name, its value and its single definition.
+
+    The helper is imported by ``cli.py`` (the ``realtime run --once`` tick budget),
+    by ``RealtimeOrchestrator._warn_on_idle_bound`` and by
+    ``tests/test_cli_realtime.py``, so both its signature and its value are a
+    contract.  The head-room itself now lives in exactly one place --
+    :func:`trading_platform.realtime.waits.wait_bound` -- and the runner owns no copy
+    of the ratio or of the floor any more: two definitions of the same margin is how
+    the runner and the stream drifted apart in the first place.
+    """
+    assert runner_module.stream_wait_bound(10.0, 15.0) == 15.8
+    assert runner_module.stream_wait_bound(5.0) == 5.3
+    assert runner_module.stream_wait_bound(0.0, 0.0) == 0.05
+    # the bound follows the *larger* declared wait, whichever argument carries it
+    assert runner_module.stream_wait_bound(30.0, 10.0) == 31.55
+    assert runner_module.stream_wait_bound(10.0, 30.0) == 31.55
+    # bit for bit the shared arithmetic, and nothing of its own
+    assert runner_module.stream_wait_bound(2.0, 0.0) == wait_bound(2.0)
+    assert runner_module.stream_wait_bound(0.0, 7.0) == wait_bound(7.0)
+    assert "stream_wait_bound" in runner_module.__all__
+    assert not hasattr(runner_module, "_BOUND_MARGIN_RATIO")
+    assert not hasattr(runner_module, "_BOUND_MARGIN_FLOOR_SECONDS")
 
 
 @pytest.mark.parametrize(
@@ -1425,34 +1521,45 @@ def test_every_bound_the_tick_applies_is_strictly_greater_than_the_wait_it_wraps
     poll_interval_seconds: float,
     timeout_seconds: float,
 ) -> None:
-    """INVARIANT: a bound that cuts a legitimate wait is a crash, not a bound.
+    """INVARIANT: a budget that cuts a legitimate wait is a crash, not a budget.
 
-    The bound the runner applies around a call that may legitimately idle must be
+    The budget the runner hands to a call that may legitimately idle must be
     STRICTLY GREATER than the longest wait that call can take, for ANY
     (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
     equal ones and the deployment's 30 s / 10 s.
 
-    Before the fix the bound was derived from ``stream_poll_timeout_seconds``
+    Before the fix the budget was derived from ``stream_poll_timeout_seconds``
     alone, so on the deployment's pair (a stream pacing at a 30 s poll interval
     under a 10 s stream timeout) the tick applied ``10 * 1.05 + 0.05 = 10.55 s``
-    around a healthy 30 s idle poll: ``asyncio.wait_for`` raised ``TimeoutError``
-    on the very first idle poll and every profile crash-looped.  A bound EQUAL to
-    the wait it wraps is the same race -- the two deadlines collide on the loop --
-    hence the strict comparison, made float-exact with ``math.nextafter``.
+    around a healthy 30 s idle poll: the bounded wait raised ``TimeoutError`` on the
+    very first idle poll and every profile crash-looped.  A budget EQUAL to the wait
+    it wraps is the same race -- the two deadlines collide on the loop -- hence the
+    strict comparison, made float-exact with ``math.nextafter``.
 
-    The comparison is on the *bound* the tick applies, captured from a spy on
-    ``asyncio.wait_for``: no wall clock is read and no duration is asserted, so the
-    test cannot rot as the suite gets faster or slower.
+    The comparison is on the *bound* the tick hands to
+    :func:`~trading_platform.realtime.waits.awaited_within`, captured from a spy on
+    ``runner_module.awaited_within``: no wall clock is read and no duration is
+    asserted, so the test cannot rot as the suite gets faster or slower.  The spy
+    also pins the second half of the contract -- a bounded call is **named**, so a
+    timeout can be read instead of persisted as an empty message.
     """
     install(mode="hold")
-    bounds: list[float] = []
-    real_wait_for = asyncio.wait_for
+    bounds: list[tuple[float, str]] = []
+    real_awaited_within = runner_module.awaited_within
 
-    async def bound_spy(awaitable: Any, timeout: float | None = None) -> Any:
-        bounds.append(float("inf") if timeout is None else float(timeout))
-        return await real_wait_for(awaitable, timeout=timeout)
+    async def bound_spy(
+        awaitable: Any,
+        *,
+        bound: float,
+        label: str,
+        grace_seconds: float = LATE_GRACE_SECONDS,
+    ) -> Any:
+        bounds.append((float(bound), str(label)))
+        return await real_awaited_within(
+            awaitable, bound=bound, label=label, grace_seconds=grace_seconds
+        )
 
-    monkeypatch.setattr(runner_module.asyncio, "wait_for", bound_spy)
+    monkeypatch.setattr(runner_module, "awaited_within", bound_spy)
     stream = FakeStream(max_wait_seconds=poll_interval_seconds)
     runner, _stream, _gateway, _store, _clock = build(
         stream=stream,
@@ -1464,17 +1571,21 @@ def test_every_bound_the_tick_applies_is_strictly_greater_than_the_wait_it_wraps
         await runner.start()
         return await runner.run_once()
 
-    # The real ``wait_for`` bounds the harness: the spy only records, it never
-    # replaces the bound that keeps a hung implementation from hanging the suite.
-    asyncio.run(real_wait_for(scenario(), timeout=TIMEOUT))
+    # ``run`` bounds the harness as well: a hung implementation fails the suite
+    # instead of hanging it.  The spy above only records, it replaces nothing.
+    run(scenario())
 
     longest_wait = max(float(poll_interval_seconds), float(timeout_seconds))
     strictly_above = longest_wait * math.nextafter(1.0, math.inf)
     assert bounds, "the tick applied no bound at all"
-    for bound in bounds:
+    for bound, label in bounds:
         assert bound > float(timeout_seconds), bound
         assert bound > float(poll_interval_seconds), bound
         assert bound >= strictly_above, bound
+        assert label, "every bounded call of the tick must be named"
+    labels = [label for _bound, label in bounds]
+    assert any("next_candle" in label for label in labels), labels
+    assert any("history" in label for label in labels), labels
 
 
 def test_an_idle_poll_of_the_whole_interval_is_never_cut(install: Any) -> None:
@@ -1490,11 +1601,11 @@ def test_an_idle_poll_of_the_whole_interval_is_never_cut(install: Any) -> None:
     whole test stays well under a quarter of a second.
 
     A real clock is required and is the point of this test: ``ManualClock.sleep``
-    returns immediately, so the inner wait would complete instantly and the outer
-    ``asyncio.wait_for`` would never be reached -- the manual clock is exactly why
-    the suite never caught this defect in production.  The assertion is about the
-    absence of a ``TimeoutError`` and about the profile staying healthy, never about
-    a wall-clock duration.
+    returns immediately, so the inner wait would complete instantly and the bounded
+    call would never be reached -- the manual clock is exactly why the suite never
+    caught this defect in production.  The assertion is about the absence of a
+    ``TimeoutError`` and about the profile staying healthy, never about a wall-clock
+    duration.
     """
     install(mode="hold")
     clock = SystemClock()
@@ -1516,6 +1627,147 @@ def test_an_idle_poll_of_the_whole_interval_is_never_cut(install: Any) -> None:
     assert stream.calls == 1
     assert runner.counters().errors == 0
     assert runner.health().status is not ProfileStatus.ERROR
+
+
+def test_a_neighbour_inside_its_idle_poll_survives_a_blocking_fetch(install: Any) -> None:
+    """REGRESSION: one profile's blocking provider read must not kill another profile.
+
+    The live incident: five config-identical profiles shared **one** event loop and
+    three of them were persisted as ``ERROR`` with ``health.last_error =
+    "TimeoutError: "`` (an empty message) tens of seconds after start, while the
+    provider never failed once and the exchange answered in 0.26 s.  The mechanism was
+    that ``PollingMarketStream`` ran ``provider.fetch_ohlcv(...)`` synchronously, so
+    one profile's read froze the loop every other profile ran on, and the frozen loop
+    made a *healthy* idle poll of a neighbour expire.
+
+    Two ProfileRunners share this loop:
+
+    * ``victim`` is inside its idle poll -- it sleeps a whole ``poll_interval_seconds``
+      (0.05 s) under a budget of ``stream_wait_bound(0.05, 0.05) = 0.1025 s``;
+    * ``aggressor`` then performs a provider read that blocks the loop for 0.3 s, so
+      the victim's sleep deadline and its bound are both overdue when the loop resumes.
+
+    On the pre-fix code that is the bare ``TimeoutError('')`` the incident persisted
+    (on the interpreters whose ``asyncio.wait_for`` cancels the awaited task when its
+    deadline expires, which is never granted a further loop step); ``stream.py`` called
+    ``_idle()`` outside its ``try``/``except``, so the error escaped the stream, was
+    recorded as a fatal ``ERROR`` and logged as ``profile_crashed``.  With the fix the
+    bounded call *returns its late answer* instead of timing out, so a delayed idle
+    poll is a delay, not a death.
+
+    Nothing here waits for a race to resolve: two loop iterations bring the victim
+    inside its idle sleep (asserted), the freeze of the aggressor's provider read is
+    then longer than both of the victim's deadlines, and neither assertion reads a
+    wall clock.  The twin ordering -- the same freeze landing one step earlier, in the
+    window between the bound and the first step of the call -- is
+    :func:`test_a_neighbour_whose_call_had_not_started_survives_a_blocking_fetch`.
+    """
+    install(mode="hold")
+    clock = SystemClock()
+    aggressor_stream = BlockingFetchStream(freeze_seconds=SHARED_LOOP_FREEZE_SECONDS)
+    victim_stream = IdleWaitStream(clock=clock, max_wait_seconds=SHARED_LOOP_IDLE_SECONDS)
+    aggressor, _a_stream, _a_gateway, _a_store, _a_clock = build(
+        stream=aggressor_stream,
+        clock=clock,
+        profile_config=profile(id="aggressor", poll_interval_seconds=SHARED_LOOP_IDLE_SECONDS),
+        timeout_seconds=SHARED_LOOP_IDLE_SECONDS,
+    )
+    victim, _v_stream, _v_gateway, _v_store, _v_clock = build(
+        stream=victim_stream,
+        clock=clock,
+        profile_config=profile(id="victim", poll_interval_seconds=SHARED_LOOP_IDLE_SECONDS),
+        timeout_seconds=SHARED_LOOP_IDLE_SECONDS,
+    )
+
+    async def scenario() -> tuple[Any, Any]:
+        await aggressor.start()
+        await victim.start()
+        idle = asyncio.ensure_future(victim.run_once())
+        # Two loop iterations: the victim's task reaches its bounded wait and its
+        # inner ``next_candle`` registers the idle sleep.  Neither reads a clock.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert victim_stream.calls == 1, "the victim must be inside its idle poll"
+        freezing = asyncio.ensure_future(aggressor.run_once())
+        # ... and the aggressor's provider read now freezes the loop they share.
+        await asyncio.sleep(0)
+        return await idle, await freezing
+
+    victim_decision, aggressor_decision = run(scenario())
+
+    assert victim_stream.calls == 1, "the victim's idle poll was the call that was delayed"
+    assert aggressor_stream.freezes == 1
+    assert victim_decision is None, "an idle poll that answers late answers 'no candle'"
+    assert aggressor_decision is None
+    assert victim.health().status is not ProfileStatus.ERROR
+    assert victim.counters().errors == 0
+    assert victim.health().last_error is None
+    assert aggressor.health().status is not ProfileStatus.ERROR
+    assert aggressor.counters().errors == 0
+
+
+def test_a_neighbour_whose_call_had_not_started_survives_a_blocking_fetch(install: Any) -> None:
+    """REGRESSION: the same freeze landing one step earlier must not kill either.
+
+    The second ordering of the incident, and the one that is fatal on the CPython the
+    suite runs on.  A tick registers its bound on one loop step and only gets the
+    first step of its call on the next; a neighbour's synchronous provider read that
+    occupies the loop **inside that window** leaves the bound already overdue when the
+    loop resumes, with the call not even started.  The pre-fix ``asyncio.wait_for``
+    then cancels a call that never ran and raises the bare ``TimeoutError('')`` an
+    operator read as ``error="TimeoutError: "``.
+
+    Profile B's bound is registered, then profile A's provider read occupies the shared
+    loop for 0.3 s -- longer than B's whole budget of 0.1025 s -- and only then does
+    B's call take its first step.  The budget of a call that answered *late* is what
+    the fix delivers: ``awaited_within`` grants the late grace window after the freeze
+    and returns the idle poll's ``None`` instead of cancelling it.  Profile A's own
+    tick is driven afterwards, on the same loop, so the platform shape is preserved:
+    two profiles, one provider read that blocks, and neither profile dies.
+
+    Every step is a loop iteration, never a wall-clock guess: B's call is asserted not
+    to have started when the freeze begins, and the freeze outlasts B's whole budget.
+    """
+    install(mode="hold")
+    clock = SystemClock()
+    aggressor_stream = BlockingFetchStream(freeze_seconds=SHARED_LOOP_FREEZE_SECONDS)
+    victim_stream = IdleWaitStream(clock=clock, max_wait_seconds=SHARED_LOOP_IDLE_SECONDS)
+    victim, _v_stream, _v_gateway, _v_store, _v_clock = build(
+        stream=victim_stream,
+        clock=clock,
+        profile_config=profile(id="victim", poll_interval_seconds=SHARED_LOOP_IDLE_SECONDS),
+        timeout_seconds=SHARED_LOOP_IDLE_SECONDS,
+    )
+    aggressor, _a_stream, _a_gateway, _a_store, _a_clock = build(
+        stream=aggressor_stream,
+        clock=clock,
+        profile_config=profile(id="aggressor", poll_interval_seconds=SHARED_LOOP_IDLE_SECONDS),
+        timeout_seconds=SHARED_LOOP_IDLE_SECONDS,
+    )
+
+    async def scenario() -> tuple[Any, Any, Any]:
+        await victim.start()
+        await aggressor.start()
+        loop = asyncio.get_running_loop()
+        idle = asyncio.ensure_future(victim.run_once())
+        # The victim's first step registers its bound; the very next thing the loop
+        # runs is profile A's provider read, which blocks the loop they share.
+        loop.call_soon(aggressor_stream.fetch_synchronously)
+        await asyncio.sleep(0)
+        assert victim_stream.calls == 0, "the victim's call must not have started yet"
+        assert aggressor_stream.freezes == 1, "the freeze must be over by now"
+        return await idle, await aggressor.run_once(), victim_stream.calls
+
+    victim_decision, aggressor_decision, victim_calls = run(scenario())
+
+    assert victim_calls == 1, "the victim's call ran, it was not cancelled before it started"
+    assert victim_decision is None
+    assert aggressor_decision is None
+    assert victim.health().status is not ProfileStatus.ERROR
+    assert victim.counters().errors == 0
+    assert victim.health().last_error is None
+    assert aggressor.health().status is not ProfileStatus.ERROR
+    assert aggressor.counters().errors == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1571,6 +1823,49 @@ def test_the_pacing_sleep_survives_when_the_interval_equals_the_timeout(
     run(scenario())
     assert runner.counters().errors == 0
     assert runner.health().status is not ProfileStatus.ERROR
+
+
+def test_a_delayed_pacing_sleep_is_reported_and_never_fatal(install: Any, logs: Any) -> None:
+    """A pacing sleep the loop could not honour is a warning, never a failure.
+
+    The pacing wait of ``run`` is not a call that must answer: when a loop frozen by
+    another profile makes it overrun its budget, the sleeper is abandoned, the delay
+    is reported **once** as ``profile_pacing_delayed`` -- with the configured delay,
+    the budget it was given and what it really took -- and the profile keeps running.
+    The pre-fix pacing sleep was an ``asyncio.wait_for`` at the same budget, so this
+    very overrun raised ``TimeoutError`` and ended a healthy profile.
+
+    The overrun is expressed by the clock (one ``sleep`` really takes four times what
+    it was asked for) rather than by a freezer task: a real freeze would leave "did
+    the sleeper's own deadline pass first?" to the scheduler, while the clock makes
+    the overrun exact and repeatable.  The numbers are the deployment's shape scaled
+    down 100x: a 0.05 s pacing delay under a 0.1025 s budget, really sleeping 0.2 s.
+    """
+    install(mode="hold")
+    runner, _stream, _gateway, _store, _clock = build(
+        clock=OverrunningClock(),
+        profile_config=profile(poll_interval_seconds=0.05),
+        timeout_seconds=0.05,
+    )
+
+    async def scenario() -> None:
+        await runner.start()
+        await runner.run(max_iterations=1)
+
+    run(scenario())
+    assert runner.counters().errors == 0
+    assert runner.health().status is not ProfileStatus.ERROR
+    delayed = [
+        record for record in logs if getattr(record, "event", "") == "profile_pacing_delayed"
+    ]
+    assert len(delayed) == 1, "a delayed pacing wait is reported exactly once"
+    assert delayed[0].levelno == logging.WARNING
+    assert delayed[0].profile_id == "btc-paper"
+    assert delayed[0].context["expected_seconds"] == 0.05
+    assert delayed[0].context["bound_seconds"] == wait_bound(0.05)
+    overrun = delayed[0].context["elapsed_seconds"]
+    assert overrun > 0.05, "the delay really overran the pacing wait it was asked for"
+    assert overrun < 0.05 * OverrunningClock.OVERRUN, "and it gave up instead of sleeping it out"
 
 
 def test_run_once_survives_an_idle_poll_when_the_interval_equals_the_timeout(
@@ -1727,6 +2022,98 @@ def test_an_error_inside_the_loop_is_persisted_and_reraised(install: Any, logs: 
     assert runner.health().status is ProfileStatus.ERROR
     assert runner.health().last_error == "RuntimeError: stream exploded"
     assert runner.counters().errors == 1
+
+
+def test_mark_crashed_does_not_record_a_failure_the_tick_loop_already_recorded(
+    install: Any, logs: Any
+) -> None:
+    """One failure leaves one record: the supervision must not write it twice.
+
+    A profile that leaves its loop produces two *records* and they are deliberately
+    not collapsed -- the tick loop records what failed inside the tick
+    (``profile_error``) and the supervision records that the profile is no longer
+    supervised (``profile_crashed`` / ``profile_stopped_on_error``).  What must not
+    happen twice is the **same** failure: the tick loop persisted it, so
+    ``mark_crashed`` recognises it as the error of this profile, logs nothing, writes
+    nothing and answers ``False``.  That answer is what the orchestration's
+    supervision relies on; callers that ignore it keep working unchanged.
+    """
+    install(mode="hold")
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(store=store, timeout_seconds=0.05)
+    failure = RuntimeError("stream exploded")
+
+    async def failing() -> Any:
+        await runner.start()
+        raise failure
+
+    runner.run_once = failing  # type: ignore[method-assign]
+
+    async def scenario() -> tuple[bool, bool]:
+        with pytest.raises(RuntimeError, match="stream exploded"):
+            await runner.run(max_iterations=1)
+        # the tick loop recorded it: the last-resort path has nothing left to write
+        return runner.mark_crashed(failure), runner.mark_crashed(failure)
+
+    first, second = run(scenario())
+    assert first is False
+    assert second is False
+    assert runner.health().last_error == "RuntimeError: stream exploded"
+    assert runner.counters().errors == 1, "the failure counter moved once, not three times"
+    assert events(logs).count("profile_error") == 1
+    assert len(store.statuses_of(ProfileStatus.ERROR)) == 1
+
+
+def test_mark_crashed_records_a_failure_the_tick_loop_never_saw(install: Any, logs: Any) -> None:
+    """The last-resort path still writes once -- and says that it did.
+
+    The failure that never went through ``run``'s tick handler (a reconciliation
+    mismatch found before the first tick, a crash outside the loop) is *not* the error
+    of the profile yet, so ``mark_crashed`` records it and answers ``True``; a second
+    call with the same failure answers ``False``.
+    """
+    install(mode="hold")
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(store=store)
+    failure = RuntimeError("the venue vanished")
+
+    async def scenario() -> tuple[bool, bool]:
+        await runner.start()
+        return runner.mark_crashed(failure), runner.mark_crashed(failure)
+
+    first, second = run(scenario())
+    assert first is True
+    assert second is False
+    assert runner.health().status is ProfileStatus.ERROR
+    assert runner.health().last_error == "RuntimeError: the venue vanished"
+    assert runner.counters().errors == 1
+    assert events(logs).count("profile_error") == 1
+    assert len(store.statuses_of(ProfileStatus.ERROR)) == 1
+
+
+def test_a_failure_without_a_message_is_persisted_with_its_type(install: Any, logs: Any) -> None:
+    """``str(TimeoutError())`` is empty -- the persisted error never is.
+
+    The live incident persisted ``health.last_error = "TimeoutError: "`` and logged
+    ``profile_crashed error="TimeoutError: "``: a profile died and the record said
+    nothing at all.  ``_record_error`` renders through
+    :func:`~trading_platform.realtime.observability.failure_text`, so the type is
+    always named and a message-less failure becomes ``TimeoutError (no message)``.
+    """
+    install(mode="hold")
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(store=store)
+
+    async def scenario() -> None:
+        await runner.start()
+        runner._record_error(TimeoutError())
+
+    run(scenario())
+    assert runner.health().last_error == "TimeoutError (no message)"
+    assert store.statuses_of(ProfileStatus.ERROR)[-1][2] == "TimeoutError (no message)"
+    records = [record for record in logs if getattr(record, "event", "") == "profile_error"]
+    assert len(records) == 1
+    assert records[0].context["error"] == "TimeoutError (no message)"
 
 
 def test_an_entry_signal_while_a_position_is_open_is_ignored(install: Any, logs: Any) -> None:

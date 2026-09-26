@@ -55,6 +55,7 @@ __all__ = [
     "JsonLogFormatter",
     "RedactionFilter",
     "configure_logging",
+    "failure_text",
     "log_event",
     "log_path",
 ]
@@ -118,6 +119,21 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_json_value(item) for item in value]
     return str(value)
+
+
+def failure_text(exc: BaseException) -> str:
+    """Return the persisted text of a failure: never empty, always typed.
+
+    ``str(TimeoutError())`` is the empty string, so a profile that died on a bare
+    timeout used to be persisted with ``health.last_error = "TimeoutError: "`` and
+    logged as ``profile_crashed error="TimeoutError: "`` -- an operator could not
+    tell *what* timed out, nor even that the exception carried no detail.  Every
+    error surface of the realtime layer therefore renders its exceptions through
+    this single function: ``"<Type>: <message>"`` when the exception carries a
+    message, ``"<Type> (no message)"`` when it carries none (or only blanks).
+    """
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else f"{type(exc).__name__} (no message)"
 
 
 def _environment_secrets(environ: Mapping[str, str]) -> tuple[str, ...]:

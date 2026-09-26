@@ -26,7 +26,8 @@ the *cadence*: read a candle, warm the frame, decide, route, poll, persist.
 
 Frozen order of one tick (each step numbered as in the delivery brief)
 ---------------------------------------------------------------------
-1. read the next candle, bounded by ``asyncio.wait_for``;
+1. read the next candle, bounded by
+   :func:`~trading_platform.realtime.waits.awaited_within`;
 2. skip a candle that is not strictly newer than the persisted watermark, so a
    restart neither replays nor skips one;
 3. rebuild the frame ending at that candle (``history`` + the candle), through
@@ -63,10 +64,30 @@ appends its candle, its equity point and its watermark, exactly like any other t
 The gate is plain in-memory state of the runner and never touches the store, the
 status, the strategy or the gateway; ``resume()`` clears it.
 
-Every ``await`` of a wait this module owns is bounded by an explicit
-``asyncio.wait_for`` timeout, so no tick can hang -- and that bound is always
-strictly greater than the longest wait the wrapped call may legitimately take,
-including the stream's whole poll interval (see :func:`stream_wait_bound`).
+Every wait this module owns goes through
+:mod:`trading_platform.realtime.waits`, so no tick can hang **and** no healthy
+wait can be turned into a fatal error by a delayed event loop:
+
+* a call that must answer -- the next candle, the history window -- runs under
+  :func:`~trading_platform.realtime.waits.awaited_within` with a budget derived
+  from the longest wait that call may legitimately take: the configured timeout
+  *and* the wait the stream itself declares (see :func:`stream_wait_bound`).  The
+  budget is strictly greater than that wait, and it is derived from the wait
+  rather than from the timeout alone.  Head-room is nevertheless **not** a
+  guarantee -- a shared loop frozen by a blocking call overruns any margin -- so
+  the *behaviour* is what carries the tick: a call that answers late is returned
+  as its own result, and only a call still pending after the budget **plus**
+  :data:`~trading_platform.realtime.waits.LATE_GRACE_SECONDS` is abandoned, with a
+  :class:`TimeoutError` naming the call and its budget.  The hang detector is
+  intact; a late answer is no longer a failure, and the persisted error of a
+  failed call is never the empty ``"TimeoutError: "`` of the incident;
+* the pacing wait between two ticks runs through
+  :func:`~trading_platform.realtime.waits.paced_wait`, which can **not** raise
+  ``TimeoutError`` at all: a sleep the frozen loop could not honour in time is
+  abandoned and reported once as ``profile_pacing_delayed``, so a delayed idle
+  poll can never end a healthy profile, whatever
+  (``poll_interval_seconds``, ``stream_poll_timeout_seconds``, ``max_reconnects``,
+  ``reconnect_backoff_seconds``, number of profiles) the platform runs with.
 """
 
 from __future__ import annotations
@@ -111,8 +132,14 @@ from trading_platform.realtime.models import (
     new_client_order_id,
     status_error,
 )
-from trading_platform.realtime.observability import LOGGER_NAME, Counters, log_event
+from trading_platform.realtime.observability import (
+    LOGGER_NAME,
+    Counters,
+    failure_text,
+    log_event,
+)
 from trading_platform.realtime.strategies import resolve_strategy
+from trading_platform.realtime.waits import awaited_within, paced_wait, wait_bound
 from trading_platform.realtime.warmup import (
     SEVERITY_ERROR,
     candles_per_day,
@@ -133,19 +160,6 @@ _LOGGER = logging.getLogger(LOGGER_NAME)
 #: Lowest number of rows a frame must hold before a strategy may decide.
 MIN_FRAME_ROWS = 2
 
-#: Relative and absolute head-room added to every bound this module applies.
-#:
-#: A bound *equal to the wait it wraps* is a race, not a bound: the pacing sleep and
-#: the stream calls were bounded by exactly the stream timeout, so whenever a
-#: profile's poll interval equalled that timeout -- the natural thing to configure,
-#: and the shape the Docker deployment ships -- the two deadlines fell on the same
-#: instant and the tick died with ``TimeoutError`` on the first idle poll, taking
-#: the whole platform down with it.  The margin stays proportional so a tight bound
-#: (a test, or an operator asking for a 50 ms budget) is still tight: 5 % plus 50 ms
-#: leaves a 0.05 s budget at ~0.10 s and a 30 s budget at ~31.6 s.
-_BOUND_MARGIN_RATIO = 0.05
-_BOUND_MARGIN_FLOOR_SECONDS = 0.05
-
 #: Order type every order of the engine uses (the venue decides the fill).
 _ORDER_TYPE = OrderType.MARKET
 
@@ -154,17 +168,25 @@ _STOP_PREFIX = "stopped after: "
 
 
 def stream_wait_bound(timeout_seconds: float, max_wait_seconds: float = 0.0) -> float:
-    """Return the bound a caller must apply around one call that may legitimately idle.
+    """Return the budget a caller must apply around one call that may legitimately idle.
 
-    The bound is derived from the wait itself -- the larger of the configured stream
-    timeout and the stream's declared maximum wait -- never from the timeout alone,
-    and it is always **strictly greater** than that wait (see
-    :data:`_BOUND_MARGIN_RATIO`).
+    The budget is the larger of the two declared waits -- the configured stream
+    timeout and the stream's own ``max_wait_seconds`` -- plus the single head-room
+    defined in :mod:`trading_platform.realtime.waits`
+    (:func:`~trading_platform.realtime.waits.wait_bound`): 5 % plus 50 ms, so the
+    deadline of the call and the deadline of its budget are never registered on the
+    same event-loop instant.  The value is pinned by ``tests/test_cli_realtime.py``,
+    which builds the ``realtime run --once`` tick budget from it, and by
+    ``RealtimeOrchestrator._warn_on_idle_bound``, which reports the very budget the
+    runner applies.
 
-    The bound the runner applies around a call that may legitimately idle must be
-    STRICTLY GREATER than the longest wait that call can take, for ANY
-    (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
-    equal ones and the deployment's 30 s / 10 s.
+    This member is the arithmetic *and* the seam: the identical value can no longer
+    be derived twice, because the ratio and the floor used to live here as well as
+    in the stream.  Note what the number is and is not: it is head-room, **not** a
+    guarantee.  A shared event loop frozen by a blocking call overruns any margin,
+    which is why the callers of this budget reach for
+    :func:`~trading_platform.realtime.waits.awaited_within` -- a call that answers
+    late is returned, and only a call that never answers is reported as a timeout.
 
     Parameters
     ----------
@@ -173,15 +195,15 @@ def stream_wait_bound(timeout_seconds: float, max_wait_seconds: float = 0.0) -> 
     max_wait_seconds:
         Longest wait the stream declares it may legitimately take
         (``MarketStream.max_wait_seconds``).  ``0.0`` for a stream that never waits,
-        which reduces the bound to the configured timeout plus its margin.
+        which reduces the budget to the configured timeout plus its head-room.
 
     Returns
     -------
     float
-        The larger of the two waits, plus the proportional and absolute margin.
+        The larger of the two waits, plus the shared proportional and absolute
+        head-room.
     """
-    wait = max(0.0, float(timeout_seconds), float(max_wait_seconds))
-    return (wait * (1.0 + _BOUND_MARGIN_RATIO)) + _BOUND_MARGIN_FLOOR_SECONDS
+    return wait_bound(max(0.0, float(timeout_seconds), float(max_wait_seconds)))
 
 
 def _strip_stop_prefix(text: str) -> str:
@@ -543,23 +565,27 @@ class ProfileRunner:
         self._started = True
 
     def _bound(self) -> float:
-        """Return the bound applied to one wait of this profile's loop.
+        """Return the budget given to one call of this tick that must answer.
 
-        The bound the runner applies around a call that may legitimately idle must be
-        STRICTLY GREATER than the longest wait that call can take, for ANY
-        (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
-        equal ones and the deployment's 30 s / 10 s.  It is therefore derived from
-        the wait itself -- the larger of ``self._timeout`` and the wait the stream
-        declares through ``MarketStream.max_wait_seconds`` -- and never from
-        ``self._timeout`` alone (see :func:`stream_wait_bound`).
+        The budget is derived from the wait itself -- the larger of ``self._timeout``
+        and the wait the stream declares through ``MarketStream.max_wait_seconds`` --
+        plus the single head-room defined in
+        :mod:`trading_platform.realtime.waits` (see :func:`stream_wait_bound`), never
+        from ``self._timeout`` alone.  For ANY
+        (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, the
+        deployment's 30 s / 10 s included, the deadline of the call and the deadline
+        of this budget are therefore never registered on the same event-loop instant.
 
-        The deployment's pair is the case this exists for: with a profile pacing at
-        ``poll_interval_seconds = 30`` and ``stream_poll_timeout_seconds = 10``, the
-        old bound of ``10 * 1.05 + 0.05 = 10.55 s`` cut the polling stream's
-        legitimate 30 s idle sleep, raised ``TimeoutError`` on the first idle poll
-        and crash-looped the container.  The new bound is
-        ``30 * 1.05 + 0.05 = 31.55 s``, so no wait the stream is entitled to take is
-        ever cut, whatever the two configured values are.
+        Head-room is a margin, **not** a guarantee: a shared event loop frozen by
+        another profile's blocking call overruns any margin, and the earlier "5 %
+        plus 50 ms" bound was exactly what the incident outran.  What keeps a delayed
+        profile alive is not this number but the behaviour its callers get from
+        :mod:`trading_platform.realtime.waits`: :meth:`run_once` hands this budget to
+        :func:`~trading_platform.realtime.waits.awaited_within`, which returns a call
+        that answered late and reserves its named ``TimeoutError`` for a call that
+        never answered at all, and the pacing wait of :meth:`run` never raises on
+        expiry.  This member is what the hang detector measures against; it is not
+        what protects a healthy tick from a frozen loop.
         """
         return stream_wait_bound(self._timeout, self._stream_wait)
 
@@ -579,14 +605,35 @@ class ProfileRunner:
         self._store.save_status(self.profile_id, ProfileStatus.STOPPED, detail=detail)
         log_event(_LOGGER, "profile_stopped", profile_id=self.profile_id, detail=detail)
 
-    def mark_crashed(self, exc: BaseException) -> None:
+    def mark_crashed(self, exc: BaseException) -> bool:
         """Persist the last-resort failure of a profile that left its loop.
 
         Called by the orchestrator when :meth:`run` raised: the store is the durable
         record an operator reads through the dashboard, so a profile that died must
         not keep saying ``running`` until the process disappears.
+
+        Idempotent, because two records describe one profile that left its loop: the
+        tick loop records the failure *inside* the tick (``profile_error``, persisted
+        by :meth:`_record_error`) and the supervision records that the profile is no
+        longer supervised.  A failure whose rendering already **is** the persisted
+        error of this profile has therefore been recorded once already, and this
+        method then logs nothing, writes nothing and answers ``False`` -- one failure
+        never leaves two ``ERROR`` rows and two ``profile_error`` records behind.
+        Otherwise the failure is recorded exactly once and the answer is ``True``.
+
+        The answer is what the orchestrator's supervision relies on to know whether
+        it still had to write; callers that ignore it keep working unchanged.
+
+        Returns
+        -------
+        bool
+            ``True`` when this call recorded the failure, ``False`` when the very
+            same failure was already the error of this profile.
         """
+        if failure_text(exc) == self._last_error:
+            return False
         self._record_error(exc)
+        return True
 
     def mark_degraded(self, detail: str) -> None:
         """Mark the profile degraded and keep it degraded across its next ticks.
@@ -631,7 +678,14 @@ class ProfileRunner:
         """Loop over :meth:`run_once` until cancelled or ``max_iterations`` is met.
 
         Each iteration is followed by a bounded sleep so the profile paces itself
-        instead of busy-waiting.
+        instead of busy-waiting.  That sleep is a **pacing** wait, not a call that
+        must answer: it runs through
+        :func:`~trading_platform.realtime.waits.paced_wait`, which returns when the
+        delay elapsed and, when a shared event loop was frozen past the delay's
+        budget, abandons the sleeper, logs one ``profile_pacing_delayed`` warning and
+        returns.  ``run`` therefore never raises ``TimeoutError``, whatever
+        (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) the profile
+        holds and however long another profile blocked the loop.
 
         Raises
         ------
@@ -649,11 +703,10 @@ class ProfileRunner:
                 iterations += 1
                 try:
                     await self.run_once()
-                    await asyncio.wait_for(
-                        self._clock.sleep(
-                            min(float(self._profile.poll_interval_seconds), self._timeout)
-                        ),
-                        timeout=self._bound(),
+                    await paced_wait(
+                        self._clock,
+                        min(float(self._profile.poll_interval_seconds), self._timeout),
+                        on_delayed=self._log_pacing_delayed,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -665,6 +718,26 @@ class ProfileRunner:
             # must persist STOPPED before the task really ends.
             await self.stop()
             raise
+
+    def _log_pacing_delayed(self, expected_seconds: float, elapsed_seconds: float) -> None:
+        """Report one pacing sleep the event loop could not honour in time.
+
+        The observer of :func:`~trading_platform.realtime.waits.paced_wait`.  A
+        delayed pacing wait is a **warning about the loop**, never a failure of the
+        profile: the tick that follows is a perfectly ordinary tick, and the profile
+        stays ``RUNNING``.  The record carries the configured delay, the budget the
+        delay was given and what it really took, so "the loop was frozen for N
+        seconds" can be read off the log without a second measurement.
+        """
+        log_event(
+            _LOGGER,
+            "profile_pacing_delayed",
+            level=logging.WARNING,
+            profile_id=self.profile_id,
+            expected_seconds=float(expected_seconds),
+            bound_seconds=wait_bound(float(expected_seconds)),
+            elapsed_seconds=float(elapsed_seconds),
+        )
 
     # -- one tick -----------------------------------------------------------
 
@@ -681,13 +754,20 @@ class ProfileRunner:
         symbol = str(self._profile.symbol)
         timeframe = str(self._profile.timeframe)
 
-        # 1. the next candle, always bounded.  The bound carries the same
+        # 1. the next candle, always bounded.  The budget carries the same
         #    head-room as the pacing sleep, plus the stream's own declared wait:
         #    a stream that is idle legitimately waits a whole poll interval, which
-        #    may equal -- or exceed -- ``self._timeout``.
-        candle = await asyncio.wait_for(
+        #    may equal -- or exceed -- ``self._timeout``.  The call is a call that
+        #    must answer, so it goes through ``awaited_within``: it hangs the tick
+        #    when it never answers (with a message naming it), and it is *returned*
+        #    when it answers late because another profile froze the shared loop.
+        candle = await awaited_within(
             self._stream.next_candle(symbol, timeframe),
-            timeout=self._bound(),
+            bound=self._bound(),
+            label=(
+                f"the market stream next_candle for {symbol} {timeframe} "
+                f"of profile {self.profile_id}"
+            ),
         )
         if candle is None:
             return None
@@ -709,9 +789,12 @@ class ProfileRunner:
             self._sequence_stamp = stamp
 
         # 3. the frame ending at this candle.
-        history = await asyncio.wait_for(
+        history = await awaited_within(
             self._stream.history(symbol, timeframe, self._warmup),
-            timeout=self._bound(),
+            bound=self._bound(),
+            label=(
+                f"the market stream history for {symbol} {timeframe} of profile {self.profile_id}"
+            ),
         )
         frame = ensure_ohlcv(
             self._build_frame(history, candle, stamp), name=f"realtime:{self.profile_id}"
@@ -1748,8 +1831,17 @@ class ProfileRunner:
         return None if value is None else int(value)
 
     def _record_error(self, exc: BaseException) -> None:
-        """Log, persist and remember an unexpected failure of one tick."""
-        message = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        """Log, persist and remember an unexpected failure of one tick.
+
+        The message is rendered by
+        :func:`~trading_platform.realtime.observability.failure_text`, which always
+        names the type of the failure: ``str(TimeoutError())`` is the empty string,
+        so a profile that died on a bare timeout used to be persisted as
+        ``health.last_error = "TimeoutError: "`` -- an error an operator cannot act
+        on, and one that said nothing about *what* had timed out.  A failure with no
+        message is now recorded as ``"<Type> (no message)"``.
+        """
+        message = failure_text(exc)
         self._last_error = message
         self._status = ProfileStatus.ERROR
         self._counters.increment("errors")

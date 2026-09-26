@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from trading_platform.realtime import observability
 from trading_platform.realtime.models import EngineCounters
 from trading_platform.realtime.observability import (
     LOGGER_NAME,
@@ -31,6 +32,7 @@ from trading_platform.realtime.observability import (
     JsonLogFormatter,
     RedactionFilter,
     configure_logging,
+    failure_text,
     log_event,
     log_path,
 )
@@ -344,6 +346,22 @@ def test_counters_repr_is_readable() -> None:
     counters = Counters()
     counters.increment("orders_filled", 2)
     assert "orders_filled" in repr(counters)
+
+
+def test_failure_text_is_never_empty() -> None:
+    """The one error text of the layer: a bare timeout still says what happened."""
+    assert failure_text(RuntimeError("boom")) == "RuntimeError: boom"
+    assert failure_text(TimeoutError()) == "TimeoutError (no message)"
+    assert failure_text(ValueError("   ")) == "ValueError (no message)"
+    assert "failure_text" in observability.__all__
+    # ``__all__`` lists the constant, then the classes, then the functions -- and
+    # the functions are alphabetical.
+    assert [name for name in observability.__all__ if name.islower()] == [
+        "configure_logging",
+        "failure_text",
+        "log_event",
+        "log_path",
+    ]
 
 
 # ---------------------------------------------------------------------------

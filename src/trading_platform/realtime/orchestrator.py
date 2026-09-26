@@ -93,7 +93,10 @@ either: it is logged as ``profile_boot_failed``, it degrades
 
 Two failure classes are deliberately **not** quarantined: :class:`asyncio.CancelledError`
 (a shutdown is not a profile fault) and an unexpected :class:`Exception`, which is a
-programming bug and stays loud.
+programming bug and stays loud.  The expiry of the *boot bound* the platform applies
+around ``stream.start()`` **is** quarantined: a wait the platform itself imposed says
+nothing about the profile's code, and one venue that never answers must not keep the
+whole platform down.
 """
 
 from __future__ import annotations
@@ -146,7 +149,7 @@ from trading_platform.realtime.models import (
     TradeSignalDecision,
     new_client_order_id,
 )
-from trading_platform.realtime.observability import LOGGER_NAME, log_event
+from trading_platform.realtime.observability import LOGGER_NAME, failure_text, log_event
 
 # --- ORPHAN SWEEP WIRING (WP3) ---------------------------------------------
 # Everything about the sweep itself lives in ``realtime.orphans``; this module
@@ -157,7 +160,6 @@ from trading_platform.realtime.orphans import (
     sweep_orphaned_positions,
 )
 
-# --- END ORPHAN SWEEP WIRING (WP3) -----------------------------------------
 # --- PROFILE QUARANTINE WIRING ---------------------------------------------
 # The one profile-related helper the orchestrator borrows from the store: the
 # sanitiser that strips the value a validation error echoes.  A profile row is
@@ -168,7 +170,10 @@ from trading_platform.realtime.orphans import (
 # this name for its existing callers.
 from trading_platform.realtime.store import _redact_profile_error
 
+# --- END ORPHAN SWEEP WIRING (WP3) -----------------------------------------
 # --- END PROFILE QUARANTINE WIRING -----------------------------------------
+# The bounded waits of the realtime layer: the boot bound below is one of theirs.
+from trading_platform.realtime.waits import awaited_within
 
 if TYPE_CHECKING:
     from trading_platform.realtime.broker import Broker
@@ -219,6 +224,18 @@ _UNHEALTHY_STATUSES: frozenset[ProfileStatus] = frozenset(
 #: ``timesfm`` strategy had been removed by a release) from taking the whole
 #: platform down.  Both are caught; anything else stays loud.
 _PROFILE_BOOT_ERRORS: tuple[type[BaseException], ...] = (RealtimeError, StrategyError)
+
+#: Everything :meth:`RealtimeOrchestrator._start_runner` quarantines.
+#:
+#: :data:`_PROFILE_BOOT_ERRORS` plus the expiry of the boot bound the orchestrator
+#: itself applies around ``stream.start()``: a wait the platform imposed says nothing
+#: about the profile's code, and before this the bare ``TimeoutError`` of a delayed or
+#: unreachable venue was not quarantined at all -- it escaped the per-profile
+#: quarantine and aborted the boot of every other profile.
+_BOOT_QUARANTINE_ERRORS: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    *_PROFILE_BOOT_ERRORS,
+)
 
 
 def _sanitised_failure(exc: BaseException, reason: str) -> BaseException:
@@ -1617,13 +1634,26 @@ class RealtimeOrchestrator:
         """Warn loudly when a profile polls slower than the configured stream timeout.
 
         A profile whose ``poll_interval_seconds`` exceeds
-        ``stream_poll_timeout_seconds`` is perfectly legal -- the runner's bound
-        carries the stream's own declared wait, so the platform boots and the tick
-        survives the longer idle poll -- but the mismatch between the two configured
-        values is worth naming, loudly and once per built profile.  Before that bound
-        carried the declared wait, the runner would have bounded the tick by
-        ``stream_poll_timeout_seconds`` alone and killed the profile on its first
-        legitimate idle poll.
+        ``stream_poll_timeout_seconds`` is perfectly legal -- this is the pair the
+        Docker deployment ships, 30 s of idle poll under a 10 s stream timeout -- and
+        the mismatch between the two configured values is worth naming, loudly and
+        once per built profile.
+
+        What keeps such a profile alive is **not** the width of a margin.  Head-room
+        is not a guarantee: a shared event loop frozen by a blocking call overruns any
+        margin, which is exactly how the earlier "5 % plus 50 ms" bound failed.  The
+        two properties that are delivered, and the only ones this warning may claim,
+        are:
+
+        * the stream's declared wait still derives the tick budget -- the runner
+          bounds a tick with :func:`~trading_platform.realtime.runner.stream_wait_bound`,
+          which carries ``MarketStream.max_wait_seconds``, so a tick is never cut by
+          ``stream_poll_timeout_seconds`` alone; and
+        * a delayed loop can no longer turn an idle poll into a failure: the idle poll
+          is a *pacing* wait that never raises when it expires (see
+          :func:`~trading_platform.realtime.waits.paced_wait`), and a provider read
+          runs off the shared event loop, so one profile's synchronous fetch cannot
+          push another profile's healthy wait past its bound in the first place.
 
         The trigger is the operator's pair -- the profile's own
         ``poll_interval_seconds`` against ``stream_poll_timeout_seconds`` -- and
@@ -1658,8 +1688,9 @@ class RealtimeOrchestrator:
             tick_bound_seconds=stream_wait_bound(timeout, stream_wait),
             detail=(
                 f"the profile idles {poll_interval:g} s while the stream timeout is "
-                f"{timeout:g} s; the tick bound carries the stream's declared wait, so "
-                "the profile keeps running -- the poll interval no longer has to be lowered"
+                f"{timeout:g} s; the stream's declared wait still derives the tick budget "
+                "and a delayed loop can no longer turn an idle poll into a failure, so the "
+                "profile keeps running -- the poll interval no longer has to be lowered"
             ),
         )
 
@@ -1779,27 +1810,61 @@ class RealtimeOrchestrator:
             whole platform down with it.
 
         Only :data:`_PROFILE_BOOT_ERRORS` -- a realtime failure or a broken strategy
-        configuration -- is quarantined.  :class:`asyncio.CancelledError` propagates
-        (a shutdown is not a profile fault) and so does any other exception, because
-        a programming bug must stay loud rather than become a silently degraded
-        profile.
+        configuration -- is quarantined, **and** the expiry of the boot bound this
+        method applies.  That bound goes through
+        :func:`~trading_platform.realtime.waits.awaited_within`: a stream that answers
+        late because another profile froze the shared event loop is started instead of
+        being cut, and only a start that never answers at all raises -- a
+        ``TimeoutError`` naming this profile, which is an infrastructure fault of one
+        profile and never a reason to abort the boot of the platform.  Before that, a
+        delayed boot escaped the quarantine (``TimeoutError`` was not in
+        :data:`_PROFILE_BOOT_ERRORS`) and took every other profile down with it.
+        :class:`asyncio.CancelledError` propagates (a shutdown is not a profile fault)
+        and so does any other exception, because a programming bug must stay loud
+        rather than become a silently degraded profile.
         """
         if profile_id in self._started_ids:
             return True
         try:
-            await asyncio.wait_for(
+            await awaited_within(
                 self._streams[profile_id].start(),
-                timeout=float(self._realtime.stream_poll_timeout_seconds),
+                bound=float(self._realtime.stream_poll_timeout_seconds),
+                label=f"the stream start of profile {profile_id}",
             )
             await self._runners[profile_id].start()
-        except _PROFILE_BOOT_ERRORS as exc:
+        except _BOOT_QUARANTINE_ERRORS as exc:
+            # A start that never answered is quarantined like any other boot failure:
+            # one profile that could not reach its venue must not keep the rest of the
+            # platform down, and the log names the profile the boot bound belonged to.
             self._record_profile_failure(profile_id, exc)
             return False
         self._started_ids.add(profile_id)
         return True
 
     async def _supervise(self, runner: ProfileRunner) -> None:
-        """Keep one profile's failure from taking the platform down with it."""
+        """Keep one profile's failure from taking the platform down with it.
+
+        A profile that left its loop leaves **two** records behind, and the two are
+        deliberately not collapsed: the tick loop records what failed *inside* a tick
+        (``profile_error``, persisted by the runner itself) and this method records
+        what *ended the profile's loop* -- ``profile_stopped_on_error`` for a
+        realtime failure, ``profile_crashed`` for anything else.  They answer two
+        different questions ("which tick broke?" and "is this profile still
+        supervised?") and the second one survives the tick loop, so neither may
+        absorb the other.
+
+        Both render the exception through
+        :func:`~trading_platform.realtime.observability.failure_text`: a bare
+        ``TimeoutError`` -- whose ``str()`` is the empty string, and which the live
+        incident persisted and logged as ``error="TimeoutError: "`` -- then always
+        names its type, so an operator can tell what happened.
+
+        Persisting the failure is **idempotent**:
+        :meth:`~trading_platform.realtime.runner.ProfileRunner.mark_crashed` answers
+        whether the failure still had to be written, and writes (and logs) nothing
+        when the tick loop already recorded that very failure.  One failure therefore
+        never leaves two ``ERROR`` rows or two ``profile_error`` records behind.
+        """
         failure: BaseException | None = None
         try:
             await runner.run()
@@ -1812,7 +1877,7 @@ class RealtimeOrchestrator:
                 "profile_stopped_on_error",
                 level=logging.ERROR,
                 profile_id=runner.profile_id,
-                error=str(exc),
+                error=failure_text(exc),
             )
         except Exception as exc:
             failure = exc
@@ -1821,13 +1886,14 @@ class RealtimeOrchestrator:
                 "profile_crashed",
                 level=logging.ERROR,
                 profile_id=runner.profile_id,
-                error=f"{type(exc).__name__}: {exc}",
+                error=failure_text(exc),
             )
         if failure is not None:
             # A profile that ended on an error must say so on the dashboard, not
             # only in the log stream: the persisted status is what survives the
             # process.  ``ProfileRunner.run`` records its own tick failures, so this
-            # is the last-resort path (a failure outside the tick loop).
+            # is the last-resort path (a failure outside the tick loop) -- and the
+            # runner itself refuses to record the same failure twice.
             runner.mark_crashed(failure)
 
     async def _stop_streams(self) -> None:
