@@ -111,6 +111,7 @@ from .config_builder import (
 
 __all__ = [
     "API_PASSWORD_BYTES",
+    "CAP_QUEUE_REASON_TEMPLATE",
     "CONTAINER_STRATEGIES_DIR",
     "EVENT_BLOCKED_LIVE",
     "EVENT_CAP_REACHED",
@@ -194,6 +195,12 @@ REASON_RESTART_BACKOFF = "restart_backoff"
 STAGGER_QUEUE_REASON_TEMPLATE = (
     "queued: starting workers gradually ({used} of {total} slots in use)"
 )
+
+#: Reason recorded on a profile left beyond the fleet cap.
+#: ``used`` is the number of slots occupied at the end of the scheduling pass
+#: (the running workers, the ones a restart backoff reserves and the ones that
+#: pass started), ``total`` the cap.
+CAP_QUEUE_REASON_TEMPLATE = "queued: fleet cap reached ({used} of {total} slots in use)"
 
 #: Reasons of a ``stopped`` profile the scheduler must not restart by itself:
 #: they record a deliberate operator decision rather than a fleet decision. A
@@ -465,20 +472,23 @@ class Supervisor:
         """Reconcile the fleet with the store: start, queue, block or stop.
 
         Candidates are the enabled profiles sorted by ``priority`` descending
-        then ``id`` ascending. The first ``max_running_profiles`` positions get a
-        worker; the rest are ``queued`` with a reason naming the cap. A live
-        profile that does not pass
+        then ``id`` ascending. The cap bounds the slots occupied at the end of
+        the pass, not the candidate positions: a running worker occupies a slot,
+        a worker waiting for its restart backoff reserves its slot, and a worker
+        this pass starts takes one. A candidate left beyond the cap is ``queued``
+        with :data:`CAP_QUEUE_REASON_TEMPLATE`. A live profile that does not pass
         :func:`~trading_platform.config.live_trading_gate` is ``blocked``
-        instead, a disabled profile is ``stopped``, and a profile waiting for
-        its restart backoff is left alone until it is due.
+        instead and occupies no slot, so the walk goes on to the next candidate;
+        a disabled profile is ``stopped``, and a profile waiting for its restart
+        backoff is left alone until it is due.
 
         Inside the cap the fleet grows gradually: at most one candidate is
         started per pass, and only when ``worker_start_stagger_seconds`` have
         elapsed since the last worker started, so a cold start never spawns the
         whole fleet at once. The candidates the gate holds back are ``queued``
-        with :data:`STAGGER_QUEUE_REASON_TEMPLATE`. With
-        ``worker_start_stagger_seconds = 0`` the gate is always open and the
-        whole pass behaves as it always did.
+        with :data:`STAGGER_QUEUE_REASON_TEMPLATE`; they hold no worker yet and
+        consume no slot. With ``worker_start_stagger_seconds = 0`` the gate is
+        always open and the whole pass behaves as it always did.
 
         While the kill switch is engaged the method only makes sure that nothing
         runs: it never rewrites a state, so the journal keeps reporting the kill
@@ -500,22 +510,30 @@ class Supervisor:
         now = self.now()
         queued: list[ProfileRecord] = []
         staggered: list[ProfileRecord] = []
-        for index, record in enumerate(self._candidates(profiles)):
-            if index >= cap:
+        # Slots occupied at the end of the pass: the workers already running, the
+        # ones a restart backoff reserves and the ones this pass starts.
+        slots_used = 0
+        for record in self._candidates(profiles):
+            if slots_used >= cap:
                 queued.append(record)
                 continue
             if self.is_running(record.id):
+                slots_used += 1
                 continue
             if not self._consume_backoff(record.id):
+                slots_used += 1
+                continue
+            if self._refuse_live(record):
                 continue
             if not self._stagger_ready(now):
                 staggered.append(record)
                 continue
             if self._start(record, event_kind=EVENT_START):
+                slots_used += 1
                 # A successful start closes the gate for the rest of this pass
                 # and for every pass until the interval elapses.
                 self._last_worker_start_at = now
-        self._apply_queue(queued, cap)
+        self._apply_queue(queued, cap, slots_used)
         self._apply_stagger(staggered, profiles, cap)
         for record in profiles:
             if not record.enabled:
@@ -920,9 +938,14 @@ class Supervisor:
         for record in staggered:
             self._set_state(record, STATE_QUEUED, reason)
 
-    def _apply_queue(self, queued: Sequence[ProfileRecord], cap: int) -> None:
-        """Mark the profiles beyond the cap ``queued`` and release their workers."""
-        reason = f"queued: fleet cap reached ({cap} slots in use)"
+    def _apply_queue(self, queued: Sequence[ProfileRecord], cap: int, used: int) -> None:
+        """Mark the profiles beyond the cap ``queued`` and release their workers.
+
+        ``used`` is the number of slots occupied at the end of the scheduling
+        pass and ``cap`` the fleet cap: the reason names both, so the operator
+        reads the exact numbers the cap was enforced with.
+        """
+        reason = CAP_QUEUE_REASON_TEMPLATE.format(used=used, total=cap)
         for record in queued:
             if record.id in self._operator_starts and self.is_running(record.id):
                 continue
@@ -967,6 +990,29 @@ class Supervisor:
         return True
 
     # -- starting and stopping workers --------------------------------------
+    def _refuse_live(self, record: ProfileRecord) -> bool:
+        """Whether the live-trading gate refuses ``record``; block it when it does.
+
+        This is the single live-gate decision point of the supervisor:
+        :meth:`schedule` calls it to leave the slot of a refused profile free,
+        and :meth:`_start` calls it again before it spawns anything, so an
+        explicit operator start is refused exactly like an automatic one.
+        """
+        if not record.is_live:
+            return False
+        allowed, gate_reason = live_trading_gate(record.mode, self._env)
+        if allowed:
+            return False
+        reason = gate_reason or "live trading refused"
+        if self._set_state(record, STATE_BLOCKED, reason):
+            self.store.record_event(
+                "warning",
+                EVENT_BLOCKED_LIVE,
+                f"refused to start live profile {record.id!r}: {reason}",
+                record.id,
+            )
+        return True
+
     def _start(self, record: ProfileRecord, *, event_kind: str, level: str = "info") -> bool:
         """Generate the configuration of ``record`` and spawn its worker."""
         profile_id = record.id
@@ -976,18 +1022,8 @@ class Supervisor:
         if not record.enabled:
             self._set_state(record, STATE_STOPPED, REASON_DISABLED)
             return False
-        if record.is_live:
-            allowed, gate_reason = live_trading_gate(record.mode, self._env)
-            if not allowed:
-                reason = gate_reason or "live trading refused"
-                if self._set_state(record, STATE_BLOCKED, reason):
-                    self.store.record_event(
-                        "warning",
-                        EVENT_BLOCKED_LIVE,
-                        f"refused to start live profile {profile_id!r}: {reason}",
-                        profile_id,
-                    )
-                return False
+        if self._refuse_live(record):
+            return False
 
         port = self._api_port_for(profile_id)
         username = self._api_username(profile_id)

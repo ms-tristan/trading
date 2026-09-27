@@ -43,6 +43,7 @@ from trading_platform.engine.config_builder import (
     profile_runtime_dir,
 )
 from trading_platform.engine.supervisor import (
+    CAP_QUEUE_REASON_TEMPLATE,
     HISTORY_TRADE_LIMIT,
     KILL_SWITCH_FILENAME,
     MAX_RESTARTS_IN_WINDOW,
@@ -717,7 +718,7 @@ def test_cap_queues_the_profiles_beyond_the_limit(tmp_path: Path) -> None:
     assert running == [f"p{index:02d}" for index in range(12)]
     assert len(queued) == 10
     assert {record.state_reason for record in queued} == {
-        "queued: fleet cap reached (12 slots in use)"
+        "queued: fleet cap reached (12 of 12 slots in use)"
     }
     assert len(harness.launcher.calls) == 12
     assert harness.kinds().count("cap_reached") == 1
@@ -745,7 +746,7 @@ def test_priority_then_id_orders_the_fleet(tmp_path: Path) -> None:
     records = harness.records()
     running = [record.id for record in harness.supervisor.profiles() if record.state == "running"]
     assert running == ["d-high", "e-high", "a-low"]
-    assert records["b-low"].state_reason == "queued: fleet cap reached (3 slots in use)"
+    assert records["b-low"].state_reason == "queued: fleet cap reached (3 of 3 slots in use)"
 
 
 def test_api_ports_follow_the_id_sorted_catalogue(tmp_path: Path) -> None:
@@ -837,6 +838,210 @@ def test_disabled_profile_is_stopped_with_reason(tmp_path: Path) -> None:
     assert not harness.supervisor.is_running("alpha")
     assert harness.records()["alpha"].state == "stopped"
     assert harness.records()["alpha"].state_reason == "disabled"
+
+
+# ---------------------------------------------------------------------------
+# Fleet slots: the cap bounds occupied slots, not candidate positions
+# ---------------------------------------------------------------------------
+def test_a_refused_live_profile_does_not_consume_a_slot(tmp_path: Path) -> None:
+    """A live profile the gate refuses is blocked and leaves its slot to the next one.
+
+    The refused profile sorts first, so the two paper profiles behind it must
+    both run in the very same pass: a profile the gate refuses holds no worker
+    and therefore occupies no slot of the fleet cap.
+    """
+    profiles = [
+        profile_config("live-first", mode="live", priority=300),
+        profile_config("paper-a", priority=200),
+        profile_config("paper-b", priority=100),
+    ]
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
+    )
+
+    harness.supervisor.bootstrap()
+
+    expected = live_trading_gate("live", harness.env)
+    records = harness.records()
+    assert expected[0] is False
+    assert records["paper-a"].state == "running"
+    assert records["paper-b"].state == "running"
+    assert records["live-first"].state == "blocked"
+    assert records["live-first"].state_reason == expected[1]
+    assert [record.id for record in records.values() if record.state == "queued"] == []
+    assert harness.spawned_ids() == ["paper-a", "paper-b"]
+    assert len(harness.launcher.calls) == 2
+    assert harness.kinds().count("blocked_live") == 1
+
+
+def test_the_fleet_converges_to_the_cap_with_a_refused_live_profile_among_the_top_priorities(
+    tmp_path: Path,
+) -> None:
+    """The production catalogue: the refused live profile must not waste a slot.
+
+    ``faber-btc-1d-live`` sorts sixth, inside the six-slot budget, and the gate
+    refuses it. The sixth slot therefore goes to the next candidate,
+    ``keltner-sol-1h``, instead of staying empty: six workers run, the refused
+    profile is blocked and every remaining candidate is queued for the cap.
+    """
+    profiles = [
+        profile_config("basic-btc-1h"),
+        profile_config("bollinger-eth-1h"),
+        profile_config("donchian-eth-4h"),
+        profile_config("dual-thrust-eth-15m"),
+        profile_config("faber-btc-1d"),
+        profile_config("faber-btc-1d-live", mode="live"),
+        profile_config("keltner-sol-1h"),
+        profile_config("basic-eth-4h", priority=50),
+    ]
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(max_running_profiles=6, worker_start_stagger_seconds=0),
+    )
+
+    harness.supervisor.bootstrap()
+
+    records = harness.records()
+    running = sorted(record.id for record in records.values() if record.state == "running")
+    assert len(running) == 6
+    assert "keltner-sol-1h" in running
+    assert records["faber-btc-1d-live"].state == "blocked"
+    assert not harness.supervisor.is_running("faber-btc-1d-live")
+    queued = [record for record in records.values() if record.state == "queued"]
+    assert [record.id for record in queued] == ["basic-eth-4h"]
+    assert {record.state_reason for record in queued} == {
+        "queued: fleet cap reached (6 of 6 slots in use)"
+    }
+    assert len(harness.launcher.calls) == 6
+    assert harness.kinds().count("cap_reached") == 1
+
+
+def test_the_cap_queue_reason_names_the_used_and_total_slots(tmp_path: Path) -> None:
+    """The queued reason carries the occupied slots and the cap, not just the cap."""
+    assert CAP_QUEUE_REASON_TEMPLATE == (
+        "queued: fleet cap reached ({used} of {total} slots in use)"
+    )
+    profiles = [profile_config(f"p{index:02d}") for index in range(8)]
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(max_running_profiles=6, worker_start_stagger_seconds=0),
+    )
+
+    harness.supervisor.bootstrap()
+
+    queued = [record for record in harness.records().values() if record.state == "queued"]
+    expected = CAP_QUEUE_REASON_TEMPLATE.format(used=6, total=6)
+    assert expected == "queued: fleet cap reached (6 of 6 slots in use)"
+    assert len(queued) == 2
+    assert {record.state_reason for record in queued} == {expected}
+
+
+def test_slots_used_equals_the_running_profiles_and_the_fleet_converges(tmp_path: Path) -> None:
+    """The published ``slots_used`` counts the rows in state ``running``.
+
+    Asserted inside the convergence scenario, where six workers run because the
+    refused live profile costs no slot.
+    """
+    profiles = [
+        profile_config("basic-btc-1h"),
+        profile_config("bollinger-eth-1h"),
+        profile_config("donchian-eth-4h"),
+        profile_config("dual-thrust-eth-15m"),
+        profile_config("faber-btc-1d"),
+        profile_config("faber-btc-1d-live", mode="live"),
+        profile_config("keltner-sol-1h"),
+        profile_config("basic-eth-4h", priority=50),
+    ]
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(max_running_profiles=6, worker_start_stagger_seconds=0),
+    )
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+
+    status = supervisor.status()
+    assert status["slots_used"] == status["profiles_running"] == 6
+    assert status["slots_total"] == 6
+    assert (
+        len([record for record in harness.store.list_profiles() if record.state == "running"]) == 6
+    )
+
+
+def test_a_low_priority_refused_live_profile_costs_no_slot(tmp_path: Path) -> None:
+    """A refused profile releases its slot to the next candidate by priority."""
+    profiles = [
+        profile_config("paper-a", priority=300),
+        profile_config("live-low", mode="live", priority=200),
+        profile_config("paper-b", priority=100),
+        profile_config("paper-c", priority=50),
+    ]
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
+    )
+
+    harness.supervisor.bootstrap()
+
+    expected = live_trading_gate("live", harness.env)
+    records = harness.records()
+    assert expected[0] is False
+    assert records["paper-a"].state == "running"
+    assert records["paper-b"].state == "running"
+    assert records["live-low"].state == "blocked"
+    assert records["live-low"].state_reason == expected[1]
+    assert records["paper-c"].state == "queued"
+    assert records["paper-c"].state_reason == ("queued: fleet cap reached (2 of 2 slots in use)")
+    assert harness.spawned_ids() == ["paper-a", "paper-b"]
+
+
+async def test_a_restart_backoff_reserves_its_slot_but_is_not_a_used_slot(tmp_path: Path) -> None:
+    """A reserved backoff slot bounds the fleet without being a published slot.
+
+    ``alpha`` is stopped by the health policy and waits for its restart backoff
+    while the clock is frozen: it holds no worker, yet its slot stays reserved,
+    so ``gamma`` is queued for the cap although only one worker (``beta``) is
+    alive. ``status()`` still reports the rows in state ``running``, so the
+    reserved slot is not published as a used slot.
+    """
+    harness = make_harness(
+        tmp_path,
+        profiles=[
+            profile_config("alpha", priority=300),
+            profile_config("beta", priority=200),
+            profile_config("gamma", priority=100),
+        ],
+        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
+    )
+    supervisor = harness.supervisor
+    await supervisor.start()
+    assert supervisor.is_running("alpha")
+    assert supervisor.is_running("beta")
+    assert harness.records()["gamma"].state == "queued"
+
+    await fail_cycle(harness, "alpha", 1)
+
+    record = harness.records()["alpha"]
+    assert record.state == "stopped"
+    assert record.state_reason == f"restart_backoff: retrying in {RESTART_BACKOFF_SECONDS[0]}s"
+    assert not supervisor.is_running("alpha")
+
+    supervisor.schedule()
+
+    assert supervisor.is_running("beta")
+    assert not supervisor.is_running("alpha")
+    assert harness.records()["gamma"].state == "queued"
+    assert harness.records()["gamma"].state_reason == (
+        "queued: fleet cap reached (2 of 2 slots in use)"
+    )
+    assert len(harness.launcher.running()) == 1
+    status = supervisor.status()
+    assert status["slots_used"] == status["profiles_running"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1199,7 +1404,7 @@ def test_apply_settings_persists_and_reschedules(tmp_path: Path) -> None:
     records = harness.records()
     assert records["alpha"].state == "running"
     assert records["beta"].state == "queued"
-    assert records["beta"].state_reason == "queued: fleet cap reached (1 slots in use)"
+    assert records["beta"].state_reason == "queued: fleet cap reached (1 of 1 slots in use)"
     assert not supervisor.is_running("beta")
     assert harness.launcher.terminated
 
@@ -1526,10 +1731,11 @@ def test_the_stagger_boots_the_fleet_one_worker_per_interval(tmp_path: Path) -> 
 
     Four eligible profiles and three slots. The candidates are ordered by
     priority descending then id ascending, so the fourth one is ``omega``. The
-    first pass spawns exactly one worker; the two candidates *inside* the cap are
-    queued with the gradual-start reason while ``omega`` keeps the fleet-cap
-    reason; and the gate then admits exactly one more worker per
-    ``worker_start_stagger_seconds`` interval -- no more, no less.
+    first pass spawns exactly one worker; every other candidate is queued with the
+    gradual-start reason, because a staggered profile holds no worker yet and so
+    consumes no slot; and the gate then admits exactly one more worker per
+    ``worker_start_stagger_seconds`` interval -- no more, no less. Only the last
+    pass, once the three slots are occupied, gives ``omega`` the fleet-cap reason.
     """
     profiles = [profile_config(name) for name in ("alpha", "beta", "gamma", "omega")]
     harness = make_harness(tmp_path, profiles=profiles, settings=staggered_settings())
@@ -1546,8 +1752,10 @@ def test_the_stagger_boots_the_fleet_one_worker_per_interval(tmp_path: Path) -> 
             "queued: starting workers gradually (1 of 3 slots in use)"
         )
     assert records["omega"].state == "queued"
-    assert records["omega"].state_reason == "queued: fleet cap reached (3 slots in use)"
-    assert harness.kinds().count("cap_reached") == 1
+    assert records["omega"].state_reason == (
+        "queued: starting workers gradually (1 of 3 slots in use)"
+    )
+    assert harness.kinds().count("cap_reached") == 0
     # A staggered profile holds no worker, so the pass journals no stop.
     assert "stop" not in harness.kinds()
 
@@ -1572,7 +1780,10 @@ def test_the_stagger_boots_the_fleet_one_worker_per_interval(tmp_path: Path) -> 
     supervisor.schedule()
 
     assert harness.spawned_ids() == ["alpha", "beta", "gamma"]
-    assert harness.records()["omega"].state_reason == "queued: fleet cap reached (3 slots in use)"
+    assert harness.records()["omega"].state_reason == (
+        "queued: fleet cap reached (3 of 3 slots in use)"
+    )
+    assert harness.kinds().count("cap_reached") == 1
 
 
 def test_a_zero_stagger_keeps_the_immediate_boot(tmp_path: Path) -> None:
@@ -1589,7 +1800,7 @@ def test_a_zero_stagger_keeps_the_immediate_boot(tmp_path: Path) -> None:
     assert harness.spawned_ids() == ["alpha", "beta", "gamma"]
     records = harness.records()
     assert records["omega"].state == "queued"
-    assert records["omega"].state_reason == "queued: fleet cap reached (3 slots in use)"
+    assert records["omega"].state_reason == "queued: fleet cap reached (3 of 3 slots in use)"
     assert all("gradually" not in (record.state_reason or "") for record in records.values())
 
 
@@ -1625,7 +1836,9 @@ def test_the_stagger_delays_promotions_without_reordering_them(tmp_path: Path) -
     supervisor.schedule()
 
     assert harness.spawned_ids() == ["d-high", "e-high", "a-low"]
-    assert harness.records()["b-low"].state_reason == "queued: fleet cap reached (3 slots in use)"
+    assert harness.records()["b-low"].state_reason == (
+        "queued: fleet cap reached (3 of 3 slots in use)"
+    )
 
 
 def test_apply_settings_opens_and_re_arms_the_stagger_gate(tmp_path: Path) -> None:
