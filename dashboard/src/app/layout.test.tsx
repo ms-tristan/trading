@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { forgetLastKnown } from "@/lib/api";
 
-import RootLayout from "./layout";
+import RootLayout, { metadata } from "./layout";
 
 const { refreshMock } = vi.hoisted(() => ({ refreshMock: vi.fn() }));
 
@@ -100,5 +100,26 @@ describe("RootLayout", () => {
     render(await RootLayout({ children: <p>page content</p> }));
 
     expect(screen.getByText("Operator token")).toBeInTheDocument();
+  });
+
+  it("renders the dark theme colour for the browser chrome", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ max_running_profiles: 12 }));
+
+    render(await RootLayout({ children: <p>page content</p> }));
+
+    const themeColour = document.head.querySelector('meta[name="theme-color"]');
+    expect(themeColour).not.toBeNull();
+    expect(themeColour).toHaveAttribute("content", "#020617");
+  });
+});
+
+describe("metadata", () => {
+  it("names the application and titles pages through the template", () => {
+    expect(metadata.applicationName).toBe("Trading platform");
+    expect(metadata.title).toEqual({
+      default: "Trading platform",
+      template: "%s - Trading platform",
+    });
+    expect(metadata.description).toBe("Multi-profile paper and live trading monitor.");
   });
 });

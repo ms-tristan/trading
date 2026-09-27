@@ -6,9 +6,11 @@
  * only runs when an operator explicitly asks for another ranking.
  */
 
+import { needsDecision } from "./states";
 import type { ProfileMode, ProfileState, ProfileView, SortKey } from "./types";
 
 export { isAttentionState } from "./states";
+export { isWaitingForSlot, needsDecision } from "./states";
 
 /** Split the ranked profile list by trading mode, preserving the API order. */
 export function splitByMode(profiles: ProfileView[]): {
@@ -71,9 +73,13 @@ export function sortProfiles(profiles: ProfileView[], key: SortKey): ProfileView
   return decorated.map((entry) => entry.profile);
 }
 
-/** `true` when at least one profile of the list needs an operator decision. */
+/**
+ * `true` when at least one profile of the list needs an operator decision.
+ *
+ * A `queued` profile only waits for an engine slot: it is not a decision.
+ */
 export function hasAttentionProfile(states: ProfileState[]): boolean {
-  return states.some((state) => state === "queued" || state === "error" || state === "blocked");
+  return states.some(needsDecision);
 }
 
 /** Sorting keys offered by the tables, in display order. */

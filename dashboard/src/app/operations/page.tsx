@@ -6,6 +6,10 @@ import {
 import { EventsTable } from "@/components/operations/EventsTable";
 import { OperationsConsole } from "@/components/operations/OperationsConsole";
 import { SlotUsageSection } from "@/components/operations/SlotUsageSection";
+import {
+  FleetCapacityNotice,
+  fleetCapacitySentence,
+} from "@/components/overview/FleetCapacityNotice";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { fetchEvents, fetchHealth, fetchProfiles, fetchSettings } from "@/lib/api";
@@ -44,6 +48,9 @@ export default async function OperationsPage() {
   const killSwitchEngaged =
     health.data.kill_switch_engaged || settings.data.kill_switch_engaged === true;
   const version = health.data.version === "" ? null : health.data.version;
+  const waitingForSlot = profiles.data.profiles.filter(
+    (profile) => profile.state === "queued",
+  ).length;
   const subtitle = [
     `engine ${health.data.status}`,
     version === null ? null : `version ${version}`,
@@ -63,6 +70,18 @@ export default async function OperationsPage() {
     ...health.data,
     live_trading_enabled: settings.data.allow_live_trading,
   };
+
+  // One always-visible line, in ordinary text, that says why a profile waits for
+  // a worker: the cap of `GET /api/settings`, the slot pair of `GET /api/health`
+  // and the profiles known but waiting. No cap is written here - every figure of
+  // the sentence comes from the two endpoints the page already reads.
+  const capacityLine = `${fleetCapacitySentence({
+    maxRunningProfiles: settings.data.max_running_profiles,
+    engineSlotsUsed: health.data.engine_slots_used,
+    engineSlotsTotal: health.data.engine_slots_total,
+    waitingProfiles: waitingForSlot,
+    staggerSeconds: settings.data.worker_start_stagger_seconds,
+  })} ${waitingForSlot} profiles are known but waiting for a slot.`;
 
   return (
     <div className="grid grid-cols-12 gap-2">
@@ -89,13 +108,30 @@ export default async function OperationsPage() {
         title="The event log could not be refreshed"
       />
 
+      <p className="col-span-12 mb-2 min-w-0 text-base text-muted-foreground">{capacityLine}</p>
+
+      <FleetCapacityNotice
+        className="col-span-12"
+        maxRunningProfiles={settings.data.max_running_profiles}
+        engineSlotsUsed={health.data.engine_slots_used}
+        engineSlotsTotal={health.data.engine_slots_total}
+        waitingProfiles={waitingForSlot}
+        staggerSeconds={settings.data.worker_start_stagger_seconds}
+      />
+
       <EngineStateCard
         className="col-span-12"
         health={engineState}
         profiles={profiles.data.profiles}
       />
 
-      <SlotUsageSection className="col-span-12" profiles={profiles.data.profiles} />
+      <SlotUsageSection
+        className="col-span-12"
+        profiles={profiles.data.profiles}
+        maxRunningProfiles={settings.data.max_running_profiles}
+        engineSlotsUsed={health.data.engine_slots_used}
+        engineSlotsTotal={health.data.engine_slots_total}
+      />
 
       <OperationsConsole
         className="col-span-12"

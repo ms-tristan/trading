@@ -85,6 +85,28 @@ docker compose -f deploy/docker-compose.yml build trading-dashboard
 docker compose -f deploy/docker-compose.yml up -d trading-dashboard
 ```
 
+### Dashboard branding assets
+
+The dashboard ships its own icon set, and it is part of the image like every
+other page: three files under `dashboard/src/app/` (the Next.js 16 **App Router
+file-based metadata** convention) are emitted as the document's icon tags.
+
+| File | Format | Emitted as |
+| --- | --- | --- |
+| `dashboard/src/app/icon.svg` | SVG, 32x32 viewBox, `#020617` background and `#16A34A` mark | `<link rel="icon">` |
+| `dashboard/src/app/favicon.ico` | real multi-resolution ICO carrying 16x16, 32x32 and 48x48 entries | the `/favicon.ico` request |
+| `dashboard/src/app/apple-icon.png` | PNG, 180x180, opaque (no alpha) | `<link rel="apple-touch-icon">` |
+
+Two consequences worth knowing:
+
+* **no hand-written `<head>` tag and no extra dependency**: the App Router
+  discovers the three files by their names and generates the tags, so the icons
+  cannot drift out of sync with the build and no icon package is installed;
+* **the files are served by the dashboard origin itself**: `/favicon.ico`,
+  `/icon.svg` and `/apple-icon.png` answer `200` on `127.0.0.1:3031` (and therefore
+  behind nginx too), which is what lets the browser and the iOS home-screen
+  bookmark render the branding without any extra nginx rule.
+
 ### Volumes (state survives a restart)
 
 | Volume | Path | Content | Used by |
@@ -202,13 +224,28 @@ file alone is enough).
 
 One running `freqtrade trade` process costs about **390 MiB RSS** (measured: 8
 instances = 3.13 GiB, linear), and the Docker VM has **12 GiB** on a 16 GiB host
-that already swaps heavily. The platform therefore runs at most **6 concurrent
-workers** by default (`max_running_profiles`, overridable by
-`TB_MAX_RUNNING_PROFILES`), which is roughly **2.3 GiB** of workers and leaves the
-rest of the VM to the supervisor, the dashboard and the image builds. Profiles
-beyond the cap are **queued**: they are reported with the state `queued` and a
-reason naming the cap, they appear in the dashboard's ranking like every other
-profile, and the next one is promoted automatically as soon as a slot frees.
+that already swaps heavily. The cap is `max_running_profiles`, and it has two
+values on purpose:
+
+* the **shipped default is 6** (`config/platform.json`, overridable by
+  `TB_MAX_RUNNING_PROFILES`), which is roughly **2.3 GiB** of workers and leaves
+  the rest of the VM to the supervisor, the dashboard and the image builds — the
+  safe choice for a smaller machine;
+* the **deployed stack runs 10**, because `deploy/docker-compose.yml` sets
+  `TB_MAX_RUNNING_PROFILES=10`: **one profile per strategy**, i.e. the ten
+  priority-100 primary profiles of the catalogue.
+
+Ten is a measured decision, not a guess. At a cap of 6 the `trading-realtime`
+container held about **2.4 GiB**, the whole guest about **5 GB**, and the host
+swap did not move; scaling linearly to ten workers still leaves head-room on the
+12 GiB guest, and the stagger (§below) spreads the boot instead of spending that
+head-room all at once.
+
+Profiles beyond the cap are **queued**: they are reported with the state `queued`
+and a reason naming the cap, they appear in the dashboard's ranking like every
+other profile, and the next one is promoted automatically as soon as a slot
+frees. `queued` means **waiting for a slot** — it is not a failure and it needs
+no operator decision.
 
 The cap is a memory guard, not a trading decision. Raise it with
 `TB_MAX_RUNNING_PROFILES`, with `max_running_profiles` in `config/platform.json`,
@@ -217,7 +254,7 @@ to back it (`docker stats`).
 
 ### Why the fleet also starts gradually
 
-Filling the six slots at once is exactly what killed the guest: a simultaneous
+Filling the slots at once is exactly what killed the guest: a simultaneous
 cold start of many workers spiked memory and CPU together and made the VM
 unresponsive — reproduced twice on this host. The supervisor therefore starts **at
 most one new worker per stagger interval**, controlled by
@@ -232,8 +269,12 @@ immediate behaviour. Staggering only delays promotions, it never reorders them:
 the order stays priority descending, then id ascending, so a high-priority profile
 is still promoted before a low-priority one.
 
-That is why `deploy/docker-compose.yml` sets `TB_MAX_RUNNING_PROFILES=6` and
-`TB_WORKER_START_STAGGER_SECONDS=10` for the `trading-realtime` service.
+That is why `deploy/docker-compose.yml` sets `TB_MAX_RUNNING_PROFILES=10` — the
+ten priority-100 primaries of the catalogue, one profile per strategy — and
+`TB_WORKER_START_STAGGER_SECONDS=10` for the `trading-realtime` service. Reach the
+same figures without opening a shell: the overview and the operations page print
+the cap, the slots in use and the number of profiles waiting for a slot as
+visible text, read from `GET /api/settings` and `GET /api/health`.
 
 ### Live-trading preconditions
 
@@ -264,11 +305,13 @@ true in this order:
    `state.db.legacy-<timestamp>` and creates a fresh one (an unrelated schema can
    therefore never abort the boot);
 2. it seeds the **22-profile catalogue** and computes the schedule;
-3. it promotes the highest-priority profiles up to the cap of **6**, one new
-   worker per stagger interval (`worker_start_stagger_seconds`, 10 s by default),
-   and spawns one `freqtrade trade` worker for each; the rest are `queued` with
-   their reason — the profiles that are eligible but still waiting for the gate
-   carry `queued: starting workers gradually (N of M slots in use)`;
+3. it promotes the highest-priority profiles up to the cap of the deployed stack —
+   **10** (`max_running_profiles`, set by `TB_MAX_RUNNING_PROFILES` in the compose
+   file), one new worker per stagger interval (`worker_start_stagger_seconds`,
+   10 s by default) — and spawns one `freqtrade trade` worker for each; the rest
+   are `queued`, i.e. waiting for a slot, with their reason — the profiles that
+   are eligible but still waiting for the gate carry
+   `queued: starting workers gradually (N of M slots in use)`;
 4. the API starts serving as soon as the supervisor is up, and `/api/health`
    reports `status == "ok"` with `profiles_running > 0` as soon as **one** worker
    is alive and healthy — which is what the smoke test waits for.
@@ -564,9 +607,11 @@ Operational notes:
   nginx authentication, never published on a public interface;
 - **no shared state between the containers**: the dashboard holds no database
   and no volume; everything it shows comes from the JSON API at request time;
-- **no more than 6 workers by default, and they start one at a time**: the fleet
-  cap is a memory guard and the stagger protects the guest from a cold-start spike
-  (§1bis); the remaining profiles of the catalogue are queued, not dropped;
+- **a capped fleet that starts one worker at a time**: this stack runs at most
+  **10** workers (the shipped default is 6), and the fleet cap is a memory guard
+  while the stagger protects the guest from a cold-start spike (§1bis); the
+  remaining profiles of the catalogue are `queued` — waiting for a slot, not
+  dropped;
 - **no live trading by default**: the two live catalogue entries stay `blocked`
   (in the API) and `refused_live` (in provisioning) until an operator provides
   `TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK` and both exchange credentials in

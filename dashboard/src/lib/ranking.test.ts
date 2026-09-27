@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { MODE_ORDER, SORT_KEYS, hasAttentionProfile, isAttentionState, sortProfiles, splitByMode } from "./ranking";
+import {
+  MODE_ORDER,
+  SORT_KEYS,
+  hasAttentionProfile,
+  isAttentionState,
+  isWaitingForSlot,
+  needsDecision,
+  sortProfiles,
+  splitByMode,
+} from "./ranking";
 import type { ProfileView } from "./types";
 
 function profile(overrides: Partial<ProfileView> & { id: string }): ProfileView {
@@ -115,9 +124,24 @@ describe("ranking vocabulary", () => {
     expect(isAttentionState("stopped")).toBe(false);
   });
 
-  it("flags a list holding at least one attention state", () => {
+  it("re-exports the decision and waiting predicates of the state module", () => {
+    expect(needsDecision("error")).toBe(true);
+    expect(needsDecision("blocked")).toBe(true);
+    expect(needsDecision("queued")).toBe(false);
+    expect(isWaitingForSlot("queued")).toBe(true);
+    expect(isWaitingForSlot("error")).toBe(false);
+    expect(isWaitingForSlot("blocked")).toBe(false);
+  });
+
+  it("flags a list holding at least one decision state", () => {
     expect(hasAttentionProfile(["running", "stopped"])).toBe(false);
     expect(hasAttentionProfile(["running", "error"])).toBe(true);
+    expect(hasAttentionProfile(["running", "blocked"])).toBe(true);
+  });
+
+  it("does not treat a queued profile as a decision", () => {
+    expect(hasAttentionProfile(["running", "queued"])).toBe(false);
+    expect(hasAttentionProfile(["queued", "queued"])).toBe(false);
   });
 
   it("publishes the sort keys and the mode order", () => {

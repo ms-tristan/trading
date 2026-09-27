@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   ATTENTION_STATES,
+  STATES_NEEDING_DECISION,
   STATE_COLOR_VARS,
   STATE_LABELS,
+  WAITING_STATES,
   isAttentionState,
+  isWaitingForSlot,
+  needsDecision,
   stateColorVar,
   stateLabel,
 } from "./states";
@@ -38,6 +42,24 @@ describe("state vocabulary", () => {
     expect(STATES.filter(isAttentionState)).toEqual(["queued", "error", "blocked"]);
   });
 
+  it("separates the states needing a decision from the states waiting for a slot", () => {
+    expect(STATES_NEEDING_DECISION).toEqual(["error", "blocked"]);
+    expect(WAITING_STATES).toEqual(["queued"]);
+    expect(STATES.filter(needsDecision)).toEqual(["error", "blocked"]);
+    expect(STATES.filter(isWaitingForSlot)).toEqual(["queued"]);
+  });
+
+  it("never flags a queued profile as needing a decision", () => {
+    expect(needsDecision("queued")).toBe(false);
+    expect(isWaitingForSlot("queued")).toBe(true);
+    expect(needsDecision("error")).toBe(true);
+    expect(needsDecision("blocked")).toBe(true);
+    expect(isWaitingForSlot("error")).toBe(false);
+    expect(isWaitingForSlot("blocked")).toBe(false);
+    expect(needsDecision("running")).toBe(false);
+    expect(isWaitingForSlot("running")).toBe(false);
+  });
+
   it("exposes label and colour of every state", () => {
     for (const state of STATES) {
       expect(stateLabel(state)).toBe(STATE_LABELS[state]);
@@ -50,5 +72,7 @@ describe("state vocabulary", () => {
     expect(stateLabel(unknown)).toBe("Unknown");
     expect(stateColorVar(unknown)).toBe("--status-stopped");
     expect(isAttentionState(unknown)).toBe(false);
+    expect(needsDecision(unknown)).toBe(false);
+    expect(isWaitingForSlot(unknown)).toBe(false);
   });
 });

@@ -11,6 +11,8 @@ import { formatUsdt } from "@/lib/format";
 import { isAttentionState } from "@/lib/states";
 import type { ProfileView } from "@/lib/types";
 
+import { formatCount } from "./EngineStateCard";
+
 /** One row of the slot ranking. */
 export interface SlotUsageRow {
   profile: ProfileView;
@@ -129,7 +131,43 @@ const COLUMNS: DataTableColumn<SlotUsageRow>[] = [
 export interface SlotUsageSectionProps {
   /** The ranked profile list of `GET /api/profiles`. */
   profiles: ProfileView[];
+  /** `max_running_profiles` of `GET /api/settings`; `undefined` when unreadable. */
+  maxRunningProfiles?: number;
+  /** Slots in use / slots total of `GET /api/health`; `NaN` when unreadable. */
+  engineSlotsUsed?: number;
+  engineSlotsTotal?: number;
   className?: string;
+}
+
+/** Read a figure of the fleet cap: `null` when it is absent, zero or not finite. */
+function usableCount(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** The subtitle of the section: who holds a slot, the cap and the slots in use. */
+export function slotUsageSubtitle(
+  running: number,
+  queued: number,
+  maxRunningProfiles?: number,
+  engineSlotsUsed?: number,
+  engineSlotsTotal?: number,
+): string {
+  // The engine setting is the cap; a deployment that does not publish it still
+  // hands out at most `engine_slots_total` workers, so the health pair is the
+  // documented fallback. When neither is usable the segment says so in words -
+  // printing an em dash for a cap would read as "no cap at all".
+  const cap = usableCount(maxRunningProfiles) ?? usableCount(engineSlotsTotal);
+  const used = usableCount(engineSlotsUsed);
+  const total = usableCount(engineSlotsTotal);
+
+  const capacity =
+    cap === null
+      ? "cap unknown"
+      : `cap ${formatCount(cap)}, ${formatCount(used ?? Number.NaN)} of ${formatCount(
+          total ?? Number.NaN,
+        )} slots in use`;
+
+  return `${running} running, ${queued} queued - ${capacity} - the engine promotes by priority, then by id`;
 }
 
 /**
@@ -138,8 +176,18 @@ export interface SlotUsageSectionProps {
  *
  * Profiles that are stopped, blocked or in error are deliberately absent: they
  * are not part of the slot race, and the engine-state card above counts them.
+ *
+ * The header states the fleet cap, the slots in use and the number of waiting
+ * profiles as ordinary text: a queue is normal operation and the operator must
+ * not have to hover anything to learn why a profile is not running yet.
  */
-export function SlotUsageSection({ profiles, className }: SlotUsageSectionProps) {
+export function SlotUsageSection({
+  profiles,
+  maxRunningProfiles,
+  engineSlotsUsed,
+  engineSlotsTotal,
+  className,
+}: SlotUsageSectionProps) {
   const rows = slotUsageRows(profiles);
   const running = rows.filter((row) => row.slot !== null || row.profile.state === "running").length;
   const queued = rows.length - running;
@@ -149,7 +197,13 @@ export function SlotUsageSection({ profiles, className }: SlotUsageSectionProps)
       <SectionHeader
         id="slot-usage-heading"
         title="Engine slots"
-        subtitle={`${running} running, ${queued} queued - the engine promotes by priority, then by id`}
+        subtitle={slotUsageSubtitle(
+          running,
+          queued,
+          maxRunningProfiles,
+          engineSlotsUsed,
+          engineSlotsTotal,
+        )}
       />
       <Card>
         <DataTable

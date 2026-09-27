@@ -42,6 +42,15 @@ const PAPER_ROWS = [
     // A single snapshot: the cell must say "no data" instead of drawing a chart.
     sparkline: [1000],
   }),
+  apiProfile({
+    id: "delta",
+    name: "Delta",
+    portfolio_value: 1000,
+    // A profile that waits for a worker: the engine publishes the reason, and it
+    // must be visible text in the row and counted as waiting, never as a problem.
+    state: "queued",
+    state_reason: "queued: fleet cap reached (10 of 10 slots in use)",
+  }),
 ];
 
 const LIVE_ROW = apiProfile({
@@ -98,11 +107,13 @@ const ACCOUNT = {
 
 const HEALTH = apiHealth({
   profiles_running: 2,
-  engine_slots_used: 2,
-  engine_slots_total: 4,
+  engine_slots_used: 10,
+  engine_slots_total: 10,
+  // One paper profile waits for a slot: a queued profile is not a failure.
+  profiles_queued: 11,
 });
 
-const SETTINGS = apiSettings({ allow_live_trading: false });
+const SETTINGS = apiSettings({ allow_live_trading: false, max_running_profiles: 10 });
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -197,8 +208,66 @@ describe("OverviewPage", () => {
 
     expect(screen.getByText("Engine slots")).toBeInTheDocument();
     // `engine_slots_used` of `engine_slots_total`, straight from `/api/health`.
-    expect(screen.getByText("2 of 4")).toBeInTheDocument();
-    expect(screen.queryByText("0 of 4")).not.toBeInTheDocument();
+    expect(screen.getByText("10 of 10")).toBeInTheDocument();
+    expect(screen.queryByText("0 of 10")).not.toBeInTheDocument();
+  });
+
+  it("states the fleet cap of /api/settings as ordinary text under both sections", async () => {
+    await renderOverview();
+
+    // The cap and the slot pair come from the API, never from a number written
+    // in the page: `max_running_profiles` is 10 and the engine reports 10 slots.
+    // Each section states it twice - the caption under its header and the notice
+    // above its table.
+    const capacity = screen.getAllByText(/at most 10 profiles/);
+    expect(capacity).toHaveLength(4);
+    for (const line of capacity) {
+      expect(line).toHaveTextContent("10 of 10 slots in use");
+      expect(line).not.toHaveAttribute("title");
+    }
+
+    // One paper profile waits for a slot; the live section has none.
+    expect(screen.getByText(/Fleet capacity: 10 of 10 slots in use \(cap 10\), 1 of 3 profiles/))
+      .toBeInTheDocument();
+    expect(screen.getByText(/Fleet capacity: 10 of 10 slots in use \(cap 10\), 0 of 1 profiles/))
+      .toBeInTheDocument();
+    expect(screen.getByText("1 profile is waiting for a slot in this section.")).toBeInTheDocument();
+    expect(screen.getByText("No profile of this section is waiting for a slot.")).toBeInTheDocument();
+    // A waiting profile is counted as waiting, never as an attention count. The
+    // one "needing attention" of the page is the live profile in error state.
+    expect(screen.queryByText(/1 profile is needing attention/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/profiles? are? waiting for a slot\b/)).not.toBeInTheDocument();
+  });
+
+  it("states an honest capacity when the health read fails", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/health")) {
+        throw new Error("connect ECONNREFUSED");
+      }
+      if (url.startsWith("/api/settings")) {
+        return jsonResponse(SETTINGS);
+      }
+      if (url.startsWith("/api/profiles")) {
+        return jsonResponse(RANKED);
+      }
+      return jsonResponse(ACCOUNT);
+    });
+
+    await renderOverview();
+
+    expect(screen.getByText("The fleet capacity could not be refreshed")).toBeInTheDocument();
+    expect(screen.getByText(/Fleet capacity: Unknown at the moment\. 1 of 3 profiles/))
+      .toBeInTheDocument();
+    // The degraded line never prints a figure it does not have: the caption says
+    // the capacity is unknown and names no slot pair of the failed read.
+    const captions = screen.getAllByText(/Fleet capacity: Unknown at the moment\./);
+    expect(captions).toHaveLength(2);
+    for (const caption of captions) {
+      expect(caption).not.toHaveTextContent("10 of 10 slots in use");
+      expect(caption).not.toHaveTextContent("cap ");
+      expect(caption).not.toHaveTextContent("NaN");
+    }
   });
 
   it("draws the equity cell of a two-point sparkline and says no data below that", async () => {
@@ -222,10 +291,22 @@ describe("OverviewPage", () => {
     await renderOverview();
 
     const rows = tableRows(0);
-    expect(rows).toHaveLength(3); // header + two profiles
+    expect(rows).toHaveLength(4); // header + three profiles
     expect(rows[1]).toHaveTextContent("Bravo");
     expect(rows[2]).toHaveTextContent("Alpha");
+    expect(rows[3]).toHaveTextContent("Delta");
     expect(screen.getByRole("link", { name: "Bravo" })).toHaveAttribute("href", "/profiles/bravo");
+  });
+
+  it("shows the reason a waiting profile published, as visible text", async () => {
+    await renderOverview();
+
+    const delta = screen.getByRole("link", { name: "Delta" }).closest("tr");
+    expect(delta).not.toBeNull();
+    expect(within(delta as HTMLElement).getByText("Queued")).toBeInTheDocument();
+    expect(
+      within(delta as HTMLElement).getByText("queued: fleet cap reached (10 of 10 slots in use)"),
+    ).toBeInTheDocument();
   });
 
   it("keeps live profiles in the real-trading section only", async () => {
@@ -235,7 +316,11 @@ describe("OverviewPage", () => {
     expect(realRows).toHaveLength(2);
     expect(realRows[1]).toHaveTextContent("Funded BTC");
     expect(screen.getByText("Refused profile")).toBeInTheDocument();
-    expect(screen.getByRole("note")).toHaveTextContent("Live trading is not enabled");
+    expect(
+      screen.getAllByRole("note").some((note) =>
+        note.textContent?.includes("Live trading is not enabled"),
+      ),
+    ).toBe(true);
   });
 
   it("fetches the requested window and marks it as current", async () => {
@@ -255,7 +340,7 @@ describe("OverviewPage", () => {
   it("renders the aggregate line of both sections", async () => {
     await renderOverview();
 
-    expect(screen.getByText(/2 profiles - 2 running/)).toBeInTheDocument();
+    expect(screen.getByText(/3 profiles - 2 running/)).toBeInTheDocument();
     expect(screen.getByText(/1 profile - 0 running/)).toBeInTheDocument();
   });
 
@@ -265,10 +350,12 @@ describe("OverviewPage", () => {
     await renderOverview();
 
     const banners = screen.getAllByRole("status");
-    expect(banners).toHaveLength(3);
+    expect(banners).toHaveLength(4);
     expect(banners[0]).toHaveTextContent("/api/account?window=24h");
     expect(screen.getByRole("heading", { level: 2, name: /Paper trading/ })).toBeInTheDocument();
     expect(screen.getByText("Live trading status unknown")).toBeInTheDocument();
+    expect(screen.getByText("The fleet capacity could not be refreshed")).toBeInTheDocument();
+    expect(screen.getAllByText(/Fleet capacity: Unknown at the moment\./)).toHaveLength(2);
   });
 
   it("renders the empty messages when no profile exists", async () => {
