@@ -10,6 +10,7 @@ without ever opening a socket.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,19 @@ from trading_platform.profiles.catalogue import PROFILE_CATALOGUE
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 RUNNER = CliRunner()
+
+#: ANSI SGR escape sequences emitted by rich when the CLI runs in a colour-forcing
+#: environment (GitHub Actions sets ``GITHUB_ACTIONS``, which makes typer force the
+#: terminal on even under ``CliRunner``).  Rich styles *inside* tokens -- ``--api-url``
+#: comes out as ``\x1b[1m-\x1b[0m\x1b[1m-api\x1b[0m\x1b[1m-url\x1b[0m`` -- so a raw
+#: substring check on ``result.output`` would only pass on a non-colourised local run.
+#: The captured streams are therefore de-colourised, never the assertions relaxed.
+_ANSI_SGR = re.compile(rb"\x1b\[[0-9;]*m")
+
+#: Terminal width pinned for the ``--help`` assertions.  At the default 80 columns rich
+#: folds a long option name mid-token, which hides it from a substring check for reasons
+#: that have nothing to do with the command surface.
+HELP_COLUMNS = "200"
 
 #: The frozen payload keys of the ``realtime-provision`` command.
 PAYLOAD_KEYS = frozenset(
@@ -142,9 +156,19 @@ def stubbed_client(monkeypatch: pytest.MonkeyPatch) -> StubClient:
     return StubClient
 
 
-def invoke(*args: str) -> Any:
-    """Run the CLI in-process and return the click result."""
-    return RUNNER.invoke(app, list(args))
+def invoke(*args: str, env: dict[str, str] | None = None) -> Any:
+    """Run the CLI in-process and return the click result, without ANSI styling.
+
+    ``env`` adds environment overrides for this one invocation: the ``--help`` tests
+    pin a wide ``COLUMNS`` so rich never folds a long option name mid-token.  Stripping
+    the styling keeps the run deterministic whatever the colour environment of the
+    machine running the suite (docs/testing-policy.md section 1, rule 3).
+    """
+    result = RUNNER.invoke(app, list(args), env=env)
+    result.stdout_bytes = _ANSI_SGR.sub(b"", result.stdout_bytes)
+    result.stderr_bytes = _ANSI_SGR.sub(b"", result.stderr_bytes)
+    result.output_bytes = _ANSI_SGR.sub(b"", result.output_bytes)
+    return result
 
 
 def last_client() -> StubClient:
@@ -166,7 +190,7 @@ def arm_live_trading(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_provision_help_lists_the_four_options() -> None:
-    result = invoke("realtime", "provision", "--help")
+    result = invoke("realtime", "provision", "--help", env={"COLUMNS": HELP_COLUMNS})
 
     assert result.exit_code == 0
     for option in ("--api-url", "--dry-run", "--prune", "--force", "--json"):
@@ -175,14 +199,14 @@ def test_provision_help_lists_the_four_options() -> None:
 
 def test_provision_help_never_offers_a_token_option() -> None:
     """The operator token travels through the environment, never through argv."""
-    result = invoke("realtime", "provision", "--help")
+    result = invoke("realtime", "provision", "--help", env={"COLUMNS": HELP_COLUMNS})
 
     assert "--token" not in result.output
     assert "TB_OPERATOR_TOKEN" in result.output
 
 
 def test_the_realtime_group_still_lists_its_historical_commands() -> None:
-    result = invoke("realtime", "--help")
+    result = invoke("realtime", "--help", env={"COLUMNS": HELP_COLUMNS})
 
     assert result.exit_code == 0
     for command in ("run", "serve", "check", "provision"):
