@@ -29,6 +29,7 @@ from trading_platform.realtime.models import (
     RunMode,
 )
 from trading_platform.realtime.observability import LOGGER_NAME
+from trading_platform.realtime.warmup import profile_warmup_findings
 
 #: How long a test may wait for the engine thread.  Every wait is bounded.
 _WAIT = 5.0
@@ -512,3 +513,132 @@ def test_create_profile_never_refuses_a_strategy_without_a_warm_up(tmp_path: Pat
 
     assert created.profile_id == "sol-paper"
     assert fake.names() == ["profile_config", "add_profile"]
+
+
+# ---------------------------------------------------------------------------
+# the warm-up verdict is taken on the window the profile is REALLY served
+# ---------------------------------------------------------------------------
+
+
+def coherence_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the captured ``profile_warmup_coherence`` records."""
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "profile_warmup_coherence"
+    ]
+
+
+def create_with_warmup(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    controller_history: int,
+    warmup_candles: int,
+    history_candles: int | None,
+) -> tuple[FakeOrchestrator, ProfileConfig]:
+    """Create one 4h ``momentum`` profile and return the fake plus what was forwarded."""
+    fake = FakeOrchestrator()
+    controller = controller_for(tmp_path, fake, history_candles=controller_history)
+    body: dict[str, Any] = {
+        "strategy": "momentum",
+        "timeframe": "4h",
+        "warmup_candles": warmup_candles,
+    }
+    if history_candles is not None:
+        body["history_candles"] = history_candles
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER_NAME),
+        EngineThread() as engine,
+    ):
+        engine.bind(controller)
+        controller.create_profile(valid_payload(**body))
+    forwarded = fake.calls[-1][1][0]
+    assert isinstance(forwarded, ProfileConfig)
+    return fake, forwarded
+
+
+def test_the_warm_up_verdict_runs_on_the_profile_override_not_on_the_realtime_setting(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A profile served 500 candles is judged on 500, never on the realtime 300.
+
+    ``momentum`` needs 169 candles on 4h and this profile asks for 400, inside the
+    500-candle window it overrides for itself: there is **no** incoherence to
+    report.  Judging it against the realtime-level 300 instead would invent a
+    finding about a window the profile is never served -- and the start-time
+    verdict and ``realtime check`` both use the effective one, so the create-time
+    verdict has to use it too: one window, one verdict.
+    """
+    _fake, forwarded = create_with_warmup(
+        tmp_path,
+        caplog,
+        controller_history=300,
+        warmup_candles=400,
+        history_candles=500,
+    )
+
+    # the profile is served its own window, and the authority finds nothing on it
+    assert forwarded.effective_history_candles(300) == 500
+    assert profile_warmup_findings(forwarded, history_candles=500) == []
+    # ... while the realtime-level window would have produced a finding: the test
+    # would be vacuous if the two windows agreed.
+    assert profile_warmup_findings(forwarded, history_candles=300) != []
+    assert coherence_records(caplog) == []
+
+
+def test_the_coherence_log_carries_the_effective_window_of_the_profile(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The logged ``history_candles`` is the window the verdict was taken on.
+
+    A 600-candle warm-up is wider than both windows, so the warning fires either
+    way -- and the context must name 500, the window this profile really polls,
+    not the 300 of the realtime setting it overrides.
+    """
+    _fake, forwarded = create_with_warmup(
+        tmp_path,
+        caplog,
+        controller_history=300,
+        warmup_candles=600,
+        history_candles=500,
+    )
+
+    reported = coherence_records(caplog)
+    assert len(reported) == 1
+    assert reported[0].levelno == logging.WARNING
+    assert reported[0].context["history_candles"] == 500
+    assert reported[0].context["warmup_candles"] == 600
+    assert (
+        reported[0].context["message"]
+        == profile_warmup_findings(forwarded, history_candles=500)[0].message
+    )
+    assert forwarded.effective_history_candles(300) == 500
+
+
+def test_an_absent_override_reproduces_the_realtime_level_verdict_byte_for_byte(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No override means the realtime-level window, to the candle and to the byte.
+
+    ``effective_history_candles`` resolves ``None`` to the value the controller was
+    configured with, so the finding, its severity and its message are exactly the
+    ones the warm-up authority produces for that very number -- the previous
+    behaviour, unchanged.
+    """
+    _fake, forwarded = create_with_warmup(
+        tmp_path,
+        caplog,
+        controller_history=300,
+        warmup_candles=400,
+        history_candles=None,
+    )
+
+    assert forwarded.history_candles is None
+    assert forwarded.effective_history_candles(300) == 300
+    expected = profile_warmup_findings(forwarded, history_candles=300)
+    assert len(expected) == 1
+    reported = coherence_records(caplog)
+    assert len(reported) == 1
+    assert reported[0].context["history_candles"] == 300
+    assert reported[0].context["message"] == expected[0].message

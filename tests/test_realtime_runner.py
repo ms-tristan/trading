@@ -29,6 +29,7 @@ import pytest
 from trading_platform.config.models import ProfileConfig, RiskLimitsConfig
 from trading_platform.core.errors import (
     KillSwitchActiveError,
+    MarketStreamError,
     OrderRejectedError,
     RiskLimitExceededError,
     WalletError,
@@ -260,6 +261,60 @@ class BlockingFetchStream(FakeStream):
         self.calls += 1
         self.fetch_synchronously()
         return None
+
+
+class FlakyStream(FakeStream):
+    """A stream whose chosen read fails a scripted number of times, then answers.
+
+    Both failure shapes of the incident are expressible and both are exact rather
+    than racy: ``hang`` models the provider read that never answers -- the tick's
+    bound abandons it after ``bound + LATE_GRACE_SECONDS``, which is precisely how
+    the live profiles died -- while ``hang=False`` models a read the venue refused
+    (:class:`~trading_platform.core.errors.MarketStreamError`).  A failing read
+    consumes no candle, so the tick that follows it is the very same tick, retried.
+    """
+
+    #: A failure budget large enough to outlast any streak a test may build.
+    FOREVER = 1_000_000
+
+    def __init__(
+        self,
+        *,
+        read: str = "next_candle",
+        failures: int = 1,
+        hang: bool = True,
+        frame: pd.DataFrame | None = None,
+        cursor: int = 1,
+    ) -> None:
+        super().__init__(frame, cursor=cursor)
+        self.read = str(read)
+        self.remaining_failures = int(failures)
+        self.hang = bool(hang)
+        self.attempts: list[str] = []
+
+    def _fails_now(self, name: str) -> bool:
+        """Consume one scripted failure when ``name`` is the failing read."""
+        self.attempts.append(name)
+        if name != self.read or self.remaining_failures <= 0:
+            return False
+        self.remaining_failures -= 1
+        return True
+
+    async def _fail(self) -> None:
+        """Play the scripted failure: a read that never answers, or a refused one."""
+        if not self.hang:
+            raise MarketStreamError(f"the {self.read} read of the venue failed")
+        await asyncio.sleep(3600)
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        if self._fails_now("next_candle"):
+            await self._fail()
+        return await super().next_candle(symbol, timeframe)
+
+    async def history(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+        if self._fails_now("history"):
+            await self._fail()
+        return await super().history(symbol, timeframe, count)
 
 
 class OverrunningClock(SystemClock):
@@ -1356,8 +1411,12 @@ def test_the_tick_warning_names_the_warm_up_arithmetic(
     assert len(warnings) == 1
     assert warnings[0].levelno == logging.WARNING
     assert warnings[0].context["required_candles"] == 100
-    # five rows: the four history rows strictly before the candle, plus the candle
-    assert warnings[0].context["rows"] == 5
+    # six rows: the five history rows strictly before the candle, plus the candle.
+    # The window asked for carries the closed-row head-room, so the warm-up of five
+    # closed candles is served six rows -- five of them strictly before ``t`` -- and
+    # the frame holds those five plus ``t`` itself.
+    assert warnings[0].context["rows"] == 6
+    assert warnings[0].context["warmup_candles"] == 5
     assert warnings[0].context["candles_per_day"] == pytest.approx(24.0)
     assert store.statuses[-1][1] is ProfileStatus.RUNNING
     assert ProfileStatus.ERROR not in [status for _identifier, status, _detail in store.statuses]
@@ -1452,31 +1511,336 @@ def test_a_stream_that_never_answers_times_out_fast(install: Any) -> None:
     fails the tick.  What changed is the message.  The budget is
     ``stream_wait_bound(0.05, 0.0) = 0.1025 s`` and the call is then granted one
     ``LATE_GRACE_SECONDS`` window (0.25 s) before it is abandoned, so the failure
-    lands around 0.35 s -- and it names the call and its budget instead of raising
-    the bare ``TimeoutError('')`` the incident persisted as ``"TimeoutError: "``.
+    lands around 0.35 s per tick -- and it names the call and its budget instead of
+    raising the bare ``TimeoutError('')`` the incident persisted as
+    ``"TimeoutError: "``.
+
+    A read that never answers is a **tick** failure first (see the section below):
+    the profile keeps running and retries, and the named ``TimeoutError`` is raised
+    on the ``TRANSIENT_READ_STRIKE_LIMIT``-th consecutive failing tick instead of on
+    the first.  That is the whole point -- one slow read must not cost a profile --
+    and the detector is not weakened by it: the sequence is bounded by the strike
+    limit times one bounded call, never by a hang.
     """
     install(mode="hold")
     runner, _stream, _gateway, _store, _clock = build(
         stream=FakeStream(block=True), timeout_seconds=0.05
     )
+    strike_limit = runner_module.TRANSIENT_READ_STRIKE_LIMIT
 
     async def scenario() -> Any:
         await runner.start()
-        return await runner.run_once()
+        with pytest.raises(TimeoutError) as failure:
+            await runner.run(max_iterations=strike_limit)
+        return failure.value
 
+    per_tick = runner_module.stream_wait_bound(0.05, 0.0) + LATE_GRACE_SECONDS
     started = time.monotonic()
-    with pytest.raises(TimeoutError) as failure:
-        run(scenario())
-    assert time.monotonic() - started < 1.0
-    assert str(failure.value).strip(), "a bounded timeout must never carry an empty message"
-    assert "next_candle" in str(failure.value)
-    assert "btc-paper" in str(failure.value)
+    failure = run(scenario())
+    elapsed = time.monotonic() - started
+    assert elapsed < strike_limit * per_tick + 1.0, "the detector is bounded, never a hang"
+    assert runner.transient_read_streak == strike_limit
+    assert str(failure).strip(), "a bounded timeout must never carry an empty message"
+    assert "next_candle" in str(failure)
+    assert "btc-paper" in str(failure)
+    assert f"{per_tick:.3f} s" in str(failure)
 
 
 def test_a_non_positive_timeout_is_refused() -> None:
     """A bound of zero would be no bound at all: the constructor refuses it."""
     with pytest.raises(ValueError, match="timeout_seconds"):
         build(timeout_seconds=0.0)
+
+
+def test_the_transient_read_contract_is_named_and_exported() -> None:
+    """The two names, the strike limit and the frozen counter model, pinned.
+
+    The classification of a failed read is a *contract*, not an implementation
+    detail: the two failure types it covers, the number of consecutive failing ticks
+    after which a seam really is stuck, and the fact that the transient tally lives
+    on the runner -- the dashboard's counter model is frozen and gains no field.
+    """
+    errors = runner_module.TRANSIENT_READ_ERRORS
+    assert errors == (TimeoutError, MarketStreamError)
+    assert issubclass(TimeoutError, errors)
+    assert issubclass(MarketStreamError, errors)
+    assert runner_module.TRANSIENT_READ_STRIKE_LIMIT == 3
+    for name in ("stream_wait_bound", "TRANSIENT_READ_ERRORS", "TRANSIENT_READ_STRIKE_LIMIT"):
+        assert name in runner_module.__all__, name
+    # the frozen counter model of the dashboard is untouched by the new tally
+    assert set(EngineCounters().to_dict()) == {
+        "candles_processed",
+        "orders_submitted",
+        "orders_filled",
+        "orders_rejected",
+        "stream_reconnects",
+        "risk_rejections",
+        "errors",
+    }
+    assert not any("transient" in name for name in EngineCounters().to_dict())
+
+
+def test_a_single_slow_read_is_transient_and_the_profile_keeps_running(
+    install: Any, logs: Any
+) -> None:
+    """DEFECT B regression: one hung ``next_candle`` leaves the profile RUNNING.
+
+    The incident: a single slow provider read on a 4h profile polled every 5 s
+    raised the runner's named ``TimeoutError``, ``run`` recorded it as a fatal
+    ``profile_error`` and the profile was dead for good -- four of the five live
+    profiles died exactly once each, every one of them with the same message.  A read
+    that does not answer is a **tick** failure: it is counted, reported as
+    ``tick_read_failed`` at WARNING and retried on the next tick, with no store
+    write, no status write, no watermark and no counter increment -- and the very
+    same runner trades the candle on the tick that follows.
+    """
+    install(mode="entry_long")
+    stream = FlakyStream(read="next_candle", failures=1, hang=True)
+    store = FakeStore()
+    runner, _stream, gateway, _store, _clock = build(
+        stream=stream, store=store, timeout_seconds=0.05
+    )
+
+    async def first_tick() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(first_tick()) is None
+
+    # one warning, naming the read, the streak, the tally, the limit and the budget
+    failed = [record for record in logs if getattr(record, "event", None) == "tick_read_failed"]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.WARNING
+    assert failed[0].profile_id == "btc-paper"
+    context = failed[0].context
+    assert context["read"] == "next_candle"
+    assert context["symbol"] == SYMBOL
+    assert context["timeframe"] == TIMEFRAME
+    assert context["consecutive_failures"] == 1
+    assert context["transient_failures"] == 1
+    assert context["strike_limit"] == runner_module.TRANSIENT_READ_STRIKE_LIMIT
+    assert context["bound_seconds"] == pytest.approx(runner_module.stream_wait_bound(0.05, 0.0))
+    assert "next_candle" in context["error"]
+    assert "did not answer within" in context["error"]
+
+    # the tally is on the runner, the profile is alive and nothing was persisted
+    assert runner.transient_read_failures == 1
+    assert runner.transient_read_streak == 1
+    assert runner.health().status is ProfileStatus.RUNNING
+    assert store.statuses_of(ProfileStatus.ERROR) == []
+    assert store.marked == []
+    assert store.equity == []
+    assert runner.counters().errors == 0
+    assert runner.health().last_error is None
+    assert "tick_read_stuck" not in events(logs)
+
+    async def second_tick() -> Any:
+        return await runner.run_once()
+
+    decision = run(second_tick())
+
+    # the same runner trades the candle it could not read on the first tick
+    assert decision is not None
+    assert decision.action is SignalAction.ENTER_LONG
+    assert len(gateway.submissions) == 1
+    assert runner.counters().candles_processed == 1
+    assert store.last_processed == pd.Timestamp(stream.frame.index[1])
+    assert runner.transient_read_failures == 1
+    assert runner.transient_read_streak == 0, "the first answering tick clears the streak"
+    assert (
+        len([record for record in logs if getattr(record, "event", None) == "tick_read_failed"])
+        == 1
+    )
+
+
+def test_a_single_failed_read_is_transient_and_the_profile_keeps_running(
+    install: Any, logs: Any
+) -> None:
+    """The other failure shape: a read the venue *refused* is transient too.
+
+    ``MarketStreamError`` is what the polling stream raises once its own retry
+    budget is spent, so it reaches the runner as an ordinary read failure -- the
+    same classification as a read that never answers, and the profile stays
+    ``RUNNING``.
+    """
+    install(mode="entry_long")
+    stream = FlakyStream(read="next_candle", failures=1, hang=False)
+    store = FakeStore()
+    runner, _stream, gateway, _store, _clock = build(stream=stream, store=store)
+
+    async def scenario() -> tuple[Any, Any]:
+        await runner.start()
+        first = await runner.run_once()
+        return first, await runner.run_once()
+
+    first, second = run(scenario())
+
+    assert first is None
+    failed = [record for record in logs if getattr(record, "event", None) == "tick_read_failed"]
+    assert len(failed) == 1
+    assert failed[0].context["read"] == "next_candle"
+    assert "MarketStreamError" in failed[0].context["error"]
+    assert runner.transient_read_failures == 1
+    assert runner.transient_read_streak == 0, "the second tick answered"
+    assert store.statuses_of(ProfileStatus.ERROR) == []
+    assert runner.counters().errors == 0
+    assert second is not None
+    assert second.action is SignalAction.ENTER_LONG
+    assert len(gateway.submissions) == 1
+
+
+def test_a_failed_history_read_is_transient_too(install: Any, logs: Any) -> None:
+    """The second bounded read of the tick is classified the same way.
+
+    Both reads of a tick may fail independently, and the warm-up read is the one the
+    incident's 4h profiles spent most of their time in.  The failing read names
+    itself, the candle is **not** watermarked as processed (nothing of the tick is
+    persisted) and the profile keeps running.
+    """
+    install(mode="entry_long")
+    stream = FlakyStream(read="history", failures=1, hang=False)
+    store = FakeStore()
+    runner, _stream, gateway, _store, _clock = build(stream=stream, store=store)
+
+    async def first_tick() -> Any:
+        await runner.start()
+        return await runner.run_once()
+
+    assert run(first_tick()) is None
+
+    failed = [record for record in logs if getattr(record, "event", None) == "tick_read_failed"]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.WARNING
+    assert failed[0].context["read"] == "history"
+    assert failed[0].context["consecutive_failures"] == 1
+    assert runner.transient_read_failures == 1
+    assert runner.transient_read_streak == 1
+    assert runner.health().status is ProfileStatus.RUNNING
+    assert store.statuses_of(ProfileStatus.ERROR) == []
+    # nothing of the failed tick was persisted: no watermark, no candle, no equity
+    assert store.marked == []
+    assert store.candles == []
+    assert store.equity == []
+    assert runner.counters().candles_processed == 0
+    assert runner.counters().errors == 0
+
+    async def second_tick() -> Any:
+        return await runner.run_once()
+
+    second = run(second_tick())
+
+    # and the runner really keeps going, with the streak cleared by the good reads
+    assert second is not None
+    assert len(gateway.submissions) == 1
+    assert runner.counters().candles_processed == 1
+    assert runner.transient_read_streak == 0
+
+
+def test_a_successful_tick_resets_the_transient_streak(install: Any, logs: Any) -> None:
+    """A poll that answers with no new candle counts as answered and clears the streak.
+
+    The streak counts *ticks whose read failed*, so a ``next_candle`` that
+    legitimately answers ``None`` -- a poll that found nothing new, the ordinary case
+    on a 4h grid polled every 5 s -- is an answered read: the seam is not stuck, and
+    a following failure starts a new streak from one.
+    """
+    install(mode="hold")
+    stream = FlakyStream(read="next_candle", failures=1, hang=False, frame=make_frame(5), cursor=5)
+    runner, _stream, _gateway, _store, _clock = build(stream=stream)
+
+    async def scenario() -> tuple[Any, Any]:
+        await runner.start()
+        return await runner.run_once(), await runner.run_once()
+
+    first, second = run(scenario())
+
+    assert first is None and second is None
+    assert stream.attempts == ["next_candle", "next_candle"]
+    assert runner.transient_read_failures == 1
+    assert runner.transient_read_streak == 0
+    assert (
+        len([record for record in logs if getattr(record, "event", None) == "tick_read_failed"])
+        == 1
+    )
+
+
+def test_a_transient_failure_never_moves_the_error_counter(install: Any, logs: Any) -> None:
+    """A transient read failure moves no counter at all -- the frozen model stays put.
+
+    ``counters().errors`` moves through :meth:`ProfileRunner._record_error` only, so
+    it is the fatal path's counter: a read the runner retries is not an error of the
+    profile, exactly like a pacing delay (``profile_pacing_delayed``) or a blocked
+    order.
+    """
+    install(mode="hold")
+    stream = FlakyStream(read="next_candle", failures=1, hang=False)
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(stream=stream, store=store)
+
+    async def scenario() -> tuple[EngineCounters, EngineCounters]:
+        await runner.start()
+        before = runner.counters()
+        assert await runner.run_once() is None
+        return before, runner.counters()
+
+    before, after = run(scenario())
+
+    assert before == after, "a transient read failure must not move any counter"
+    assert after.errors == 0
+    assert after.candles_processed == 0
+    assert "profile_error" not in events(logs)
+    assert "tick_read_failed" in events(logs)
+    assert store.status_values() == [ProfileStatus.STARTING.value, ProfileStatus.RUNNING.value]
+
+
+def test_a_stream_that_never_answers_is_still_detected(install: Any, logs: Any) -> None:
+    """The hang detector is not deleted: a genuinely stuck seam still kills a profile.
+
+    A stream that never answers is retried tick after tick -- and each of those ticks
+    already consumed the stream's own full declared retry budget -- so after
+    ``TRANSIENT_READ_STRIKE_LIMIT`` consecutive failing ticks the read is no longer a
+    hiccup: the runner reports ``tick_read_stuck`` at ERROR, re-raises the original
+    named ``TimeoutError`` and the fatal path runs end to end (``run`` ->
+    ``_record_error`` -> ``ProfileStatus.ERROR``, which the orchestrator's
+    ``mark_crashed`` supervision then sees).
+    """
+    install(mode="hold")
+    stream = FlakyStream(read="next_candle", failures=FlakyStream.FOREVER, hang=True)
+    store = FakeStore()
+    runner, _stream, _gateway, _store, _clock = build(
+        stream=stream, store=store, timeout_seconds=0.05
+    )
+    strike_limit = runner_module.TRANSIENT_READ_STRIKE_LIMIT
+
+    async def scenario() -> Any:
+        await runner.start()
+        with pytest.raises(TimeoutError) as failure:
+            await runner.run(max_iterations=strike_limit)
+        return failure.value
+
+    failure = run(scenario())
+
+    # the escalation is loud, counted and named
+    assert runner.transient_read_failures == strike_limit
+    assert runner.transient_read_streak == strike_limit
+    warned = [record for record in logs if getattr(record, "event", None) == "tick_read_failed"]
+    stuck = [record for record in logs if getattr(record, "event", None) == "tick_read_stuck"]
+    assert len(warned) == strike_limit - 1, "every failing tick before the escalation warns"
+    assert len(stuck) == 1
+    assert stuck[0].levelno == logging.ERROR
+    assert stuck[0].context["read"] == "next_candle"
+    assert stuck[0].context["consecutive_failures"] == strike_limit
+    assert stuck[0].context["transient_failures"] == strike_limit
+    assert stuck[0].context["strike_limit"] == strike_limit
+    assert "did not answer within" in stuck[0].context["error"]
+
+    # the fatal path is preserved end to end
+    assert "profile_error" in events(logs)
+    assert len(store.statuses_of(ProfileStatus.ERROR)) == 1
+    assert runner.health().status is ProfileStatus.ERROR
+    assert runner.counters().errors == 1
+    assert "next_candle" in str(failure)
+    assert "btc-paper" in str(failure)
 
 
 def test_the_stream_wait_bound_is_the_shared_head_room_over_the_declared_wait() -> None:

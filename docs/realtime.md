@@ -174,11 +174,32 @@ price**. Deterministic replay of a past window is the job of
 `ReplayMarketStream` (`realtime run --once`, tests), never that of a live
 stream.
 
+**A requested window is not a usable window: one row of every live window is
+still forming.** `PollingMarketStream.next_candle` polls
+`[now - history_candles * candle_delta(timeframe), now]` and the venue answers the
+grid rows of that window, the newest of which is the candle the venue is **still
+forming** — its close time is in the future, so it is not a candle a strategy may
+decide on. The runner builds its frame as
+`history[index < stamp]` plus the candle `stamp` itself, so a window holding `N`
+rows yields `N - 1` **closed** candles: asking the stream for `warmup_candles`
+rows is structurally one row short of the strategy's requirement, and the tick
+then logs `warmup_incomplete` for ever (`rows=168`, `warmup_candles=169`,
+`required_candles=169`, `candles_processed=0` on every profile of the incident)
+without ever reaching `_strategy_run`. The rule this delivery fixes is therefore
+stated on **closed** rows, and `realtime.warmup` is its single arithmetic
+authority: `CLOSED_CANDLE_HEADROOM` (`1`) is the row of a requested window that
+can never be used, `history_request_candles(warmup_candles)` is the count to ask
+the stream for (`warmup_candles + CLOSED_CANDLE_HEADROOM`), and
+`usable_closed_candles(window_candles)` is what a window of that many requested
+rows can serve (`window_candles - CLOSED_CANDLE_HEADROOM`). No other module may
+restate that arithmetic.
+
 **Two different bounds: the frame budget and the stream window.** The frame a
 runner warms its strategy up on is built from
-`stream.history(symbol, timeframe, count=warmup_candles)`, so
-**`warmup_candles` bounds what the strategy sees**: the candles a strategy
-declares it needs (`Strategy.required_candles`, see
+`stream.history(symbol, timeframe, count=history_request_candles(warmup_candles))`
+— `warmup_candles + CLOSED_CANDLE_HEADROOM` requested rows, see the paragraph
+above — so **`warmup_candles` bounds what the strategy sees**: the candles a
+strategy declares it needs (`Strategy.required_candles`, see
 [`docs/strategies.md`](strategies.md) §3.1) have to fit inside that frame, and a
 profile whose strategy needs more can never warm up at all. **`history_candles`
 bounds what the stream itself asks the venue for**:
@@ -194,12 +215,20 @@ override therefore reproduces the previous behaviour **byte-for-byte**: the
 profile is served `realtime.history_candles`, which is why the field is declared
 **last** in `ProfileConfig`: no serialised profile changes shape.
 
-A profile that asks for **more warm-up candles than its stream window holds**
-(`warmup_candles > history_candles`) is reported as a **WARNING** everywhere and
-is never refused (§8). The reason is the sentence above: the frame the strategy
-receives is bounded by `warmup_candles`, so a smaller stream window does not by
-itself silence the profile — but the operator asked for more history than the
-engine is configured to serve, and that must be visible rather than inferred.
+A profile whose **stream window cannot serve its closed warm-up rows** is reported
+as a **WARNING** everywhere and is never refused (§8). The rule is stated on
+**closed** rows, in `realtime.warmup` and nowhere else:
+`history_request_candles(warmup_candles) > history_candles`, equivalently
+`warmup_candles > usable_closed_candles(history_candles)`. The head-room is the
+point: a `warmup_candles` equal to `history_candles` is **not** coherent — that
+window serves one closed candle fewer than the strategy requires, which is
+exactly the one-row shortfall that silenced every profile of the incident — and
+the finding names its fix (raise `history_candles` — the realtime setting or the
+per-profile override — to at least `history_request_candles(warmup_candles)`, or
+lower `warmup_candles`). It is still reported, never refused: the frame the
+strategy receives is bounded by `warmup_candles`, so a smaller stream window does
+not by itself silence the profile, and refusing it would refuse working
+configurations.
 
 ### 2.3 Mandatory reuse
 
@@ -356,31 +385,43 @@ A stream declares its longest legitimate wait through the read-only member
 
 | stream | `max_wait_seconds` |
 | --- | --- |
-| `PollingMarketStream` | its `poll_interval_seconds`, or its whole retry backoff series when that is longer |
-| `CcxtProMarketStream` | its read timeout, or that same retry backoff series when that is longer |
+| `PollingMarketStream` | its whole **retry path** when that is the longer one — every attempt its reconnect budget allows, each paying one bounded read (the read timeout plus the late grace window) plus the whole backoff series — else one bounded read plus the pacing idle `poll_interval_seconds` |
+| `CcxtProMarketStream` | the same declaration with no idle wait folded in (`poll_interval_seconds = 0.0`: a `watch_ohlcv` read that has nothing new answers `None` immediately) |
 | `CompositeMarketStream` | the longest wait of its children |
 | `ReplayMarketStream` | `0.0` (a replay never idles) |
 
-The runner no longer derives its bound from `stream_poll_timeout_seconds` alone:
-it is `max(stream_poll_timeout_seconds, max_wait_seconds)` plus a proportional
-margin and a small floor, so the shipped pair — profile
-`poll_interval_seconds = 30.0`, `stream_poll_timeout_seconds = 10.0` — is bounded
-by ~31.6 s instead of ~10.55 s, and the 30 s idle wait completes. A single
-`realtime run --once` tick budgets, per profile, the same bound that profile's
-runner applies — the stream's declared wait included, the retry backoff series
-and all — plus one stream timeout for the shutdown: the budget is derived from the
-same declared waits as the bound itself, never from `stream_poll_timeout_seconds`
-alone; on the default profile that per-profile budget is ~15.8 s, because the
-15 s retry backoff series (`max_stream_reconnects = 5`,
-`reconnect_backoff_seconds = 1.0`) dominates both the 5 s poll interval and the
-10 s stream timeout.
+**The declared wait carries every component of the call, not just its backoff.**
+`realtime.stream.declared_read_worst_case_seconds` is the single authority for it,
+and it folds in three things a caller has to accommodate: the **per-attempt read
+cost** (the read timeout plus one late grace window, because every attempt goes
+through `waits.awaited_within`), the **pacing idle wait** a call that found nothing
+new sleeps (`poll_interval_seconds`), and the **full retry path** — every attempt
+the reconnect budget allows, each paying another bounded read, plus the whole
+backoff series on top of them. For the default profile
+(`poll_interval_seconds = 5.0`, `stream_poll_timeout_seconds = 10.0`,
+`max_stream_reconnects = 5`, `reconnect_backoff_seconds = 1.0`) the declaration is
+`5 * (10.0 + 0.25) + 15.0 = 66.25 s` — **not** the `15.0 s` the backoff series
+alone announced, which is what let a 15.8 s external bound cut a retry the stream
+was entitled to take and kill the profile mid-flight.
+
+The runner derives its bound from that declaration and never from
+`stream_poll_timeout_seconds` alone: it is `max(stream_poll_timeout_seconds,
+max_wait_seconds)` plus a proportional margin and a small floor, so on the default
+profile the bound is the same ~69.6 s as on the shipped pair — profile
+`poll_interval_seconds = 30.0`, `stream_poll_timeout_seconds = 10.0` — instead of
+the ~15.8 s / ~31.55 s the backoff series alone used to produce, and the 30 s idle
+wait completes. A single `realtime run --once` tick budgets, per profile, the same
+bound that profile's runner applies — the whole declared wait included — plus one
+stream timeout for the shutdown: the budget is derived from the same declaration
+as the bound itself, never from `stream_poll_timeout_seconds` alone; on the
+default profile that per-profile budget is ~79.6 s (`69.6 s + 10 s`).
 
 Because the two values meet at boot, the platform checks the pair when the
 profiles are wired to the realtime settings and logs a **WARNING** — event
 `profile_poll_interval_exceeds_stream_timeout`, naming both values — whenever a
 profile's `poll_interval_seconds` is longer than `stream_poll_timeout_seconds`.
 The trigger is that pair alone: a stream that declares a longer wait only because
-its retry backoff series is longer is not a misconfiguration and stays silent.
+its retry path is longer is not a misconfiguration and stays silent.
 The record also carries the declared wait and the bound the runner really applies
 (`stream_max_wait_seconds`, `tick_bound_seconds`), so the mismatch can be read
 straight off the log.
@@ -407,11 +448,17 @@ grep -rn "setInterval\|setTimeout" dashboard/src
 The first two answer "is anything sleeping or shelling out synchronously, and
 which awaits are bounded?"; the third asks the same question of the browser side,
 where a delayed cycle is a display nuisance rather than a crash. The first command
-answers **no `time.sleep` call and no `subprocess.` call**, and its only
-`requests` matches are prose (`store.py`, `stream.py`): the blocking reads of this
-layer do not show up as imports, they enter through two seams — `requests`/`ccxt`
-**inside** the market-data provider, `ccxt` **inside** the broker — which is why
-the audit below is a table of call sites rather than a table of imports.
+answers **no `time.sleep` call, no `subprocess.` call and no `requests.` match at
+all** in the Python tree: the blocking reads of this layer do not show up as
+imports, they enter through two seams — `requests`/`ccxt` **inside** the
+market-data provider, `ccxt` **inside** the broker — which is why the audit below
+is a table of call sites rather than a table of imports.
+
+The table is the audit of the **whole defect class**, not of the crash alone:
+classes 1 to 5 below are the five shapes a window or a bound can be wrong in, and
+every row names one site, its class, its verdict and — for anything left standing
+— the reason. A `path:line` is a snapshot of the tree this delivery ships: a site
+that moves must have its row moved with it.
 
 | `path:line` | defect class | verdict |
 | --- | --- | --- |
@@ -424,11 +471,43 @@ the audit below is a table of call sites rather than a table of imports.
 | `src/trading_platform/realtime/stream.py` — the `_MISSING_CCXT_PRO` message | dead code: the constant was defined twice, identically, in the same module | **FIXED** — one definition, and a test pins the count so the duplicate cannot come back |
 | `src/trading_platform/realtime/orchestrator.py` — `_start_runner` (the bound around `stream.start()`) | a boot bounded by `asyncio.wait_for` whose `TimeoutError` was **not** part of `_PROFILE_BOOT_ERRORS`: a venue that never answered escaped the per-profile quarantine and aborted the whole boot, so one slow profile took every other profile down with it | **FIXED** — the boot wait goes through `waits.awaited_within`, so a start that answers late because another profile froze the shared loop is started rather than cut, and a start that never answers is quarantined like any other boot failure. Two regressions pin it (`tests/test_realtime_orchestrator.py` section 17), and both are red on the pre-fix tree with the empty `TimeoutError` of the incident |
 | `src/trading_platform/realtime/waits.py` | the duplicated, drifting margin constants (`_WAIT_MARGIN_RATIO`/`_WAIT_MARGIN_FLOOR_SECONDS` in `stream.py`, `_BOUND_MARGIN_RATIO`/`_BOUND_MARGIN_FLOOR_SECONDS` in `runner.py`) | **FIXED** — the single arithmetic authority of the layer: `wait_bound`, `paced_wait`, `awaited_within`, `PACING_MARGIN_RATIO`, `PACING_MARGIN_FLOOR_SECONDS`, `LATE_GRACE_SECONDS`; the two former constant pairs are gone |
-| `src/trading_platform/realtime/runner.py:798` — `run_once` step 9 `self._gateway.poll()`, and the same seam on the shutdown paths (`src/trading_platform/realtime/orchestrator.py:1930` in `_flatten_profile`, `src/trading_platform/realtime/orphans.py:612` in the startup sweep) → `src/trading_platform/realtime/gateway.py:520` `ExecutionGateway.poll` → `src/trading_platform/realtime/broker.py:886` `CcxtBroker.poll` (`fetch_open_orders`, `fetch_my_trades`) | synchronous `ccxt` HTTP on the shared loop, once per tick of every live profile | **REPORTED, deliberately left** — the whole gateway poll would have to move to a worker thread, where it would race the gateway's in-memory orders and fills against the loop (`_apply_event`, `closed_trade`, the risk path all read them on the loop); it needs a broker-side async seam of its own, which is a larger change than this delivery |
-| `src/trading_platform/realtime/runner.py:1046` — `_strategy_run` (`Strategy.run`: pandas over a frame of up to `warmup_candles` rows) | CPU-bound compute on the loop | **REPORTED, deliberately left** — moving it off-loop needs thread-safe strategy and gateway seams; it is bounded by `warmup_candles` (the frame budget of §2.2), but it stays a **residual risk**: under the GIL a long `Strategy.run` still delays every other profile's timers, and a delay is survivable (§3.1) rather than free |
-| `src/trading_platform/realtime/store.py:1047` — `_new_connection` and every `sqlite3` statement executed on it | local synchronous I/O on the loop | **REPORTED, deliberately left** — `sqlite3` with `check_same_thread=False` and the store's internal lock; every write is a small local transaction against the durable state the platform exists to keep, and moving them off-loop would require a per-thread connection discipline on every write path. Accepted local I/O, not a network read |
+| `src/trading_platform/realtime/runner.py:1141` — `run_once` step 9 `self._gateway.poll()`, and the same seam on the shutdown paths (`src/trading_platform/realtime/orchestrator.py:1959` in `_flatten_profile`, `src/trading_platform/realtime/orphans.py:612` in the startup sweep) → `src/trading_platform/realtime/gateway.py:520` `ExecutionGateway.poll` → `src/trading_platform/realtime/broker.py:886` `CcxtBroker.poll` (`fetch_open_orders`, `fetch_my_trades`) | synchronous `ccxt` HTTP on the shared loop, once per tick of every live profile | **REPORTED, deliberately left** — the whole gateway poll would have to move to a worker thread, where it would race the gateway's in-memory orders and fills against the loop (`_apply_event`, `closed_trade`, the risk path all read them on the loop); it needs a broker-side async seam of its own, which is a larger change than this delivery |
+| `src/trading_platform/realtime/runner.py:1412` — `_strategy_run` (`Strategy.run`: pandas over a frame of up to `warmup_candles` rows) | CPU-bound compute on the loop | **REPORTED, deliberately left** — moving it off-loop needs thread-safe strategy and gateway seams; it is bounded by `warmup_candles` (the frame budget of §2.2), but it stays a **residual risk**: under the GIL a long `Strategy.run` still delays every other profile's timers, and a delay is survivable (§3.1) rather than free |
+| `src/trading_platform/realtime/store.py:1045` — `_new_connection` and every `sqlite3` statement executed on it | local synchronous I/O on the loop | **REPORTED, deliberately left** — `sqlite3` with `check_same_thread=False` and the store's internal lock; every write is a small local transaction against the durable state the platform exists to keep, and moving them off-loop would require a per-thread connection discipline on every write path. Accepted local I/O, not a network read |
 | `dashboard/src/lib/use-polling.ts:96` (abort-supersede) and `:150` (`setInterval`) | a delayed or superseded polling cycle surfacing as an error | **NO DEFECT** — a new cycle aborts the previous controller (`:96-98`), and a superseded or disposed cycle returns early on `disposedRef.current \|\| controller.signal.aborted` (`:102-104`, `:110-112`), so a late answer is dropped and produces no error, no failure and no status change |
 | `dashboard/src/lib/use-profile-control.ts:281` (`setInterval`, superseded by `:241`, guarded at `:251`/`:256`) | the same delayed-cycle question, in the profile control hook | **NO DEFECT** — the same abort-supersede and dispose guards: a delayed cycle is discarded instead of reported |
+
+| `src/trading_platform/realtime/runner.py:1050` — the tick's history request (`self._stream.history(symbol, timeframe, history_request_candles(self._warmup))`) | **class 1** — requested window vs usable window: the stream used to be asked for `warmup` rows while one row of every live window is the still-forming candle, so `_build_frame` could only ever produce `warmup - 1` closed rows and the tick guard (`runner.py:1068`, `len(frame) < max(MIN_FRAME_ROWS, required)`) could never pass: `warmup_incomplete` on every tick, `_strategy_run` never reached, no signal and no position on any profile (defect A) | **FIXED IN THIS DELIVERY** — the runner asks for `history_request_candles(warmup)` rows (`warmup + CLOSED_CANDLE_HEADROOM`), so the frame really holds the `warmup` **closed** candles the strategy requires |
+| `src/trading_platform/realtime/runner.py:1487` — `_build_frame` (`window = window[window.index < stamp]`, then `pd.concat([window, row])` at `:1490`) | **class 1** — the slice drops the row of the candle being decided on **and** the still-forming row, then re-appends `stamp`, so the frame is one row shorter than the window the stream returned | **DELIBERATELY LEFT** — the slice plus the re-appended `stamp` is correct **only** when the request carries the head-room (`history_request_candles(warmup)` rows in, `warmup` closed rows out); the request is what this delivery fixes (`runner.py:1050`), not the frame builder, and its docstring now states the arithmetic it relies on |
+| `src/trading_platform/realtime/warmup.py:365` — `profile_warmup_findings` (`if history_request_candles(warmup) > window:`) | **class 1** — the coherence rule used to read `warmup > window`, blind to the still-forming row: a profile whose window equalled its warm-up (`169` vs `169` in the incident) was declared coherent while its frame could never warm up | **FIXED IN THIS DELIVERY** — both findings now reason on **closed** rows, and a window equal to the warm-up is reported as incoherent |
+| `src/trading_platform/realtime/runner.py:1343` — `_check_warmup` (`history_candles=self._warmup_request()`) | **class 1** — when no stream window was resolved, the start-time verdict used to be taken on `self._warmup`, the very request the tick makes; under the closed-row rule that window can never serve its own closed rows, so such a runner warned about a request it was entitled to make | **FIXED IN THIS DELIVERY** — `_warmup_request` (`runner.py:1376`) answers the window the profile is really served: the resolved `history_candles` when the deployment declared one, else `history_request_candles(warmup)`, and both the findings call and the `warmup_coherence` context read it (defect A, start-time surface) |
+| `src/trading_platform/realtime/stream.py:867` — `PollingMarketStream.history` ("The window is the raw provider answer (closed *and* still-forming candles)"), against the protocol declaration `MarketStream.history` at `:456` ("Return at most `count` recent candles") | **class 1** — a `count` handed to the seam is a count of **requested rows**, not of the closed candles a warm-up can use; the two agree only when the caller adds `CLOSED_CANDLE_HEADROOM`. The window the factory builds (`cli.py:1716`), the window the create-time verdict is taken on and the window the runner receives are all the same **requested** count (`effective_history_candles`), and only `realtime.warmup` converts it to closed rows | **REPORTED** — the seam keeps returning the raw provider window (filtering is `next_candle`'s job); the head-room belongs to the caller and `realtime.warmup` owns its arithmetic. The verdict window itself is aligned: one window, one verdict (below) |
+| `src/trading_platform/realtime/stream.py:598` — `ReplayMarketStream.history` (`frame.iloc[start:cursor]`, cursor advanced at `:574`) | **class 1** — the replay window ends at the **last emitted** candle while a live window ends at the still-forming one, so the same requested `count` yields `count` usable rows on replay and `count - 1` live: that divergence is exactly why the off-by-one survived a green test suite | **REPORTED** — deliberate (a replay emits prepared rows, never idles, and deterministic replay of a past window is its purpose), and now harmless because the live request carries the head-room |
+| `src/trading_platform/realtime/runner.py:859-861` — `run` (`self._record_error(exc)` then `raise`) | **class 2** — transient classified as fatal: one failed tick — a slow read whose bound expired, one failed provider poll — ended the profile loop for good, and supervision never re-arms it (`orchestrator.py:1897`); that message killed 4 of the 5 live profiles, once each, in a 12-hour run | **FIXED IN THIS DELIVERY** — a slow or failed read is a **tick** failure: logged, counted, the profile stays `RUNNING` and the next tick retries (defect B). The fatal branch is still there, and now only a failure that survives `TRANSIENT_READ_STRIKE_LIMIT` consecutive ticks reaches it |
+| `src/trading_platform/realtime/runner.py:2135` — `_record_error` (`self._status = ProfileStatus.ERROR`) | **class 2** — every tick failure was persisted as the terminal `ERROR`, although the runner already carries a recoverable `DEGRADED` state (`mark_degraded`, `:778`) and an error counter | **FIXED IN THIS DELIVERY** — the transient path no longer goes through `_record_error`; a genuinely fatal failure still does |
+| `src/trading_platform/realtime/runner.py:923` — `awaited_within(awaitable, bound=self._bound(), label=label)` inside `_read` (`:890`), around the `next_candle` call at `:1008` | **class 2** — the bound turned one slow read into the named `TimeoutError` the loop above recorded as a fatal profile `ERROR` | **FIXED IN THIS DELIVERY** — the bound follows the stream's true declared worst case (§3.1), and a read that does expire is a transient tick failure: `_read` counts it (`_record_transient_read_failure`, `:930`), `run_once` answers `None`, and only the failure that survives the strike limit is re-raised |
+| `src/trading_platform/realtime/runner.py:890` — `_read`, with `_record_transient_read_failure` (`:930`) and `_reads_answered` (`:965`) | **class 2** — the one seam both bounded reads of a tick pass through, and the classification the class above is about | **FIXED IN THIS DELIVERY** — a transient failure is counted (`transient_read_failures`, `transient_read_streak`), logged as `tick_read_failed` with the read, the rendered error, the streak, the strike limit and `bound_seconds`, and answered as `(False, None)`: `run_once` returns `None`, nothing is persisted and the profile stays `RUNNING`. The streak is cleared by the first tick whose reads all answered; exactly `TRANSIENT_READ_STRIKE_LIMIT` consecutive failures log `tick_read_stuck` (ERROR) and re-raise the **original** exception into the fatal branch above |
+| `src/trading_platform/realtime/runner.py:1376` — `_warmup_request` | **class 1** — the window the start-time verdict is taken on, resolved in one place instead of restated at each call site | **FIXED IN THIS DELIVERY** — it answers the resolved `history_candles` when the deployment declared one, else `history_request_candles(warmup)`, and feeds both `profile_warmup_findings` and the `warmup_coherence` context, so the start-time verdict and the create-time verdict of `control.py` are taken on the same window |
+| `src/trading_platform/realtime/stream.py:858` — `next_candle` raising `MarketStreamError` once the retry budget is exhausted | **class 2** — the failure that leaves the stream after `max_reconnects` consecutive failed polls | **DELIBERATELY LEFT** — exhausting the declared reconnect budget is a real stream failure, not a hiccup; what this delivery changes is what the **tick** does with it (retry on the next tick, stay `RUNNING`), not the stream's own verdict |
+| `src/trading_platform/realtime/orchestrator.py:1897` — `_supervise` (`runner.mark_crashed(failure)`) | **class 2** — a profile that left its loop is recorded as crashed and never restarted | **DELIBERATELY LEFT** — supervision records a crash, it is not a restart policy: with the tick path no longer classifying a slow read as fatal, a crash means a genuine failure the operator must see, and a silent restart loop would hide it |
+| `src/trading_platform/realtime/stream.py:988` — `PollingMarketStream.max_wait_seconds`, delegated to `declared_read_worst_case_seconds` (`stream.py:238`) | **class 3** — the declaration was `max(poll_interval, backoff series)` = `15.0 s`, which ignored every bounded read the retry path pays: one call can legitimately take `5 * (10.0 + 0.25) + 15.0 = 66.25 s` | **FIXED IN THIS DELIVERY** — the declaration folds in the per-attempt read cost (timeout plus late grace), the pacing idle wait and the whole retry path |
+| `src/trading_platform/realtime/runner.py:309` — `stream_wait_bound`, applied by `_bound` (`runner.py:730`) | **class 3** — the external bound of a tick (15.8 s) was narrower than the retry budget of the call it wrapped (66.25 s), so it cut `next_candle` mid-retry and turned a legitimate retry into a fatal timeout | **FIXED IN THIS DELIVERY** — the bound follows the declaration (~69.6 s on the default profile), so the stream's own budget is what ends the call |
+| `src/trading_platform/cli.py:1754` — `_realtime_tick_budget` | **class 3** — the `realtime run --once` budget restated the wait from the backoff series alone: the same under-statement, one level higher | **FIXED IN THIS DELIVERY** — the budget is derived from the same declaration as the bound the profile's runner applies, plus one stream timeout for the shutdown |
+| `src/trading_platform/realtime/stream.py:1426` — `CompositeMarketStream._fan_out` (`bound=_FAN_OUT_TIMEOUT_SECONDS`, `:150`, `10.0 s` plus grace) | **class 3** — the fan-out bound is **equal to**, not strictly greater than, a child's own worst case (`CcxtProMarketStream.stop` bounds its `close()` by `timeout_seconds` plus the late grace, `stream.py:1127` = 10.25 s), and a child's `start()` (cold `import ccxt.pro`, `:1094`) is bounded by nothing at all | **REPORTED** — the composite owns no read timeout and the fan-out is a lifecycle call, not a data call: bounding it by the children's declared waits is the correct fix and needs a per-child declaration of its own |
+| `src/trading_platform/realtime/orchestrator.py:1905` — `_stop_streams`, and the same `asyncio.wait_for` shape at `:710`, `:2034`, `:2051` | **class 3** — the shutdown waits are bounded by `stream_poll_timeout_seconds` alone, a read timeout that does not include what a `stream.stop()` may legitimately take (the `ccxt.pro` teardown is itself bounded by `timeout_seconds` plus grace) | **REPORTED, deliberately left** — a shutdown that trips its bound is logged, never fatal, and the tasks it awaits are already cancelled: widening it would change no profile's life, and the delivery does not refactor the shutdown path |
+| `docs/realtime.md` — this audit table's own `path:line` rows (`runner.py:798`, `runner.py:1046`, `orchestrator.py:1930`, `store.py:1047`) and the §3.2 sentence "its only `requests` matches are prose (`store.py`, `stream.py`)" | **class 4** — documentation the code does not deliver: the page claims every row names a real site, and four cited lines were wrong (`_gateway.poll()` is at `runner.py:881`, `_strategy_run` at `runner.py:1129`, `_flatten_profile`'s poll at `orchestrator.py:1959`, `_new_connection` at `store.py:1045`), while the first evidence command now answers **no** `requests.` match at all | **FIXED IN THIS DELIVERY** — the four references and the sentence are corrected, and a test pins them |
+| `src/trading_platform/realtime/warmup.py:277` — the `history_request_candles` docstring ("the runner asks the stream for `history_request_candles(warmup)` rows, never `warmup`") | **class 4** — the claim was contradicted by the tick request, which used to pass `self._warmup` | **FIXED IN THIS DELIVERY** — the tick asks for `history_request_candles(self._warmup)` rows (`runner.py:1050`) and the start-time verdict reads the same request (`_warmup_request`, `runner.py:1376`), so the sentence describes the code again |
+| `src/trading_platform/realtime/runner.py:1460` — the `_build_frame` docstring ("The history rows are the candles already emitted strictly *before* the candle being decided on") | **class 4** — the rows it is handed are the raw provider window, closed **and** still-forming (`stream.py:864`), which is precisely why the filter on the next lines exists | **FIXED IN THIS DELIVERY** — the prose now describes the window it is given, the two rows the slice drops and the head-room the request must carry |
+| `src/trading_platform/realtime/stream.py:802-807` — the provider-read comment of `next_candle` ("a read that never answers becomes an ordinary poll failure of this stream ... instead of an empty `TimeoutError` escaping into the runner's fatal path") | **class 4** — the claim holds only while the stream's own bound fires first; the runner's 15.8 s bound used to cut the second attempt of the very retry loop the comment describes | **FIXED IN THIS DELIVERY** — the declaration now covers the whole retry path (§3.1), so the stream's own budget is what ends the read, and a read that does expire is a transient tick failure |
+| `src/trading_platform/realtime/stream.py:193` — `_wait_bound` | **class 5** — dead code: a one-line delegation with no caller in `src/` (only its own definition, one docstring reference at `:922`, and one test pin at `tests/test_realtime_stream.py:2184`) | **REPORTED** — the module belongs to the stream package of this delivery (wp-2), and deleting the helper would break a passing test in another package's file; the value is already available as `waits.wait_bound` |
+| `src/trading_platform/cli.py:1946` — the one production `RuntimeProfileController(...)`, against its default `timeout_seconds` (`control.py:104`) | **class 3** — the controller bounds every marshalled command by 10 s, a number unrelated to the ~66-70 s the same engine legitimately spends on one retrying tick; `_call` cancels the pending future on expiry and answers the documented `503` | **REPORTED** — the fix is to wire the controller's timeout to the same declared wait, which changes the `503` contract of the four mutation routes: the web/CLI surface, not this package |
+| `src/trading_platform/web/routes.py:831` — `self._provider.profile_snapshot(argument)` outside the `_failed_mutation` boundary (same shape at `:811`, `:1020`, `:1172`) | **class 2** — a transient read-model failure (`MonitoringError` raised by the monitor on a store or lock hiccup) escapes the documented error mapping and answers the generic `500` instead of the documented `503` | **REPORTED** — the web layer is outside this delivery's scope; the mapping belongs to the router's own boundary |
+| `src/trading_platform/cli.py` — `_read_profile_store` | **class 5** — dead code: defined and never called (grep over `src/`, `tests/`, `docs/`, `dashboard/` answered one hit, the definition itself) | **FIXED IN THIS DELIVERY** — the helper is removed, and the store-opening helper it wrapped (`_open_state_store`, `:1571`) stays: it is what every other command path uses |
+| `src/trading_platform/cli.py:1975` — the `_state_db_writable` docstring ("the directory is usable **without ever creating the state database itself**, which is the documented guarantee of ``realtime check``") | **class 4** — documentation the code does not deliver: `realtime check` **does** create the state database — `_realtime_settings` calls `store.initialize()` (`cli.py:1639`) and the check path initializes it again at `cli.py:2154` — so the sentence claimed a guarantee the command never made | **FIXED IN THIS DELIVERY** — the docstring now says what the probe really promises (a writability verdict, no database opened) and states the initialisation the command performs |
+| `src/trading_platform/realtime/broker.py:900` — `CcxtBroker.poll`'s vanished-order diff, against `_read_open_orders`' failure return at `:1109-1111` | **class 1** — requested vs usable read: the docstring at `:889` promises that a venue failure "does not abort the loop: it becomes an ``ERROR`` event", but the failed read answers three **empty** sets, so the diff reads "every order the venue still holds" as vanished and emits `ORDER_CANCELLED` for each one, which the store persists as a terminal `CANCELLED` state | **REPORTED** — the poll self-heals on the next successful read, and the honest fix (skip the vanished-diff when the read itself failed) changes the broker's reconciliation contract, a venue-layer state machine with its own suite; it is named here rather than guessed at |
+| `src/trading_platform/realtime/stream.py:1221` — `CcxtProMarketStream.history` (`exchange.fetch_ohlcv(symbol, timeframe, None, int(count))`) | **class 1** — the same shape as defect A on the other stream: one un-paginated call, so a venue that caps the rows per request silently answers a shorter window and the warm-up is short for ever, without a single log line | **REPORTED** — the shipped wiring builds `PollingMarketStream`, and paginating the `ccxt.pro` history read is a change of its own (cursor arithmetic, its own tests, and the optional extra the suite never installs) |
+| `src/trading_platform/strategy/freqtrade_parameters.py:556` — `startup_candle_count_for`, called by `freqtrade_adapter.py:818` | **class 1** — the Freqtrade-side warm-up is resolved as "the largest ``int`` parameter of the model" (`28` for ``momentum``, measured) while the house requirement on the grid the wrapper deploys (`4h`) is `169` candles: the shim declares **141 rows fewer** than the strategy reads, so its indicators are still NaN over the warm part of a short run | **REPORTED** — another layer, and the correct fix is to resolve the requirement on the target grid through the arithmetic owner of `realtime.warmup` (which forbids a second copy of it); the adapter only passes the parameter model today, so the helper needs the timeframe first |
+
 
 **The dashboard was audited, not rewritten.** No file under `dashboard/` changes:
 the third evidence command answers six matches, and all six are accounted for —
@@ -1032,8 +1111,15 @@ fed, and `realtime.warmup` is the single arithmetic authority that compares them
 the candles the strategy **requires** on the profile's candle grid, the candles
 the profile **asks for** (`warmup_candles`, the frame budget of §2.2) and the
 candles the stream is configured to **serve** (`history_candles`, the realtime
-setting or the profile's own override). Two findings come out of it, and they are
-not the same thing:
+setting or the profile's own override). **All three are counts of CLOSED
+candles** — the candles a strategy may decide on — and a *requested* window is
+always one row wider than the closed candles it serves, because its last row is
+the candle the venue is still forming (§2.2). `CLOSED_CANDLE_HEADROOM` (`1`),
+`history_request_candles(warmup_candles)` and
+`usable_closed_candles(window_candles)` are the three names of that rule, and they
+live in `realtime.warmup` alone; no check, no catalogue rule and no warm-up matrix
+may compare `required_candles` against a raw row count. Two findings come out of
+it, and they are not the same thing:
 
 * **`strategy-warmup-impossible` (`error`)** — `required_candles >
   warmup_candles`, read on the **resolved** warm-up: the frame can *never* grow to
@@ -1047,19 +1133,28 @@ not the same thing:
   and the timeframes that **would** work with those parameters, cheapest grid
   first. The same sentence is used by every surface that reports it, so an
   operator who read it once recognises it everywhere.
-* **`warmup-exceeds-history` (`warning`)** — `warmup_candles > history_candles`:
-  the profile asks the stream for more candles than its window holds. It is
-  **reported, never refused**: the frame the strategy receives is bounded by
-  `warmup_candles` (§2.2), so a smaller stream window does not by itself silence
-  the profile, and refusing it would refuse working configurations. It is logged
-  at create (`profile_warmup_coherence`) and at start (`warmup_coherence`), both
-  at `WARNING`, with the fix spelled out (raise `history_candles` — the realtime
-  setting or the per-profile override — to at least `warmup_candles`, or lower
-  `warmup_candles`). The stream the runner polls is built with the **effective**
-  window — `cli.py`'s stream factory passes
-  `profile.effective_history_candles(realtime.history_candles)` to
-  `PollingMarketStream`, and the runner receives the same number — so the window
-  the finding names is the window that actually polls.
+* **`warmup-exceeds-history` (`warning`)** —
+  `history_request_candles(warmup_candles) > history_candles`, equivalently
+  `warmup_candles > usable_closed_candles(history_candles)`: the window cannot
+  serve the **closed** candles the warm-up needs, because one of its rows is the
+  still-forming candle. A `warmup_candles` **equal** to `history_candles` is
+  therefore not coherent — that window serves one closed candle fewer than the
+  strategy requires, the exact one-row shortfall that silenced every profile of
+  the incident. It is **reported, never refused**: the frame the strategy receives
+  is bounded by `warmup_candles` (§2.2), so a smaller stream window does not by
+  itself silence the profile, and refusing it would refuse working configurations.
+  It is logged at create (`profile_warmup_coherence`) and at start
+  (`warmup_coherence`), both at `WARNING`, with the fix spelled out (raise
+  `history_candles` — the realtime setting or the per-profile override — to at
+  least `history_request_candles(warmup_candles)`, or lower `warmup_candles`).
+  **One window, one verdict**: the create-time check (`RuntimeProfileController`),
+  the start-time check (`ProfileRunner._check_warmup`) and `realtime check` all
+  take their verdict on the window the profile is **really** served —
+  `profile.effective_history_candles(realtime.history_candles)`, the per-profile
+  override when it declares one and the realtime-level setting otherwise — which is
+  the number `cli.py`'s stream factory hands to `PollingMarketStream` and the
+  number the runner receives, so the window the finding names is the window that
+  actually polls.
 
 **`realtime check` reports the same contract.** Every profile entry carries an
 **additive** `warmup` key; the existing keys keep their names, their types and
@@ -1107,6 +1202,20 @@ different:
   without a decision. The profile **keeps running** and warms up on its own:
   every profile legitimately starts with a short frame, and ending it there would
   turn a normal warm-up into an outage.
+
+**The tick asks for the head-room, so the frame really holds `warmup_candles`
+closed candles.** The runner requests
+`history_request_candles(warmup_candles)` rows from the stream —
+`warmup_candles + CLOSED_CANDLE_HEADROOM` — and then builds the frame as
+`history[index < stamp]` plus the candle `stamp` itself: the still-forming row of
+the window is dropped by the filter, the candle being decided on is re-appended,
+and the frame the strategy receives holds exactly the `warmup_candles` closed
+candles the warm-up counts. Asking for `warmup_candles` rows instead — the
+pre-fix request — can only ever produce `warmup_candles - 1` closed rows, which is
+why `run_once` logged `warmup_incomplete` on every tick and never reached
+`_strategy_run` (defect A of §3.2). A **slow or failed read** of that request is a
+*tick* failure, not a profile failure: the error is logged and counted, the
+profile stays `RUNNING` and the next tick retries (defect B, §3.2).
 
 **The `profiles` table is the source of truth.** Adding or removing a profile is
 one transaction of the state store (an UPSERT on the natural key, or a `DELETE`),

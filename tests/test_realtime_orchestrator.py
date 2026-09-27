@@ -21,6 +21,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,25 @@ HEALTH_KEYS = frozenset(
 def run(coro: Any) -> Any:
     """Run one coroutine under an explicit bound so nothing can hang the suite."""
     return asyncio.run(asyncio.wait_for(coro, timeout=TIMEOUT))
+
+
+async def settle_until(predicate: Callable[[], bool], *, budget: float = 5.0) -> bool:
+    """Await ``predicate`` until it holds, and answer whether it ever did.
+
+    A fixed sleep is a bet on how many ticks of the supervised loops fit inside
+    it.  One failed read is transient by contract and only becomes fatal after
+    ``TRANSIENT_READ_STRIKE_LIMIT`` consecutive failures, so the tests that assert
+    the fatal outcome wait for the **outcome** -- bounded, so nothing can hang the
+    suite, and answered, so a loop that never gets there fails the assertion
+    instead of silently observing a profile that is still running.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.005)
+    return predicate()
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +702,15 @@ def test_a_failing_profile_does_not_take_the_platform_down(tmp_path: Path, logs:
 
     async def scenario() -> Any:
         await orchestrator.start()
-        await asyncio.sleep(_SETTLE)
+
+        def crashed() -> bool:
+            snapshot = orchestrator.profile_snapshot("eth-paper")
+            return snapshot is not None and snapshot.status is ProfileStatus.ERROR
+
+        # A failed read is transient by contract: the profile only leaves its loop
+        # after ``TRANSIENT_READ_STRIKE_LIMIT`` consecutive failing ticks, so the
+        # fatal outcome is awaited instead of guessed from a fixed settle.
+        await settle_until(crashed)
         broken = orchestrator.profile_snapshot("eth-paper")
         await orchestrator.stop()
         return broken
@@ -2636,7 +2664,15 @@ def test_one_failing_tick_is_recorded_once_by_the_loop_and_the_supervision(
 
     async def scenario() -> None:
         await orchestrator.start()
-        await asyncio.sleep(_SETTLE)
+
+        def crashed() -> bool:
+            snapshot = orchestrator.profile_snapshot("btc-paper")
+            return snapshot is not None and snapshot.status is ProfileStatus.ERROR
+
+        # The stream fails every tick: the profile leaves its loop once the
+        # transient strike limit is reached, and the records below answer for that
+        # single fatal failure -- not for however many ticks fit in a fixed sleep.
+        await settle_until(crashed)
         await orchestrator.stop()
 
     run(scenario())
@@ -2687,7 +2723,14 @@ def test_a_bare_timeout_is_never_logged_as_an_empty_failure(tmp_path: Path, logs
 
     async def scenario() -> None:
         await orchestrator.start()
-        await asyncio.sleep(_SETTLE)
+
+        def crashed() -> bool:
+            return any(getattr(record, "event", "") == "profile_crashed" for record in logs)
+
+        # A bare ``TimeoutError`` is a transient read failure too: the profile only
+        # leaves its loop once the strike limit is reached, so the crash record the
+        # assertions read is awaited rather than assumed.
+        await settle_until(crashed)
         await orchestrator.stop()
 
     run(scenario())

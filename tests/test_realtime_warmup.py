@@ -8,6 +8,12 @@ verdicts here, so this file pins the module's public vocabulary, its two rules
 and the totality that lets a validation path ask "is this profile feedable?"
 without adding a failure mode of its own.
 
+The arithmetic reasons about **closed** candles: a live provider window always
+ends with the still-forming candle, so a window of ``N`` requested rows serves at
+most ``N - CLOSED_CANDLE_HEADROOM`` closed ones.  That is the one-row shortfall of
+the incident: 169 requested 4h klines carried 168 closed candles while the
+strategy needed 169, so no frame ever reached the requirement.
+
 Offline and deterministic: every value is a pure function of its arguments, and
 nothing here touches a clock, a file or the network.
 """
@@ -25,6 +31,7 @@ from trading_platform.core.constants import SUPPORTED_TIMEFRAMES, timeframe_minu
 from trading_platform.core.errors import ConfigError, StrategyError
 from trading_platform.realtime import warmup as warmup_module
 from trading_platform.realtime.warmup import (
+    CLOSED_CANDLE_HEADROOM,
     DEFAULT_WARMUP_CANDLES,
     SEVERITY_ERROR,
     SEVERITY_WARNING,
@@ -33,14 +40,17 @@ from trading_platform.realtime.warmup import (
     WarmupFinding,
     candles_per_day,
     effective_warmup_candles,
+    history_request_candles,
     profile_warmup_findings,
     required_candles_for,
+    usable_closed_candles,
     warmup_report,
     working_timeframes,
 )
 
 #: The frozen public surface of the module.
 FROZEN_EXPORTS = {
+    "CLOSED_CANDLE_HEADROOM",
     "DEFAULT_WARMUP_CANDLES",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
@@ -49,8 +59,10 @@ FROZEN_EXPORTS = {
     "WarmupFinding",
     "candles_per_day",
     "effective_warmup_candles",
+    "history_request_candles",
     "profile_warmup_findings",
     "required_candles_for",
+    "usable_closed_candles",
     "warmup_report",
     "working_timeframes",
 }
@@ -103,12 +115,15 @@ INCIDENT_MESSAGE = (
     "raise warmup_candles to at least 40321"
 )
 
-#: The coherence sentence, pinned byte-for-byte.
+#: The coherence sentence, pinned byte-for-byte.  It names the resolved warm-up,
+#: the configured window, the CLOSED rows that window can serve and the minimum
+#: window to configure (the warm-up plus the headroom).
 COHERENCE_MESSAGE = (
     "profile 'momentum-1m' asks for 1000 warm-up candles (warmup_candles=1000) but "
-    "the live stream is configured to serve a 300-candle window (history_candles=300); "
-    "raise history_candles to at least 1000 (realtime setting or the per-profile "
-    "override) or lower warmup_candles"
+    "the live stream is configured to serve a 300-candle window (history_candles=300), "
+    "which holds only 299 closed candles (the venue always appends one still-forming "
+    "candle); raise history_candles to at least 1001 (realtime setting or the "
+    "per-profile override) or lower warmup_candles"
 )
 
 
@@ -260,6 +275,60 @@ def test_effective_warmup_never_raises_where_the_strict_reader_does() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2c. the closed-row headroom: a requested window always carries one unusable row
+# ---------------------------------------------------------------------------
+
+#: Warm-ups the headroom arithmetic is pinned on, including the incident's 169.
+HEADROOM_BOUNDARIES: tuple[int, ...] = (0, 1, 2, 168, 169, 40321)
+
+#: Values a validation path may hand the helpers: none of them may raise.
+UNUSABLE_INPUTS: tuple[Any, ...] = ("many", None, -5, 2.9, True)
+
+
+def test_the_headroom_is_the_unusable_still_forming_candle() -> None:
+    """One row of every live window is still forming, so it can never be used.
+
+    Measured on the incident: 169 requested 4h klines came back as 168 closed
+    candles plus the still-forming one, while the strategy needed 169 -- the whole
+    reason no profile ever reached its strategy.
+    """
+    assert CLOSED_CANDLE_HEADROOM == 1
+    assert isinstance(CLOSED_CANDLE_HEADROOM, int)
+    assert usable_closed_candles(169) == 168
+    assert usable_closed_candles(170) == 169
+    assert usable_closed_candles(2) == 1
+    assert usable_closed_candles(1) == 0
+    assert usable_closed_candles(0) == 0
+
+
+@pytest.mark.parametrize("warmup_candles", HEADROOM_BOUNDARIES)
+def test_the_requested_window_always_carries_one_unusable_row(warmup_candles: int) -> None:
+    """THE DEFECT A ARITHMETIC: request the warm-up alone and the frame is one short.
+
+    To serve ``N`` CLOSED candles the stream must be asked for ``N +
+    CLOSED_CANDLE_HEADROOM`` rows, and the pair is a round trip: a window can never
+    look big enough while serving one closed row too few.
+    """
+    requested = history_request_candles(warmup_candles)
+    assert requested == max(1, warmup_candles) + CLOSED_CANDLE_HEADROOM
+    if warmup_candles >= 1:
+        assert requested == warmup_candles + 1, "169 closed candles need 170 requested rows"
+    assert usable_closed_candles(requested) == max(1, warmup_candles)
+
+
+def test_the_headroom_helpers_are_total_and_never_answer_a_negative_number() -> None:
+    """A validation path may hand them anything: they still answer a usable number."""
+    assert history_request_candles(0) == 2
+    assert history_request_candles(1) == 2
+    assert usable_closed_candles(-5) == 0
+    assert usable_closed_candles(-1) == 0
+    assert usable_closed_candles(0) == 0
+    for unusable in UNUSABLE_INPUTS:
+        assert history_request_candles(unusable) >= 2, unusable
+        assert usable_closed_candles(unusable) >= 0, unusable
+
+
+# ---------------------------------------------------------------------------
 # 3. the two rules
 # ---------------------------------------------------------------------------
 
@@ -271,7 +340,8 @@ def test_a_healthy_profile_has_no_finding_at_all() -> None:
 
 def test_the_incident_profile_without_an_override_is_never_impossible() -> None:
     """THE INCIDENT SHAPE, fixed: no override resolves to 40321, so the silent
-    no-op is gone by construction -- the operator gets a coherent profile."""
+    no-op is gone by construction -- the profile is reported as incoherent at
+    worst, never as impossible."""
     target = profile()
     assert effective_warmup_candles(target) == 40321
     report = warmup_report(target, history_candles=300)
@@ -333,7 +403,11 @@ def test_a_default_profile_can_never_be_impossible() -> None:
 
 
 def test_equal_requirement_and_warmup_is_not_an_error() -> None:
-    """The boundary is inclusive: exactly enough candles is enough."""
+    """The impossible boundary stays inclusive: exactly enough candles is enough.
+
+    It is the *other* boundary -- the stream window's -- that is not: see
+    :func:`test_equal_warmup_and_history_is_one_row_short_and_warns`.
+    """
     findings = profile_warmup_findings(
         profile(timeframe="4h", warmup_candles=REQUIRED_BY_TIMEFRAME["4h"]), history_candles=300
     )
@@ -371,12 +445,45 @@ def test_the_resolved_default_warmup_is_coherent_with_the_default_window() -> No
     assert effective_warmup_candles(target) == REQUIRED_BY_TIMEFRAME["4h"]
 
 
-def test_equal_warmup_and_history_is_coherent() -> None:
-    """The coherence boundary is inclusive too."""
+def test_the_incident_arithmetic_is_one_row_short_without_the_headroom() -> None:
+    """THE DEFECT A REGRESSION: equality is one closed row short, so it warns.
+
+    The live 4h momentum profile resolves to 169 candles with no override, and a
+    169-row live window serves only 168 closed ones: the frame ``_build_frame``
+    builds is one row below the requirement on every tick, the strategy is never
+    reached, and no position is ever opened.  A window of
+    ``history_request_candles(169)`` -- the warm-up plus the headroom -- is the
+    first one that really feeds it.
+    """
+    target = profile(timeframe="4h")
+    assert target.warmup_candles is None
+    assert required_candles_for(target) == REQUIRED_BY_TIMEFRAME["4h"] == 169
+    assert effective_warmup_candles(target) == 169
+
+    short = profile_warmup_findings(target, history_candles=169)
+    assert [finding.code for finding in short] == [WARMUP_CODE_COHERENCE]
+    assert short[0].severity == SEVERITY_WARNING
+
+    assert profile_warmup_findings(target, history_candles=history_request_candles(169)) == []
+    assert warmup_report(target, history_candles=170)["findings"] == []
+
+
+def test_equal_warmup_and_history_is_one_row_short_and_warns() -> None:
+    """The coherence boundary is NOT inclusive: equality loses the forming candle.
+
+    A 673-row window holds 672 closed candles, so a 673-candle warm-up is exactly
+    the off-by-one the fix must make impossible to repeat; one extra requested row
+    (674) is enough to serve it.
+    """
     findings = profile_warmup_findings(
         profile(timeframe="1h", warmup_candles=673), history_candles=673
     )
-    assert findings == []
+    assert [finding.code for finding in findings] == [WARMUP_CODE_COHERENCE]
+    assert findings[0].severity == SEVERITY_WARNING
+    assert (
+        profile_warmup_findings(profile(timeframe="1h", warmup_candles=673), history_candles=674)
+        == []
+    )
 
 
 def test_a_profile_can_be_both_impossible_and_incoherent() -> None:

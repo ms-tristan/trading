@@ -69,6 +69,8 @@ from trading_platform.realtime.stream import (
     MarketStream,
     PollingMarketStream,
     ReplayMarketStream,
+    declared_read_worst_case_seconds,
+    max_backoff_seconds,
 )
 
 #: Every await of this module is bounded by this explicit timeout.
@@ -1497,33 +1499,41 @@ def test_max_wait_seconds_declares_the_longest_legitimate_wait() -> None:
 
     * a replay reads prepared rows and never waits -- ``0.0``;
     * the deployment's polling pair (``poll_interval_seconds = 30``,
-      ``timeout_seconds = 10``) declares the **30 s** idle poll, not the 10 s
-      timeout: deriving the bound from the timeout alone cut that healthy idle poll
-      into a ``TimeoutError`` and crash-looped every profile;
-    * a retry may instead sleep the whole bounded backoff series, which dominates a
-      tiny poll interval (``1 + 2 + 4 + 8 = 15 s`` for a base of 1 s and
-      ``max_reconnects = 5``), so the declared wait is the longer of the two;
+      ``timeout_seconds = 10``) declares the whole retrying call, never the 30 s idle
+      poll nor the 15 s backoff series alone: deriving the bound from the timeout
+      alone cut that healthy idle poll into a ``TimeoutError`` and crash-looped every
+      profile, and deriving it from the backoff series cut a retry mid-flight;
     * a composite delegates to exactly one child per call, so its declared wait is
       the longest declared wait of the children it may route to.
+
+    Every expected number is derived from the shared authority
+    (:func:`declared_read_worst_case_seconds`) so this test cannot drift from it.
     """
     assert ReplayMarketStream({(BTC, HOUR): replay_frame(2)}).max_wait_seconds == 0.0
 
     deployment = PollingMarketStream(
         GridProvider(), clock=ManualClock(), poll_interval_seconds=30.0, timeout_seconds=10.0
     )
-    assert deployment.max_wait_seconds == 30.0
-    # The declared wait is the longer of the two inputs the stream was built with,
-    # and the cadence itself is readable back for a caller deriving its own bound.
+    assert deployment.max_wait_seconds == declared_read_worst_case_seconds(
+        read_timeout_seconds=10.0,
+        poll_interval_seconds=30.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+    # The declared wait is no longer the bare idle poll, and the cadence itself is
+    # readable back for a caller deriving its own bound.
+    assert deployment.max_wait_seconds > 30.0
     assert deployment.poll_interval_seconds == 30.0
 
     retrying = PollingMarketStream(
         GridProvider(),
         clock=ManualClock(),
         poll_interval_seconds=0.01,
+        timeout_seconds=10.0,
         reconnect_backoff_seconds=1.0,
         max_reconnects=5,
     )
-    assert retrying.max_wait_seconds == 15.0
+    assert retrying.max_wait_seconds == 5 * (10.0 + waits.LATE_GRACE_SECONDS) + 15.0
 
     live = CcxtProMarketStream(
         clock=ManualClock(),
@@ -1531,7 +1541,7 @@ def test_max_wait_seconds_declares_the_longest_legitimate_wait() -> None:
         reconnect_backoff_seconds=1.0,
         max_reconnects=5,
     )
-    assert live.max_wait_seconds == 15.0
+    assert live.max_wait_seconds == 5 * (10.0 + waits.LATE_GRACE_SECONDS) + 15.0
     assert live.timeout_seconds == 10.0
 
     composite = CompositeMarketStream(
@@ -1545,6 +1555,182 @@ def test_max_wait_seconds_declares_the_longest_legitimate_wait() -> None:
     # A duck-typed child that predates the member declares no wait at all.
     legacy = CompositeMarketStream({(BTC, HOUR): LegacyFakeChild()})
     assert legacy.max_wait_seconds == 0.0
+
+
+def test_the_declared_wait_covers_every_retry_the_stream_is_entitled_to_take() -> None:
+    """FAILING-FIRST: a retrying call pays reads *and* backoff, not backoff alone.
+
+    The defect: the polling stream used to declare ``max(poll_interval,
+    max_backoff_seconds(...))``, i.e. the bare backoff series -- 15.0 s for the
+    deployment pair -- while one call of that stream may legitimately spend the backoff
+    *and* a full bounded read per attempt (each bounded by ``timeout_seconds`` plus one
+    ``LATE_GRACE_SECONDS`` window).  An external bound derived from 15.0 s (the runner's
+    15.8 s) therefore cut a retry the stream was entitled to take, and the resulting
+    named ``TimeoutError`` killed the profile for good.
+
+    Pure arithmetic on the built stream: no clock, no provider read, no duration.
+    """
+    from trading_platform.realtime.runner import stream_wait_bound
+
+    stream = PollingMarketStream(
+        GridProvider(),
+        clock=ManualClock(),
+        poll_interval_seconds=5.0,
+        timeout_seconds=10.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+
+    # Every attempt the retry budget allows is a bounded read, and the backoff series
+    # is paid on top of them.
+    assert stream.max_wait_seconds >= 5 * (10.0 + waits.LATE_GRACE_SECONDS) + 15.0
+    # The old declaration: exactly the backoff series.
+    assert stream.max_wait_seconds > max_backoff_seconds(1.0, 5)
+    assert stream.max_wait_seconds > 15.0
+
+    # The bound wraps the *declared* wait with strict head-room -- never equal to it,
+    # or the deadline of the call and the deadline of its bound land on the same
+    # event-loop instant.
+    assert stream_wait_bound(10.0, stream.max_wait_seconds) > stream.max_wait_seconds
+
+    # Same invariant for the 30 s / 10 s deployment pair the Docker image ships.
+    deployment = PollingMarketStream(
+        GridProvider(), clock=ManualClock(), poll_interval_seconds=30.0, timeout_seconds=10.0
+    )
+    assert deployment.max_wait_seconds > max_backoff_seconds(1.0, 5)
+    assert stream_wait_bound(10.0, deployment.max_wait_seconds) > deployment.max_wait_seconds
+
+
+def test_the_declared_wait_includes_the_idle_poll() -> None:
+    """A stream that paces itself may idle a whole poll interval inside one call.
+
+    ``next_candle`` answers ``None`` after :meth:`_idle` when nothing new exists, so a
+    poll interval longer than the whole retry path is the longest legitimate wait.  A
+    declaration that kept only the retry path would let a caller's bound cut that idle
+    poll -- the very defect that started this invariant.
+    """
+    paced = PollingMarketStream(
+        GridProvider(),
+        clock=ManualClock(),
+        poll_interval_seconds=600.0,
+        timeout_seconds=10.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+
+    assert paced.max_wait_seconds == declared_read_worst_case_seconds(
+        read_timeout_seconds=10.0,
+        poll_interval_seconds=600.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+    # The idle path wins: one bounded attempt plus the whole 600 s pacing wait.
+    assert paced.max_wait_seconds == 600.0 + 10.0 + waits.LATE_GRACE_SECONDS
+    assert paced.max_wait_seconds > 5 * (10.0 + waits.LATE_GRACE_SECONDS) + 15.0
+
+
+@pytest.mark.parametrize(
+    ("read_timeout_seconds", "poll_interval_seconds", "max_reconnects", "backoff"),
+    [
+        (0.0, 0.0, 5, 1.0),
+        (-1.0, -5.0, 5, 1.0),
+        (10.0, 0.0, 0, 1.0),
+        (10.0, 0.0, -3, 1.0),
+        (10.0, 0.0, 5, 0.0),
+        (10.0, 0.0, 5, -1.0),
+    ],
+)
+def test_declared_read_worst_case_seconds_is_total(
+    read_timeout_seconds: float,
+    poll_interval_seconds: float,
+    max_reconnects: int,
+    backoff: float,
+) -> None:
+    """The declaration is a pure, total function: it never raises, never goes negative.
+
+    Each edge is a shape a caller really reaches: a zero or negative read cost is
+    clamped, a retry budget below one attempt still pays exactly one attempt, a zero or
+    negative backoff contributes nothing, and ``poll_interval_seconds = 0.0`` is the
+    ``ccxt.pro`` shape -- a stream that answers ``None`` immediately and never idles.
+    """
+    declared = declared_read_worst_case_seconds(
+        read_timeout_seconds=read_timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        max_reconnects=max_reconnects,
+        reconnect_backoff_seconds=backoff,
+    )
+
+    attempts = max(1, int(max_reconnects))
+    per_attempt = max(0.0, float(read_timeout_seconds)) + waits.LATE_GRACE_SECONDS
+    expected_retry = attempts * per_attempt + max_backoff_seconds(backoff, max_reconnects)
+    expected_idle = per_attempt + max(0.0, float(poll_interval_seconds))
+
+    assert declared == max(expected_retry, expected_idle)
+    assert declared >= 0.0
+    # The retry path is never *narrower* than the backoff series it contains: the
+    # series is the read-cost-free part of it.
+    assert declared >= max_backoff_seconds(backoff, max_reconnects)
+    assert declared - attempts * waits.LATE_GRACE_SECONDS >= max_backoff_seconds(
+        backoff, max_reconnects
+    )
+
+
+def test_the_declared_wait_reduces_to_the_backoff_series_when_the_read_cost_is_zero() -> None:
+    """With no read cost and no idle pace, the whole declaration is the backoff series.
+
+    Every attempt still pays one ``LATE_GRACE_SECONDS`` window (the grace
+    :func:`~trading_platform.realtime.waits.awaited_within` grants before it gives up),
+    so the identity with :func:`max_backoff_seconds` holds exactly once that floor is
+    taken out -- and the series stays the value that dominates a large one.
+    """
+    declared = declared_read_worst_case_seconds(
+        read_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+
+    assert declared - 5 * waits.LATE_GRACE_SECONDS == max_backoff_seconds(1.0, 5)
+    assert declared > max_backoff_seconds(1.0, 5)
+    # A budget below two attempts never sleeps at all, so only the grace floor is left.
+    assert (
+        declared_read_worst_case_seconds(
+            read_timeout_seconds=0.0,
+            poll_interval_seconds=0.0,
+            max_reconnects=1,
+            reconnect_backoff_seconds=1.0,
+        )
+        == waits.LATE_GRACE_SECONDS
+    )
+
+
+def test_the_live_stream_declares_every_retry_it_is_entitled_to_take() -> None:
+    """The same declaration and the same strict bound for the ``ccxt.pro`` stream.
+
+    Built offline: the ccxt extra is imported inside ``start`` and never at module
+    import time (the suite rule), so the constructor -- and therefore this declaration
+    -- is reachable without it.  The polling stream and this one share one authority,
+    which is why neither can drift from the other.
+    """
+    from trading_platform.realtime.runner import stream_wait_bound
+
+    stream = CcxtProMarketStream(
+        clock=ManualClock(),
+        timeout_seconds=10.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+
+    assert stream.max_wait_seconds >= 5 * (10.0 + waits.LATE_GRACE_SECONDS) + 15.0
+    assert stream.max_wait_seconds > max_backoff_seconds(1.0, 5)
+    # ``watch_ohlcv`` answers ``None`` immediately when nothing is new: no idle wait.
+    assert stream.max_wait_seconds == declared_read_worst_case_seconds(
+        read_timeout_seconds=10.0,
+        poll_interval_seconds=0.0,
+        max_reconnects=5,
+        reconnect_backoff_seconds=1.0,
+    )
+    assert stream_wait_bound(10.0, stream.max_wait_seconds) > stream.max_wait_seconds
 
 
 def test_a_local_fake_satisfies_the_market_stream_protocol() -> None:

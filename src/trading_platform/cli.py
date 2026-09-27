@@ -1584,21 +1584,6 @@ def _open_state_store(state_db: Path) -> Any:
     return store
 
 
-def _read_profile_store(state_db: Path) -> list[ProfileConfig]:
-    """Return every profile the state database holds, and close the store.
-
-    A database path that does not exist yet is a legal empty platform, not an
-    error: the store creates it, finds nothing and answers ``[]``.  Only a real
-    storage failure (an unusable path, a database written by a newer build)
-    propagates, as a :class:`~trading_platform.core.errors.StateStoreError`.
-    """
-    store = _open_state_store(state_db)
-    try:
-        return list(store.load_profiles())
-    finally:
-        store.close()
-
-
 def _realtime_settings(
     state_db: Path,
     logs_dir: Path | None,
@@ -1769,36 +1754,52 @@ def _realtime_profiles(orchestrator: Any) -> list[dict[str, Any]]:
 def _realtime_tick_budget(profiles: Sequence[ProfileConfig], realtime: RealtimeConfig) -> float:
     """Return the budget of one whole ``realtime run --once`` tick, in seconds.
 
-    The orchestrator ticks its profiles sequentially, so the budget is, per profile,
-    **the very bound that profile's runner applies** around its idle-able calls --
-    the larger of the stream timeout and the stream's own declared wait, plus its
-    margin -- and one bare stream timeout for the shutdown.
+    The whole-tick budget must **never be narrower than the bounds the runners inside
+    it apply**: the orchestrator ticks its profiles sequentially, so the budget is, per
+    profile, the very bound that profile's runner applies around its idle-able calls
+    -- the larger of the stream timeout and the stream's own declared wait, plus its
+    margin -- and one bare stream timeout for the shutdown.  A narrower outer budget
+    would cut a profile's legitimate wait and report it as the failure instead.
 
-    The declared wait is the part that cannot be skipped.  The stream this command
-    builds is a :class:`~trading_platform.realtime.stream.PollingMarketStream`, which
-    declares ``max(poll_interval_seconds, the whole retry backoff series)``: a profile
-    pacing below the stream timeout whose retry series is longer still gets a runner
-    bound larger than the timeout, and a tick budget derived from the poll interval
-    and the timeout alone would cut it.  Bounding the whole tick by
-    ``stream_poll_timeout_seconds`` per profile is the same defect the runner's own
-    bound had: with the deployment's 30 s poll interval and a 10 s stream timeout,
-    two profiles got a 30 s budget that cut a perfectly legitimate 30 s idle poll of
-    the second one.
+    The declared wait is the part that cannot be skipped, and it is read from its
+    single authority, :func:`~trading_platform.realtime.stream.declared_read_worst_case_seconds`
+    -- the same function the stream this command builds
+    (:class:`~trading_platform.realtime.stream.PollingMarketStream`) declares
+    ``max_wait_seconds`` through.  Restating the arithmetic here from the retry backoff
+    series alone under-stated a retrying call: every attempt of that call also pays a
+    bounded read (its timeout plus one late grace window) and a successful one may idle
+    a whole poll interval, so a budget built from the backoff series cut retries the
+    stream was entitled to take.  With the deployment's 5 s poll and 10 s stream
+    timeout the declaration is ``5 * (10 + 0.25) + 15 = 66.25 s``, not 15 s.
+
+    Bounding the whole tick by ``stream_poll_timeout_seconds`` per profile was the same
+    defect in an earlier form: with the deployment's 30 s poll interval and a 10 s
+    stream timeout, two profiles got a 30 s budget that cut a perfectly legitimate 30 s
+    idle poll of the second one.
     """
     # Imported here on purpose: ``cli`` is imported by the realtime package, so a
     # module-level import of the runner and of the stream seam would be circular.
     from trading_platform.realtime.runner import stream_wait_bound as _bound
-    from trading_platform.realtime.stream import max_backoff_seconds as _retry_wait
+    from trading_platform.realtime.stream import (
+        declared_read_worst_case_seconds as _declared_wait,
+    )
 
     timeout = float(realtime.stream_poll_timeout_seconds)
-    # The longest retry series the streams of this configuration can sleep, exactly
-    # as they compute it themselves.
-    retry_wait = _retry_wait(
-        float(realtime.reconnect_backoff_seconds), int(realtime.max_stream_reconnects)
-    )
     return (
         sum(
-            _bound(max(timeout, float(profile.poll_interval_seconds), retry_wait))
+            # The declared wait of the very stream the runner of this profile builds:
+            # same read timeout, same poll cadence, same retry budget and backoff.
+            _bound(
+                max(
+                    timeout,
+                    _declared_wait(
+                        read_timeout_seconds=timeout,
+                        poll_interval_seconds=float(profile.poll_interval_seconds),
+                        max_reconnects=int(realtime.max_stream_reconnects),
+                        reconnect_backoff_seconds=float(realtime.reconnect_backoff_seconds),
+                    ),
+                )
+            )
             for profile in profiles
         )
         + timeout
@@ -1975,9 +1976,12 @@ def _state_db_writable(path: Path) -> tuple[bool, str]:
     """Probe the writability of the state-database directory.
 
     The probe creates the parent directory (``mkdir(parents=True, exist_ok=True)``)
-    and then writes and deletes a temporary file next to the database: it proves
-    the directory is usable **without ever creating the state database itself**,
-    which is the documented guarantee of ``realtime check``.
+    and then writes and deletes a temporary file next to the database, so it answers
+    "could a state database live here?" without opening one.  That is all it
+    promises: ``realtime check`` **does** create the state database when it resolves
+    the engine settings (``_realtime_settings`` -> ``store.initialize()``), like
+    every other command path, and the probe is what makes an unusable directory
+    readable as a verdict instead of a traceback.
     """
     parent = path.parent
     try:
@@ -2000,14 +2004,16 @@ def _realtime_profile_entry(
     and the credentials are only ever probed for **presence**: neither a value nor
     a network call is involved.
 
-    ``history_candles`` is the realtime-level window this profile is resolved
-    against (the profile's own :meth:`ProfileConfig.effective_history_candles`
-    answers the effective one).  The warm-up contract is reported under the
-    additive ``warmup`` key -- the full finding set, warning and error alike -- and
-    every **error** severity finding is also appended to ``issues``: that is what
-    keeps ``ok`` and the exit code semantics unchanged, because an impossible
-    profile is exactly a profile that cannot start.  A warning never reaches
-    ``issues``: a profile that is merely not warm *yet* must still report ``ok``.
+    ``history_candles`` is the window this profile is really served -- the one
+    :meth:`ProfileConfig.effective_history_candles` resolves from the profile's own
+    override and the realtime-level value, the same window the create-time verdict
+    (``control``) and the start-time verdict (orchestrator -> runner) use.  The
+    warm-up contract is reported under the additive ``warmup`` key -- the full
+    finding set, warning and error alike -- and every **error** severity finding is
+    also appended to ``issues``: that is what keeps ``ok`` and the exit code
+    semantics unchanged, because an impossible profile is exactly a profile that
+    cannot start.  A warning never reaches ``issues``: a profile that is merely not
+    warm *yet* must still report ``ok``.
     """
     # Imported inside the function body on purpose: ``cli`` stays importable
     # without the engine layer, exactly like every other realtime seam here.
@@ -2168,7 +2174,12 @@ def _realtime_preflight(
             profile,
             environ=os.environ,
             gate=gate,
-            history_candles=int(realtime.history_candles),
+            # The window this profile is really served, never the platform-level
+            # value it may override: the create-time verdict (``control``) and the
+            # start-time verdict (orchestrator -> runner) both take their warm-up
+            # decision on the effective window, so ``realtime check`` has to as well
+            # or it reports a finding the engine would never produce.
+            history_candles=int(profile.effective_history_candles(realtime.history_candles)),
         )
         for profile in profiles
     ]

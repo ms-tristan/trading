@@ -949,8 +949,18 @@ def test_a_bounded_lookback_is_accepted_and_acts(
 def test_a_lookback_larger_than_the_frame_degrades_safely(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A window wider than the frame scans what exists and never raises."""
-    signals = signal_frame(entries=(0,), rows=FRAME_ROWS)
+    """A window wider than the frame scans what exists and never raises.
+
+    The scripted frame is one row longer than the frame the runner builds, so the
+    cross it marks on its own first row sits **outside** the window: a script is
+    aligned on the last row and by positional distance from it (see
+    :class:`RecordingSignals`), which makes the fixture state the reach of the
+    scan instead of inheriting it from the length of the runner's frame.  The
+    over-wide lookback is therefore clamped to the rows that exist, finds no
+    candidate and degrades into the ordinary last-row decision, with the tick
+    completed in full.
+    """
+    signals = signal_frame(entries=(0,), rows=FRAME_ROWS + 1)
     install_signals(monkeypatch, signals)
     runner, stream, gateway, store, _clock = build_lookback(signals=signals, lookback=200)
 

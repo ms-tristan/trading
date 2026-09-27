@@ -89,11 +89,12 @@ class RuntimeProfileController:
         keeps an HTTP worker from waiting for ever on a stuck engine.
     history_candles:
         The history window the engine serves a profile by default -- the realtime
-        setting ``realtime.history_candles`` of the running platform.  It is used
-        by the create-time warm-up check to tell "this profile can never warm up"
-        (refused) from "this profile asks for more than the stream serves"
-        (reported).  ``None`` falls back to the model default, so a controller
-        built without it keeps the documented behaviour.
+        setting ``realtime.history_candles`` of the running platform.  The
+        create-time warm-up check (:meth:`_check_warmup`) takes its verdict on the
+        window the profile is **really** served: this value, unless the profile
+        carries its own ``history_candles`` override, in which case the override
+        wins -- one window, one verdict.  ``None`` falls back to the model default,
+        so a controller built without it keeps the documented behaviour.
     """
 
     def __init__(
@@ -208,12 +209,33 @@ class RuntimeProfileController:
           nothing is served its strategy's own requirement and this branch is
           unreachable for it: it is reached **only** by an explicit
           ``warmup_candles`` below the requirement;
-        * a **warning** finding (``warmup_candles > history_candles``) is logged
-          and the profile *is* created: the frame the strategy receives is bounded
-          by ``warmup_candles``, so a smaller stream window does not by itself
-          silence the profile and refusing it would refuse working configurations.
+        * a **warning** finding -- the requested window cannot serve the **closed**
+          warm-up rows the strategy needs, because one of its rows is the
+          still-forming candle -- is logged and the profile *is* created: the frame
+          the strategy receives is bounded by ``warmup_candles``, so a smaller
+          stream window does not by itself silence the profile and refusing it
+          would refuse working configurations.
+
+        Both rules are owned by :mod:`trading_platform.realtime.warmup` and are
+        **not** re-implemented here: this method only hands that module the window
+        the profile is *really* served.
+
+        Verdict on the **effective** window
+        -----------------------------------
+        The window the finding is taken on is
+        :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`
+        -- the per-profile ``history_candles`` override when the profile declares
+        one, the realtime-level setting otherwise -- which is the same window the
+        start-time verdict uses (``RealtimeOrchestrator`` hands
+        ``ProfileRunner`` ``profile.effective_history_candles(realtime.history_candles)``)
+        and the same one ``realtime check`` reports.  Judging a profile that
+        overrides the window against the realtime-level setting would take a
+        second, narrower verdict on a window the profile is never served.  With no
+        override the resolved value **is** the realtime-level setting, so the
+        create-time verdict is byte-for-byte the previous one.
         """
-        for finding in profile_warmup_findings(profile, history_candles=self._history_candles):
+        window = int(profile.effective_history_candles(self._history_candles))
+        for finding in profile_warmup_findings(profile, history_candles=window):
             if finding.severity == SEVERITY_ERROR:
                 raise ConfigError(finding.message)
             log_event(
@@ -224,7 +246,7 @@ class RuntimeProfileController:
                 symbol=str(profile.symbol),
                 timeframe=str(profile.timeframe),
                 warmup_candles=effective_warmup_candles(profile),
-                history_candles=self._history_candles,
+                history_candles=window,
                 message=finding.message,
             )
 
