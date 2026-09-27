@@ -14,7 +14,7 @@ repository does not re-implement exchange connectivity, order management,
 and aggregates what they report.
 
 ```
- 22 profiles in the catalogue   ->  at most 12 freqtrade workers at a time
+ 22 profiles in the catalogue   ->  at most 6 freqtrade workers at a time
  (20 paper + 2 live)                (the rest are queued)
 ```
 
@@ -92,9 +92,11 @@ dashboard:
    |  |   | freqtrade #1      |<----------| SQLite state database           |  |  |
    |  |   | freqtrade #2      |  :8101+   | /app/data/realtime/state.db     |  |  |
    |  |   | ...               |  loopback | tables: profiles,               |  |  |
-   |  |   | freqtrade #12     |  in the   | profile_snapshots, settings,    |  |  |
-   |  |   +-------------------+  container| events  (PRAGMA user_version 1) |  |  |
-   |  |        |   ^                     +---------------------------------+  |  |
+   |  |   | freqtrade #6      |  in the   | profile_snapshots,              |  |  |
+   |  |   +-------------------+  container| profile_trades, profile_daily,  |  |  |
+   |  |        |   ^                      | settings, events                |  |  |
+   |  |        |   |                      | (PRAGMA user_version 2)         |  |  |
+   |  |        |   |                      +---------------------------------+  |  |
    |  |        |   | HTTP Basic to each worker's own /api/v1/               |  |
    |  |        v   |                                                          |  |
    |  |   generated per-profile config + tradesv3.sqlite + OHLCV cache        |  |
@@ -305,8 +307,9 @@ skips the catalogue-vs-platform coherence refusal.
 | --- | --- | --- |
 | `TB_OPERATOR_TOKEN` | unset | operator token of the mutating API routes (`X-Operator-Token`); a missing header is `401`, a wrong one `403` |
 | `TB_LOG_LEVEL` | `INFO` | log level of the supervisor and the API |
-| `TB_MAX_RUNNING_PROFILES` | `12` | fleet cap: how many `freqtrade trade` workers may run at once |
+| `TB_MAX_RUNNING_PROFILES` | `6` | fleet cap: how many `freqtrade trade` workers may run at once |
 | `TB_SNAPSHOT_INTERVAL_SECONDS` | `60` | snapshot loop period (`config/platform.json` sets the default) |
+| `TB_WORKER_START_STAGGER_SECONDS` | `10` | gradual start: at most one new worker every N seconds (`0` starts them immediately) |
 | `TB_PROFILE_API_PORT_BASE` | `8101` | first private worker REST port; the profile at index *i* of the id-sorted catalogue uses `base + i` |
 | `TB_REALTIME_STATE_DB` | `data/realtime/state.db` | path of the SQLite state database (the container passes `/app/data/realtime/state.db` on the command line) |
 | `TB_ALLOW_LIVE_TRADING` | unset | must equal exactly `I_UNDERSTAND_THE_RISK` before any live profile may start |
@@ -326,7 +329,7 @@ is set.
 
 | Path (in the container) | Content |
 | --- | --- |
-| `/app/data/realtime/state.db` | the SQLite state database: `profiles`, `profile_snapshots`, `settings`, `events`, `PRAGMA user_version = 1` |
+| `/app/data/realtime/state.db` | the SQLite state database: `profiles`, `profile_snapshots`, `profile_trades`, `profile_daily`, `settings`, `events`, `PRAGMA user_version = 2` |
 | `/app/data/realtime/KILL_SWITCH` | kill-switch marker; while the file exists no worker starts |
 | `/app/data/realtime/logs/<id>.log` | the freqtrade log file of one profile |
 | `/app/data/realtime/profiles/<id>/config.json` | the generated freqtrade configuration of one profile, mode `0600` |
@@ -409,10 +412,12 @@ docker compose -f deploy/docker-compose.yml up -d --build --wait
 deployment this platform replaced left one behind) it is archived as
 `state.db.legacy-<UTC timestamp>` and a fresh database is created. The 22-profile
 catalogue is then seeded, the fleet scheduler promotes the highest-priority
-profiles up to the cap of 12 and spawns one `freqtrade trade` worker for each.
-`/api/health` answers as soon as the API is serving, and reports
-`profiles_running > 0` as soon as **one** worker is alive and healthy — which is
-what the smoke test waits for, with twelve retries five seconds apart.
+profiles up to the cap of 6 — **at most one new worker every
+`worker_start_stagger_seconds` (10 s by default)** — and spawns one
+`freqtrade trade` worker for each. `/api/health` answers as soon as the API is
+serving, and reports `profiles_running > 0` as soon as **one** worker is alive
+and healthy — which is what the smoke test waits for, with twelve retries five
+seconds apart.
 
 Operational detail, the nginx front (TLS, Basic auth, `limit_req`, fail2ban),
 the volumes and the rollback procedure are in `deploy/README.md`; the day-to-day
@@ -422,15 +427,27 @@ runbook is in `docs/operations.md`.
 
 ## 11. Operational limits
 
-* **12 concurrent workers by default.** One running `freqtrade trade` process
+* **6 concurrent workers by default.** One running `freqtrade trade` process
   costs about **390 MiB RSS** (measured: 8 instances = 3.13 GiB, linear), and the
-  Docker VM has **11.65 GiB**. 12 workers therefore sit at roughly 4.6 GiB and
-  leave room for the supervisor, the API, the dashboard and the build caches. The
-  rest of the catalogue is **queued**: those profiles are reported with the state
-  `queued` and a `state_reason` naming the cap, and the next one is promoted
-  automatically as soon as a slot frees. Raise the cap with
-  `TB_MAX_RUNNING_PROFILES` (or `max_running_profiles` in `config/platform.json`)
-  only if the host has the memory to back it.
+  Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily. 6 workers
+  therefore sit at roughly **2.3 GiB** and leave room for the supervisor, the API,
+  the dashboard and the build caches. The rest of the catalogue is **queued**:
+  those profiles are reported with the state `queued` and a `state_reason` naming
+  the cap, and the next one is promoted automatically as soon as a slot frees.
+  Raise the cap with `TB_MAX_RUNNING_PROFILES` (or `max_running_profiles` in
+  `config/platform.json`) only if the host has the memory to back it.
+* **Workers start gradually.** `worker_start_stagger_seconds` (default **10**, in
+  `config/platform.json` and overridable with `TB_WORKER_START_STAGGER_SECONDS`)
+  lets the supervisor start **at most one new worker per interval**: after a worker
+  starts, the gate closes for that interval and every other profile that is
+  eligible to run but has to wait stays in the state `queued` with the reason
+  `queued: starting workers gradually (N of M slots in use)` (N = workers alive,
+  M = `max_running_profiles`). A stagger of `0` restores the immediate behaviour.
+  Staggering only delays promotions, it never reorders them: the order stays
+  priority descending, then id ascending. It exists because a simultaneous cold
+  start of many workers spiked memory and CPU together and made the guest
+  unresponsive (reproduced twice), which is why `deploy/docker-compose.yml` pins
+  `TB_MAX_RUNNING_PROFILES=6` and `TB_WORKER_START_STAGGER_SECONDS=10`.
 * **One supervisor, one writer.** The state database has a single writer (the
   supervisor process); two supervisors over the same file are unsupported.
 * **One exchange account per mode.** Every profile of a mode trades the same

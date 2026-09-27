@@ -94,8 +94,28 @@ describe("EngineStateCard", () => {
     expect(screen.getByText("degraded")).toBeInTheDocument();
   });
 
+  it("reads the engine-slot KPI from the wire pair, not from the fleet size", () => {
+    render(
+      <EngineStateCard
+        health={health({ profiles_running: 3, engine_slots_used: 3, engine_slots_total: 8 })}
+        profiles={[profile({ id: "a", state: "running" })]}
+      />,
+    );
+
+    expect(screen.getByText("3 of 8")).toBeInTheDocument();
+    expect(screen.queryByText("3 of 3")).not.toBeInTheDocument();
+    expect(screen.queryByText("0 of 8")).not.toBeInTheDocument();
+  });
+
   it("renders an honest unknown card when the API answered nothing", () => {
     render(<EngineStateCard health={EMPTY_HEALTH} profiles={[]} />);
+
+    // The fallback keeps the wire names of the slot pair, and both counters stay
+    // unknown so the KPI renders em dashes instead of zeroes.
+    expect(Object.keys(EMPTY_HEALTH)).toContain("engine_slots_used");
+    expect(Object.keys(EMPTY_HEALTH)).toContain("engine_slots_total");
+    expect(Number.isNaN(EMPTY_HEALTH.engine_slots_used)).toBe(true);
+    expect(Number.isNaN(EMPTY_HEALTH.engine_slots_total)).toBe(true);
 
     expect(screen.getByText("unknown")).toBeInTheDocument();
     expect(screen.getAllByText("\u2014").length).toBeGreaterThanOrEqual(2);

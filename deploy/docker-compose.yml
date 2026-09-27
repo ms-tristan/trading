@@ -41,21 +41,26 @@ services:
       - .env
     environment:
       TB_LOG_LEVEL: INFO
-      # Fleet cap: how many Freqtrade workers may run at the same time.
+      # Fleet cap and stagger: how many Freqtrade workers may run at the same
+      # time, and how fast the fleet is allowed to grow to that cap.
       #
-      # A worker costs about 390 MiB RSS (measured: eight workers, 3.13 GiB,
-      # linear), so ten of them hold roughly 3.9 GiB inside the Docker VM, on
-      # top of the supervisor and the other stacks on this machine. The host has
-      # 16 GiB of RAM and the VM is limited to 12 GiB; pushing the fleet higher
-      # makes the host swap hard and the VM unresponsive, which is exactly the
-      # failure this cap exists to prevent.
+      # One running worker costs about 390 MiB RSS (measured: 8 workers at
+      # 3.13 GiB, linear). The Docker VM of this host is limited to 12 GiB while
+      # the host itself has 16 GiB of RAM and already swaps heavily (about
+      # 5.7 GiB of swap in use, and guest page cache counts as host RAM). A
+      # simultaneous cold start of ten workers spiked memory and CPU together,
+      # made the guest unresponsive and forced a VM restart -- twice.
       #
-      # Ten is also the number that keeps ONE profile of EVERY strategy running
-      # at the same time: the catalogue gives the primary profile of each
-      # strategy priority 100 and its secondary profile priority 50, and the
-      # scheduler starts the highest priorities first. Raise it here -- and only
+      # The fleet therefore boots gradually: six slots, and at most one new
+      # worker per TB_WORKER_START_STAGGER_SECONDS interval; a profile that is
+      # eligible but not admitted yet stays queued with the gradual-start
+      # reason. Six slots hold the six highest-priority profiles, and the
+      # catalogue gives every strategy's primary profile priority 100 and its
+      # secondary profile 50, so the primary profiles are promoted first
+      # (priority descending, then id ascending). Raise the cap here -- and only
       # after checking free memory -- to run more profiles concurrently.
-      TB_MAX_RUNNING_PROFILES: "10"
+      TB_MAX_RUNNING_PROFILES: "6"
+      TB_WORKER_START_STAGGER_SECONDS: "10"
       TB_SNAPSHOT_INTERVAL_SECONDS: "60"
 
     ports:

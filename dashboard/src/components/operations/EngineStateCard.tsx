@@ -18,8 +18,9 @@ export const EMPTY_HEALTH: HealthStatus = {
   status: "unknown",
   version: "",
   uptime_seconds: Number.NaN,
-  running_profiles: Number.NaN,
-  max_running_profiles: Number.NaN,
+  profiles_running: Number.NaN,
+  engine_slots_used: Number.NaN,
+  engine_slots_total: Number.NaN,
   live_trading_enabled: false,
   kill_switch_engaged: false,
   generated_at: "",
@@ -102,7 +103,7 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
         <KpiStat
           className="col-span-6 md:col-span-4 lg:col-span-3"
           label="Engine slots"
-          value={`${formatCount(health.running_profiles)} of ${formatCount(health.max_running_profiles)}`}
+          value={`${formatCount(health.engine_slots_used)} of ${formatCount(health.engine_slots_total)}`}
           hint="profiles holding a worker"
         />
         <KpiStat

@@ -119,7 +119,15 @@ describe("ModeSection", () => {
     // row 0: the profit % cell and the sparkline summary carry the same wording
     expect(within(rows[0]).getByText("+30.00%")).toBeInTheDocument();
     expect(within(rows[0]).getByText("\u25B2 +30.00%")).toBeInTheDocument();
-    expect(rows[0].querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+
+    // The chart is announced: a named image with the same title as its label.
+    const chart = rows[0].querySelector("svg");
+    expect(chart).not.toBeNull();
+    expect(chart).not.toHaveAttribute("aria-hidden", "true");
+    expect(chart).toHaveAttribute("role", "img");
+    expect(chart).toHaveAttribute("aria-label", "Bravo portfolio value");
+    expect(chart?.querySelector("title")).toHaveTextContent("Bravo portfolio value");
+    expect(within(rows[0]).getByRole("img", { name: "Bravo portfolio value" })).toBeInTheDocument();
 
     // row 2 has no series at all: wording only, never an empty chart
     expect(within(rows[2]).getByText("no data")).toBeInTheDocument();

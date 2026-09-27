@@ -47,8 +47,8 @@ export default async function OperationsPage() {
   const subtitle = [
     `engine ${health.data.status}`,
     version === null ? null : `version ${version}`,
-    `${formatCount(health.data.running_profiles)} of ${formatCount(
-      health.data.max_running_profiles,
+    `${formatCount(health.data.engine_slots_used)} of ${formatCount(
+      health.data.engine_slots_total,
     )} engine slots used`,
     `${profiles.data.profiles.length} ${
       profiles.data.profiles.length === 1 ? "profile" : "profiles"

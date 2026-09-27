@@ -51,9 +51,11 @@ export function buildSparklinePath(
 /**
  * Tiny inline chart of one series.
  *
- * The SVG is decorative (`aria-hidden`); the series is summarised by visible
- * text next to it (direction glyph + relative change), so nothing is available
- * to sighted users only.
+ * The SVG is announced: it carries `role="img"`, the accessible name the caller
+ * passed as `label` and a `<title>` child with the same wording, so a screen
+ * reader reports the series where the chart sits. The visible summary next to it
+ * spells the change out for everyone else, and a series of fewer than two finite
+ * points renders no chart at all: the wording is then exactly "no data".
  */
 export function Sparkline({
   values,
@@ -78,13 +80,15 @@ export function Sparkline({
     <span className={cn("inline-flex min-w-0 items-center gap-2", className)}>
       {hasSeries ? (
         <svg
-          aria-hidden="true"
+          role="img"
+          aria-label={label}
           focusable="false"
           width={width}
           height={height}
           viewBox={`0 0 ${width} ${height}`}
           className="shrink-0"
         >
+          <title>{label}</title>
           <path
             d={buildSparklinePath(usable, width, height)}
             fill="none"

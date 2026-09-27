@@ -17,6 +17,11 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn() }),
 }));
 
+/**
+ * One detail payload, as `GET /api/profiles/{id}` serves it: the state-database
+ * daily series, an open trade, a closed trade and the three worker fields of the
+ * profile (`sparkline`, `slot`, `worker_port`).
+ */
 const DETAIL = apiDetail({
   profile: {
     id: "alpha",
@@ -36,12 +41,18 @@ const DETAIL = apiDetail({
     rank: 2,
     cash: 40,
     positions_value: 1000,
+    engine_slot: 1,
+    api_port: 8081,
+    sparkline: [1000, 1040],
   },
   equity_curve: [
     { timestamp: "2026-09-26T12:00:00Z", portfolio_value: 1000, profit_usdt: 0, profit_pct: 0 },
     { timestamp: "2026-09-27T12:00:00Z", portfolio_value: 1040, profit_usdt: 40, profit_pct: 0.04 },
   ],
-  daily_profit: [{ date: "2026-09-26", profit_usdt: 15, trades: 2 }],
+  daily_profit: [
+    { date: "2026-09-25", profit_usdt: -5, trades: 1 },
+    { date: "2026-09-26", profit_usdt: 15, trades: 2 },
+  ],
   open_trades: [tradeRow({ trade_id: 12 })],
   recent_trades: [
     tradeRow({
@@ -127,15 +138,22 @@ describe("ProfileDetailPage", () => {
     expect(screen.getAllByText("Running").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByRole("button", { name: "Start" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Restart" })).toBeInTheDocument();
-    // The API publishes neither the engine slot index nor the worker REST port,
-    // so the identity header renders no slot line (the configuration card below
-    // still labels both rows, with an em dash for the values).
+    // The profile row publishes the engine slot of the worker and its private
+    // REST port: the identity header prints both.
     const header = screen.getByRole("heading", { level: 1, name: "Alpha BTC 5m" }).closest(
       "section",
     );
     expect(header).not.toBeNull();
-    expect(header).not.toHaveTextContent(/engine slot #/);
-    expect(header).not.toHaveTextContent(/freqtrade API port/);
+    expect(header).toHaveTextContent("engine slot #1");
+    expect(header).toHaveTextContent("freqtrade API port 8081");
+  });
+
+  it("renders the engine slot and the REST port of the profile only once", async () => {
+    await renderDetail();
+
+    // The header line and the "API port" row of the resolved configuration.
+    expect(screen.getAllByText(/8081/)).toHaveLength(2);
+    expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });
 
   it("ranks the profile through the ranked list and reads the engine uptime", async () => {
@@ -170,6 +188,48 @@ describe("ProfileDetailPage", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("#41")).toBeInTheDocument();
     expect(screen.getByText("roi")).toBeInTheDocument();
+  });
+
+  it("lists every day of the daily series, profit and trade count included", async () => {
+    await renderDetail();
+
+    // The days used to be published under `profit_abs`/`trades`; the state
+    // database serves `abs_profit`/`trade_count`, and the table lists both days.
+    const card = screen.getByRole("heading", { level: 2, name: "Daily profit" }).closest(
+      "section",
+    );
+    expect(card).not.toBeNull();
+    const rows = within(within(card as HTMLElement).getByRole("table")).getAllByRole("row");
+
+    expect(rows).toHaveLength(3); // header + two days
+    expect(rows[1]).toHaveTextContent("2026-09-25");
+    expect(rows[2]).toHaveTextContent("2026-09-26");
+    // The two numeric cells of every day: profit and trade count.
+    const losingDay = within(rows[1]).getAllByRole("cell");
+    expect(losingDay[0]).toHaveTextContent("-5.00 USDT");
+    expect(losingDay[1]).toHaveTextContent("1");
+    const winningDay = within(rows[2]).getAllByRole("cell");
+    expect(winningDay[0]).toHaveTextContent("+15.00 USDT");
+    expect(winningDay[1]).toHaveTextContent("2");
+  });
+
+  it("says exactly what is missing when both trade lists are empty", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const path = String(input).split("?")[0];
+      if (path === "/api/health") {
+        return jsonResponse(apiHealth());
+      }
+      if (path === "/api/profiles/alpha") {
+        return jsonResponse(apiDetail({ profile: { id: "alpha", name: "Alpha" } }));
+      }
+      return jsonResponse({ generated_at: "", profiles: [] });
+    });
+
+    await renderDetail();
+
+    expect(screen.getByText("No open position")).toBeInTheDocument();
+    expect(screen.getByText("No closed trade yet")).toBeInTheDocument();
+    expect(screen.queryByText("This profile holds no open trade.")).not.toBeInTheDocument();
   });
 
   it("renders the resolved configuration and the embedded strategy", async () => {
@@ -230,7 +290,8 @@ describe("ProfileDetailPage", () => {
     expect(screen.getByText("This profile does not exist")).toBeInTheDocument();
     expect(screen.getByText(/HTTP 404/)).toBeInTheDocument();
     expect(screen.getByRole("heading", { level: 1, name: "ghost" })).toBeInTheDocument();
-    expect(screen.getByText("This profile holds no open trade.")).toBeInTheDocument();
+    expect(screen.getByText("No open position")).toBeInTheDocument();
+    expect(screen.getByText("No closed trade yet")).toBeInTheDocument();
     expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });
 
@@ -250,7 +311,8 @@ describe("ProfileDetailPage", () => {
     await renderDetail();
 
     expect(screen.getByRole("heading", { level: 1, name: "alpha" })).toBeInTheDocument();
-    expect(screen.getByText("This profile holds no open trade.")).toBeInTheDocument();
+    expect(screen.getByText("No open position")).toBeInTheDocument();
+    expect(screen.getByText("No closed trade yet")).toBeInTheDocument();
     expect(screen.queryByText("NaN")).not.toBeInTheDocument();
     expect(screen.queryByText("The profile could not be refreshed")).not.toBeInTheDocument();
   });

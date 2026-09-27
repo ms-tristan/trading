@@ -102,7 +102,7 @@ describe("OpenTradesCard", () => {
   it("says so when the profile holds no open trade", () => {
     render(<OpenTradesCard trades={[]} />);
 
-    expect(screen.getByText("This profile holds no open trade.")).toBeInTheDocument();
+    expect(screen.getByText("No open position")).toBeInTheDocument();
     expect(screen.getByText("0 open positions")).toBeInTheDocument();
   });
 });
@@ -128,11 +128,22 @@ describe("ClosedTradesCard", () => {
     expect(rows[2]).toHaveTextContent("-0.50%");
   });
 
-  it("says so when the window holds no closed trade", () => {
+  it("says so when the profile has closed no trade yet", () => {
     render(<ClosedTradesCard trades={[]} />);
 
-    expect(screen.getByText("No closed trade in the selected window.")).toBeInTheDocument();
+    expect(screen.getByText("No closed trade yet")).toBeInTheDocument();
     expect(screen.getByText("0 closed trades in the window")).toBeInTheDocument();
+  });
+
+  it("falls back to the open rate for the current rate of a stalled row", () => {
+    const rows = readTradeList(
+      [tradeRow({ trade_id: 9, current_rate: undefined, open_rate: 60000 })],
+      true,
+    );
+    render(<OpenTradesCard trades={rows} />);
+
+    const table = screen.getAllByRole("table")[0];
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("60,000");
   });
 
   it("renders unknown numbers as an em dash", () => {

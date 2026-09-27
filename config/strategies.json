@@ -8,7 +8,7 @@
       "title": "EMA cross baseline",
       "summary": "Minimal EMA crossover used as the platform baseline.",
       "description": "A deliberately small trend strategy: it enters when the fast EMA crosses above the slow EMA and exits on the opposite cross. It carries no filters, no stop-loss tuning and no pair specific parameters, which makes it the reference every other strategy is measured against. Because it reacts to every cross, it is expected to lose money in ranging markets.",
-      "indicators": ["EMA(12)", "EMA(26)"],
+      "indicators": ["EMA(20)", "EMA(50)", "RSI(14)"],
       "timeframes": ["1h", "4h"],
       "reference": "Freqtrade strategy customization guide - https://www.freqtrade.io/en/stable/strategy-customization/",
       "risk_notes": "Whipsaws in ranging markets; the only exit is the opposite cross, so drawdowns can run."
@@ -21,7 +21,7 @@
       "title": "Momentum breakout",
       "summary": "Buys strength while price momentum stays positive and above its trend filter.",
       "description": "The strategy measures the rate of change of the close over a short lookback and only trades in the direction of that momentum. A longer EMA acts as a regime filter so that long entries are taken in uptrends and short entries in downtrends. Momentum decays quickly in crypto, so positions are closed as soon as the reading flips sign.",
-      "indicators": ["Momentum(10)", "EMA(50)"],
+      "indicators": ["ROC(12)", "EMA(50)", "EMA(200)", "ADX(14)"],
       "timeframes": ["15m", "1h", "4h"],
       "reference": "Momentum investing - https://www.investopedia.com/terms/m/momentum.asp",
       "risk_notes": "Momentum crashes: it enters late in an extended move and gives back gains on a sharp reversal."

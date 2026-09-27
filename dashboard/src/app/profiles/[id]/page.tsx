@@ -50,6 +50,10 @@ export interface ProfileDetailPageProps {
  * endpoint: the rank is the position of the profile in the ranked list of
  * `GET /api/profiles`, and the uptime is the process uptime of `GET /api/health`
  * (a per-profile `uptime_seconds` wins when the payload carries one).
+ *
+ * The engine slot and the freqtrade REST port the header prints are part of the
+ * profile row (`slot`, `worker_port` on the wire): they are read from the mapped
+ * `ProfileView`, so a profile that holds no worker simply omits the line.
  */
 export default async function ProfileDetailPage({
   params,

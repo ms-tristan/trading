@@ -19,7 +19,12 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn() }),
 }));
 
-const HEALTH = apiHealth({ kill_switch_engaged: false, running_profiles: 2, max_running_profiles: 4 });
+const HEALTH = apiHealth({
+  kill_switch_engaged: false,
+  profiles_running: 2,
+  engine_slots_used: 2,
+  engine_slots_total: 4,
+});
 
 const PROFILES = apiProfiles([
   apiProfile({
@@ -28,6 +33,10 @@ const PROFILES = apiProfiles([
     state: "running",
     portfolio_value: 1040,
     strategy_title: "EMA cross baseline",
+    // The engine publishes the slot of a running profile and the REST port of its
+    // worker: the two columns of the slot table read exactly those.
+    engine_slot: 1,
+    api_port: 8081,
   }),
   apiProfile({
     id: "bravo",
@@ -142,10 +151,16 @@ describe("OperationsPage", () => {
     expect(slots).not.toBeNull();
     const slotRows = within(within(slots as HTMLElement).getByRole("table")).getAllByRole("row");
     expect(slotRows).toHaveLength(4); // header + two running + one queued
-    // The API publishes no engine slot index and no worker REST port: the two
-    // columns render the em dash rather than a number the engine never sent.
-    expect(slotRows[1]).toHaveTextContent("\u2014");
+    // The engine publishes the slot index and the worker REST port of a running
+    // profile: the two columns print them instead of an em dash.
+    expect(slotRows[1]).toHaveTextContent("#1");
+    expect(slotRows[1]).toHaveTextContent("8081");
     expect(slotRows[1]).toHaveTextContent("Alpha");
+    // A running profile the engine has given no slot and no port keeps the em
+    // dash, and a waiting profile keeps the "queued" label.
+    expect(slotRows[2]).toHaveTextContent("\u2014");
+    expect(slotRows[2]).toHaveTextContent("Bravo");
+    expect(slotRows[3]).toHaveTextContent("queued");
     expect(slotRows[3]).toHaveTextContent("waiting for an engine slot");
 
     const journal = screen.getByRole("heading", { level: 2, name: "Recent events" }).closest("section");

@@ -7,6 +7,7 @@ import {
   EMPTY_EVENTS,
   EMPTY_PROFILES,
   EMPTY_STRATEGIES,
+  type HealthStatus,
 } from "./types";
 
 /**
@@ -37,5 +38,41 @@ describe("fallback payloads", () => {
   it("exposes empty strategies and events", () => {
     expect(EMPTY_STRATEGIES.strategies).toEqual([]);
     expect(EMPTY_EVENTS.events).toEqual([]);
+  });
+});
+
+/**
+ * The view model of `GET /api/health` mirrors the wire names: the slot pair is
+ * `engine_slots_used`/`engine_slots_total` and the fleet size is
+ * `profiles_running`. The literal below is typed, so a rename on the wire side
+ * breaks this test at compile time instead of blanking a KPI.
+ */
+describe("HealthStatus", () => {
+  const health: HealthStatus = {
+    status: "ok",
+    version: "2026.8",
+    uptime_seconds: 60,
+    profiles_running: 2,
+    engine_slots_used: 2,
+    engine_slots_total: 4,
+    live_trading_enabled: false,
+    kill_switch_engaged: false,
+    generated_at: "2026-09-27T12:00:00Z",
+  };
+
+  it("carries the three counters the wire publishes", () => {
+    expect(Object.keys(health)).toEqual([
+      "status",
+      "version",
+      "uptime_seconds",
+      "profiles_running",
+      "engine_slots_used",
+      "engine_slots_total",
+      "live_trading_enabled",
+      "kill_switch_engaged",
+      "generated_at",
+    ]);
+    expect(health.profiles_running).toBe(2);
+    expect(health.engine_slots_total).toBe(4);
   });
 });

@@ -31,10 +31,16 @@ describe("buildSparklinePath", () => {
 });
 
 describe("Sparkline", () => {
-  it("hides the SVG from assistive technology and summarises it in visible text", () => {
+  it("announces the series with a title, an aria-label and visible text", () => {
     const { container } = render(<Sparkline values={[100, 110]} label="Combined equity" />);
+    const svg = container.querySelector("svg");
 
-    expect(container.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    expect(svg).not.toBeNull();
+    expect(svg).not.toHaveAttribute("aria-hidden", "true");
+    expect(svg).toHaveAttribute("role", "img");
+    expect(svg).toHaveAttribute("aria-label", "Combined equity");
+    expect(container.querySelector("svg > title")).toHaveTextContent("Combined equity");
+    expect(screen.getByRole("img", { name: "Combined equity" })).toBeInTheDocument();
     expect(screen.getByText(/\+10\.00%/)).toBeInTheDocument();
     expect(screen.getByText(/Combined equity:/)).toBeInTheDocument();
   });
@@ -43,7 +49,25 @@ describe("Sparkline", () => {
     const { container } = render(<Sparkline values={[100]} label="Combined equity" />);
 
     expect(container.querySelector("svg")).toBeNull();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(screen.getByText("no data")).toBeInTheDocument();
+  });
+
+  it("says no data only below two finite points", () => {
+    const empty = render(<Sparkline values={[]} label="Combined equity" />);
+    expect(screen.getByText("no data")).toBeInTheDocument();
+    empty.unmount();
+
+    const malformed = render(
+      <Sparkline values={[Number.NaN, 100]} label="Combined equity" />,
+    );
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByText("no data")).toBeInTheDocument();
+    malformed.unmount();
+
+    render(<Sparkline values={[100, 100]} label="Combined equity" />);
+    expect(screen.queryByText("no data")).not.toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Combined equity" })).toBeInTheDocument();
   });
 
   it("shows a fall instead of a rise for a declining series", () => {

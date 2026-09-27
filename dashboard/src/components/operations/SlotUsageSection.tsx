@@ -14,7 +14,10 @@ import type { ProfileView } from "@/lib/types";
 /** One row of the slot ranking. */
 export interface SlotUsageRow {
   profile: ProfileView;
-  /** Engine slot the profile holds, `null` when it only waits for one. */
+  /**
+   * View model of the wire `slot`: the engine slot the profile holds, `null` when
+   * it only waits for one.
+   */
   slot: number | null;
 }
 
@@ -25,6 +28,11 @@ export interface SlotUsageRow {
  * only wait for a worker follow in the order the API ranked them, each with the
  * reason the engine published. A running profile the API has not given a slot
  * number yet stays in the running group, at the end of it.
+ *
+ * The slot and the port the table renders come from the mapped profile: the
+ * engine slot from the wire `slot`, the port from the wire `worker_port`, so a
+ * running profile renders `#N` next to its port and the em dash only marks a
+ * profile that holds no port.
  */
 export function slotUsageRows(profiles: ProfileView[]): SlotUsageRow[] {
   const running = profiles.filter((profile) => profile.state === "running");

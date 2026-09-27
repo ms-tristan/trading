@@ -14,6 +14,7 @@ def test_environment_variable_names() -> None:
     assert config.ENV_MAX_RUNNING_PROFILES == "TB_MAX_RUNNING_PROFILES"
     assert config.ENV_SNAPSHOT_INTERVAL_SECONDS == "TB_SNAPSHOT_INTERVAL_SECONDS"
     assert config.ENV_PROFILE_API_PORT_BASE == "TB_PROFILE_API_PORT_BASE"
+    assert config.ENV_WORKER_START_STAGGER_SECONDS == "TB_WORKER_START_STAGGER_SECONDS"
     assert config.ENV_OPERATOR_TOKEN == "TB_OPERATOR_TOKEN"
     assert config.ENV_ALLOW_LIVE_TRADING == "TB_ALLOW_LIVE_TRADING"
     assert config.ENV_LIVE_EXCHANGE_KEY == "TB_LIVE_EXCHANGE_KEY"
@@ -26,8 +27,9 @@ def test_environment_variable_names() -> None:
 
 def test_default_settings_are_the_documented_ones() -> None:
     settings = config.PlatformSettings()
-    assert settings.max_running_profiles == 12
+    assert settings.max_running_profiles == 6
     assert settings.snapshot_interval_seconds == 60
+    assert settings.worker_start_stagger_seconds == 10
     assert settings.profile_api_port_base == 8101
     assert settings.default_exchange == "binance"
     assert settings.default_timeframe == "1h"
@@ -38,7 +40,7 @@ def test_default_settings_are_the_documented_ones() -> None:
     assert settings.equity_retention_days == 90
 
 
-def test_platform_document_carries_exactly_the_ten_settings(repo_root: Path) -> None:
+def test_platform_document_carries_exactly_the_eleven_settings(repo_root: Path) -> None:
     document = json.loads((repo_root / "config" / "platform.json").read_text(encoding="utf-8"))
     assert set(document) == set(config.PlatformSettings.model_fields)
     assert config.PlatformSettings.load(env={}).model_dump() == document
@@ -101,7 +103,7 @@ def test_load_resolves_the_document_from_the_environment(monkeypatch, tmp_path: 
     )
     monkeypatch.setenv("TB_CONFIG_DIR", str(config_dir))
     assert config.PlatformSettings.load().max_running_profiles == 7
-    assert config.PlatformSettings.load(env={}).max_running_profiles == 12
+    assert config.PlatformSettings.load(env={}).max_running_profiles == 6
 
 
 def test_load_applies_the_documented_environment_overrides() -> None:
@@ -109,11 +111,28 @@ def test_load_applies_the_documented_environment_overrides() -> None:
         config.ENV_MAX_RUNNING_PROFILES: "3",
         config.ENV_SNAPSHOT_INTERVAL_SECONDS: "5",
         config.ENV_PROFILE_API_PORT_BASE: "9000",
+        config.ENV_WORKER_START_STAGGER_SECONDS: "25",
     }
     settings = config.PlatformSettings.load(env=env)
     assert settings.max_running_profiles == 3
     assert settings.snapshot_interval_seconds == 5
     assert settings.profile_api_port_base == 9000
+    assert settings.worker_start_stagger_seconds == 25
+
+
+def test_load_honours_a_zero_worker_stagger() -> None:
+    """``0`` is a documented value: it keeps the immediate boot, not an error."""
+    settings = config.PlatformSettings.load(env={config.ENV_WORKER_START_STAGGER_SECONDS: "0"})
+    assert settings.worker_start_stagger_seconds == 0
+
+
+@pytest.mark.parametrize("raw", ["many", "-1"])
+def test_load_ignores_an_unusable_worker_stagger(raw: str, tmp_path: Path) -> None:
+    """A non-integer or negative stagger is ignored: the document value wins."""
+    path = tmp_path / "platform.json"
+    path.write_text(json.dumps({"worker_start_stagger_seconds": 30}), encoding="utf-8")
+    env = {config.ENV_WORKER_START_STAGGER_SECONDS: raw}
+    assert config.PlatformSettings.load(path, env=env).worker_start_stagger_seconds == 30
 
 
 def test_load_ignores_unusable_environment_values() -> None:
@@ -131,6 +150,7 @@ def test_load_ignores_blank_environment_values() -> None:
         config.ENV_MAX_RUNNING_PROFILES: "  ",
         config.ENV_SNAPSHOT_INTERVAL_SECONDS: "",
         config.ENV_PROFILE_API_PORT_BASE: " ",
+        config.ENV_WORKER_START_STAGGER_SECONDS: " ",
     }
     assert config.PlatformSettings.load(env=env) == config.PlatformSettings()
 
@@ -159,7 +179,16 @@ def test_with_overrides_returns_a_new_validated_settings_object() -> None:
     assert updated is not base
     assert updated.max_running_profiles == 2
     assert updated.snapshot_interval_seconds == 10
-    assert base.max_running_profiles == 12
+    assert base.max_running_profiles == 6
+
+
+def test_with_overrides_round_trips_a_zero_worker_stagger() -> None:
+    base = config.PlatformSettings()
+    immediate = base.with_overrides(worker_start_stagger_seconds=0)
+    assert immediate is not base
+    assert immediate.worker_start_stagger_seconds == 0
+    assert base.worker_start_stagger_seconds == 10
+    assert immediate.with_overrides().worker_start_stagger_seconds == 0
 
 
 def test_with_overrides_ignores_unknown_keys() -> None:

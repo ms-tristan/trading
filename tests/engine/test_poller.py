@@ -5,14 +5,16 @@ The poller is driven through its real supervisor, whose REST client is the real
 :class:`httpx.MockTransport`: the payloads are the documented Freqtrade ones, no
 socket is opened, and no ``freqtrade`` process is ever started (the launcher is a
 recording double). The state store is a real SQLite file under ``tmp_path``,
-because what the poller writes there -- one row per profile and minute, and
-nothing else -- is exactly what these tests pin down.
+because what the poller writes there -- one row per profile and minute, plus the
+monitoring read model of the trades and the days of every running worker -- is
+exactly what these tests pin down.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
@@ -69,6 +71,77 @@ PROFIT = {
 }
 
 COUNT = {"current": 3, "max": 2, "total_stake": 500.0}
+
+#: ``GET /trades``: a closed trade and the open trade the worker just reported as
+#: closed as well (Freqtrade answers both lists newest first).
+CLOSED_TRADES: list[dict[str, Any]] = [
+    {
+        "trade_id": 11,
+        "pair": "BTC/USDT",
+        "is_open": False,
+        "open_date": "2026-09-26T08:00:00Z",
+        "close_date": "2026-09-26T09:30:00Z",
+        "amount": 0.5,
+        "open_rate": 100.0,
+        "close_rate": 110.0,
+        "stake_amount": 50.0,
+        "profit_abs": 5.0,
+        "profit_ratio": 0.1,
+        "exit_reason": "roi",
+    },
+    {
+        "trade_id": 12,
+        "pair": "ETH/USDT",
+        "is_open": False,
+        "open_date": "2026-09-27T10:00:00Z",
+        "close_date": "2026-09-27T11:00:00Z",
+        "amount": 1.0,
+        "open_rate": 50.0,
+        "close_rate": 55.0,
+        "stake_amount": 50.0,
+        "profit_abs": 5.0,
+        "profit_ratio": 0.1,
+        "exit_reason": "roi",
+    },
+]
+
+#: ``GET /status``: the position that is still open (trade 12 is *not* in it; it
+#: appears there only in the "flipped in place" test).
+OPEN_TRADES: list[dict[str, Any]] = [
+    {
+        "trade_id": 13,
+        "pair": "SOL/USDT",
+        "is_open": True,
+        "open_date": "2026-09-27T11:30:00Z",
+        "amount": 2.0,
+        "open_rate": 25.0,
+        "stake_amount": 50.0,
+        "profit_abs": 1.5,
+        "profit_ratio": 0.03,
+    }
+]
+
+#: ``GET /daily`` rows; the second one carries no ``rel_profit`` on purpose, so
+#: the derived ratio is exercised as well.
+DAILY_ROWS: list[dict[str, Any]] = [
+    {
+        "date": "2026-09-26",
+        "abs_profit": 4.0,
+        "rel_profit": 0.004,
+        "starting_balance": 1000.0,
+        "fiat_value": 4.0,
+        "trade_count": 1,
+    },
+    {
+        "date": "2026-09-27",
+        "abs_profit": 3.0,
+        "starting_balance": 1000.0,
+        "fiat_value": 3.0,
+        "trade_count": 2,
+    },
+]
+
+DAILY_ENVELOPE = {"data": DAILY_ROWS, "stake_currency": "USDT"}
 
 #: ``profit_pct`` of one successful read, computed against the initial capital.
 EXPECTED_PROFIT_PCT = (630.0 - INITIAL_CAPITAL) / INITIAL_CAPITAL
@@ -153,14 +226,26 @@ class RecordingLauncher:
 
 
 class ApiStub:
-    """The Freqtrade REST payloads of one profile, served without a socket."""
+    """The Freqtrade REST payloads of one profile, served without a socket.
+
+    Every endpoint the supervisor reads is answered in its real shape: the
+    metric endpoints (``/balance``, ``/profit``, ``/count``, ``/status``) in the
+    order ``fetch_all`` reads them, then the history endpoints ``/daily`` and
+    ``/trades``. ``trades``, ``open_trades`` and ``daily`` are attributes, so a
+    test can move a trade from ``/status`` to ``/trades`` (what Freqtrade does
+    when a position closes) or change a day between two ticks.
+    """
 
     def __init__(self) -> None:
         self.failures = 0
+        self.daily_failures = 0
         self.requests: list[str] = []
+        self.trades: list[dict[str, Any]] = [dict(row) for row in CLOSED_TRADES]
+        self.open_trades: list[dict[str, Any]] = [dict(row) for row in OPEN_TRADES]
+        self.daily: list[dict[str, Any]] = [dict(row) for row in DAILY_ROWS]
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        """Answer the four endpoints ``fetch_all`` reads."""
+        """Answer every endpoint of one poll cycle, or fail as told to."""
         path = request.url.path
         self.requests.append(path)
         if self.failures > 0:
@@ -173,7 +258,22 @@ class ApiStub:
         if path.endswith("/count"):
             return httpx.Response(200, json=COUNT)
         if path.endswith("/status"):
-            return httpx.Response(200, json=[])
+            return httpx.Response(200, json=self.open_trades)
+        if path.endswith("/daily"):
+            if self.daily_failures > 0:
+                self.daily_failures -= 1
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json={"data": self.daily, "stake_currency": "USDT"})
+        if path.endswith("/trades"):
+            return httpx.Response(
+                200,
+                json={
+                    "trades": self.trades,
+                    "trades_count": len(self.trades),
+                    "offset": 0,
+                    "total_trades": len(self.trades),
+                },
+            )
         return httpx.Response(404, json={"error": "not found"})
 
 
@@ -206,6 +306,25 @@ class Harness:
     def snapshots(self, profile_id: str) -> list[Any]:
         """Return the stored snapshots of a profile, oldest first."""
         return self.store.list_snapshots(profile_id)
+
+    def trades(self, profile_id: str) -> list[Any]:
+        """Return the stored trades of a profile, newest ``open_date`` first."""
+        return self.store.trade_records(profile_id)
+
+    def daily(self, profile_id: str) -> list[Any]:
+        """Return the stored days of a profile, newest first."""
+        return self.store.daily_records(profile_id)
+
+    def raw_trade_rows(self, profile_id: str) -> list[tuple[Any, ...]]:
+        """Return the raw ``(trade_id, is_open)`` columns, ordered by trade id."""
+        with sqlite3.connect(self.store.path) as connection:
+            return list(
+                connection.execute(
+                    "SELECT trade_id, is_open FROM profile_trades"
+                    " WHERE profile_id = ? ORDER BY trade_id",
+                    (profile_id,),
+                )
+            )
 
 
 def profile_config(profile_id: str, **overrides: Any) -> ProfileConfig:
@@ -329,16 +448,20 @@ async def test_tick_writes_one_snapshot_per_running_profile(tmp_path: Path) -> N
     assert harness.poller.snapshots_written == 1
 
 
-async def test_tick_reads_the_four_documented_endpoints(tmp_path: Path) -> None:
+async def test_tick_reads_the_documented_endpoints(tmp_path: Path) -> None:
     harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
     await harness.supervisor.start()
 
     await harness.poller.tick()
 
+    # One poll cycle: the metrics first, then the history of the worker.
     assert harness.stub.requests == [
         "/api/v1/balance",
         "/api/v1/profit",
         "/api/v1/count",
+        "/api/v1/status",
+        "/api/v1/daily",
+        "/api/v1/trades",
         "/api/v1/status",
     ]
 
@@ -366,7 +489,13 @@ async def test_the_minute_is_idempotent(tmp_path: Path) -> None:
 
 async def test_two_running_profiles_get_one_snapshot_each(tmp_path: Path) -> None:
     profiles = [profile_config("alpha"), profile_config("beta")]
-    harness = make_harness(tmp_path, profiles=profiles)
+    # The stagger gate starts one worker per pass; this test is about the two
+    # workers of one tick, so the gate is opened.
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(worker_start_stagger_seconds=0),
+    )
     await harness.supervisor.start()
 
     await harness.poller.tick()
@@ -374,6 +503,172 @@ async def test_two_running_profiles_get_one_snapshot_each(tmp_path: Path) -> Non
     assert len(harness.snapshots("alpha")) == 1
     assert len(harness.snapshots("beta")) == 1
     assert harness.poller.snapshots_written == 2
+
+
+# ---------------------------------------------------------------------------
+# The monitoring read model: the trades and the days of a running worker
+# ---------------------------------------------------------------------------
+async def test_tick_persists_the_trades_and_the_days_of_a_running_worker(
+    tmp_path: Path,
+) -> None:
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    await harness.supervisor.start()
+
+    await harness.poller.tick()
+
+    trades = harness.trades("alpha")
+    assert [trade.trade_id for trade in trades] == [13, 12, 11]
+    open_trade = trades[0]
+    assert open_trade.profile_id == "alpha"
+    assert open_trade.pair == "SOL/USDT"
+    assert open_trade.is_open is True
+    assert open_trade.open_date == "2026-09-27T11:30:00Z"
+    assert open_trade.close_date is None
+    assert open_trade.amount == 2.0
+    assert open_trade.open_rate == 25.0
+    assert open_trade.close_rate == 0.0
+    assert open_trade.stake_amount == 50.0
+    assert open_trade.profit_abs == 1.5
+    # The API reports profit_ratio as a fraction; the store keeps the percentage.
+    assert open_trade.profit_pct == pytest.approx(3.0)
+    assert open_trade.exit_reason is None
+    # ``updated_at`` is empty in the payload and stamped by the store.
+    assert open_trade.updated_at
+
+    closed = trades[1]
+    assert closed.trade_id == 12
+    assert closed.is_open is False
+    assert closed.close_date == "2026-09-27T11:00:00Z"
+    assert closed.close_rate == 55.0
+    assert closed.exit_reason == "roi"
+    assert closed.profit_pct == pytest.approx(10.0)
+
+    days = harness.daily("alpha")
+    assert [day.date for day in days] == ["2026-09-27", "2026-09-26"]
+    assert days[0].abs_profit == 3.0
+    # The API omitted rel_profit: it is derived from the starting balance.
+    assert days[0].rel_profit == pytest.approx(0.003)
+    assert days[0].starting_balance == 1000.0
+    assert days[0].trade_count == 2
+    assert days[1].rel_profit == pytest.approx(0.004)
+
+    assert harness.poller.trade_rows_written == 3
+    assert harness.poller.daily_rows_written == 2
+
+
+async def test_a_trade_that_closes_is_flipped_in_place(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    await harness.supervisor.start()
+    await harness.poller.tick()
+    assert harness.raw_trade_rows("alpha") == [(11, 0), (12, 0), (13, 1)]
+
+    # Freqtrade answers the trade in /trades once it closed and drops it from
+    # /status, which is exactly how a position moves from one list to the other.
+    harness.stub.trades = [
+        {
+            **OPEN_TRADES[0],
+            "is_open": False,
+            "close_date": "2026-09-27T12:30:00Z",
+            "close_rate": 26.0,
+            "profit_ratio": 0.04,
+            "exit_reason": "roi",
+        },
+        *harness.stub.trades,
+    ]
+    harness.stub.open_trades = []
+    harness.clock.advance(60)
+    await harness.poller.tick()
+
+    # One row per trade id, and the open row became closed in place.
+    assert harness.raw_trade_rows("alpha") == [(11, 0), (12, 0), (13, 0)]
+    flipped = next(trade for trade in harness.trades("alpha") if trade.trade_id == 13)
+    assert flipped.is_open is False
+    assert flipped.close_date == "2026-09-27T12:30:00Z"
+    assert flipped.close_rate == 26.0
+    assert flipped.exit_reason == "roi"
+    assert flipped.profit_pct == pytest.approx(4.0)
+    assert harness.poller.trade_rows_written == 6
+
+
+async def test_the_daily_rows_are_upserted_on_the_date(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    await harness.supervisor.start()
+    await harness.poller.tick()
+    assert [day.date for day in harness.daily("alpha")] == ["2026-09-27", "2026-09-26"]
+
+    # The day is still unfolding: the same date comes back with new numbers.
+    harness.stub.daily = [
+        DAILY_ROWS[0],
+        {**DAILY_ROWS[1], "abs_profit": 9.5, "rel_profit": 0.0095, "trade_count": 4},
+    ]
+    harness.clock.advance(60)
+    await harness.poller.tick()
+
+    days = {day.date: day for day in harness.daily("alpha")}
+    assert sorted(days) == ["2026-09-26", "2026-09-27"]
+    assert days["2026-09-27"].abs_profit == 9.5
+    assert days["2026-09-27"].rel_profit == pytest.approx(0.0095)
+    assert days["2026-09-27"].trade_count == 4
+    assert days["2026-09-26"].abs_profit == 4.0
+    assert harness.poller.daily_rows_written == 4
+
+
+async def test_a_stopped_profile_keeps_its_persisted_rows(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    await harness.supervisor.start()
+    await harness.poller.tick()
+    assert len(harness.trades("alpha")) == 3
+
+    harness.supervisor.stop_profile("alpha")
+    # Even an empty answer from a worker nobody reads must not clear the rows.
+    harness.stub.trades = []
+    harness.stub.open_trades = []
+    harness.stub.daily = []
+    harness.clock.advance(60)
+    await harness.poller.tick()
+
+    assert not harness.supervisor.is_running("alpha")
+    assert [trade.trade_id for trade in harness.trades("alpha")] == [13, 12, 11]
+    assert [day.date for day in harness.daily("alpha")] == ["2026-09-27", "2026-09-26"]
+    # A profile that is not running is skipped entirely: no read, no delete.
+    assert harness.stub.requests.count("/api/v1/daily") == 1
+    assert harness.poller.trade_rows_written == 3
+    assert harness.poller.daily_rows_written == 2
+
+
+async def test_a_failing_daily_read_writes_no_row_and_leaves_the_worker_healthy(
+    tmp_path: Path,
+) -> None:
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    await supervisor.start()
+    harness.stub.daily_failures = 1
+
+    await harness.poller.tick()
+
+    assert harness.trades("alpha") == []
+    assert harness.daily("alpha") == []
+    assert harness.poller.trade_rows_written == 0
+    assert harness.poller.daily_rows_written == 0
+    # A history hiccup is not a read failure: the metrics were read, so the
+    # snapshot is written, and the worker is neither restarted nor counted.
+    assert len(harness.snapshots("alpha")) == 1
+    assert supervisor.is_running("alpha")
+    assert supervisor.healthy_count() == 1
+    assert supervisor.status()["profiles_healthy"] == 1
+    assert supervisor._health_for("alpha").failures == 0
+    assert len(harness.launcher.commands) == 1
+
+
+async def test_a_tick_with_an_empty_fleet_writes_nothing(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path)
+
+    await harness.poller.tick()
+
+    assert harness.stub.requests == []
+    assert harness.poller.snapshots_written == 0
+    assert harness.poller.trade_rows_written == 0
+    assert harness.poller.daily_rows_written == 0
 
 
 # ---------------------------------------------------------------------------

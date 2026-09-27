@@ -1,5 +1,7 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
+
+import { toProfileDetail } from "@/lib/api-wire";
 
 import { PROFILE_WINDOWS, ProfileEquitySection, normaliseProfileWindow } from "./ProfileEquitySection";
 import { dailyBar, equityPoint } from "./fixtures";
@@ -87,5 +89,51 @@ describe("ProfileEquitySection", () => {
 
     expect(screen.getByText("No daily profit published yet.")).toBeInTheDocument();
     expect(screen.getByText("Not enough data to draw the equity curve.")).toBeInTheDocument();
+  });
+
+  it("lists the days of a wire payload: `abs_profit` and `trade_count` reach the table", () => {
+    // The state database serves `abs_profit`/`trade_count`; the section renders
+    // the mapped bars, so the table is pinned on the real field names.
+    const payload = toProfileDetail(
+      {
+        profile: { id: "alpha", name: "Alpha", initial_capital: 1000 },
+        daily: [
+          {
+            date: "2026-09-25",
+            abs_profit: -5,
+            rel_profit: -0.005,
+            starting_balance: 1000,
+            trade_count: 1,
+          },
+          {
+            date: "2026-09-26",
+            abs_profit: 15,
+            rel_profit: 0.015,
+            starting_balance: 1000,
+            trade_count: 2,
+          },
+        ],
+      },
+      "24h",
+    );
+
+    render(
+      <ProfileEquitySection
+        profileId="alpha"
+        window="24h"
+        equity={payload.equity_curve}
+        daily={payload.daily_profit}
+      />,
+    );
+
+    const card = screen.getByRole("heading", { level: 2, name: "Daily profit" }).closest("section");
+    expect(card).not.toBeNull();
+    const rows = within(within(card as HTMLElement).getByRole("table")).getAllByRole("row");
+
+    expect(rows).toHaveLength(3);
+    expect(rows[1]).toHaveTextContent("2026-09-25");
+    expect(rows[2]).toHaveTextContent("2026-09-26");
+    expect(within(rows[1]).getAllByRole("cell")[0]).toHaveTextContent("-5.00 USDT");
+    expect(within(rows[2]).getAllByRole("cell")[1]).toHaveTextContent("2");
   });
 });

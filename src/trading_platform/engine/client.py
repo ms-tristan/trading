@@ -14,10 +14,20 @@ Two behaviours matter as much as the endpoints themselves:
 * every number is passed through :func:`~trading_platform.models.finite_float`,
   because Freqtrade reports ``Infinity`` for ``profit_factor`` as soon as a
   profile has never lost a trade, and ``Infinity`` is not valid JSON.
+
+The record readers (:meth:`FreqtradeClient.daily_records`,
+:meth:`FreqtradeClient.trade_records` and
+:meth:`FreqtradeClient.open_trade_records`) follow a third rule: the *request*
+keeps the failure convention above -- a transport, HTTP or JSON failure still
+raises :class:`FreqtradeClientError` -- while a malformed *row* is normalised
+away by :func:`normalise_trade_row` / :func:`normalise_daily_row` instead of
+failing the whole read, so one odd row never costs a profile its history.
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any
 
@@ -25,7 +35,12 @@ import httpx
 
 from ..models import ProfileMetrics, finite_float, normalise_drawdown_pct, normalise_win_rate
 
-__all__ = ["FreqtradeClient", "FreqtradeClientError"]
+__all__ = [
+    "FreqtradeClient",
+    "FreqtradeClientError",
+    "normalise_daily_row",
+    "normalise_trade_row",
+]
 
 
 class FreqtradeClientError(RuntimeError):
@@ -119,6 +134,54 @@ class FreqtradeClient:
         list is returned. A bare list is accepted as well.
         """
         return await self._get_collection("trades", params={"limit": int(limit)})
+
+    async def daily_records(self) -> list[dict[str, Any]]:
+        """Return ``GET /daily`` as the normalised daily rows of the profile.
+
+        Freqtrade documents an object (``{"data": [{"date", "abs_profit",
+        "rel_profit", "starting_balance", "fiat_value", "trade_count"}],
+        "stake_currency": "USDT"}``); a bare list is accepted too. A body of
+        neither shape, or one whose ``data`` is not a list, answers ``[]``: the
+        endpoint exists to feed the read model, and "no rows" is the honest
+        answer of a payload that carries none. The API order is preserved
+        (Freqtrade answers oldest first) and every row goes through
+        :func:`normalise_daily_row`, which drops an unusable row instead of
+        raising.
+        """
+        rows = _rows_of(await self._get("daily"), "data")
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            normalised = normalise_daily_row(row)
+            if normalised is not None:
+                records.append(normalised)
+        return records
+
+    async def trade_records(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return ``GET /trades?limit=N`` as the normalised trade rows.
+
+        The documented body is an object (``{"trades": [...], "trades_count": n,
+        "offset": o, "total_trades": n}``), not a bare array, but a bare list is
+        tolerated as well; a body of neither shape answers ``[]``. Rows keep the
+        API order and go through :func:`normalise_trade_row` with
+        ``default_open=False``: this endpoint answers closed trades, and a row
+        that does not say otherwise is read as closed.
+        """
+        body = await self._get("trades", params={"limit": int(limit)})
+        return _normalise_trade_rows(_rows_of(body, "trades"), default_open=False)
+
+    async def open_trade_records(self) -> list[dict[str, Any]]:
+        """Return ``GET /status`` as the normalised open trades of the profile.
+
+        ``/status`` is the endpoint that really answers the open positions, so
+        every row is normalised with ``default_open=True`` and ``is_open`` is
+        forced to ``True``: a position served here is open by definition.
+        """
+        records = _normalise_trade_rows(
+            _rows_of(await self._get("status"), "trades"), default_open=True
+        )
+        for record in records:
+            record["is_open"] = True
+        return records
 
     async def fetch_all(self) -> ProfileMetrics:
         """Read every measurement of the profile in one pass.
@@ -217,3 +280,133 @@ def _free_balance(balance: dict[str, Any], stake_currency: str) -> float:
         if str(entry.get("currency") or "") == stake_currency:
             return finite_float(entry.get("free"))
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Row normalisation: the read model of the monitoring surface
+# ---------------------------------------------------------------------------
+def _rows_of(body: Any, key: str) -> list[Any]:
+    """Return the row list of a Freqtrade body, or ``[]`` when it has none.
+
+    A body is either the documented envelope (an object carrying ``key``) or the
+    bare list some Freqtrade releases answer; anything else -- including an
+    envelope whose ``key`` is not a list -- carries no row.
+    """
+    items = body.get(key) if isinstance(body, dict) else body
+    return items if isinstance(items, list) else []
+
+
+def _usable_number(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or ``None`` when it is not usable.
+
+    ``None``, text that is not a number and the non-finite floats Freqtrade
+    emits (``NaN``, ``Infinity``) are all unusable.
+    """
+    number = finite_float(value, math.nan)
+    return None if math.isnan(number) else number
+
+
+def _text(value: Any, default: str = "") -> str:
+    """Return ``value`` as text, ``default`` when it is missing or null."""
+    return default if value is None else str(value)
+
+
+def _optional_text(value: Any) -> str | None:
+    """Return ``value`` as text, or ``None`` when it is missing or null."""
+    return None if value is None else str(value)
+
+
+def normalise_trade_row(
+    raw: Mapping[str, Any],
+    *,
+    default_open: bool = False,
+) -> dict[str, Any] | None:
+    """Normalise one ``/trades`` or ``/status`` row into the stored trade keys.
+
+    The result always carries the same twelve keys, so the store and the API
+    never have to guess: ``trade_id`` (int), ``pair`` (str), ``is_open`` (bool),
+    ``open_date``/``close_date``/``exit_reason`` (str or ``None``), and the
+    numbers ``amount``, ``open_rate``, ``close_rate``, ``stake_amount``,
+    ``profit_abs`` and ``profit_pct`` (float, ``0.0`` when the API omits them or
+    answers a non-finite value).
+
+    ``is_open`` is the payload's own boolean when it really is one and
+    ``default_open`` otherwise, which is how ``/status`` (open positions only)
+    and ``/trades`` (closed trades only) each get an honest default.
+
+    ``profit_pct`` is a percentage: the API reports ``profit_ratio`` as a
+    fraction, so a usable ratio is multiplied by ``100``; a row that only
+    carries ``profit_pct`` keeps it verbatim.
+
+    ``None`` is returned for an unusable row -- not a mapping, or without a
+    usable ``trade_id``. This function never raises, whatever the payload looks
+    like.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    trade_id = int(finite_float(raw.get("trade_id"), 0.0))
+    if trade_id == 0:
+        return None
+    ratio = _usable_number(raw.get("profit_ratio"))
+    is_open = raw.get("is_open")
+    return {
+        "trade_id": trade_id,
+        "pair": _text(raw.get("pair")),
+        "is_open": is_open if isinstance(is_open, bool) else default_open,
+        "open_date": _optional_text(raw.get("open_date")),
+        "close_date": _optional_text(raw.get("close_date")),
+        "amount": finite_float(raw.get("amount"), 0.0),
+        "open_rate": finite_float(raw.get("open_rate"), 0.0),
+        "close_rate": finite_float(raw.get("close_rate"), 0.0),
+        "stake_amount": finite_float(raw.get("stake_amount"), 0.0),
+        "profit_abs": finite_float(raw.get("profit_abs"), 0.0),
+        "profit_pct": (
+            ratio * 100.0 if ratio is not None else finite_float(raw.get("profit_pct"), 0.0)
+        ),
+        "exit_reason": _optional_text(raw.get("exit_reason")),
+    }
+
+
+def normalise_daily_row(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Normalise one ``/daily`` row into the stored daily keys.
+
+    The result is ``{"date" (str), "abs_profit" (float), "rel_profit" (float),
+    "starting_balance" (float), "trade_count" (int)}``. ``date`` is the only
+    required key: a row without one is unusable and answers ``None``.
+
+    ``rel_profit`` is the API's own ratio when the row carries the key; when the
+    API omits it, it is derived as ``abs_profit / starting_balance`` -- the rule
+    :func:`trading_platform.metrics.daily_rows` already applies -- and stays
+    ``0.0`` when there is no usable starting balance.
+
+    Every number goes through :func:`~trading_platform.models.finite_float`, and
+    this function never raises, whatever the payload looks like.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    date = raw.get("date")
+    if date is None or not str(date):
+        return None
+    abs_profit = finite_float(raw.get("abs_profit"), 0.0)
+    starting_balance = finite_float(raw.get("starting_balance"), 0.0)
+    if "rel_profit" in raw:
+        rel_profit = finite_float(raw.get("rel_profit"), 0.0)
+    else:
+        rel_profit = abs_profit / starting_balance if starting_balance > 0 else 0.0
+    return {
+        "date": str(date),
+        "abs_profit": abs_profit,
+        "rel_profit": rel_profit,
+        "starting_balance": starting_balance,
+        "trade_count": int(finite_float(raw.get("trade_count"), 0.0)),
+    }
+
+
+def _normalise_trade_rows(rows: list[Any], *, default_open: bool) -> list[dict[str, Any]]:
+    """Normalise every usable row of ``rows``, preserving the API order."""
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        normalised = normalise_trade_row(row, default_open=default_open)
+        if normalised is not None:
+            records.append(normalised)
+    return records

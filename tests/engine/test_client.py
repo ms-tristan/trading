@@ -14,7 +14,12 @@ from typing import Any
 import httpx
 import pytest
 
-from trading_platform.engine.client import FreqtradeClient, FreqtradeClientError
+from trading_platform.engine.client import (
+    FreqtradeClient,
+    FreqtradeClientError,
+    normalise_daily_row,
+    normalise_trade_row,
+)
 
 BASE_URL = "http://127.0.0.1:8101/api/v1/"
 API_PORT_BASE_URL = "http://127.0.0.1:8101"
@@ -213,6 +218,363 @@ async def test_trades_passes_its_limit() -> None:
     await client.trades(limit=5)
     assert requests[0].url.params["limit"] == "50"
     assert requests[1].url.params["limit"] == "5"
+
+
+# ---------------------------------------------------------------------------
+# Record readers: the read model the poller persists
+# ---------------------------------------------------------------------------
+DAILY_PAYLOAD: dict[str, Any] = {
+    "data": [
+        {
+            "date": "2026-09-26",
+            "abs_profit": 4.0,
+            "rel_profit": 0.004,
+            "starting_balance": 1000.0,
+            "fiat_value": 4.0,
+            "trade_count": 1,
+        },
+        {"date": "2026-09-27", "abs_profit": -1.5, "starting_balance": 1004.0, "trade_count": 2},
+    ],
+    "stake_currency": "USDT",
+}
+
+TRADES_PAYLOAD: dict[str, Any] = {
+    "trades": [
+        {
+            "trade_id": 9,
+            "pair": "BTC/USDT",
+            "is_open": False,
+            "open_date": "2026-09-26T08:00:00Z",
+            "close_date": "2026-09-26T09:00:00Z",
+            "amount": 0.5,
+            "open_rate": 100.0,
+            "close_rate": 110.0,
+            "stake_amount": 50.0,
+            "profit_abs": 5.0,
+            "profit_ratio": 0.0123,
+            "exit_reason": "roi",
+        },
+        {"trade_id": 10, "pair": "ETH/USDT", "profit_pct": 2.5},
+    ],
+    "trades_count": 2,
+    "offset": 0,
+    "total_trades": 2,
+}
+
+STATUS_ROWS: list[dict[str, Any]] = [
+    {
+        "trade_id": 21,
+        "pair": "SOL/USDT",
+        "open_date": "2026-09-27T11:30:00Z",
+        "amount": 2.0,
+        "open_rate": 25.0,
+        "stake_amount": 50.0,
+        "profit_abs": 1.5,
+        "profit_ratio": 0.0123,
+    },
+    {"trade_id": 22, "pair": "ADA/USDT", "is_open": False},
+]
+
+#: The exact keys of one normalised trade row.
+TRADE_ROW_KEYS = {
+    "trade_id",
+    "pair",
+    "is_open",
+    "open_date",
+    "close_date",
+    "amount",
+    "open_rate",
+    "close_rate",
+    "stake_amount",
+    "profit_abs",
+    "profit_pct",
+    "exit_reason",
+}
+
+#: The exact keys of one normalised daily row.
+DAILY_ROW_KEYS = {"date", "abs_profit", "rel_profit", "starting_balance", "trade_count"}
+
+
+async def test_daily_records_map_the_documented_envelope() -> None:
+    records = await make_client({"/api/v1/daily": DAILY_PAYLOAD}).daily_records()
+
+    assert len(records) == 2
+    first, second = records
+    # An unknown extra key of the API (fiat_value) is ignored.
+    assert set(first) == DAILY_ROW_KEYS
+    assert first == {
+        "date": "2026-09-26",
+        "abs_profit": 4.0,
+        "rel_profit": 0.004,
+        "starting_balance": 1000.0,
+        "trade_count": 1,
+    }
+    # The API omitted rel_profit: it is derived from the starting balance.
+    assert second["date"] == "2026-09-27"
+    assert second["abs_profit"] == -1.5
+    assert second["rel_profit"] == pytest.approx(-1.5 / 1004.0)
+    assert second["starting_balance"] == 1004.0
+    assert second["trade_count"] == 2
+
+
+async def test_daily_records_tolerate_a_bare_list() -> None:
+    client = make_client({"/api/v1/daily": DAILY_PAYLOAD["data"]})
+
+    records = await client.daily_records()
+
+    assert [row["date"] for row in records] == ["2026-09-26", "2026-09-27"]
+
+
+async def test_daily_records_answer_empty_without_a_usable_data_list() -> None:
+    missing = await make_client({"/api/v1/daily": {"stake_currency": "USDT"}}).daily_records()
+    assert missing == []
+
+    not_a_list = await make_client(
+        {"/api/v1/daily": {"data": {"date": "2026-09-27"}}}
+    ).daily_records()
+    assert not_a_list == []
+
+    neither_shape = await make_client({"/api/v1/daily": "not-a-payload"}).daily_records()
+    assert neither_shape == []
+
+
+async def test_daily_records_drop_an_unusable_row() -> None:
+    payload = {
+        "data": [
+            "not-an-object",
+            {"abs_profit": 1.0},
+            {"date": "", "abs_profit": 1.0},
+            {"date": "2026-09-27", "abs_profit": 1.0},
+        ]
+    }
+
+    records = await make_client({"/api/v1/daily": payload}).daily_records()
+
+    assert records == [
+        {
+            "date": "2026-09-27",
+            "abs_profit": 1.0,
+            "rel_profit": 0.0,
+            "starting_balance": 0.0,
+            "trade_count": 0,
+        }
+    ]
+
+
+async def test_trade_records_map_the_documented_envelope() -> None:
+    records = await make_client({"/api/v1/trades": TRADES_PAYLOAD}).trade_records()
+
+    assert len(records) == 2
+    first, second = records
+    assert set(first) == TRADE_ROW_KEYS
+    assert first["trade_id"] == 9
+    assert first["pair"] == "BTC/USDT"
+    assert first["is_open"] is False
+    assert first["open_date"] == "2026-09-26T08:00:00Z"
+    assert first["close_date"] == "2026-09-26T09:00:00Z"
+    assert first["amount"] == 0.5
+    assert first["open_rate"] == 100.0
+    assert first["close_rate"] == 110.0
+    assert first["stake_amount"] == 50.0
+    assert first["profit_abs"] == 5.0
+    # profit_ratio is a fraction; the row carries the percentage.
+    assert first["profit_pct"] == pytest.approx(1.23)
+    assert first["exit_reason"] == "roi"
+    # A row carrying only profit_pct keeps it, and every missing key defaults.
+    assert set(second) == TRADE_ROW_KEYS
+    assert second == {
+        "trade_id": 10,
+        "pair": "ETH/USDT",
+        "is_open": False,
+        "open_date": None,
+        "close_date": None,
+        "amount": 0.0,
+        "open_rate": 0.0,
+        "close_rate": 0.0,
+        "stake_amount": 0.0,
+        "profit_abs": 0.0,
+        "profit_pct": 2.5,
+        "exit_reason": None,
+    }
+
+
+async def test_trade_records_tolerate_a_bare_list() -> None:
+    client = make_client({"/api/v1/trades": TRADES_PAYLOAD["trades"]})
+
+    records = await client.trade_records()
+
+    assert [row["trade_id"] for row in records] == [9, 10]
+
+
+async def test_trade_records_drop_a_row_without_a_usable_trade_id() -> None:
+    payload = {
+        "trades": [
+            {"pair": "BTC/USDT"},
+            {"trade_id": 0, "pair": "BTC/USDT"},
+            {"trade_id": None},
+            "not-an-object",
+            {"trade_id": 7},
+        ]
+    }
+
+    records = await make_client({"/api/v1/trades": payload}).trade_records()
+
+    assert records == [
+        {
+            "trade_id": 7,
+            "pair": "",
+            "is_open": False,
+            "open_date": None,
+            "close_date": None,
+            "amount": 0.0,
+            "open_rate": 0.0,
+            "close_rate": 0.0,
+            "stake_amount": 0.0,
+            "profit_abs": 0.0,
+            "profit_pct": 0.0,
+            "exit_reason": None,
+        }
+    ]
+
+
+async def test_trade_records_collapse_non_finite_numbers() -> None:
+    # Freqtrade emits bare NaN/Infinity tokens, so the body is built by hand.
+    body = json.dumps(
+        {
+            "trades": [
+                {
+                    "trade_id": 9,
+                    "profit_ratio": float("inf"),
+                    "profit_abs": float("nan"),
+                    "amount": float("-inf"),
+                    "open_rate": float("nan"),
+                }
+            ]
+        }
+    )
+    response = httpx.Response(
+        200, content=body.encode(), headers={"content-type": "application/json"}
+    )
+
+    records = await make_client({"/api/v1/trades": response}).trade_records()
+
+    assert records[0]["profit_pct"] == 0.0
+    assert records[0]["profit_abs"] == 0.0
+    assert records[0]["amount"] == 0.0
+    assert records[0]["open_rate"] == 0.0
+
+
+async def test_trade_records_pass_the_history_limit() -> None:
+    requests: list[httpx.Request] = []
+    client = make_client({"/api/v1/trades": TRADES_PAYLOAD}, requests=requests)
+
+    await client.trade_records()
+    await client.trade_records(limit=7)
+
+    assert requests[0].url.params["limit"] == "50"
+    assert requests[1].url.params["limit"] == "7"
+
+
+async def test_open_trade_records_force_is_open_on_the_status_rows() -> None:
+    requests: list[httpx.Request] = []
+    client = make_client({"/api/v1/status": STATUS_ROWS}, requests=requests)
+
+    records = await client.open_trade_records()
+
+    assert requests[0].url.path == "/api/v1/status"
+    assert [row["trade_id"] for row in records] == [21, 22]
+    # /status only ever answers open positions, whatever the row claims.
+    assert [row["is_open"] for row in records] == [True, True]
+    assert records[0]["pair"] == "SOL/USDT"
+    assert records[0]["profit_pct"] == pytest.approx(1.23)
+    assert set(records[0]) == TRADE_ROW_KEYS
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("daily_records", "/api/v1/daily"),
+        ("trade_records", "/api/v1/trades"),
+        ("open_trade_records", "/api/v1/status"),
+    ],
+)
+async def test_record_readers_still_raise_on_a_failed_read(method: str, path: str) -> None:
+    http_error = make_client({path: httpx.Response(500, json={"error": "boom"})})
+    with pytest.raises(FreqtradeClientError):
+        await getattr(http_error, method)()
+
+    connection_error = make_client({path: httpx.ConnectError("connection refused")})
+    with pytest.raises(FreqtradeClientError):
+        await getattr(connection_error, method)()
+
+    timeout = make_client({path: httpx.ReadTimeout("timed out")})
+    with pytest.raises(FreqtradeClientError):
+        await getattr(timeout, method)()
+
+    malformed = make_client(
+        {
+            path: httpx.Response(
+                200, content=b"<html>not json</html>", headers={"content-type": "application/json"}
+            )
+        }
+    )
+    with pytest.raises(FreqtradeClientError):
+        await getattr(malformed, method)()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        {},
+        {"trade_id": "not-a-number"},
+        {"trade_id": None},
+        {"trade_id": float("nan")},
+        {"trade_id": float("inf")},
+        {"trade_id": 0},
+        "not-a-mapping",
+        [1, 2, 3],
+        5,
+    ],
+)
+def test_normalise_trade_row_never_raises(raw: Any) -> None:
+    assert normalise_trade_row(raw) is None
+
+
+def test_normalise_trade_row_pins_every_key() -> None:
+    row = normalise_trade_row({"trade_id": 3, "is_open": "yes", "profit_ratio": "bad"})
+
+    assert row is not None
+    assert set(row) == TRADE_ROW_KEYS
+    assert row["trade_id"] == 3
+    # ``is_open`` is only honoured when it really is a boolean.
+    assert row["is_open"] is False
+    assert row["profit_pct"] == 0.0
+
+
+def test_normalise_trade_row_honours_the_open_default() -> None:
+    row = normalise_trade_row({"trade_id": 3}, default_open=True)
+
+    assert row is not None
+    assert row["is_open"] is True
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, {}, {"date": ""}, {"date": None}, {"abs_profit": 1.0}, "not-a-mapping", [1], 7],
+)
+def test_normalise_daily_row_never_raises(raw: Any) -> None:
+    assert normalise_daily_row(raw) is None
+
+
+def test_normalise_daily_row_keeps_a_zero_relative_profit() -> None:
+    row = normalise_daily_row({"date": "2026-09-27", "abs_profit": 5.0, "rel_profit": 0.0})
+
+    assert row is not None
+    assert set(row) == DAILY_ROW_KEYS
+    assert row["rel_profit"] == 0.0
+    assert row["starting_balance"] == 0.0
+    assert row["trade_count"] == 0
 
 
 # ---------------------------------------------------------------------------

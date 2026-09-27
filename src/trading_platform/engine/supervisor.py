@@ -19,9 +19,11 @@ per-profile configuration, starts the children and returns, so the HTTP API is
 servable within seconds of process start and never waits for a worker to become
 healthy. Reading the workers happens in :meth:`Supervisor.refresh_once`, which
 the snapshot poller (:mod:`trading_platform.engine.poller`) drives once per
-interval; that is also where the health policy is applied.
+interval; that is also where the health policy is applied and where the daily
+and trade history of every answering worker is read, for the monitoring read
+model.
 
-Five rules are worth stating because they are easy to get wrong:
+Six rules are worth stating because they are easy to get wrong:
 
 * a worker the supervisor stopped itself (operator stop, kill switch, restart,
   shutdown) is **never** reported as a crash -- the process handle is dropped
@@ -34,6 +36,12 @@ Five rules are worth stating because they are easy to get wrong:
 * an explicit :meth:`Supervisor.start_profile` / :meth:`Supervisor.restart_profile`
   is honoured even when the fleet is full: the fleet cap governs automatic
   promotion, not an operator decision made on one profile;
+* the fleet grows gradually: a scheduling pass promotes at most one worker per
+  ``worker_start_stagger_seconds`` interval, and a profile that is inside the
+  cap but not admitted yet is ``queued`` with the gradual-start reason. Slots
+  beyond the cap keep the fleet-cap reason. Staggering delays promotions, it
+  never reorders them, and ``worker_start_stagger_seconds = 0`` keeps the
+  immediate boot;
 * the restart budget is a sliding window: at most
   :data:`MAX_RESTARTS_IN_WINDOW` restarts inside
   :data:`RESTART_WINDOW_SECONDS`, with the backoff saturating at 45 s. Once the
@@ -118,6 +126,7 @@ __all__ = [
     "EVENT_SETTINGS_UPDATED",
     "EVENT_START",
     "EVENT_STOP",
+    "HISTORY_TRADE_LIMIT",
     "KILL_SWITCH_FILENAME",
     "MAX_RESTARTS_IN_WINDOW",
     "PINNED_STOP_REASONS",
@@ -129,6 +138,7 @@ __all__ = [
     "RESTART_BACKOFF_SECONDS",
     "RESTART_WINDOW_SECONDS",
     "SETTINGS_KEY",
+    "STAGGER_QUEUE_REASON_TEMPLATE",
     "TERMINATE_GRACE_SECONDS",
     "UNHEALTHY_THRESHOLD",
     "ProcessLauncher",
@@ -160,6 +170,9 @@ SETTINGS_KEY = "platform_settings"
 #: Entropy of a generated worker REST password, in bytes.
 API_PASSWORD_BYTES = 24
 
+#: Closed trades read per profile and per poll cycle, for the trade read model.
+HISTORY_TRADE_LIMIT = 50
+
 #: Reason recorded on a profile the operator stopped.
 REASON_OPERATOR_STOP = "operator_stop"
 
@@ -174,6 +187,13 @@ REASON_SHUTDOWN = "shutdown"
 
 #: Reason prefix recorded while a worker waits for its restart backoff.
 REASON_RESTART_BACKOFF = "restart_backoff"
+
+#: Reason recorded on a profile the stagger gate holds back from starting.
+#: ``used`` is the number of workers alive when the reason is written (the
+#: worker just started counts), ``total`` the fleet cap.
+STAGGER_QUEUE_REASON_TEMPLATE = (
+    "queued: starting workers gradually ({used} of {total} slots in use)"
+)
 
 #: Reasons of a ``stopped`` profile the scheduler must not restart by itself:
 #: they record a deliberate operator decision rather than a fleet decision. A
@@ -358,6 +378,7 @@ class Supervisor:
         self._clients: dict[str, FreqtradeClient] = {}
         self._discarded_clients: list[FreqtradeClient] = []
         self._metrics: dict[str, ProfileMetrics] = {}
+        self._history: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
         self._health: dict[str, _WorkerHealth] = {}
         self._operator_stops: set[str] = set()
         self._operator_starts: set[str] = set()
@@ -367,6 +388,7 @@ class Supervisor:
         self._running = False
         self._started_at: datetime | None = None
         self._last_poll_at: datetime | None = None
+        self._last_worker_start_at: datetime | None = None
         self._cap_event_recorded = False
 
     # -- clock -------------------------------------------------------------
@@ -450,6 +472,14 @@ class Supervisor:
         instead, a disabled profile is ``stopped``, and a profile waiting for
         its restart backoff is left alone until it is due.
 
+        Inside the cap the fleet grows gradually: at most one candidate is
+        started per pass, and only when ``worker_start_stagger_seconds`` have
+        elapsed since the last worker started, so a cold start never spawns the
+        whole fleet at once. The candidates the gate holds back are ``queued``
+        with :data:`STAGGER_QUEUE_REASON_TEMPLATE`. With
+        ``worker_start_stagger_seconds = 0`` the gate is always open and the
+        whole pass behaves as it always did.
+
         While the kill switch is engaged the method only makes sure that nothing
         runs: it never rewrites a state, so the journal keeps reporting the kill
         switch as the reason the fleet is down.
@@ -467,13 +497,26 @@ class Supervisor:
             return
 
         cap = int(self.settings.max_running_profiles)
+        now = self.now()
         queued: list[ProfileRecord] = []
+        staggered: list[ProfileRecord] = []
         for index, record in enumerate(self._candidates(profiles)):
             if index >= cap:
                 queued.append(record)
                 continue
-            self._schedule_candidate(record)
+            if self.is_running(record.id):
+                continue
+            if not self._consume_backoff(record.id):
+                continue
+            if not self._stagger_ready(now):
+                staggered.append(record)
+                continue
+            if self._start(record, event_kind=EVENT_START):
+                # A successful start closes the gate for the rest of this pass
+                # and for every pass until the interval elapses.
+                self._last_worker_start_at = now
         self._apply_queue(queued, cap)
+        self._apply_stagger(staggered, profiles, cap)
         for record in profiles:
             if not record.enabled:
                 self._apply_disabled(record)
@@ -564,6 +607,19 @@ class Supervisor:
         """
         return self._metrics.get(profile_id)
 
+    def history_for(
+        self,
+        profile_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+        """Return the ``(daily_rows, trade_rows)`` of the last successful read.
+
+        A failed read clears them, exactly like :meth:`metrics_for`: the poller
+        must never persist the rows of a worker that has not just answered.
+        ``None`` means the profile is not running, has never been read, or its
+        last read or history pass failed.
+        """
+        return self._history.get(profile_id)
+
     def status(self) -> dict[str, Any]:
         """Return the operational snapshot of the engine.
 
@@ -604,19 +660,24 @@ class Supervisor:
         *,
         max_running_profiles: int | None = None,
         snapshot_interval_seconds: int | None = None,
+        worker_start_stagger_seconds: int | None = None,
     ) -> PlatformSettings:
         """Change the run-time settings, persist them and reschedule at once.
 
         The whole document is stored under the ``platform_settings`` key, so the
         next boot merges the operator's values over ``config/platform.json``.
         Scheduling runs immediately: raising the cap starts the queued profiles
-        at once, lowering it stops the workers that no longer fit.
+        at once -- one per pass while the stagger gate is closed -- lowering it
+        stops the workers that no longer fit, and
+        ``worker_start_stagger_seconds = 0`` opens the stagger gate at once.
         """
         changes: dict[str, int] = {}
         if max_running_profiles is not None:
             changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
+        if worker_start_stagger_seconds is not None:
+            changes["worker_start_stagger_seconds"] = max(0, int(worker_start_stagger_seconds))
         self.settings = self.settings.with_overrides(**changes)
         self.store.set_setting(SETTINGS_KEY, json.dumps(self.settings.model_dump()))
         if changes:
@@ -823,13 +884,41 @@ class Supervisor:
             and not (record.state == STATE_STOPPED and record.state_reason in PINNED_STOP_REASONS)
         ]
 
-    def _schedule_candidate(self, record: ProfileRecord) -> None:
-        """Start one candidate, or leave it alone while it waits for its backoff."""
-        if self.is_running(record.id):
+    def _stagger_ready(self, now: datetime) -> bool:
+        """Whether the stagger gate is open, that is whether a worker may start.
+
+        The gate is open when ``worker_start_stagger_seconds`` is ``0`` (the
+        immediate boot), when no worker has been started by this supervisor yet,
+        and otherwise once the interval elapsed since the last start. The
+        interval is clamped at ``0``, so a negative value can only mean
+        "immediate" and never "never".
+        """
+        stagger = max(0, int(self.settings.worker_start_stagger_seconds))
+        if stagger == 0:
+            return True
+        if self._last_worker_start_at is None:
+            return True
+        return (now - self._last_worker_start_at).total_seconds() >= stagger
+
+    def _apply_stagger(
+        self,
+        staggered: Sequence[ProfileRecord],
+        profiles: Sequence[ProfileRecord],
+        cap: int,
+    ) -> None:
+        """Mark the candidates the stagger gate held back ``queued``.
+
+        The reason names the workers alive *now*, so the profile started by this
+        very pass is counted. Nothing is stopped here: a staggered profile holds
+        no worker yet, so it journals no stop, and the pass never reports the
+        fleet cap -- the profiles beyond the cap are the only ones that do.
+        """
+        if not staggered:
             return
-        if not self._consume_backoff(record.id):
-            return
-        self._start(record, event_kind=EVENT_START)
+        used = sum(1 for record in profiles if self.is_running(record.id))
+        reason = STAGGER_QUEUE_REASON_TEMPLATE.format(used=used, total=cap)
+        for record in staggered:
+            self._set_state(record, STATE_QUEUED, reason)
 
     def _apply_queue(self, queued: Sequence[ProfileRecord], cap: int) -> None:
         """Mark the profiles beyond the cap ``queued`` and release their workers."""
@@ -945,6 +1034,7 @@ class Supervisor:
 
         self._processes[profile_id] = process
         self._metrics.pop(profile_id, None)
+        self._history.pop(profile_id, None)
         health = self._health_for(profile_id)
         health.failures = 0
         health.retry_at = None
@@ -959,6 +1049,10 @@ class Supervisor:
             profile_id,
         )
         logger.info("started worker %s on port %d (pid %s)", profile_id, port, pid)
+        # The spawn succeeded, so arm the stagger gate: the next automatic
+        # promotion waits for the interval. An explicit operator start is never
+        # refused by the gate, but it does delay the promotions that follow it.
+        self._last_worker_start_at = self.now()
         return True
 
     def _terminate_worker(self, profile_id: str) -> subprocess.Popen[bytes] | None:
@@ -970,6 +1064,7 @@ class Supervisor:
         process = self._processes.pop(profile_id, None)
         self._discard_client(profile_id)
         self._metrics.pop(profile_id, None)
+        self._history.pop(profile_id, None)
         self._operator_starts.discard(profile_id)
         self.store.set_profile_runtime(profile_id, pid=None, started_at=None)
         if process is not None and process.poll() is None:
@@ -1035,6 +1130,38 @@ class Supervisor:
                 health.failures = 0
                 health.last_error = None
                 self._metrics[record.id] = metrics
+                try:
+                    self._history[record.id] = await self._read_history(client)
+                except FreqtradeClientError as exc:
+                    self._drop_history(record.id, exc)
+                except Exception as exc:  # a history bug must not restart a worker
+                    self._drop_history(record.id, exc)
+
+    async def _read_history(
+        self,
+        client: FreqtradeClient,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Read the daily rows and the trade rows of one worker.
+
+        The trade list is the closed trades (the ``HISTORY_TRADE_LIMIT`` most
+        recent ones) followed by the open ones: the persisted read model is
+        upserted on ``(profile_id, trade_id)``, so a live open row must come
+        last to win over a closed row carrying the same id.
+        """
+        daily_rows = await client.daily_records()
+        trade_rows = await client.trade_records(HISTORY_TRADE_LIMIT)
+        open_rows = await client.open_trade_records()
+        return (daily_rows, [*trade_rows, *open_rows])
+
+    def _drop_history(self, profile_id: str, exc: Exception) -> None:
+        """Forget the cached history of a profile and report why.
+
+        This is deliberately *not* a read failure: a worker that answers
+        ``/balance`` but not ``/daily`` is healthy, and a history hiccup must
+        neither count a failure nor restart it.
+        """
+        self._history.pop(profile_id, None)
+        logger.warning("could not read the history of profile %r: %s", profile_id, exc)
 
     def _reap_exited_children(self) -> None:
         """Journal and handle every child that exited without being asked to."""
@@ -1061,6 +1188,7 @@ class Supervisor:
         health.failures += 1
         health.last_error = message
         self._metrics.pop(record.id, None)
+        self._history.pop(record.id, None)
         if not fatal and health.failures < UNHEALTHY_THRESHOLD:
             return
         self._handle_unhealthy(record, health, message)
