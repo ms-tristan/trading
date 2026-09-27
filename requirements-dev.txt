@@ -1,0 +1,20 @@
+# Development and test dependencies: the venv bootstrap of docs/testing-policy.md.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/pip install -e . --no-deps
+#
+# The virtualenv lives in .venv/ and is git-ignored: never commit it.
+-r requirements.txt
+
+# The trading engine itself. The supervisor spawns the `freqtrade` console
+# script, and the strategy tests load the ten shipped strategies through
+# freqtrade's own StrategyResolver, so freqtrade is a test dependency too.
+freqtrade==2026.8
+
+# Test, lint and type-check gates (docs/testing-policy.md).
+pytest>=8.0
+pytest-cov>=5.0
+pytest-asyncio>=0.24
+ruff>=0.6
+mypy>=1.11

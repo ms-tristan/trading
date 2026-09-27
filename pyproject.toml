@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-platform"
+version = "1.0.0"
+description = "Multi-profile crypto trading platform supervised by Freqtrade"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Tristan" }]
+keywords = ["trading", "freqtrade", "crypto", "multi-profile"]
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+# Mirrors requirements.txt. The realtime image never resolves these: it installs
+# the package with `--no-deps` on top of the freqtrade base image, whose own
+# pins must win.
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn>=0.30,<1.0",
+  "pydantic>=2.9,<3.0",
+  "httpx>=0.27,<1.0",
+]
+
+[project.scripts]
+trading = "trading_platform.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------------------
+# TEST + COVERAGE GATE (docs/testing-policy.md).
+#
+# `pythonpath = ["src"]` makes the package importable from a plain checkout
+# without an editable install; the full gate is `python -m pytest` and FAILS
+# below 80 % coverage of the trading_platform package. A scoped work-package run
+# appends `--no-cov` (see docs/testing-policy.md).
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-ra --cov=trading_platform --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+source = ["trading_platform"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
+
+# ---------------------------------------------------------------------------
+# LINT + TYPE GATE (docs/testing-policy.md): `ruff check .`,
+# `ruff format --check .` and `mypy src` must all pass.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+exclude = ["^src/trading_platform/.*/migrations/"]

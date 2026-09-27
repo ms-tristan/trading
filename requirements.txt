@@ -1,0 +1,10 @@
+# Runtime dependencies of the trading platform package.
+#
+# This list mirrors [project].dependencies in pyproject.toml. It is used by the
+# host/CI virtualenv; the realtime container installs the package with
+# `--no-deps` on top of the `freqtradeorg/freqtrade:2026.8` base image, which
+# already ships every one of these libraries (and must keep its own pins).
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+pydantic>=2.9,<3.0
+httpx>=0.27,<1.0

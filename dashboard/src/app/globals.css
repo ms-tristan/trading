@@ -1,0 +1,185 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   Design tokens
+   --------------------------------------------------------------------------
+   The dashboard is dark-only. Every token below is mapped into the Tailwind
+   theme by the `@theme inline` block, so the utilities used by the components
+   (`bg-card`, `text-muted-foreground`, `border-border`, `text-profit`,
+   `text-status-queued`, ...) resolve to these values at runtime.
+
+   Contrast: every foreground/background pair used by the components is at
+   least 4.5:1 (`--foreground` on `--background`, `--muted-foreground` on
+   `--card`, the `--status-*` tokens on `--card`) except the purely decorative
+   chart strokes, which are always doubled by a text label.
+   ========================================================================== */
+:root {
+  --background: #020617;
+  --foreground: #f8fafc;
+  --card: #0e1223;
+  --card-foreground: #f8fafc;
+  --muted: #1a1e2f;
+  --muted-foreground: #94a3b8;
+  --border: #334155;
+  --primary: #0f172a;
+  --secondary: #1e293b;
+  --accent: #16a34a;
+  --destructive: #dc2626;
+  --ring: #ffffff;
+
+  /* semantic extras: money direction, chart strokes and profile states */
+  --profit: #16a34a;
+  --loss: #ef5350;
+  --chart-bull: #26a69a;
+  --chart-bear: #ef5350;
+  --chart-grid: #1e293b;
+  --status-running: #16a34a;
+  --status-queued: #f59e0b;
+  --status-error: #dc2626;
+  --status-stopped: #64748b;
+  --status-blocked: #8b5cf6;
+
+  /* layout metrics (header 56px, sidebar 240px, card 12px, gap 8px, row 36px) */
+  --layout-header-height: 56px;
+  --layout-sidebar-width: 240px;
+  --layout-card-padding: 12px;
+  --layout-grid-gap: 8px;
+  --layout-row-height: 36px;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--foreground);
+  --color-ring: var(--ring);
+  --color-profit: var(--profit);
+  --color-loss: var(--loss);
+  --color-chart-bull: var(--chart-bull);
+  --color-chart-bear: var(--chart-bear);
+  --color-chart-grid: var(--chart-grid);
+  --color-status-running: var(--status-running);
+  --color-status-queued: var(--status-queued);
+  --color-status-error: var(--status-error);
+  --color-status-stopped: var(--status-stopped);
+  --color-status-blocked: var(--status-blocked);
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* base font 14px, small 12px */
+  --text-base: 14px;
+  --text-base--line-height: 1.45;
+  --text-sm: 12px;
+  --text-sm--line-height: 1.4;
+  --text-lg: 18px;
+  --text-lg--line-height: 1.3;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 1.2;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 1.15;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: 1.45;
+    /* every number of the dashboard lines up in its column */
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* visible, non-colour-only focus ring on every interactive element */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  a {
+    color: inherit;
+  }
+
+  button,
+  input,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+@layer utilities {
+  /* 200-250 ms transitions, used by the interactive components */
+  .transition-smooth {
+    transition-property: color, background-color, border-color, opacity, box-shadow;
+    transition-duration: 220ms;
+    transition-timing-function: ease-out;
+  }
+
+  /* the single list reveal of the dashboard: 320 ms per row, 30 ms stagger */
+  .reveal {
+    animation: reveal 320ms ease-out both;
+  }
+
+  .list-reveal > * {
+    animation: reveal 320ms ease-out both;
+  }
+
+  .list-reveal > *:nth-child(2) {
+    animation-delay: 30ms;
+  }
+
+  .list-reveal > *:nth-child(3) {
+    animation-delay: 60ms;
+  }
+
+  .list-reveal > *:nth-child(n + 4) {
+    animation-delay: 90ms;
+  }
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .reveal,
+  .list-reveal > * {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}

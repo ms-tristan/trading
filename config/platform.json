@@ -1,0 +1,12 @@
+{
+  "max_running_profiles": 12,
+  "snapshot_interval_seconds": 60,
+  "profile_api_port_base": 8101,
+  "default_exchange": "binance",
+  "default_timeframe": "1h",
+  "default_stake_currency": "USDT",
+  "default_initial_capital": 1000.0,
+  "default_max_open_trades": 2,
+  "dashboard_refresh_seconds": 15,
+  "equity_retention_days": 90
+}

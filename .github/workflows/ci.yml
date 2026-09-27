@@ -1,0 +1,102 @@
+name: CI
+
+# Pull requests only. A push to `main` is owned by deploy.yml, which rebuilds and
+# restarts the stack on the self-hosted runner -- CI must never repeat it and
+# must never run twice for the same merge.
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the job reads the repository, runs the gates and talks to the
+# local Docker daemon. It never writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  # A second push to the same pull request makes the previous run obsolete.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Python gate, dashboard gate, image builds (self-hosted)
+    # Self-hosted on this Mac: the machine already carries the Python 3.14
+    # interpreter, the wheel cache and the Docker daemon the deploy stack uses,
+    # and the trading stack is running on it -- so the gates must be cheap and
+    # strictly sequential.
+    runs-on: [self-hosted, macOS, ARM64]
+    # Everything below is heavier than a lint: the freqtrade install, the
+    # Next.js production build and two container images.
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The dependency set is large (freqtrade pulls pandas, numpy, ccxt, TA-Lib)
+      # and the wheel cache is the difference between a ~30 s and a multi-minute
+      # install. Keyed on the requirements files: any dependency change busts it.
+      - name: Cache the pip wheel cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      # The venv is the only supported way to run the gates (docs/testing-policy.md
+      # §1). The interpreter is resolved explicitly: a self-hosted runner does not
+      # necessarily expose the Homebrew Python 3.14 as `python3`.
+      - name: Set up the Python virtualenv from requirements-dev.txt
+        run: |
+          set -euo pipefail
+          PYTHON_BIN=""
+          for candidate in /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3 python3.14 python3; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)'; then
+                PYTHON_BIN="$(command -v "$candidate")"
+                break
+              fi
+            fi
+          done
+          if [[ -z "$PYTHON_BIN" ]]; then
+            echo "no Python >= 3.12 interpreter found" >&2
+            exit 1
+          fi
+          echo "using $PYTHON_BIN ($("$PYTHON_BIN" -V))"
+          test -x .venv/bin/python || "$PYTHON_BIN" -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+
+      # The full documented Python gate: ruff check, ruff format --check,
+      # mypy src and pytest WITH the 80 % coverage threshold of
+      # [tool.pytest.ini_options] addopts. Same commands as `make check-python`.
+      - name: Python gate (ruff + mypy + pytest with the coverage gate)
+        run: |
+          set -euo pipefail
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+          .venv/bin/mypy src
+          .venv/bin/python -m pytest
+
+      # The full documented dashboard gate: eslint, tsc --noEmit, vitest with the
+      # coverage thresholds of vitest.config.ts, and the standalone production
+      # build the dashboard image ships.
+      - name: Dashboard gate (lint + typecheck + coverage + build)
+        working-directory: dashboard
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm run test:coverage
+          npm run build
+
+      # Both images are rebuilt from the repository root, exactly like
+      # deploy.yml does, so a Dockerfile that stopped building fails the PR
+      # instead of the deploy.
+      - name: Build both container images
+        run: |
+          set -euo pipefail
+          docker build -f deploy/Dockerfile.realtime -t trading-realtime:ci .
+          docker build -f deploy/Dockerfile.dashboard -t trading-dashboard:ci .

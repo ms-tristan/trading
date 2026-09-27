@@ -1,62 +1,108 @@
 # syntax=docker/dockerfile:1
+# ===========================================================================
+# Runtime image of the multi-profile trading platform (`trading-realtime`).
+#
+#   build -> freqtradeorg/freqtrade:2026.8 (linux/arm64 manifest verified) plus
+#            this repository's `trading_platform` package, installed with
+#            --no-deps so that the base image's own pins win. The base image
+#            already ships fastapi, uvicorn, starlette, pydantic, httpx,
+#            requests, SQLAlchemy, ccxt, TA-Lib, pandas and numpy on Python
+#            3.14, and it provides the `freqtrade` console script the supervisor
+#            spawns once per running profile.
+#   run   -> `python -m trading_platform realtime run --state-db
+#            /app/data/realtime/state.db --host 0.0.0.0 --port 8080`
+#            (the ENTRYPOINT/CMD below). One process supervises N `freqtrade
+#            trade` child processes and serves the aggregated JSON API.
+#
+# The base image's ENTRYPOINT is the `freqtrade` console script, its user is
+# `ftuser` and its WORKDIR is /freqtrade; the ENTRYPOINT below overrides it, so
+# this container boots the supervisor and never the freqtrade CLI directly.
+#
 # ---------------------------------------------------------------------------
-# Runtime image for the real-time multi-profile platform (layers 6 and 7).
-#
-#   build  -> python:3.11-slim + the package + the optional `exchange` extra
-#             (ccxt) so the polling market stream can reach a real exchange.
-#   run    -> `python -m trading_platform realtime run --state-db
-#             /app/data/realtime/state.db --host 0.0.0.0 --port 8080`
-#             engine + monitoring API on 0.0.0.0:8080 (HTTP, plain). The profile
-#             set and the engine settings come from that SQLite state database,
-#             which is the single source of truth: the image ships no profile
-#             document and nothing is read from `/app/deploy` at run time.
-#
-# TLS, authentication, rate limiting and fail2ban live in the host nginx
-# (see deploy/README.md): the container NEVER terminates TLS and is only
-# published on the loopback interface.
-#
-#   docker build -f deploy/Dockerfile.realtime -t trading-realtime:latest .
-#   docker compose -f deploy/docker-compose.yml up -d
-#
-# The image contains NO credential: the operator token and any live-exchange
-# key are injected through the environment at run time.
+# Compose contracts this file cannot see (deploy/docker-compose.yml is frozen)
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim
+#   * service names       : trading-realtime, trading-dashboard
+#   * in-container ports  : 8080 (this image), 3000 (the dashboard image)
+#   * host publishes      : 127.0.0.1:3030 -> 8080, 127.0.0.1:3031 -> 3000
+#   * named volumes       : trading-state -> /app/data/realtime
+#                           trading-cache -> /app/data/cache
+# TLS, HTTP Basic authentication, rate limiting and fail2ban belong to the host
+# nginx (see deploy/README.md): this container never terminates TLS and is
+# published on the loopback interface only.
+#
+# ---------------------------------------------------------------------------
+# Data layout under /app/data (the durable part of the platform)
+# ---------------------------------------------------------------------------
+#   /app/data/realtime/state.db        SQLite state database (single source of
+#                                      truth: profiles, snapshots, settings,
+#                                      events) -- inside trading-state
+#   /app/data/realtime/profiles/<id>/  generated freqtrade config.json (mode
+#                                      0600) and tradesv3.sqlite per profile
+#   /app/data/realtime/profiles/<id>/data
+#                                      per-profile OHLCV cache written by the
+#                                      freqtrade worker of that profile: each
+#                                      worker is isolated in its own directory,
+#                                      so two profiles never share a candle
+#                                      file and a wick in one cache can never
+#                                      corrupt another profile
+#   /app/data/realtime/logs/<id>.log   per-profile freqtrade log file
+#   /app/data/realtime/KILL_SWITCH     kill-switch marker file
+#   /app/data/cache/                   the trading-cache volume, reserved for a
+#                                      future SHARED OHLCV cache; no code path
+#                                      writes there today, it is created and
+#                                      owned by ftuser so the feature can land
+#                                      without a migration
+#
+# The image contains NO credential. The operator token and any live-exchange key
+# are injected through the environment at run time (deploy/.env plus the compose
+# `env_file`); generated per-profile freqtrade credentials (REST username,
+# password, jwt_secret_key) are created at run time and stored in the state
+# database, never baked into a layer.
+# ===========================================================================
+FROM freqtradeorg/freqtrade:2026.8
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+# The base image runs as `ftuser`; the build steps below install the package and
+# must therefore switch to root explicitly.
+USER root
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# 1. runtime dependencies (requirements.txt mirrors [project].dependencies)
-COPY requirements.txt ./
+# 1. package metadata (the build backend reads pyproject.toml; README.md is the
+#    long description referenced by it).
+COPY requirements.txt pyproject.toml README.md ./
 
-# 2. the package; the `exchange` extra pulls ccxt (lazy-imported by
-#    trading_platform.data / trading_platform.realtime, so the test-suite never
-#    needs it but the deployed engine does). `deploy/` is copied for
-#    documentation only -- it ships the compose file and its README, and the
-#    runtime needs none of it, since the durable state is the SQLite database on
-#    the /app/data volumes and no profile document exists any more.
-COPY pyproject.toml README.md ./
+# 2. the sources, the declarative catalogues (config/platform.json,
+#    config/strategies.json, config/profiles.json) and the ten freqtrade
+#    strategies the supervisor loads by name.
 COPY src ./src
 COPY config ./config
-COPY deploy ./deploy
-RUN python -m pip install --no-cache-dir . \
-    && python -m pip install --no-cache-dir "ccxt>=4.2.0" "requests>=2.31"
+COPY user_data ./user_data
 
-# 3. never run as root; /app/data is a volume (state database, OHLCV cache, logs)
-RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /app/data/realtime /app/data/cache \
-    && chown -R appuser:appuser /app
-USER appuser
+# 3. install THIS package only. --no-deps is mandatory: freqtrade 2026.8 already
+#    provides every runtime dependency at its own pinned version, and letting
+#    pip resolve them here would replace those pins inside the image. The build
+#    backend (setuptools) is fetched by pip's build isolation, so the image build
+#    needs network access -- exactly like the base image pull.
+RUN python -m pip install --no-cache-dir --no-deps .
+
+# 4. durable volumes: created here and owned by ftuser, so a fresh named volume
+#    inherits a writable directory instead of a root-owned mount point.
+RUN mkdir -p /app/data/realtime /app/data/cache && chown -R ftuser:ftuser /app
+
+# Defaults of the supervisor: where the catalogues live, where the strategies
+# live and how verbose the logs are. Every one of them is overridable from the
+# environment (deploy/.env).
+ENV TB_CONFIG_DIR=/app/config TB_STRATEGIES_DIR=/app/user_data/strategies TB_LOG_LEVEL=INFO
+
+# never run as root
+USER ftuser
 
 EXPOSE 8080
 
-# The monitoring API is the health surface of the whole platform.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).status == 200 else 1)"]
+# The aggregated JSON API is the health surface of the whole platform.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["python","-c","import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).status == 200 else 1)"]
 
-ENTRYPOINT ["python", "-m", "trading_platform"]
-CMD ["realtime", "run", "--state-db", "/app/data/realtime/state.db", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["python","-m","trading_platform"]
+CMD ["realtime","run","--state-db","/app/data/realtime/state.db","--host","0.0.0.0","--port","8080"]
