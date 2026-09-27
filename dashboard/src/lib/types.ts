@@ -442,16 +442,42 @@ export interface CatalogSymbol {
   quote: string;
 }
 
+/** Per-timeframe warm-up requirement of one strategy (`GET /api/catalog`). */
+export interface CatalogTimeframeWarmup {
+  /** Candles the strategy needs on that grid before it can emit a signal. */
+  required_candles: number;
+  /** Whether a default profile (no warm-up override) can be fed on that grid. */
+  feedable: boolean;
+}
+
+/** Per-strategy warm-up compatibility of the catalogue. */
+export interface CatalogStrategyWarmup {
+  /** Warm-up the server resolves for a profile that overrides nothing. */
+  default_warmup_candles: number;
+  /** Requirement of every supported timeframe, keyed by timeframe. */
+  timeframes: Record<string, CatalogTimeframeWarmup>;
+}
+
+/** Additive `warmup` block of `GET /api/catalog`, keyed by strategy name. */
+export type CatalogWarmup = Record<string, CatalogStrategyWarmup>;
+
 /**
  * Body of `GET /api/catalog`: everything the creation form needs to build its
  * pickers. Every list is data-driven — the dashboard never hard-codes a symbol,
  * a strategy name or a timeframe.
+ *
+ * `warmup` is the additive warm-up compatibility block, optional for the same
+ * backward-compatible reason as every other late-added key of this contract: a
+ * server that predates it stays a valid producer, and the creation form then
+ * simply has no warm-up verdict to render.
  */
 export interface CatalogPayload {
   symbols: CatalogSymbol[];
   strategies: string[];
   timeframes: string[];
   modes: RunMode[];
+  /** Warm-up compatibility per strategy; absent on a server that predates it. */
+  warmup?: CatalogWarmup;
 }
 
 /** Runtime control state of a single profile (`GET /api/control`). */

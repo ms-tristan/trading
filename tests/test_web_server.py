@@ -878,9 +878,19 @@ def test_catalog_and_control_round_trip_over_http(server: MonitoringServer) -> N
     assert status == 200
     assert headers["Content-Type"] == "application/json; charset=utf-8"
     catalog = decode(payload)
-    assert sorted(catalog) == ["modes", "strategies", "symbols", "timeframes"]
+    # ``warmup`` is the fifth key: the per-strategy warm-up matrix the catalog
+    # serves alongside the static lists, so a client can tell whether the
+    # configured budget can feed a strategy on a grid before creating a profile.
+    assert sorted(catalog) == ["modes", "strategies", "symbols", "timeframes", "warmup"]
     assert sorted(catalog["symbols"][0]) == ["base", "quote", "symbol"]
     assert catalog["modes"] == ["paper", "live"]
+    # One warm-up row per advertised strategy, each carrying the default budget
+    # and one entry per advertised timeframe: the two lists and the matrix can
+    # never drift apart.
+    assert set(catalog["warmup"]) == set(catalog["strategies"])
+    for matrix in catalog["warmup"].values():
+        assert matrix["default_warmup_candles"] >= 1
+        assert set(matrix["timeframes"]) == set(catalog["timeframes"])
 
     status, _, payload = http_request(server, "GET", "/api/control")
     assert status == 200

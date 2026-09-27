@@ -30,6 +30,7 @@ from trading_platform.realtime.models import (
 )
 from trading_platform.realtime.observability import LOGGER_NAME
 from trading_platform.realtime.warmup import profile_warmup_findings
+from trading_platform.strategy.registry import strategy_names
 
 #: How long a test may wait for the engine thread.  Every wait is bounded.
 _WAIT = 5.0
@@ -341,7 +342,10 @@ def test_a_command_that_never_returns_times_out_and_is_cancelled(tmp_path: Path)
         (valid_payload(profile_id=7), "invalid profile id: 7 (expected"),
         (
             valid_payload(strategy="nope"),
-            "unknown strategy: 'nope' (available: basic, momentum)",
+            # Built from the registry rather than hard-coded: the message lists
+            # whatever the catalogue currently registers, so adding a strategy
+            # updates this expectation instead of breaking it.
+            f"unknown strategy: 'nope' (available: {', '.join(strategy_names())})",
         ),
         (
             valid_payload(timeframe="2h"),

@@ -8,6 +8,7 @@ import { ErrorBanner } from '@/components/ui/error-banner';
 import { fetchHealth, fetchKillSwitch, fetchOrphans, fetchProfiles } from '@/lib/api';
 import { failureReport } from '@/lib/api-failure';
 import { resolvePollIntervalMs, serverApiBaseUrl } from '@/lib/config';
+import { sortProfilesByPortfolioValue } from '@/lib/ranking';
 import type {
   HealthPayload,
   KillSwitchPayload,
@@ -79,10 +80,12 @@ function ApiUnreachable({ failure, baseUrl }: { failure: unknown; baseUrl: strin
  * it is normalised to `null` on its own, so a server that does not expose that
  * route yet still renders the normal page, merely without the warning banner.
  *
- * On success the page renders, in order, the platform summary, the kill-switch
- * control (seeded with the server-rendered state) and the single live region of
- * the page, whose polling cadence is resolved here — on the server — from
- * `NEXT_PUBLIC_POLL_INTERVAL_MS`, the mirror of `monitoring.refresh_seconds`.
+ * On success the page renders, in order, the single live region of the page —
+ * whose first block is the global performance of the account, so the account
+ * leads the page — then the platform summary and the kill-switch control
+ * (seeded with the server-rendered state). The live region's polling cadence is
+ * resolved here — on the server — from `NEXT_PUBLIC_POLL_INTERVAL_MS`, the
+ * mirror of `monitoring.refresh_seconds`.
  *
  * The shared platform wallet is part of that live region: it is rendered by
  * {@link OverviewLive} from the `wallet` of the `profiles` payload this Server
@@ -95,6 +98,12 @@ function ApiUnreachable({ failure, baseUrl }: { failure: unknown; baseUrl: strin
  * `paper` too, so hydration neither flashes the other mode nor mismatches the
  * server markup. Nothing extra is fetched for it — the mode-keyed `wallets`
  * object already travels inside the `profiles` payload passed above.
+ *
+ * The profile list this component hands over is already **ranked**: it is sorted
+ * by portfolio value, highest first, by the shared pure helper of
+ * `lib/ranking.ts`. The client live region sorts with that very function, so the
+ * first paint and the hydrated page show the same order and no reorder flash is
+ * possible.
  */
 export default async function OverviewPage() {
   const baseUrl = serverApiBaseUrl();
@@ -117,22 +126,44 @@ export default async function OverviewPage() {
 
   const { health, profiles, killSwitch, orphans } = overview;
 
+  // The first paint is a ranking too. The profiles are ordered by portfolio
+  // value, highest first, with the **same pure helper** the client live region
+  // calls on every polling cycle: the server markup and the hydrated client then
+  // agree on the order, so the list cannot flash into a different one the moment
+  // React takes over. Both consumers below receive this payload — the summary
+  // and the live region are never handed two different orders.
+  const sortedProfiles: ProfilesPayload = {
+    ...profiles,
+    profiles: sortProfilesByPortfolioValue(profiles.profiles),
+  };
+
   return (
     <div className="flex flex-col gap-2xl">
       <PageHeading />
 
-      <PlatformSummary health={health} killSwitch={killSwitch} profiles={profiles.profiles} />
-
-      <KillSwitchPanel initialState={killSwitch} />
-
+      {/* The account performance block leads the page. The live region — whose
+          first block is the global performance of the account — is therefore
+          rendered **above** the platform summary and the kill-switch control:
+          the first question an operator opens this page with is "how is the
+          account doing", so that answer must not sit below a status strip.
+          The live region keeps its single polling cycle either way; only its
+          position in this column changed. */}
       <OverviewLive
-        initialProfiles={profiles}
+        initialProfiles={sortedProfiles}
         initialHealth={health}
         initialKillSwitch={killSwitch}
         initialOrphans={orphans}
         initialCheckedAt={health.checked_at ?? profiles.generated_at ?? new Date().toISOString()}
         pollIntervalMs={resolvePollIntervalMs()}
       />
+
+      <PlatformSummary
+        health={health}
+        killSwitch={killSwitch}
+        profiles={sortedProfiles.profiles}
+      />
+
+      <KillSwitchPanel initialState={killSwitch} />
     </div>
   );
 }

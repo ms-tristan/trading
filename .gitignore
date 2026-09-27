@@ -33,6 +33,14 @@ user_data/*
 user_data/strategies/*
 !user_data/strategies/BasicStrategy.py
 !user_data/strategies/MomentumStrategy.py
+!user_data/strategies/BollingerStrategy.py
+!user_data/strategies/DonchianStrategy.py
+!user_data/strategies/DualThrustStrategy.py
+!user_data/strategies/FaberStrategy.py
+!user_data/strategies/KeltnerStrategy.py
+!user_data/strategies/MacdStrategy.py
+!user_data/strategies/RsiReversionStrategy.py
+!user_data/strategies/SupertrendStrategy.py
 *.log
 logs/
 freqtrade-*.log

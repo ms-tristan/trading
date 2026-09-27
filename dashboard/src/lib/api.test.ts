@@ -1111,6 +1111,12 @@ const candle = {
 
 const candles: CandlesPayload = { candles: [candle], count: 1 };
 
+/**
+ * The catalogue of a server that emits the additive warm-up block: `basic` is
+ * feedable on every supported grid with no warm-up override, while `momentum`
+ * cannot be fed on the `1m` grid without one — the one entry a creation form has
+ * to refuse.
+ */
 const catalog: CatalogPayload = {
   symbols: [
     { symbol: 'BTC/USDT', base: 'BTC', quote: 'USDT' },
@@ -1119,7 +1125,32 @@ const catalog: CatalogPayload = {
   strategies: ['basic'],
   timeframes: ['1m', '5m', '1h'],
   modes: ['paper', 'live'],
+  warmup: {
+    basic: {
+      default_warmup_candles: 0,
+      timeframes: {
+        '1m': { required_candles: 0, feedable: true },
+        '5m': { required_candles: 0, feedable: true },
+        '1h': { required_candles: 0, feedable: true },
+      },
+    },
+    momentum: {
+      default_warmup_candles: 200,
+      timeframes: {
+        '1m': { required_candles: 5000, feedable: false },
+        '5m': { required_candles: 200, feedable: true },
+        '1h': { required_candles: 200, feedable: true },
+      },
+    },
+  },
 };
+
+/** A catalogue of an older server: the additive warm-up key removed. */
+function withoutWarmupKey<T extends { warmup?: unknown }>(payload: T): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...payload };
+  delete copy.warmup;
+  return copy;
+}
 
 const control: ControlPayload = {
   engine_running: true,
@@ -1267,6 +1298,72 @@ describe('fetchCatalog', () => {
     const { impl } = recordingFetch(jsonResponse({ ...catalog, strategies: [42] }));
 
     await expect(fetchCatalog({ fetchImpl: impl })).rejects.toMatchObject({ kind: 'malformed' });
+  });
+
+  it('carries the warm-up block of the catalogue through', async () => {
+    const { impl } = recordingFetch(jsonResponse(catalog));
+
+    const result = await fetchCatalog({ fetchImpl: impl });
+
+    expect(result.warmup).toEqual(catalog.warmup);
+    // The `momentum` entry is what the creation form reads to refuse a grid:
+    // it is not feedable on `1m` without an explicit warm-up override.
+    expect(result.warmup?.momentum?.timeframes['1m']?.feedable).toBe(false);
+    expect(result.warmup?.basic?.timeframes['1h']?.required_candles).toBe(0);
+  });
+
+  it('still accepts a catalogue that predates the warm-up block', async () => {
+    const legacy = withoutWarmupKey(catalog);
+    const { impl } = recordingFetch(jsonResponse(legacy));
+
+    const result = await fetchCatalog({ fetchImpl: impl });
+
+    // The pre-delivery server is the strongest backward-compatibility pin: it
+    // stays a valid producer, and the block simply is not there.
+    expect(result).toEqual(legacy);
+    expect(result.warmup).toBeUndefined();
+    expect(result.timeframes).toEqual(catalog.timeframes);
+  });
+
+  it('accepts an empty warm-up block', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...catalog, warmup: {} }));
+
+    await expect(fetchCatalog({ fetchImpl: impl })).resolves.toMatchObject({ warmup: {} });
+  });
+
+  it('tolerates an unknown extra top-level key alongside the warm-up block', async () => {
+    const { impl } = recordingFetch(
+      jsonResponse({ ...catalog, fees: { taker: 0.001 }, unspecified: null }),
+    );
+
+    const result = await fetchCatalog({ fetchImpl: impl });
+
+    // A slightly newer server adding a key the dashboard does not read yet must
+    // keep rendering its pickers.
+    expect(result.timeframes).toEqual(catalog.timeframes);
+    expect(result.warmup).toEqual(catalog.warmup);
+  });
+
+  it('rejects a warm-up block that is not a record', async () => {
+    const { impl } = recordingFetch(jsonResponse({ ...catalog, warmup: [] }));
+
+    await expect(fetchCatalog({ fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/catalog',
+    });
+  });
+
+  it('rejects a warm-up entry whose default warm-up is not a number', async () => {
+    const broken = {
+      ...catalog,
+      warmup: { basic: { ...catalog.warmup?.basic, default_warmup_candles: '200' } },
+    };
+    const { impl } = recordingFetch(jsonResponse(broken));
+
+    await expect(fetchCatalog({ fetchImpl: impl })).rejects.toMatchObject({
+      kind: 'malformed',
+      path: '/api/catalog',
+    });
   });
 });
 

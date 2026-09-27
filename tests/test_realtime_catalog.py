@@ -52,8 +52,24 @@ EXPECTED_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 #: Bases the static table must always carry.
 REQUIRED_BASES = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX"}
 
-#: The four documented keys of ``GET /api/catalog``.
-CATALOG_KEYS = {"symbols", "strategies", "timeframes", "modes"}
+#: The five documented keys of ``GET /api/catalog`` (the ``warmup`` matrix is the
+#: fifth one; the four vocabularies keep their names, their order and their types).
+CATALOG_KEYS = {"symbols", "strategies", "timeframes", "modes", "warmup"}
+
+#: The ten strategies of the shipped catalogue, in the sorted order the registry
+#: answers -- the vocabulary of the ``strategies`` key, pinned exhaustively.
+EXPECTED_STRATEGIES = [
+    "basic",
+    "bollinger",
+    "donchian",
+    "dual_thrust",
+    "faber",
+    "keltner",
+    "macd",
+    "momentum",
+    "rsi_reversion",
+    "supertrend",
+]
 
 
 class FakeFetcher:
@@ -145,7 +161,7 @@ def test_fallback_symbols_answers_an_empty_list_for_an_unknown_quote(quote: str)
     assert fallback_symbols(quote) == []
 
 
-def test_default_catalog_body_has_exactly_the_four_documented_keys() -> None:
+def test_default_catalog_body_has_exactly_the_five_documented_keys() -> None:
     body = default_catalog_body()
     assert set(body) == CATALOG_KEYS
     assert body["timeframes"] == EXPECTED_TIMEFRAMES
@@ -179,6 +195,20 @@ def test_strategy_names_is_resolved_at_call_time(monkeypatch: pytest.MonkeyPatch
     assert default_catalog_body()["strategies"] == ["zeta", "alpha"]
 
 
+def test_the_strategy_vocabulary_is_the_ten_house_strategies() -> None:
+    """The exhaustive pin of the ``strategies`` key of the catalog.
+
+    Every other assertion of this file compares the key with
+    :func:`strategy_names` itself, which would also hold for an empty registry;
+    this one names the catalogue the picker must offer, so a strategy silently
+    dropping out of the registry is a failure here rather than a smaller list.
+    """
+    assert sorted(EXPECTED_STRATEGIES) == EXPECTED_STRATEGIES
+    assert STRATEGY_NAMES() == EXPECTED_STRATEGIES
+    assert strategy_names() == EXPECTED_STRATEGIES
+    assert default_catalog_body()["strategies"] == EXPECTED_STRATEGIES
+
+
 # ---------------------------------------------------------------------------
 # 3. MarketCatalog offline
 # ---------------------------------------------------------------------------
@@ -203,7 +233,7 @@ def test_offline_catalog_answers_the_static_table_without_calling_the_fetcher() 
     assert fetcher.calls == 0
 
 
-def test_catalog_returns_the_four_keys_and_a_symbol_copy() -> None:
+def test_catalog_returns_the_five_keys_and_a_symbol_copy() -> None:
     market_catalog = MarketCatalog(allow_network=False, clock=ManualClock())
     body = market_catalog.catalog()
     assert set(body) == CATALOG_KEYS

@@ -218,7 +218,11 @@ PROFILE_KEYS = sorted(
 KILL_SWITCH_KEYS = ["changed_at", "kill_switch", "reason"]
 
 #: Exact keys of ``GET /api/catalog`` and of one symbol entry.
-CATALOG_KEYS = ["modes", "strategies", "symbols", "timeframes"]
+#:
+#: ``warmup`` is the fifth key: the per-strategy warm-up matrix the static catalog
+#: carries.  It stays **optional** for consumers, which is exactly what
+#: ``FakeCatalog`` proves below by omitting it.
+CATALOG_KEYS = ["modes", "strategies", "symbols", "timeframes", "warmup"]
 CATALOG_SYMBOL_KEYS = ["base", "quote", "symbol"]
 
 #: Exact keys of ``GET /api/control`` and of one profile entry.
@@ -582,7 +586,15 @@ class NonMappingProfileFailuresProvider(FakeProvider):
 
 @dataclass
 class FakeCatalog:
-    """Local implementation of :class:`CatalogProvider` (never a network call)."""
+    """Local implementation of :class:`CatalogProvider` (never a network call).
+
+    Its body deliberately carries the four original keys and **no** ``warmup``:
+    the warm-up matrix is an *additive* key, so an older producer that omits it
+    stays a perfectly valid one, and the route must pass such a body through
+    untouched.  Keeping the omission here is what makes that compatibility a
+    living, executed contract -- and it is also what keeps the
+    ``payload_of(response) == catalog.body`` assertion below valid.
+    """
 
     body: dict[str, Any] = field(
         default_factory=lambda: {
@@ -2683,12 +2695,30 @@ def test_the_static_catalog_answers_without_a_provider(router: Router) -> None:
     body = payload_of(response)
     assert sorted(body) == CATALOG_KEYS
     assert body == default_catalog_body()
-    assert body["strategies"] == ["basic", "momentum"]
+    assert body["strategies"] == [
+        "basic",
+        "bollinger",
+        "donchian",
+        "dual_thrust",
+        "faber",
+        "keltner",
+        "macd",
+        "momentum",
+        "rsi_reversion",
+        "supertrend",
+    ]
     assert body["modes"] == ["paper", "live"]
     assert body["timeframes"], "the picker needs at least one timeframe"
     assert body["symbols"], "the picker needs at least one symbol"
     for entry in body["symbols"]:
         assert sorted(entry) == CATALOG_SYMBOL_KEYS
+    # the fifth key is the warm-up guard: without it the dashboard cannot grey out
+    # a strategy/timeframe pair that would never warm up
+    assert body["warmup"], "the static catalog must carry the warm-up matrix"
+    assert set(body["warmup"]) == set(body["strategies"])
+    for strategy, matrix in body["warmup"].items():
+        assert matrix["default_warmup_candles"] >= 1
+        assert list(matrix["timeframes"]) == body["timeframes"], strategy
 
 
 def test_an_injected_catalog_wins(

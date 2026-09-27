@@ -93,8 +93,13 @@ async function settle(): Promise<void> {
 }
 
 /** Render the card and wait for the control poll of its actions island. */
-async function renderCard(profile: ProfileSnapshot) {
-  const view = render(<ProfileCard profile={profile} />);
+async function renderCard(
+  profile: ProfileSnapshot,
+  rank?: { rank?: number; rankTotal?: number },
+) {
+  const view = render(
+    <ProfileCard profile={profile} rank={rank?.rank} rankTotal={rank?.rankTotal} />,
+  );
   await settle();
   return view;
 }
@@ -403,6 +408,62 @@ describe('ProfileCard', () => {
     expect(card()?.querySelector('dl')).toBe(keyValues());
     expect(keyValues().querySelectorAll('[data-testid="profile-card-key-value"]')).toHaveLength(2);
     expect(screen.queryByText('Strategy')).toBeNull();
+  });
+
+  it('renders the ranking badge of the overview with an accessible sentence', async () => {
+    await renderCard(makeProfile(), { rank: 3, rankTotal: 12 });
+
+    const badge = screen.getByTestId('profile-card-rank');
+    // The visible ordinal, hidden from assistive technology...
+    expect(badge.querySelector('[aria-hidden="true"]')).toHaveTextContent('#3');
+    // ...and the sentence that carries its meaning.
+    expect(badge).toHaveTextContent('Rank 3 of 12 by portfolio value');
+    expect(badge.querySelector('svg')).not.toBeNull();
+
+    const pill = screen.getByText('#3').closest('span[data-tone]');
+    expect(pill).toHaveAttribute('data-tone', 'neutral');
+  });
+
+  it('omits the total from the sentence when the caller does not know it', async () => {
+    await renderCard(makeProfile(), { rank: 2 });
+
+    expect(screen.getByTestId('profile-card-rank')).toHaveTextContent('Rank 2 by portfolio value');
+  });
+
+  it('renders no rank badge at all when no rank is given', async () => {
+    // The /profiles/[id] detail route reuses this very card: no ranking there,
+    // so no badge — not an em dash, not a zero, nothing.
+    await renderCard(makeProfile());
+
+    expect(screen.queryByTestId('profile-card-rank')).toBeNull();
+    expect(screen.queryByText(/Rank/)).toBeNull();
+    expect(screen.queryByText(/^#\d+$/)).toBeNull();
+  });
+
+  it('renders no rank badge for a rank that is not a positive integer', async () => {
+    for (const rank of [0, -1, 1.5, Number.NaN]) {
+      const view = await renderCard(makeProfile(), { rank });
+      expect(screen.queryByTestId('profile-card-rank')).toBeNull();
+      view.unmount();
+    }
+  });
+
+  it('ignores a total that is not a positive integer', async () => {
+    await renderCard(makeProfile(), { rank: 2, rankTotal: 0 });
+
+    expect(screen.getByTestId('profile-card-rank')).toHaveTextContent('Rank 2 by portfolio value');
+  });
+
+  it('keeps the rank badge out of the interactive surface of the card', async () => {
+    await renderCard(makeProfile(), { rank: 1, rankTotal: 2 });
+
+    const badge = screen.getByTestId('profile-card-rank');
+    // The badge is text: it adds neither a button nor a link to the tab order,
+    // so the stretched link stays the only navigation target of the card.
+    expect(badge.querySelector('a')).toBeNull();
+    expect(badge.querySelector('button')).toBeNull();
+    expect(screen.getAllByRole('link')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled();
   });
 
   it('renders the actions island of the profile in the card footer', async () => {

@@ -12,6 +12,7 @@ import {
   TrendingDown,
   TrendingUp,
   TriangleAlert,
+  Trophy,
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -33,6 +34,15 @@ export interface ProfileCardProps {
   /** One profile as `GET /api/profiles` emits it. */
   profile: ProfileSnapshot;
   className?: string;
+  /**
+   * 1-based position of the profile in the portfolio-value ranking, when the
+   * card is rendered inside a ranked list. Absent — or not a positive integer —
+   * renders **no** badge at all, so the per-profile detail route reuses this very
+   * card unchanged.
+   */
+  rank?: number;
+  /** How many profiles the ranking holds, for the accessible sentence. */
+  rankTotal?: number;
 }
 
 const BADGE_ICON_CLASSES = 'size-3.5';
@@ -84,6 +94,25 @@ function textOrPlaceholder(value: string | null | undefined): string {
 /** Deterministic, hydration-safe DOM id of the card heading. */
 function headingId(profileId: string): string {
   return `profile-${profileId.replace(/[^a-zA-Z0-9_-]+/g, '-')}`;
+}
+
+/** Whether `value` is a usable ordinal position (a positive integer). */
+function isPositiveInteger(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+/**
+ * The accessible sentence of the rank badge.
+ *
+ * The visible badge shows only `#3`, which is meaningless read out of context, so
+ * the badge itself is hidden from assistive technology and this sentence carries
+ * the meaning instead: "Rank 3 of 12 by portfolio value". The total is omitted —
+ * rather than guessed — when the caller does not know it.
+ */
+function rankSentence(rank: number, rankTotal: number | undefined): string {
+  return isPositiveInteger(rankTotal)
+    ? `Rank ${rank} of ${rankTotal} by portfolio value`
+    : `Rank ${rank} by portfolio value`;
 }
 
 interface KeyValueProps {
@@ -164,8 +193,14 @@ function TrendValue({ text, value }: TrendValueProps) {
  * value carries an explicit label, every state pairs its tone with a text label
  * and an icon, and every absent value renders the em dash placeholder — never
  * `NaN`, `undefined` or an empty cell.
+ *
+ * The optional **rank badge** makes the ordering of the overview visible: the
+ * list is sorted by portfolio value, highest first (see `lib/ranking.ts`), and
+ * every card states the position it holds in that ranking. The badge is rendered
+ * only when the caller passes a positive integer `rank`, so the detail route —
+ * where there is no ranking — keeps reusing this component unchanged.
  */
-export function ProfileCard({ profile, className }: ProfileCardProps) {
+export function ProfileCard({ profile, className, rank, rankTotal }: ProfileCardProps) {
   const mode = MODE_BADGES[profile.mode] ?? {
     label: textOrPlaceholder(profile.mode),
     tone: 'neutral' as StatusTone,
@@ -227,6 +262,22 @@ export function ProfileCard({ profile, className }: ProfileCardProps) {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-sm">
+          {/* The rank badge of the ranking the overview renders. It is the
+              first badge of the cluster — the position is what makes the list a
+              ranking — and it carries no interactive element, so it neither
+              disturbs the stretched link nor the focus order. */}
+          {isPositiveInteger(rank) ? (
+            <span data-testid="profile-card-rank" className="inline-flex items-center">
+              <span aria-hidden="true">
+                <StatusBadge
+                  label={`#${rank}`}
+                  tone="neutral"
+                  icon={<Trophy className={BADGE_ICON_CLASSES} />}
+                />
+              </span>
+              <span className="sr-only">{rankSentence(rank, rankTotal)}</span>
+            </span>
+          ) : null}
           <StatusBadge label={mode.label} tone={mode.tone} icon={mode.icon} />
           <StatusBadge label={status.label} tone={status.tone} icon={status.icon} />
         </div>

@@ -13,6 +13,12 @@ Design rules (they are part of the package contract):
 * **typed errors**: an invalid ``period`` raises
   :class:`~trading_platform.core.errors.StrategyError`.
 
+The rolling-window family (:func:`rolling_max`, :func:`rolling_min`,
+:func:`rolling_std`, :func:`bollinger_bands`) uses full windows only
+(``min_periods == window``) and the **population** standard deviation
+(``ddof=0``) by default, so the Bollinger band width is decided once, here,
+instead of being re-decided by every caller.
+
 The smoothing conventions follow Wilder (and TA-Lib, hence Freqtrade): the
 exponential recursion ``y_t = (1 - 1/period) * y_{t-1} + (1/period) * x_t`` is
 *seeded* with the simple moving average of the first ``period`` observations,
@@ -23,13 +29,25 @@ which is why the first ``period`` values of :func:`rsi` and :func:`atr` are
 from __future__ import annotations
 
 from collections.abc import Hashable
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
 from trading_platform.core.errors import StrategyError
 
-__all__ = ["atr", "ema", "roc", "rsi", "sma", "true_range"]
+__all__ = [
+    "atr",
+    "bollinger_bands",
+    "ema",
+    "roc",
+    "rolling_max",
+    "rolling_min",
+    "rolling_std",
+    "rsi",
+    "sma",
+    "true_range",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +71,26 @@ def _validate_period(period: int, *, name: str = "period") -> int:
         raise StrategyError(f"{name} must be an integer, got {period!r}")
     if value < 1:
         raise StrategyError(f"{name} must be >= 1, got {value}")
+    return value
+
+
+def _validate_ddof(ddof: int) -> int:
+    """Return ``ddof`` as a plain ``int``, or raise :class:`StrategyError`.
+
+    Raises
+    ------
+    StrategyError
+        If ``ddof`` is not an integer or is negative (the rolling window has no
+        meaningful negative delta degrees of freedom).
+    """
+    try:
+        value = int(ddof)
+    except (TypeError, ValueError):
+        raise StrategyError(f"ddof must be an integer >= 0, got {ddof!r}") from None
+    if value != ddof:
+        raise StrategyError(f"ddof must be an integer, got {ddof!r}")
+    if value < 0:
+        raise StrategyError(f"ddof must be >= 0, got {value}")
     return value
 
 
@@ -320,6 +358,195 @@ def sma(series: pd.Series, period: int) -> pd.Series:
     values = _as_float_series(series, name="series")
     averaged = values.rolling(window=length, min_periods=length).mean()
     return _finite(averaged.to_numpy(dtype="float64"), index=values.index, name="sma")
+
+
+def rolling_max(series: pd.Series, period: int) -> pd.Series:
+    """Rolling maximum of ``series`` over ``period`` observations.
+
+    Equivalent to ``series.rolling(window=period, min_periods=period).max()``:
+    a value is only produced once a *full* window is available, so the first
+    ``period - 1`` values are ``NaN`` and the first defined value sits at
+    position ``period - 1``.
+
+    The result is a ``float64`` :class:`pandas.Series` named ``"rolling_max"``
+    (the literal name, never the input one), indexed exactly like ``series`` —
+    ``index.name`` included; the input is never mutated and an infinite input
+    value never leaks into the result (it becomes ``NaN``).
+
+    Parameters
+    ----------
+    series:
+        Input values (any numeric dtype).  Never mutated.
+    period:
+        Number of observations in each window, must be ``>= 1``.
+
+    Raises
+    ------
+    StrategyError
+        If ``period`` is not an integer ``>= 1``, or if ``series`` is not a
+        numeric :class:`pandas.Series`.
+    """
+    length = _validate_period(period)
+    values = _as_float_series(series, name="series")
+    maximum = values.rolling(window=length, min_periods=length).max()
+    return _finite(maximum.to_numpy(dtype="float64"), index=values.index, name="rolling_max")
+
+
+def rolling_min(series: pd.Series, period: int) -> pd.Series:
+    """Rolling minimum of ``series`` over ``period`` observations.
+
+    Equivalent to ``series.rolling(window=period, min_periods=period).min()``:
+    a value is only produced once a *full* window is available, so the first
+    ``period - 1`` values are ``NaN`` and the first defined value sits at
+    position ``period - 1``.
+
+    The result is a ``float64`` :class:`pandas.Series` named ``"rolling_min"``
+    (the literal name, never the input one), indexed exactly like ``series`` —
+    ``index.name`` included; the input is never mutated and an infinite input
+    value never leaks into the result (it becomes ``NaN``).
+
+    Parameters
+    ----------
+    series:
+        Input values (any numeric dtype).  Never mutated.
+    period:
+        Number of observations in each window, must be ``>= 1``.
+
+    Raises
+    ------
+    StrategyError
+        If ``period`` is not an integer ``>= 1``, or if ``series`` is not a
+        numeric :class:`pandas.Series`.
+    """
+    length = _validate_period(period)
+    values = _as_float_series(series, name="series")
+    minimum = values.rolling(window=length, min_periods=length).min()
+    return _finite(minimum.to_numpy(dtype="float64"), index=values.index, name="rolling_min")
+
+
+def rolling_std(series: pd.Series, period: int, *, ddof: int = 0) -> pd.Series:
+    """Rolling standard deviation of ``series`` over ``period`` observations.
+
+    Equivalent to ``series.rolling(window=period, min_periods=period).std(ddof=ddof)``:
+    a value is only produced once a *full* window is available, so the first
+    ``period - 1`` values are ``NaN`` and the first defined value sits at
+    position ``period - 1``.
+
+    **The default is the population estimator (``ddof=0``)** — pandas' own
+    default for a rolling standard deviation, and the convention the Bollinger
+    band width is defined with.  Pass ``ddof=1`` explicitly when the unbiased
+    sample estimator is wanted: the two differ by the factor
+    ``sqrt(period / (period - 1))`` and therefore change the band width, which
+    is why the estimator is part of this function's signature instead of being
+    hidden inside a caller.
+
+    The result is a ``float64`` :class:`pandas.Series` named ``"rolling_std"``
+    (the literal name, never the input one), indexed exactly like ``series`` —
+    ``index.name`` included; the input is never mutated and an infinite input
+    value never leaks into the result (it becomes ``NaN``).
+
+    Parameters
+    ----------
+    series:
+        Input values (any numeric dtype).  Never mutated.
+    period:
+        Number of observations in each window, must be ``>= 1``.
+    ddof:
+        Delta degrees of freedom, must be an integer ``>= 0``.  ``0`` (the
+        default) is the population estimator, ``1`` the sample one.
+
+    Raises
+    ------
+    StrategyError
+        If ``period`` is not an integer ``>= 1``, if ``ddof`` is not an integer
+        ``>= 0``, or if ``series`` is not a numeric :class:`pandas.Series`.
+    """
+    length = _validate_period(period)
+    freedom = _validate_ddof(ddof)
+    values = _as_float_series(series, name="series")
+    deviation = values.rolling(window=length, min_periods=length).std(ddof=freedom)
+    return _finite(deviation.to_numpy(dtype="float64"), index=values.index, name="rolling_std")
+
+
+class BollingerBands(NamedTuple):
+    """The three series of a Bollinger band set.
+
+    Attributes
+    ----------
+    middle:
+        The simple moving average, named ``"bollinger_mid"``.
+    upper:
+        ``middle + num_std * rolling_std``, named ``"bollinger_upper"``.
+    lower:
+        ``middle - num_std * rolling_std``, named ``"bollinger_lower"``.
+    """
+
+    middle: pd.Series
+    upper: pd.Series
+    lower: pd.Series
+
+
+def bollinger_bands(series: pd.Series, period: int, num_std: float = 2.0) -> BollingerBands:
+    """Bollinger bands: a moving average plus/minus ``num_std`` deviations.
+
+    The three series are exactly:
+
+    * ``middle == sma(series, period)``;
+    * ``upper == middle + num_std * rolling_std(series, period)``;
+    * ``lower == middle - num_std * rolling_std(series, period)``.
+
+    The band width is therefore built on the **population** standard deviation
+    (``ddof=0``, see :func:`rolling_std`) and the ``NaN`` warm-up prefix is
+    exactly the one of :func:`sma`: the first ``period - 1`` values of all three
+    series are ``NaN``.
+
+    The results are ``float64`` :class:`pandas.Series` named
+    ``"bollinger_mid"``, ``"bollinger_upper"`` and ``"bollinger_lower"``,
+    indexed exactly like ``series`` — ``index.name`` included; the input is
+    never mutated and no result ever contains ``inf``.
+
+    Parameters
+    ----------
+    series:
+        Input values (any numeric dtype).  Never mutated.
+    period:
+        Number of observations in each window, must be ``>= 1``.
+    num_std:
+        Number of standard deviations between the middle band and each outer
+        band; must be finite and strictly positive.
+
+    Returns
+    -------
+    BollingerBands
+        The ``middle``, ``upper`` and ``lower`` series.
+
+    Raises
+    ------
+    StrategyError
+        If ``period`` is not an integer ``>= 1``, if ``num_std`` is not a
+        finite number ``> 0``, or if ``series`` is not a numeric
+        :class:`pandas.Series`.
+    """
+    length = _validate_period(period)
+    try:
+        width = float(num_std)
+    except (TypeError, ValueError):
+        raise StrategyError(f"num_std must be a finite number > 0, got {num_std!r}") from None
+    if not np.isfinite(width) or width <= 0.0:
+        raise StrategyError(f"num_std must be a finite number > 0, got {num_std!r}")
+
+    values = _as_float_series(series, name="series")
+    # ``sma`` literally names its result "sma"; the band set uses the column
+    # names the strategy layer stores, so the middle band is renamed here.
+    middle = sma(values, length).rename("bollinger_mid")
+    deviation = rolling_std(values, length) * width
+    upper = middle + deviation
+    lower = middle - deviation
+    return BollingerBands(
+        middle=middle,
+        upper=_finite(upper.to_numpy(dtype="float64"), index=values.index, name="bollinger_upper"),
+        lower=_finite(lower.to_numpy(dtype="float64"), index=values.index, name="bollinger_lower"),
+    )
 
 
 def roc(series: pd.Series, period: int) -> pd.Series:

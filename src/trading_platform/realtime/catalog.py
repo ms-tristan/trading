@@ -1,6 +1,6 @@
-"""Market catalog of the realtime layer: symbols, strategies, timeframes, modes.
+"""Market catalog of the realtime layer: symbols, strategies, timeframes, modes, warm-up.
 
-The dashboard pickers need four vocabularies, and this module is their single
+The dashboard pickers need five vocabularies, and this module is their single
 source of truth:
 
 symbols
@@ -18,7 +18,22 @@ timeframes
     ordered shortest to longest through
     :func:`~trading_platform.core.constants.timeframe_minutes`;
 modes
-    ``"paper"`` and ``"live"``.
+    ``"paper"`` and ``"live"``;
+warm-up (:func:`warmup_matrix`, served under the ``warmup`` key)
+    for every strategy of ``strategies`` and every timeframe of ``timeframes``,
+    the candles that frame must hold before the strategy can emit any signal
+    (``required_candles``) and whether the platform's default warm-up can feed it
+    (``feedable``).  It is the **projection** of the warm-up contract onto the
+    catalog: the arithmetic stays in
+    :mod:`trading_platform.realtime.warmup` (:func:`~trading_platform.realtime.warmup.candles_per_day`,
+    :data:`~trading_platform.realtime.warmup.DEFAULT_WARMUP_CANDLES`) and this
+    module only reports it per strategy and timeframe, so a picker can grey out
+    the combinations that would never warm up *before* a profile is created
+    rather than after a refusal.  Like every other key of the body it is pure and
+    offline -- no I/O, no clock, no ``ProfileConfig`` -- and it is total: a
+    strategy the registry cannot build is reported as "nothing required, nothing
+    feedable" instead of raising, because the route that serves it must never
+    answer a ``500``.
 
 Offline by default, networked only when asked
 ---------------------------------------------
@@ -54,8 +69,10 @@ from functools import partial
 from typing import Any
 
 from trading_platform.core.constants import SUPPORTED_TIMEFRAMES, timeframe_minutes
+from trading_platform.core.errors import ConfigError, StrategyError
 from trading_platform.realtime.clock import Clock, SystemClock
-from trading_platform.strategy.registry import strategy_names
+from trading_platform.realtime.warmup import DEFAULT_WARMUP_CANDLES, candles_per_day
+from trading_platform.strategy.registry import get_strategy, strategy_names
 
 __all__ = [
     "CATALOG_MODES",
@@ -66,6 +83,8 @@ __all__ = [
     "MarketCatalog",
     "default_catalog_body",
     "fallback_symbols",
+    "warmup_matrix",
+    "warmup_payload",
 ]
 
 #: Module logger: every degraded (networked -> static) answer is reported here.
@@ -142,11 +161,121 @@ def fallback_symbols(quote: str = "USDT") -> list[dict[str, str]]:
     ]
 
 
+def warmup_matrix(
+    *,
+    default_warmup_candles: int = DEFAULT_WARMUP_CANDLES,
+    timeframes: Sequence[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return the per-strategy warm-up matrix of the catalog, as a plain mapping.
+
+    The answer is keyed by strategy name -- ``STRATEGY_NAMES()`` **as returned**,
+    so it follows the registry exactly like the ``strategies`` key does -- and
+    each entry carries ``default_warmup_candles`` plus one entry per timeframe:
+
+    ``required_candles``
+        the candles that frame must hold before **that** strategy can emit any
+        signal, read from the strategy's own
+        :meth:`~trading_platform.strategy.base.Strategy.required_candles` on the
+        grid of the timeframe.  Nothing is hard-coded here and no second copy of
+        the arithmetic exists: the grid comes from
+        :func:`~trading_platform.realtime.warmup.candles_per_day`, the single
+        authority of the warm-up contract;
+    ``feedable``
+        ``required_candles <= default_warmup_candles``.  It mirrors
+        :func:`~trading_platform.realtime.warmup.effective_warmup_candles` for a
+        profile that overrides nothing, whose resolved warm-up **is** the
+        strategy's own requirement: a ``False`` cell is exactly the combination
+        the create route would refuse as "can never warm up".
+
+    Parameters
+    ----------
+    default_warmup_candles:
+        The warm-up budget a profile gets when it overrides nothing
+        (:data:`~trading_platform.realtime.warmup.DEFAULT_WARMUP_CANDLES`).
+    timeframes:
+        The timeframes to report, in the order they must appear in the payload;
+        ``None`` means :data:`TIMEFRAME_ORDER`, the picker order, which is never
+        re-sorted here.
+
+    Returns
+    -------
+    dict[str, dict[str, Any]]
+        ``{strategy: {"default_warmup_candles": int, "timeframes": {tf:
+        {"required_candles": int, "feedable": bool}}}}``.
+
+    Notes
+    -----
+    The function is **total and never raises**, exactly like every other answer
+    of this module: a strategy the registry cannot build (an unknown name, a
+    rejected parameter set) answers ``required_candles == 0`` and
+    ``feedable == False`` for **every** requested timeframe, so the client
+    contract "no missing key" holds unconditionally.  ``feedable`` is *not*
+    re-derived from those zeros -- an unbuildable strategy is reported as
+    unusable, never as one that is trivially fed -- which is why the comparison
+    is conjoined with the build having succeeded.  It performs no I/O at all, so
+    it is safe on the degraded path of ``GET /api/catalog``: a venue outage must
+    not remove the guard.
+    """
+    supported = list(TIMEFRAME_ORDER) if timeframes is None else list(timeframes)
+    feedable_below = int(default_warmup_candles)
+    matrix: dict[str, dict[str, Any]] = {}
+    for name in STRATEGY_NAMES():
+        # The requirement is read per timeframe on purpose: a strategy converts
+        # its day-based lookbacks into candles with the *grid* it is handed, so
+        # the shorter the frame, the more candles it needs.
+        buildable = True
+        required: dict[str, int] = {}
+        try:
+            built = get_strategy(name, {})
+            required = {
+                timeframe: int(built.required_candles(candles_per_day(timeframe)))
+                for timeframe in supported
+            }
+        except (ConfigError, StrategyError):
+            # "Unbuildable" is not "needs nothing": the row is reported as
+            # unusable on every grid, never as a strategy that is trivially fed.
+            buildable = False
+            required = dict.fromkeys(supported, 0)
+        matrix[name] = {
+            "default_warmup_candles": feedable_below,
+            "timeframes": {
+                timeframe: {
+                    "required_candles": required[timeframe],
+                    "feedable": buildable and required[timeframe] <= feedable_below,
+                }
+                for timeframe in supported
+            },
+        }
+    return matrix
+
+
+def warmup_payload(
+    *,
+    default_warmup_candles: int = DEFAULT_WARMUP_CANDLES,
+    timeframes: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Return :func:`warmup_matrix` under its frozen ``warmup`` key.
+
+    The wrapped shape exists so the two producers of the catalog body -- the
+    I/O-free :func:`default_catalog_body` and :meth:`MarketCatalog.catalog` --
+    spread **one** expression and can never drift apart, and so the JSON key is
+    spelled once in the codebase.
+    """
+    return {
+        "warmup": warmup_matrix(
+            default_warmup_candles=default_warmup_candles,
+            timeframes=timeframes,
+        )
+    }
+
+
 def default_catalog_body(quote: str = "USDT") -> dict[str, Any]:
     """Return the whole catalog with **no** I/O at all.
 
-    The result has exactly the four documented keys of ``GET /api/catalog`` and
-    is the guaranteed answer of the route when the venue cannot be reached.
+    The result has exactly the five documented keys of ``GET /api/catalog`` --
+    the four vocabularies plus the ``warmup`` matrix, which is as offline as the
+    rest of the body -- and is the guaranteed answer of the route when the venue
+    cannot be reached.
 
     Parameters
     ----------
@@ -158,6 +287,7 @@ def default_catalog_body(quote: str = "USDT") -> dict[str, Any]:
         "strategies": STRATEGY_NAMES(),
         "timeframes": list(TIMEFRAME_ORDER),
         "modes": list(CATALOG_MODES),
+        **warmup_payload(),
     }
 
 
@@ -354,12 +484,13 @@ class MarketCatalog:
             return [dict(entry) for entry in self._symbols]
 
     def catalog(self) -> dict[str, Any]:
-        """Return the whole catalog: symbols, strategies, timeframes and modes."""
+        """Return the whole catalog: symbols, strategies, timeframes, modes and warm-up."""
         return {
             "symbols": self.symbols(),
             "strategies": STRATEGY_NAMES(),
             "timeframes": list(TIMEFRAME_ORDER),
             "modes": list(CATALOG_MODES),
+            **warmup_payload(),
         }
 
     def invalidate(self) -> None:
