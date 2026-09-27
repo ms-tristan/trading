@@ -18,7 +18,7 @@ and ``trading_platform.web`` (layer 7) are imported **inside the command bodies
 and their helpers**, never at module import time.  Importing
 ``trading_platform.cli`` therefore leaves neither of the two new layers in
 ``sys.modules``, which is what keeps ``--help`` free of the engine and of the
-optional ``ccxt``/``freqtrade`` extras.  The three commands are:
+optional ``ccxt``/``freqtrade`` extras.  The four commands are:
 
 * ``realtime run`` — starts the engine *and* the monitoring server (``--once``
   runs a single deterministic tick and exits, without starting any server);
@@ -26,16 +26,22 @@ optional ``ccxt``/``freqtrade`` extras.  The three commands are:
 * ``realtime check`` — static pre-flight: it validates the profiles document,
   the credential *presence*, the live gate, the risk limits and the writability
   of the state database; it never places an order, never needs the network, and
-  exits ``1`` as soon as one profile cannot start.
+  exits ``1`` as soon as one profile cannot start;
+* ``realtime provision`` — reconciles the declarative profile catalogue of
+  :mod:`trading_platform.profiles.catalogue` with a **running** engine, through
+  that engine's own HTTP API: it creates what is missing, skips what is already
+  there, and deletes nothing unless ``--prune`` is passed explicitly.
 
 Their payloads have their own key sets (documented verbatim in
 ``docs/usage.md`` and ``docs/realtime.md``): ``realtime-check`` carries
-``state_db_writable`` plus one entry per profile, while ``realtime-run`` and
+``state_db_writable`` plus one entry per profile, ``realtime-run`` and
 ``realtime-serve`` carry ``profiles`` (snapshots), ``decisions`` and the
-monitoring ``url``.  They travel through :func:`_emit_realtime` instead of
-:func:`_payload` for that reason; stdout still carries exactly one JSON object
-per invocation, and the startup URL is announced on **stderr** when ``--json``
-is used.
+monitoring ``url``, and ``realtime-provision`` carries the catalogue total, the
+ledger capacity and the ``created`` / ``skipped`` / ``pruned`` / ``failed`` /
+``refused_live`` reports of one reconciliation.  They travel through
+:func:`_emit_realtime` instead of :func:`_payload` for that reason; stdout still
+carries exactly one JSON object per invocation, and the startup URL is announced
+on **stderr** when ``--json`` is used.
 
 Exit codes: ``0`` success, ``1`` domain error (any
 :class:`~trading_platform.core.errors.TradingBacktestError`), ``2`` usage error
@@ -2395,6 +2401,107 @@ def realtime_serve(
             },
             json_output=json_output,
         )
+
+
+@realtime_app.command("provision")
+def realtime_provision(
+    api_url: str | None = typer.Option(
+        None,
+        "--api-url",
+        help=(
+            "Root URL of the monitoring API (default: TB_API_URL, else "
+            "http://127.0.0.1:8080, the in-container monitoring port)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run/--no-dry-run",
+        help="Report what would be created and deleted, without mutating anything.",
+    ),
+    prune: bool = typer.Option(
+        False,
+        "--prune/--no-prune",
+        help="Also delete the profiles the catalogue does not declare (never by default).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force/--no-force",
+        help="Create the catalogue even when it commits more than the paper ledger covers.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help=_JSON_HELP),
+) -> None:
+    """Create the missing profiles of the declarative catalogue (idempotent).
+
+    The catalogue (``trading_platform.profiles.catalogue``) declares 26 paper
+    profiles -- two or three per house strategy, over the 1d/4h/1h grids -- plus
+    one live entry, and this command is the only way it reaches the platform: it
+    reads the running API, creates what is missing and reports what it skipped.
+
+    It is safe to run it twice, and safe to run it first with ``--dry-run``: a dry
+    run performs **no mutation at all**.  Nothing is ever deleted without
+    ``--prune``, and a live entry is refused -- never fabricated -- while the
+    engine environment does not carry the venue credentials the broker needs
+    (``TB_PROFILE_<ID>_API_KEY``/``_API_SECRET`` or ``TB_LIVE_API_KEY``/
+    ``TB_LIVE_API_SECRET``, plus ``TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK``).
+    The operator token is read from ``TB_OPERATOR_TOKEN`` only, so no secret ever
+    appears in the process list: ``docker exec trading-realtime trading realtime
+    provision --dry-run`` works out of the box on the deployed stack.
+    """
+    with _error_surface("realtime-provision", json_output=json_output):
+        from trading_platform.profiles import apply as profiles_apply
+
+        token = (os.environ.get("TB_OPERATOR_TOKEN") or "").strip() or None
+        client = profiles_apply.ProfileApiClient(
+            base_url=api_url or os.environ.get("TB_API_URL") or "http://127.0.0.1:8080",
+            token=token,
+        )
+        payload = profiles_apply.apply_catalogue(
+            client,
+            dry_run=dry_run,
+            prune=prune,
+            force=force,
+            environ=os.environ,
+        )
+        _emit_realtime(payload, json_output=json_output)
+        if not json_output:
+            capacity = payload["ledger_capacity"]
+            console.print(
+                f"  paper catalogue: {_format_value(payload['paper_total_initial_balance'])} USDT "
+                f"against a paper ledger capacity of "
+                f"{'unknown' if capacity is None else _format_value(capacity)} USDT",
+                highlight=False,
+            )
+            console.print(
+                f"  {'would create' if payload['dry_run'] else 'created'}: "
+                f"{len(payload['created'])}  skipped: {len(payload['skipped'])}  "
+                f"pruned: {len(payload['pruned'])}  failed: {len(payload['failed'])}  "
+                f"refused live: {len(payload['refused_live'])}",
+                highlight=False,
+            )
+            for key, label in (
+                ("created", "would create" if payload["dry_run"] else "created"),
+                ("skipped", "skipped"),
+                ("pruned", "pruned"),
+            ):
+                entries = payload[key]
+                if entries:
+                    console.print(f"  {label}: {', '.join(entries)}", highlight=False)
+        for entry in payload["failed"]:
+            err_console.print(
+                f"error: {entry['id']}: {entry['error']}",
+                style="red",
+                markup=False,
+                highlight=False,
+            )
+        for entry in payload["refused_live"]:
+            err_console.print(
+                f"error: {entry['id']}: {entry['reason']}",
+                style="red",
+                markup=False,
+                highlight=False,
+            )
+        if not payload["ok"]:
+            raise typer.Exit(code=1)
 
 
 class _PersistedSnapshotProvider:
