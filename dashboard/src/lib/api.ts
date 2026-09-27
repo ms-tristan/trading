@@ -23,7 +23,10 @@ import type {
   Candle,
   CandlesPayload,
   CatalogPayload,
+  CatalogStrategyWarmup,
   CatalogSymbol,
+  CatalogTimeframeWarmup,
+  CatalogWarmup,
   ControlPayload,
   CreateProfileBody,
   CreateProfilePayload,
@@ -667,14 +670,68 @@ export function isCatalogSymbol(value: unknown): value is CatalogSymbol {
   );
 }
 
-/** Body of `GET /api/catalog`. */
+/**
+ * The per-timeframe warm-up requirement of one strategy.
+ *
+ * Both keys are required: the server always emits the pair, so an entry carrying
+ * only one of them is genuinely truncated and is refused as `'malformed'` rather
+ * than rendered as a half-known requirement.
+ */
+export function isCatalogTimeframeWarmup(value: unknown): value is CatalogTimeframeWarmup {
+  return isRecord(value) && isNumber(value.required_candles) && isBoolean(value.feedable);
+}
+
+/**
+ * The warm-up compatibility of one strategy.
+ *
+ * `timeframes` is keyed by timeframe name, which the dashboard never hard-codes:
+ * every own value of the record is validated, and an empty record is accepted
+ * because "no supported timeframe carries a requirement yet" is a legitimate
+ * answer, not a truncated one.
+ */
+export function isCatalogStrategyWarmup(value: unknown): value is CatalogStrategyWarmup {
+  return (
+    isRecord(value) &&
+    isNumber(value.default_warmup_candles) &&
+    isRecord(value.timeframes) &&
+    Object.values(value.timeframes).every((entry) => isCatalogTimeframeWarmup(entry))
+  );
+}
+
+/**
+ * The additive `warmup` block of `GET /api/catalog`.
+ *
+ * It is validated through the same optional guard as every other late-added key
+ * of this contract, so a server that predates the block — and, symmetrically, a
+ * slightly newer one that answers an explicit `null` — stays a valid producer.
+ * Every other value must be a record keyed by strategy name whose every own value
+ * is a strategy warm-up: a non-record (`[]`, `"x"`, `42`) is genuinely malformed
+ * exactly like a wrong-typed picker list, and is refused instead of half-read.
+ */
+export function isCatalogWarmup(value: unknown): value is CatalogWarmup {
+  return (
+    value === undefined ||
+    value === null ||
+    (isRecord(value) && Object.values(value).every((entry) => isCatalogStrategyWarmup(entry)))
+  );
+}
+
+/**
+ * Body of `GET /api/catalog`.
+ *
+ * The four picker lists stay strict — `warmup` is appended as the one optional
+ * key of the block — while unknown EXTRA top-level keys stay tolerated: a
+ * slightly newer server that adds a key the dashboard does not read yet must keep
+ * rendering its pickers.
+ */
 export function isCatalogPayload(value: unknown): value is CatalogPayload {
   return (
     isRecord(value) &&
     isArrayOf(value.symbols, isCatalogSymbol) &&
     isArrayOf(value.strategies, isString) &&
     isArrayOf(value.timeframes, isString) &&
-    isArrayOf(value.modes, isRunMode)
+    isArrayOf(value.modes, isRunMode) &&
+    isCatalogWarmup(value.warmup)
   );
 }
 
