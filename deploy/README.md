@@ -258,6 +258,61 @@ docker exec trading-realtime rm /app/data/realtime/KILL_SWITCH
 The log level is set by `TB_LOG_LEVEL` (default `INFO`) in
 `deploy/docker-compose.yml`.
 
+### Provisioning the profile catalogue on the deployed stack
+
+The declarative profile catalogue (`src/trading_platform/profiles/catalogue.py`)
+is applied from **inside** the engine container, against the engine's own API:
+
+```bash
+# 1. dry run first -- creates nothing, prints what would be created or skipped
+docker exec trading-realtime trading realtime provision --api-url http://127.0.0.1:8080 --dry-run
+
+# 2. apply -- creates the missing profiles, idempotently
+docker exec trading-realtime trading realtime provision --api-url http://127.0.0.1:8080
+
+# 3. prune -- the ONLY form that deletes a profile outside the catalogue
+docker exec trading-realtime trading realtime provision --api-url http://127.0.0.1:8080 --prune
+```
+
+Two reasons for running it *in* the container rather than from the host:
+
+* `TB_OPERATOR_TOKEN` already travels into `trading-realtime` through
+  `deploy/.env` (`env_file:` in the compose file), so the command authenticates
+  with no secret on the command line, in no shell history and in no log;
+* `http://127.0.0.1:8080` is the in-container API port — the port the dashboard
+  proxies to over the compose network. The host-side `127.0.0.1:3030` is the
+  **debugging** surface of the same server: the command works there too
+  (`.venv/bin/python -m trading_platform realtime provision --api-url
+  http://127.0.0.1:3030`), but the container is where the token is.
+
+**A capacity refusal is the guard working.** The apply path totals the paper
+`initial_balance` values of the catalogue and compares them to the paper ledger of
+the live platform (`wallets.paper`: `total_cash + positions_value`). This stack's
+paper ledger currently holds 5 000 USDT of profile cash against a 15 000 USDT
+platform initial balance, so the 26-entry, 26 000 USDT catalogue is refused by
+default, with an error naming both numbers. Raise the platform wallet's initial
+balance first (a configuration change), then re-run. `--force` skips the check
+and is legitimate **only** in that situation — it never creates cash, it only
+stops the command from refusing; the ledger still has to fund every order.
+
+**Provisioning is idempotent, so re-running after a deploy creates nothing.** A
+profile whose id is already in `state.db` is skipped, never recreated and never
+modified: the five hand-made `momentum` profiles of this stack
+(`momentumarpa`, `momentumbome`, `momentumbtc`, `momentumeth`, `momentumsol`)
+survive every run unless `--prune` is passed explicitly. The state volume is
+never rebuilt by a deploy, so the sequence is: deploy, then `--dry-run`, then
+apply — and the second run reports twenty-six `skipped` and an empty `created`
+list.
+
+`--prune` deletes exactly the identifiers present on the platform that the
+catalogue does **not** declare — on this stack, that is those same five legacy
+profiles, so the dry run is what says so before the fact (`pruned` lists every
+one of them, and nothing is deleted without the flag). The catalogue's single
+**live** entry (`momentum-dot-1d-live`) is refused here, and reported in
+`refused_live`: this stack configures no venue credentials and no
+`TB_ALLOW_LIVE_TRADING` (§5), so a live profile could not be authenticated by the
+broker and would be quarantined as a boot failure.
+
 ### Working on the dashboard outside Docker
 
 ```bash

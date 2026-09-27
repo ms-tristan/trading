@@ -1533,6 +1533,169 @@ timeframe inconnus, `409` sur un identifiant déjà pris). Ces quatre routes
 exigent `X-Operator-Token` et répondent `403` sur un serveur `realtime serve`,
 qui ne mute jamais l'état.
 
+### 11.9 Provisioning the profile catalogue (declarative, idempotent)
+
+This subsection is written in English: it documents the delivery that grows the
+strategy catalogue to ten strategies and provisions several profiles per
+strategy. The prose above is untouched.
+
+The paper profile set ships as **data**, not as a script:
+`src/trading_platform/profiles/catalogue.py` is a frozen, typed, import-light
+catalogue (no I/O, no network) of one entry per profile — `id`, `symbol`,
+`timeframe`, `strategy`, `mode`, `initial_balance`, `params`, `warmup_candles`
+and `history_candles`. Adding a profile is a data edit there, never a code
+change.
+
+* **26 paper entries plus 1 live entry**, covering all **ten** strategies of
+  [`docs/strategies.md`](strategies.md) — two or three paper profiles per
+  strategy — spread over different symbols and different timeframes so the
+  comparison is meaningful. Only the liquid USDT majors of the catalog's static
+  fallback list are used (BTC, ETH, SOL, BNB, XRP, ADA, DOGE, AVAX, LTC, LINK,
+  DOT, TRX), and only the `1d`, `4h` and `1h` grids: the intraday warm-ups of
+  §11.8 are enormous and were never validated. `momentum` appears only on `4h`
+  and `1d` (the two grids its own research validates), `faber` appears on `1d` —
+  where its 200-candle average is the published 200-**day** rule — and on `4h`,
+  and no `(strategy, symbol, timeframe)` triple repeats.
+* **Profile identifiers** use the readable lower-case form
+  `<strategy>-<symbol>-<timeframe>` (`donchian-btc-4h`, `faber-btc-1d`), plus a
+  `-live` suffix for the live entry (`momentum-dot-1d-live`). Every one matches
+  `ProfileConfig`'s `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
+* **The warm-up is derived, never typed.** For every entry
+  `warmup_candles = max(200, required_candles)`: the platform's
+  `DEFAULT_WARMUP_CANDLES` budget as a floor, and the strategy's **own**
+  requirement on that grid when it exceeds the budget (`faber` and
+  `rsi_reversion`: 201). `warmup_candles >= required_candles` therefore holds by
+  construction and the create route can never answer `400` for an impossible
+  warm-up. `history_candles = warmup_candles + 10` (`HISTORY_HEADROOM_CANDLES`),
+  which is strictly greater than `warmup_candles + 1`, the coherence rule of
+  [`docs/realtime.md`](realtime.md) §8. A test walks the whole catalogue and
+  asserts both invariants for every entry.
+* **The money is shared.** One USDT ledger funds every order of a mode (§9 of
+  [`docs/realtime.md`](realtime.md)), so the catalogue's paper entries commit real
+  capital: **26 000 USDT** in total (1 000 USDT each), which the paper ledger must
+  be able to cover.
+
+**The apply command.** It reads the catalogue and creates the missing profiles
+through the engine's own HTTP API (`POST /api/profiles` with the
+`X-Operator-Token` header, the token read from `TB_OPERATOR_TOKEN`). Run it in
+this order — dry run first, then apply, then prune:
+
+```bash
+# 1. DRY RUN: creates nothing; the report says what would be created, skipped or pruned
+docker exec trading-realtime trading realtime provision --api-url http://127.0.0.1:8080 --dry-run
+
+# 2. APPLY: creates the missing profiles, idempotently (re-running creates nothing)
+docker exec trading-realtime trading realtime provision --api-url http://127.0.0.1:8080
+
+# 3. PRUNE: the ONLY form that deletes anything -- never implied, always explicit
+docker exec trading-realtime trading realtime provision --api-url http://127.0.0.1:8080 --prune
+```
+
+The same command runs on a host checkout against the published debugging port of
+the engine, and through the module entry point:
+
+```bash
+.venv/bin/python -m trading_platform realtime provision --api-url http://127.0.0.1:3030 --dry-run
+```
+
+`--api-url` is the base URL of a **running** engine (`realtime run`, or
+`realtime serve` for a read-only server that will refuse every mutation); when it
+is omitted the command falls back to `TB_API_URL`, then to
+`http://127.0.0.1:8080`, the in-container monitoring port. Every run is
+idempotent: a profile whose id is already present in the state database is
+**skipped**, never recreated, never modified.
+
+**The report.** The payload has exactly these keys, and the CLI prints it as a
+single JSON object with `--json` (the human summary is the default):
+
+| key | meaning |
+| --- | --- |
+| `command` | `"realtime-provision"`, the payload discriminator of the `realtime` group |
+| `ok` | `true` exactly when neither `failed` nor `refused_live` holds an entry |
+| `api_url` | the engine the run talked to |
+| `dry_run` | `true` when `--dry-run` was passed: nothing was written |
+| `paper_total_initial_balance` | the total USDT the paper catalogue commits (26 000) |
+| `ledger_capacity` | the paper ledger capacity it was compared against, or `null` when unknown |
+| `created` | the profile ids this run created — or would create, under `--dry-run` |
+| `skipped` | the profile ids already present in the state database |
+| `pruned` | the profile ids deleted — or that would be, under `--dry-run`; always empty without `--prune` |
+| `failed` | `{id, error}` entries, one per profile the API refused |
+| `refused_live` | `{id, reason}` entries, one per live row the environment cannot authenticate |
+
+**Exit codes.** `0` when `ok` is true — including a dry run and a run that
+created nothing because everything was already there. `1` as soon as `failed` or
+`refused_live` holds an entry: at least one profile was refused, and the reason
+is printed on stderr with the API's own message. Nothing is ever swallowed.
+
+**The ledger-capacity refusal.** Before creating anything, the apply path totals
+the paper `initial_balance` values of the catalogue and compares that total to the
+paper ledger of the running platform, read from the **same** `GET /api/profiles`
+answer the plan is built from (`wallets.paper`: `total_cash + positions_value`;
+the wallet's `initial_balance` when it has no row yet, since the ledger seed is
+then the only number there is). A catalogue that would over-commit the ledger is
+refused with an actionable error naming both numbers and the shortfall, and
+**none** of the pending paper rows is created. `--force` overrides that check and
+is legitimate **only** after the ledger's own initial balance has been raised (a
+configuration change of the platform wallet, not a code change) — it never
+creates cash, it only stops the command from refusing. An **unknown** capacity (a
+platform that never booted has no ledger row) is logged as a warning and the run
+proceeds: refusing on a missing number would block the very first provisioning of
+a fresh platform. On the deployed stack the paper ledger currently holds
+5 000 USDT of profile cash against a 15 000 USDT platform initial balance, so a
+26 000 USDT catalogue is refused by default: that refusal is the guard working,
+not a bug.
+
+**What the default run never touches.** The deployed state database already holds
+**five legacy `momentum` profiles** created by hand before this delivery —
+`momentumarpa`, `momentumbome`, `momentumbtc`, `momentumeth` and `momentumsol`,
+all `paper`, all `4h`, 1 000 USDT each. The default `provision` run creates only
+the **missing** catalogue ids: it never deletes, never renames and never modifies
+an existing profile. The prune policy is exactly "every identifier present on the
+platform that the catalogue does not declare", so those five are precisely what
+`--prune` would delete — they are never touched without it, and the `pruned` list
+names every one of them before the fact on a `--dry-run`.
+
+**The two run modes.** A profile is `paper` or `live`, and the mode is part of its
+identity — of the profile, of every persisted order and of the ledger it draws on
+(§9 of [`docs/realtime.md`](realtime.md)). `paper` needs no credential and can
+never be routed to a real broker: the simulated broker is what the mode selects.
+`live` is the only mode that talks to a venue.
+
+**A live profile is never fabricated.** The catalogue carries exactly **one** live
+entry, `momentum-dot-1d-live` (DOT/USDT, `1d`, 1 000 USDT of real money), and the
+apply path **refuses to create it** while the engine environment does not carry
+what the broker needs. The refusal is not an error to work around: a live profile
+the broker cannot authenticate is quarantined as a boot failure by the engine, so
+creating one would only move the failure later. The `refused_live` list names
+every missing variable.
+
+**What the real-trading section requires to come alive.** A live profile is
+created and started only when the engine can authenticate it:
+
+```bash
+# per-profile credentials (they win over the global pair) -- the id is upper-cased,
+# every non-alphanumeric character becomes an underscore:
+#   "btc-live" -> TB_PROFILE_BTC_LIVE_API_KEY / TB_PROFILE_BTC_LIVE_API_SECRET
+export TB_PROFILE_BTC_LIVE_API_KEY="…"
+export TB_PROFILE_BTC_LIVE_API_SECRET="…"
+
+# … or the single global pair, for every live profile that has none of its own
+export TB_LIVE_API_KEY="…"
+export TB_LIVE_API_SECRET="…"
+
+# and the explicit live gate: the exact value, or every live profile is refused
+export TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK
+```
+
+With `TB_ALLOW_LIVE_TRADING` unset (or set to anything else) a `live` profile is
+refused with `LiveTradingForbiddenError`, and `realtime check` reports it as
+`live_gate_allowed: false`. Without the credentials, **creation is refused** with
+a message naming the missing variables — and a live profile that somehow reaches
+the engine without them is quarantined as a boot failure rather than traded. A
+live profile is therefore never fabricated, and this delivery provisions none:
+the real-trading section of the dashboard stays empty until an operator exports
+the credentials and creates the profile.
+
 ---
 
 ## 12. Forecast layer — offline TimesFM artifacts
