@@ -14,9 +14,18 @@ export const dynamic = "force-dynamic";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "swap" });
 
+/**
+ * The file-based metadata of the App Router (`icon.svg`, `favicon.ico` and
+ * `apple-icon.png`, all co-located in this directory) emits the `<link>` tags
+ * on its own: this object deliberately declares no `icons` entry.
+ */
 export const metadata: Metadata = {
-  title: "Trading platform",
+  title: {
+    default: "Trading platform",
+    template: "%s - Trading platform",
+  },
   description: "Multi-profile paper and live trading monitor.",
+  applicationName: "Trading platform",
 };
 
 const NAV_LINKS = [
@@ -37,6 +46,8 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
 
   return (
     <html lang="en" className={inter.variable}>
+      {/* Next.js 16 metadata exports no themeColor: the dark theme colour is rendered here. */}
+      <meta name="theme-color" content="#020617" />
       <body className="min-h-screen bg-background text-foreground">
         <header className="sticky top-0 z-10 flex h-14 items-center gap-3 border-b border-border bg-background px-3">
           <p className="text-base font-semibold">Trading platform</p>

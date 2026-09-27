@@ -71,8 +71,8 @@ What to read in `GET /api/health`:
 | `status` | `degraded` means the API serves but **no** profile is running |
 | `profiles_running` | `0` → nothing is trading; see `profiles_queued` and the events |
 | `profiles_healthy` | lower than `profiles_running` → at least one worker is failing its REST reads |
-| `profiles_queued` | profiles held back by the fleet cap, or waiting for the stagger gate; `state_reason` names which |
-| `engine_slots_used` / `engine_slots_total` | the fleet cap and how much of it is used |
+| `profiles_queued` | profiles waiting for a slot, held back by the fleet cap or by the stagger gate; `state_reason` names which. Not an error |
+| `engine_slots_used` / `engine_slots_total` | the fleet cap, how much of it is used and (with `profiles_queued`) how many profiles are waiting for a slot; the overview and the operations page print the same three figures as visible text |
 | `kill_switch_engaged` | `true` → the kill switch is engaged, nothing will start |
 | per-profile `state` / `state_reason` (`GET /api/profiles`) | `blocked` names a safety gate a live profile did not pass |
 
@@ -133,32 +133,59 @@ docker exec trading-realtime trading realtime status --api-url http://127.0.0.1:
 
 The cap is `max_running_profiles`. It exists because one running `freqtrade trade`
 worker costs about **390 MiB RSS** (8 workers measured at 3.13 GiB, linear) and
-the Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily; the
-default of **6** uses roughly **2.3 GiB** and leaves the rest for the supervisor,
-the API, the dashboard and the build caches. Profiles beyond the cap are `queued`
-with a `state_reason` naming the cap, and the next one is promoted automatically
-when a slot frees.
+the Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily.
+Profiles beyond the cap are `queued` with a `state_reason` naming the cap, and
+the next one is promoted automatically when a slot frees.
 
-Three ways to change it, in increasing order of permanence:
+**The deployed cap is 10, the shipped default is 6.** Two numbers, one meaning —
+a smaller machine is safe straight from the repository, while this host runs the
+ten priority-100 primaries:
+
+* `config/platform.json` keeps the conservative default **6** — roughly
+  **2.3 GiB** of workers — so a machine that only starts the stack from the
+  repository is safe;
+* only `deploy/docker-compose.yml` raises it, through
+  `TB_MAX_RUNNING_PROFILES=10`, which is what this host actually runs. Ten is
+  **one profile per strategy**: the ten priority-100 primary profiles of the
+  catalogue, taken priority descending then id ascending.
+
+Nothing here needs to be changed to run the deployed stack: compose already
+supplies the environment variable, and the environment wins over every other
+input.
+
+Why 10 is safe here: measured at a cap of 6, the `trading-realtime` container
+held about **2.4 GiB**, the whole guest about **5 GB**, and the host swap did not
+move. Scaling linearly to ten workers leaves head-room on the 12 GiB guest
+(roughly 3.9 GiB of workers plus the supervisor, the API and the dashboard), and
+the boot staggers the cold start (§`worker_start_stagger_seconds`), which is what
+keeps that head-room from being spent all at once.
+
+Three ways to change it, in increasing order of permanence — the third one is a
+repository edit for a larger machine, not something this deployment needs:
 
 ```bash
 # 1. at run time, through the API (persisted in the settings table of state.db)
 curl -fsS -X POST http://127.0.0.1:3030/api/settings \
   -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"max_running_profiles": 16}'
+  -d '{"max_running_profiles": 10}'
 
 # 2. as an environment override, for one deployment (compose `environment:` or deploy/.env)
-TB_MAX_RUNNING_PROFILES=16
+#    -- this is what the deployed stack does, and 10 is the value it ships
+TB_MAX_RUNNING_PROFILES=10
 
-# 3. as the documented default, in config/platform.json ("max_running_profiles": 16)
+# 3. as a larger machine's default, in config/platform.json ("max_running_profiles": 10)
+#    -- the shipped file keeps the conservative 6
 ```
 
 Precedence for every platform setting: the **environment**
 (`TB_MAX_RUNNING_PROFILES`) wins at boot, then the value stored in the `settings`
-table, then `config/platform.json`, then the built-in default. Raising the cap
-starts queued profiles on the next scheduling pass — no restart needed when it is
-done through the API. Before raising it, check the available memory:
+table, then `config/platform.json`, then the built-in default. On the deployed
+stack the environment supplies 10, so the `config/platform.json` default of 6
+never applies there — it is the fallback for a machine whose compose file does
+not set the variable. Raising the cap starts queued profiles on the next
+scheduling pass — no restart needed when it is done through the API. Before
+raising it, check the available memory:
 
 ```bash
 docker stats --no-stream trading-realtime
@@ -168,6 +195,11 @@ sysctl -n hw.memsize | awk '{printf "%.2f GiB\n", $1/1024/1024/1024}'
 Margin to keep: at least ~1 GiB for the supervisor, the dashboard, Docker itself
 and the image builds. A cap that exceeds the available memory shows up as workers
 being killed by the OOM killer and profiles landing in the state `error`.
+
+The cap is only half of the guard: a **simultaneous cold start** of many workers
+is what actually made the guest unresponsive (reproduced twice on this host), not
+the steady-state footprint of the fleet. That is why the boot is staggered to at
+most one new worker per `worker_start_stagger_seconds` — see below.
 
 The same arithmetic applies to `snapshot_interval_seconds`
 (`TB_SNAPSHOT_INTERVAL_SECONDS`, default 60): a shorter interval gives finer
@@ -204,10 +236,18 @@ What it does, and what it does not do:
   state `queued` with a `state_reason` of exactly the form
   `queued: starting workers gradually (N of M slots in use)`, where N is the
   number of workers alive and M is `max_running_profiles`;
+* a `queued` profile is **waiting for a slot**. It is not an error, it needs no
+  operator decision and nothing has to be fixed: the supervisor promotes it on its
+  own as soon as the gate reopens or a running profile releases its slot;
 * staggering only **delays promotions, it never reorders them**: the order stays
   priority descending, then id ascending;
 * it therefore changes *when* a queued profile starts, never *whether* it does —
   a fleet that is genuinely beyond the cap stays queued until a slot frees.
+
+The dashboard says the same thing in visible text, so the operator never has to
+guess: the overview and the operations page print the cap, the slots in use
+(`engine_slots_used` of `engine_slots_total`) and how many profiles are waiting
+for a slot, all derived from `GET /api/settings` and `GET /api/health`.
 
 ---
 
@@ -372,8 +412,9 @@ can be deleted once it has been inspected.
 | Symptom | Likely cause and what to do |
 | --- | --- |
 | `status: "degraded"`, `profiles_running: 0` | the fleet has not started a worker yet (wait for the first poll), the kill switch is engaged, or every profile is disabled. Check `GET /api/settings`, then the `events` table for `cap_reached` / `kill_switch` rows |
-| `profiles_running` below the cap, profiles `queued` | the cap is reached or the workers failed. Compare `engine_slots_used` with `engine_slots_total`; check `docker stats` for memory pressure |
-| profiles `queued` with the reason `queued: starting workers gradually (N of M slots in use)` | normal right after a boot or a deploy: the supervisor starts at most one new worker per `worker_start_stagger_seconds` (10 s by default). Wait for the gate to reopen; lower the setting if the fleet must fill faster |
+| `profiles_running` below the cap, profiles `queued` | the workers are still filling the slots or they failed. The overview and the operations page state the cap, the slots in use and the number of profiles waiting for a slot as visible text; cross-check `engine_slots_used` against `engine_slots_total`, then check `docker stats` for memory pressure |
+| profiles `queued` with the reason `queued: starting workers gradually (N of M slots in use)` | normal right after a boot or a deploy: the profile is **waiting for a slot** while the supervisor starts at most one new worker per `worker_start_stagger_seconds` (10 s by default). Not an error, no operator decision, no fix: wait for the gate to reopen, and lower the setting only if the fleet must fill faster |
+| profiles `queued` with the reason `queued: fleet cap reached (N of M slots in use)` | normal when the fleet is full: the cap is 10 on the deployed stack. The profile is **waiting for a slot** and is promoted automatically as soon as one frees; raise the cap only if the host has the memory to back it |
 | a profile in state `error` | five restarts inside 15 minutes: read `last_error` and `/app/data/realtime/logs/<id>.log`, fix the cause, then `POST /api/profiles/{id}/actions {"action": "restart"}` |
 | a live profile in state `blocked` | a safety gate is unmet: see `state_reason`; `TB_ALLOW_LIVE_TRADING` must equal `I_UNDERSTAND_THE_RISK` and both exchange credentials must be in the environment |
 | `GET /api/profiles` answers `401`/`403` on a mutation | the `X-Operator-Token` header is missing (`401`) or wrong (`403`); the token is `TB_OPERATOR_TOKEN` of `deploy/.env` |

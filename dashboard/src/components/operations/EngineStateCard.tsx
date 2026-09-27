@@ -3,7 +3,7 @@ import { KpiStat } from "@/components/ui/KpiStat";
 import { StateBadge } from "@/components/ui/StateBadge";
 import { cn } from "@/lib/cn";
 import { formatDuration, formatTimestamp } from "@/lib/format";
-import { STATE_LABELS, isAttentionState } from "@/lib/states";
+import { STATE_LABELS, isWaitingForSlot, needsDecision } from "@/lib/states";
 import type { HealthStatus, ProfileState, ProfileView } from "@/lib/types";
 
 /**
@@ -76,7 +76,9 @@ export interface EngineStateCardProps {
  *
  * The five states are always listed, including the empty ones: an operator
  * checks "is anything queued or in error?" at a glance, and a state that needs a
- * decision says so in words next to its badge, never through colour alone.
+ * decision says so in words next to its badge, never through colour alone. A
+ * queued profile is NOT one of them - it holds no slot yet and simply waits for
+ * one - so the two facts are stated separately.
  */
 export function EngineStateCard({ health, profiles, className }: EngineStateCardProps) {
   const counts = countByState(profiles);
@@ -86,7 +88,7 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
       className={className}
       headingLevel={2}
       title="Engine state"
-      description="What the supervisor reports right now"
+      description="What the supervisor reports right now - the fleet cap is max_running_profiles of GET /api/settings"
       actions={
         <span
           data-status={health.status}
@@ -143,8 +145,11 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
             <li key={state} className="flex min-w-0 items-center gap-2">
               <StateBadge state={state} />
               <span className="tabular-nums">{counts[state]}</span>
-              {isAttentionState(state) && counts[state] > 0 ? (
+              {needsDecision(state) && counts[state] > 0 ? (
                 <span className="text-sm text-muted-foreground">needs attention</span>
+              ) : null}
+              {isWaitingForSlot(state) && counts[state] > 0 ? (
+                <span className="text-sm text-muted-foreground">waiting for a slot</span>
               ) : null}
             </li>
           ))}

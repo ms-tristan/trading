@@ -13,14 +13,24 @@ import {
   formatSignedUsdt,
   formatUsdt,
 } from "@/lib/format";
-import { isAttentionState } from "@/lib/states";
+import { isWaitingForSlot, needsDecision } from "@/lib/states";
 import type { ProfileView } from "@/lib/types";
 
 /** Aggregate of every profile of one section. */
 export interface ModeSummary {
   profiles_total: number;
+  /** Profiles whose `ProfileView.state` is `"running"`. */
   profiles_running: number;
-  profiles_attention: number;
+  /** Profiles whose `ProfileState` is a `WAITING_STATES` entry (`"queued"`). */
+  profiles_waiting: number;
+  /**
+   * Profiles whose `ProfileState` is a `STATES_NEEDING_DECISION` entry
+   * (`"error"`, `"blocked"`).
+   *
+   * Deliberately NOT named `profiles_attention`: keeping the old name would let
+   * a stale `<n> needing attention` count survive silently.
+   */
+  profiles_needing_decision: number;
   portfolio_value: number;
   initial_capital: number;
   profit_usdt: number;
@@ -59,7 +69,8 @@ export function summariseProfiles(profiles: ProfileView[]): ModeSummary {
   const summary: ModeSummary = {
     profiles_total: profiles.length,
     profiles_running: 0,
-    profiles_attention: 0,
+    profiles_waiting: 0,
+    profiles_needing_decision: 0,
     portfolio_value: 0,
     initial_capital: 0,
     profit_usdt: 0,
@@ -86,8 +97,11 @@ export function summariseProfiles(profiles: ProfileView[]): ModeSummary {
     if (profile.state === "running") {
       summary.profiles_running += 1;
     }
-    if (isAttentionState(profile.state)) {
-      summary.profiles_attention += 1;
+    if (isWaitingForSlot(profile.state)) {
+      summary.profiles_waiting += 1;
+    }
+    if (needsDecision(profile.state)) {
+      summary.profiles_needing_decision += 1;
     }
     if (profile.closed_trades > 0 && Number.isFinite(profile.win_rate)) {
       weightedWinRate += profile.win_rate * profile.closed_trades;
@@ -106,9 +120,16 @@ export function formatModeSummary(summary: ModeSummary): string {
   return [
     `${summary.profiles_total} ${summary.profiles_total === 1 ? "profile" : "profiles"}`,
     `${summary.profiles_running} running`,
+    summary.profiles_waiting > 0
+      ? `${summary.profiles_waiting} ${
+          summary.profiles_waiting === 1 ? "profile is" : "profiles are"
+        } waiting for a slot`
+      : null,
+    summary.profiles_needing_decision > 0
+      ? `${summary.profiles_needing_decision} needing attention`
+      : null,
     summary.portfolio_value > 0 ? formatUsdt(summary.portfolio_value) : null,
     `${formatSignedUsdt(summary.profit_usdt)} (${formatSignedRatioPercent(summary.profit_pct)})`,
-    summary.profiles_attention > 0 ? `${summary.profiles_attention} needing attention` : null,
     `${formatRatioPercent(summary.win_rate)} win rate`,
   ]
     .filter((part): part is string => part !== null)

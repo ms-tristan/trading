@@ -44,9 +44,9 @@ On boot, `python -m trading_platform realtime run` performs this sequence:
    `config/profiles.json`; the settings are **not** seeded key by key, they are
    resolved at every boot by the precedence of §3.3;
 4. **compute the schedule** — every enabled profile, sorted by `priority`
-   descending then `id` ascending; the first `max_running_profiles` (default
-   **6**) get a worker, the rest are marked `queued` with a `state_reason` naming
-   the cap;
+   descending then `id` ascending; the first `max_running_profiles` (documented
+   default **6**, raised to **10** by the deployed compose file) get a worker,
+   the rest are marked `queued` with a `state_reason` naming the cap;
 5. **generate one freqtrade configuration per scheduled profile** under
    `<state_dir>/profiles/<id>/config.json`, mode `0600` (§5);
 6. **spawn one `freqtrade trade` subprocess per scheduled profile** — at most one
@@ -128,7 +128,7 @@ operator actually put in the profile.
 | State | Meaning |
 | --- | --- |
 | `running` | a worker process is alive and its last REST read succeeded |
-| `queued` | enabled and eligible, but beyond the fleet cap or waiting for the stagger gate; `state_reason` names which |
+| `queued` | enabled and eligible, but beyond the fleet cap or waiting for the stagger gate: it is **waiting for a slot**, not failing; `state_reason` names which |
 | `stopped` | not running on purpose (operator action, disabled profile, kill switch) |
 | `blocked` | refused by a safety gate; `state_reason` names the missing precondition (live trading) |
 | `error` | the supervisor stopped restarting it; `last_error` carries the reason |
@@ -149,13 +149,18 @@ in `config/platform.json` and in `PlatformSettings`, overridable through
 * a stagger of `0` restores the immediate behaviour: every eligible profile is
   started on the same pass;
 * staggering only **delays promotions, it never reorders them** — the scheduling
-  order stays `priority` descending, then `id` ascending.
+  order stays `priority` descending, then `id` ascending;
+* a `queued` profile is therefore **waiting for a slot**: it is not an error and
+  it asks for no operator decision, the supervisor promotes it on its own as soon
+  as the gate reopens or a slot frees.
 
 The setting exists because one running worker costs about **390 MiB RSS**, the
 Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily, and a
 simultaneous cold start of many workers spiked memory and CPU together and made
 the guest unresponsive (reproduced twice). `deploy/docker-compose.yml` therefore
-sets `TB_MAX_RUNNING_PROFILES=6` and `TB_WORKER_START_STAGGER_SECONDS=10`.
+sets `TB_MAX_RUNNING_PROFILES=10` — one profile per strategy, i.e. the ten
+priority-100 primaries of the catalogue — and
+`TB_WORKER_START_STAGGER_SECONDS=10`.
 
 ---
 
@@ -249,6 +254,13 @@ strongest:
    (`TB_MAX_RUNNING_PROFILES`, `TB_SNAPSHOT_INTERVAL_SECONDS`,
    `TB_WORKER_START_STAGGER_SECONDS`, `TB_PROFILE_API_PORT_BASE`, …). That is the
    documented way to change the fleet cap in Docker.
+
+For the fleet cap the first two inputs therefore disagree by design: the shipped
+`config/platform.json` carries the conservative default **6**, while the deployed
+`deploy/docker-compose.yml` sets `TB_MAX_RUNNING_PROFILES=10` (one profile per
+strategy) — and, being the environment, that 10 is what the running stack
+resolves. Edit `config/platform.json` only for a machine that starts the stack
+without that environment override.
 
 `POST /api/settings` accepts `max_running_profiles`, `snapshot_interval_seconds`
 and `worker_start_stagger_seconds` (§2).

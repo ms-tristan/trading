@@ -59,6 +59,7 @@ describe("EngineStateCard", () => {
           profile({ id: "b", state: "queued", state_reason: "waiting for an engine slot" }),
           profile({ id: "c", state: "queued" }),
           profile({ id: "d", state: "stopped" }),
+          profile({ id: "e", state: "error", state_reason: "worker exited with code 1" }),
         ]}
       />,
     );
@@ -76,8 +77,52 @@ describe("EngineStateCard", () => {
     expect(states).not.toBeNull();
     expect(within(states as HTMLElement).getByText("Running")).toBeInTheDocument();
     expect(within(states as HTMLElement).getAllByText("2").length).toBeGreaterThanOrEqual(1);
-    expect(within(states as HTMLElement).getAllByText("needs attention")).toHaveLength(1);
+    // The two queued profiles wait for a slot; the one error profile is the only
+    // entry that needs a decision.
+    expect(within(states as HTMLElement).getByText("waiting for a slot")).toBeInTheDocument();
+    expect(within(states as HTMLElement).getByText("needs attention")).toBeInTheDocument();
+    expect(within(states as HTMLElement).queryByText("needing attention")).not.toBeInTheDocument();
     expect(within(states as HTMLElement).getByText("Blocked")).toBeInTheDocument();
+  });
+
+  it("splits a waiting profile from a profile that needs a decision", () => {
+    render(
+      <EngineStateCard
+        health={health()}
+        profiles={[
+          profile({ id: "a", state: "queued", state_reason: "queued: fleet cap reached" }),
+          profile({ id: "b", state: "queued" }),
+          profile({ id: "c", state: "error", state_reason: "worker exited with code 1" }),
+        ]}
+      />,
+    );
+
+    const states = screen.getByRole("heading", { level: 3, name: "Profiles by state" })
+      .parentElement;
+    expect(states).not.toBeNull();
+    const list = states as HTMLElement;
+    // Exactly one label of each kind: the queued entry is not an attention count.
+    expect(within(list).getAllByText("waiting for a slot")).toHaveLength(1);
+    expect(within(list).getAllByText("needs attention")).toHaveLength(1);
+    expect(within(list).getAllByText("2").length).toBeGreaterThanOrEqual(1);
+    expect(within(list).getAllByText("1").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("states the cap hint and keeps the slots the engine reports", () => {
+    render(
+      <EngineStateCard
+        health={health({ engine_slots_used: 4, engine_slots_total: 4 })}
+        profiles={[]}
+      />,
+    );
+
+    expect(screen.getByText("4 of 4")).toBeInTheDocument();
+    expect(screen.getByText("profiles holding a worker")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "What the supervisor reports right now - the fleet cap is max_running_profiles of GET /api/settings",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("reports an engaged kill switch and an enabled live gate", () => {

@@ -28,6 +28,8 @@ export interface ModeSectionProps {
   /** Profiles of the section, in the API order (portfolio value, descending). */
   profiles: ProfileView[];
   emptyMessage?: string;
+  /** Short explanatory sentence rendered as visible text under the section header. */
+  summary?: string;
   /** Optional block rendered between the header and the table. */
   notice?: ReactNode;
   className?: string;
@@ -163,11 +165,12 @@ export function ModeSection({
   title,
   profiles,
   emptyMessage = "No profile in this section.",
+  summary,
   notice,
   className,
 }: ModeSectionProps) {
   const rows = rankProfiles(profiles);
-  const summary = summariseProfiles(profiles);
+  const aggregate = summariseProfiles(profiles);
 
   return (
     <section aria-labelledby={id} className={cn("min-w-0", className)}>
@@ -175,8 +178,11 @@ export function ModeSection({
         id={id}
         title={title}
         count={profiles.length}
-        subtitle={formatModeSummary(summary)}
+        subtitle={formatModeSummary(aggregate)}
       />
+      {summary !== undefined && summary.trim() !== "" ? (
+        <p className="mb-2 min-w-0 text-sm text-muted-foreground">{summary}</p>
+      ) : null}
       {notice}
       <DataTable
         columns={COLUMNS}

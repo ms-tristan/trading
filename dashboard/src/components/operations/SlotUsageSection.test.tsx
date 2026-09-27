@@ -122,6 +122,41 @@ describe("SlotUsageSection", () => {
     expect(table[1]).not.toHaveTextContent("8081");
   });
 
+  it("states the cap and the slots in use in the subtitle, without hovering", () => {
+    render(
+      <SlotUsageSection
+        profiles={PROFILES}
+        maxRunningProfiles={10}
+        engineSlotsUsed={10}
+        engineSlotsTotal={10}
+      />,
+    );
+
+    const subtitle = screen.getByText(/2 running, 1 queued/);
+    expect(subtitle).toHaveTextContent("cap 10, 10 of 10 slots in use");
+    expect(subtitle).not.toHaveAttribute("title");
+  });
+
+  it("still renders the subtitle and says the cap is unknown when none is published", () => {
+    render(<SlotUsageSection profiles={PROFILES} />);
+
+    const subtitle = screen.getByText(/2 running, 1 queued/);
+    expect(subtitle).toHaveTextContent("cap unknown");
+    expect(subtitle).not.toHaveTextContent("\u2014");
+  });
+
+  it("falls back to the slot total of the health payload for the cap", () => {
+    render(
+      <SlotUsageSection
+        profiles={PROFILES}
+        engineSlotsUsed={2}
+        engineSlotsTotal={4}
+      />,
+    );
+
+    expect(screen.getByText(/2 running, 1 queued/)).toHaveTextContent("cap 4, 2 of 4 slots in use");
+  });
+
   it("says so when no profile holds or waits for a slot", () => {
     render(<SlotUsageSection profiles={[profile({ id: "stopped-one", state: "stopped" })]} />);
 

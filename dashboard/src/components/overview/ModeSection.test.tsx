@@ -75,6 +75,33 @@ function bodyRows(): HTMLElement[] {
   return within(groups[1]).getAllByRole("row");
 }
 
+/** The aggregate line `SectionHeader` renders just under the title. */
+function aggregateLine(): HTMLElement {
+  return screen.getByText(/running/);
+}
+
+/**
+ * Text nodes of a rendered subtree, each trimmed.
+ *
+ * Assertions on wording walk the text nodes instead of `container.textContent`:
+ * an ancestor's `textContent` concatenates every descendant, so it can make a
+ * word that only exists in one place look like it also exists in another.
+ */
+function textNodes(node: Node): string[] {
+  const texts: string[] = [];
+  for (const child of Array.from(node.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      const text = child.textContent?.trim();
+      if (text) {
+        texts.push(text);
+      }
+    } else {
+      texts.push(...textNodes(child));
+    }
+  }
+  return texts;
+}
+
 describe("ModeSection", () => {
   it("heads the section with its title, count and aggregate line", () => {
     render(<ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />);
@@ -82,9 +109,76 @@ describe("ModeSection", () => {
     const heading = screen.getByRole("heading", { level: 2, name: /Paper trading/ });
     expect(heading).toHaveAttribute("id", "paper-trading");
     expect(screen.getByText("3 profiles")).toBeInTheDocument();
-    expect(
-      screen.getByText(/2 running - 3,350\.00 USDT - \+350\.00 USDT \(\+11\.67%\)/),
-    ).toBeInTheDocument();
+    expect(aggregateLine()).toHaveTextContent(
+      /2 running - 1 profile is waiting for a slot - 3,350\.00 USDT - \+350\.00 USDT \(\+11\.67%\)/,
+    );
+  });
+
+  it("describes one waiting profile in the singular", () => {
+    render(<ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />);
+
+    expect(aggregateLine()).toHaveTextContent("1 profile is waiting for a slot");
+  });
+
+  it("describes several waiting profiles in the plural", () => {
+    render(
+      <ModeSection
+        id="paper-trading"
+        title="Paper trading"
+        profiles={[RANKED[2], profile({ id: "delta", name: "Delta", state: "queued" })]}
+      />,
+    );
+
+    expect(aggregateLine()).toHaveTextContent("2 profiles are waiting for a slot");
+  });
+
+  it("reserves the 'needing attention' wording for error and blocked profiles", () => {
+    render(
+      <ModeSection
+        id="paper-trading"
+        title="Paper trading"
+        profiles={[profile({ id: "errored", name: "Errored", state: "error" })]}
+      />,
+    );
+
+    const line = aggregateLine();
+    expect(line).toHaveTextContent("0 running");
+    expect(line).toHaveTextContent("1 needing attention");
+    expect(line).not.toHaveTextContent("waiting for a slot");
+  });
+
+  it("renders an explanatory summary as visible text between the header and the table", () => {
+    render(
+      <ModeSection
+        id="paper-trading"
+        title="Paper trading"
+        profiles={RANKED}
+        summary="The engine runs at most 2 profiles at once."
+      />,
+    );
+
+    const sentence = screen.getByText("The engine runs at most 2 profiles at once.");
+    expect(sentence.tagName).toBe("P");
+
+    // The summary is visible text above the table, in document order.
+    const rows = bodyRows();
+    expect(sentence.compareDocumentPosition(rows[0]) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("renders no summary at all when none is given", () => {
+    const { container } = render(
+      <ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />,
+    );
+
+    expect(container.querySelectorAll("section p")).toHaveLength(1);
+  });
+
+  it("omits a blank summary instead of rendering an empty paragraph", () => {
+    const { container } = render(
+      <ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} summary="   " />,
+    );
+
+    expect(container.querySelectorAll("section p")).toHaveLength(1);
   });
 
   it("lists the profiles in the API order and numbers them", () => {
@@ -154,6 +248,22 @@ describe("ModeSection", () => {
     expect(queued).toHaveClass("bg-muted/50");
     expect(within(queued).getByText("Queued")).toBeInTheDocument();
     expect(within(queued).getByText("waiting for an engine slot")).toBeInTheDocument();
+  });
+
+  it("explains a queued row as a wait, never as something needing attention", () => {
+    render(<ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />);
+    const queued = bodyRows()[2];
+
+    expect(queued).toHaveTextContent("waiting for an engine slot");
+    expect(within(queued).getByText("waiting for an engine slot")).toBeInTheDocument();
+
+    // No rendered text node of the section ever says "needing attention" for a
+    // queued profile. The line break of a text node is normalised away first,
+    // so the phrase cannot hide behind it.
+    const rendered = textNodes(document.body)
+      .join(" ")
+      .replace(/\s+/g, " ");
+    expect(rendered).not.toContain("needing attention");
   });
 
   it("marks the trading mode of every row next to its state badge", () => {
