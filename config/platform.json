@@ -1,5 +1,6 @@
 {
-  "max_running_profiles": 12,
+  "max_running_profiles": 6,
+  "worker_start_stagger_seconds": 10,
   "snapshot_interval_seconds": 60,
   "profile_api_port_base": 8101,
   "default_exchange": "binance",

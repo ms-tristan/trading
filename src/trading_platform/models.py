@@ -324,6 +324,9 @@ class DailyRow(_Model):
     date: str
     abs_profit: float = 0.0
     rel_profit: float = 0.0
+    #: The balance the day started from, as the worker reported it; ``0.0`` when
+    #: the API omitted it.
+    starting_balance: float = 0.0
     trade_count: int = 0
 
 
@@ -402,6 +405,19 @@ class ProfileView(_Model):
     uptime_seconds: float = 0.0
     last_updated: str = Field(default_factory=format_ts)
     rank: int = 0
+    #: The last 60 equity points of the profile, oldest first, as published by
+    #: ``GET /api/profiles`` (``PROFILE_SPARKLINE_POINTS``); ``[]`` when the
+    #: profile has no snapshot yet. Each point is an :class:`EquityPoint`, so it
+    #: carries ``t`` (ISO-8601 UTC), ``value`` and the optional ``profit_pct``.
+    sparkline: list[EquityPoint] = Field(default_factory=list)
+    #: The 1-based position of the profile among the **running** profiles,
+    #: ordered by priority DESC then id ASC -- the order the scheduler uses.
+    #: ``None`` when the profile is not running.
+    slot: int | None = None
+    #: The private Freqtrade REST port of the worker while it is running, and
+    #: ``None`` otherwise: the port outlives a stop in the runtime columns, so
+    #: the liveness test is what makes this field honest.
+    worker_port: int | None = None
 
 
 class StrategyView(_Model):
@@ -475,8 +491,11 @@ class HealthStatus(_Model):
 class DashboardSettings(_Model):
     """The operator-facing settings payload."""
 
-    max_running_profiles: int = 12
+    max_running_profiles: int = 6
     snapshot_interval_seconds: int = 60
+    #: Seconds between two worker starts of the same scheduling pass; ``0``
+    #: opens the stagger gate at once.
+    worker_start_stagger_seconds: int = 10
     kill_switch_engaged: bool = False
     allow_live_trading: bool = False
     catalogue_profile_count: int = 0

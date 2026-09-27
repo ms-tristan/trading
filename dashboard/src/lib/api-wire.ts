@@ -18,23 +18,27 @@
  *   mapper can emit `NaN` or `Infinity`: every number goes through
  *   {@link asNumber}.
  * * **no invented measurement.** When the API publishes no counterpart for a
- *   view-model field, the mapper leaves it empty and says so in a comment:
- *   the per-profile `sparkline`, `engine_slot` and `api_port` of the profile
- *   list, the strategy `pairs`/`open_trades` scalar, and the dashboard refresh
- *   interval are the cases.
+ *   view-model field, the mapper leaves it empty and says so in a comment: the
+ *   strategy `pairs`/`open_trades` scalar and the dashboard refresh interval are
+ *   the remaining cases.
  *
  * Field-for-field correspondence (wire -> view model):
  *
  * | Wire | View model |
  * | --- | --- |
- * | `health.profiles_running` | `HealthStatus.running_profiles` |
- * | `health.engine_slots_total` | `HealthStatus.max_running_profiles` |
+ * | `health.profiles_running` | `HealthStatus.profiles_running` |
+ * | `health.engine_slots_used` | `HealthStatus.engine_slots_used` |
+ * | `health.engine_slots_total` | `HealthStatus.engine_slots_total` |
  * | `profile.profit_abs` | `ProfileView.profit_usdt` |
  * | `profile.last_updated` | `ProfileView.updated_at` |
+ * | `profile.slot` / `.worker_port` | `ProfileView.engine_slot` / `.api_port` |
+ * | `profile.sparkline[].value` | `ProfileView.sparkline` |
  * | `equity_point.t` / `.value` | `EquityPoint.timestamp` / `.portfolio_value` |
  * | `account.combined` | `AccountResponse.performance` |
  * | `account.combined.equity_curve` | `AccountResponse.equity_curve` |
  * | `profile_detail.profile` / `.strategy` | `ProfileDetail.profile` / `.strategy` |
+ * | `profile_detail.daily.abs_profit` | `DailyBarPoint.profit_usdt` |
+ * | `profile_detail.daily.trade_count` | `DailyBarPoint.trades` |
  * | `strategy.profile_count` | `StrategyView.profiles_total` |
  * | `event.ts` / `event.id` | `EventItem.timestamp` / `EventItem.id` (string) |
  * | `catalogue.skipped` / `.refused_live` | `CatalogueApplyResponse.unchanged` / `.refused` |
@@ -117,6 +121,12 @@ export interface ApiProfile {
   rank?: unknown;
   uptime_seconds?: unknown;
   best_pair?: unknown;
+  /** Portfolio-value series of the profile: `[{t, value, profit_pct}]`, oldest first. */
+  sparkline?: unknown;
+  /** 1-based engine slot among the running profiles, `null` when not running. */
+  slot?: unknown;
+  /** Private freqtrade REST port of the running worker, `null` otherwise. */
+  worker_port?: unknown;
   last_updated?: unknown;
 }
 
@@ -220,6 +230,7 @@ export interface ApiEvents {
 export interface ApiSettings {
   max_running_profiles?: unknown;
   snapshot_interval_seconds?: unknown;
+  worker_start_stagger_seconds?: unknown;
   kill_switch_engaged?: unknown;
   allow_live_trading?: unknown;
   catalogue_profile_count?: unknown;
@@ -327,10 +338,16 @@ export function asLevel(value: unknown): EventItem["level"] {
 /**
  * One profile of the ranking.
  *
- * Three fields of the view model have no counterpart in the API and stay empty
- * on purpose: `sparkline` (the list endpoint publishes no per-profile history,
- * only `GET /api/profiles/{id}` does), `engine_slot` and `api_port` (the
- * platform keeps them private to the engine and never publishes them).
+ * `sparkline` is read from the `{t, value, profit_pct}` points of the wire and
+ * reduced to their values (oldest first): the table renders the series, never the
+ * timestamps. A point the payload malformed is dropped and the order of the
+ * remaining ones is preserved.
+ *
+ * `slot` and `worker_port` describe the worker of a profile: `slot` is the
+ * 1-based position of a running profile among the running ones (priority
+ * descending, then id ascending) and `worker_port` its private freqtrade REST
+ * port. A profile that holds no worker answers `null` for both, which is exactly
+ * the `null` the view model keeps.
  */
 export function toProfileView(raw: unknown): ProfileView {
   const row = asRecord(raw);
@@ -353,9 +370,11 @@ export function toProfileView(raw: unknown): ProfileView {
     win_rate: asNumber(row.win_rate),
     profit_factor: asNumber(row.profit_factor),
     max_drawdown_pct: asNumber(row.max_drawdown_pct),
-    engine_slot: null,
-    api_port: null,
-    sparkline: [],
+    engine_slot: typeof row.slot === "number" ? row.slot : null,
+    api_port: typeof row.worker_port === "number" ? row.worker_port : null,
+    sparkline: asRecordArray(row.sparkline)
+      .map((point) => asNumber(point.value, Number.NaN))
+      .filter((value) => Number.isFinite(value)),
     updated_at: asString(row.last_updated),
   };
   // The wire publishes more than the table of the overview renders; the extra
@@ -483,12 +502,14 @@ export function toDashboardSettings(raw: unknown): DashboardSettings {
   const body = asRecord(raw);
   const maxRunning = body.max_running_profiles;
   const snapshotInterval = body.snapshot_interval_seconds;
+  const stagger = body.worker_start_stagger_seconds;
   const portBase = body.engine_api_port_base;
   return {
     refresh_interval_seconds: DEFAULT_REFRESH_INTERVAL_SECONDS,
     allow_live_trading: asBoolean(body.allow_live_trading),
     max_running_profiles: typeof maxRunning === "number" ? maxRunning : undefined,
     snapshot_interval_seconds: typeof snapshotInterval === "number" ? snapshotInterval : undefined,
+    worker_start_stagger_seconds: typeof stagger === "number" ? stagger : undefined,
     engine_api_port_base: typeof portBase === "number" ? portBase : undefined,
     kill_switch_engaged: asBoolean(body.kill_switch_engaged),
     updated_at: asOptionalString(body.updated_at) ?? undefined,
@@ -577,13 +598,18 @@ export function toEventsResponse(raw: unknown): EventsResponse {
   return { generated_at: "", events: asArray(body.events).map(toEventItem) };
 }
 
-/** One daily bar of a profile detail (`GET /api/profiles/{id}`). */
+/**
+ * One daily bar of a profile detail (`GET /api/profiles/{id}`).
+ *
+ * The wire serves `abs_profit` and `trade_count`; the older `profit_abs`/`trades`
+ * pair is still accepted so a partially deployed API keeps rendering its bars.
+ */
 export function toDailyBar(raw: unknown): DailyBarPoint {
   const row = asRecord(raw);
   return {
     date: asString(row.date, asString(row.ts)),
-    profit_usdt: asNumber(row.profit_abs, asNumber(row.profit_usdt)),
-    trades: asNumber(row.trades, asNumber(row.count)),
+    profit_usdt: asNumber(row.abs_profit, asNumber(row.profit_abs, asNumber(row.profit_usdt))),
+    trades: asNumber(row.trade_count, asNumber(row.trades, asNumber(row.count))),
   };
 }
 
@@ -714,6 +740,10 @@ export function toKillSwitchResponse(raw: unknown): KillSwitchResponse {
 /**
  * `GET /api/health`.
  *
+ * Every counter is read from the wire name it mirrors (`profiles_running`,
+ * `engine_slots_used`, `engine_slots_total`); a missing one degrades to `0`, so no
+ * page can render `NaN` from this mapper.
+ *
  * `live_trading_enabled` is not part of the health payload: the live gate is
  * published by `GET /api/settings`, and the operations page merges the two. The
  * health mapper reports the fail-safe default (`false`) so a page that only
@@ -721,13 +751,13 @@ export function toKillSwitchResponse(raw: unknown): KillSwitchResponse {
  */
 export function toHealthStatus(raw: unknown): HealthStatus {
   const body = asRecord(raw);
-  const slotsTotal = body.engine_slots_total;
   return {
     status: asString(body.status, "unknown"),
     version: asString(body.version),
     uptime_seconds: asNumber(body.uptime_seconds),
-    running_profiles: asNumber(body.profiles_running),
-    max_running_profiles: typeof slotsTotal === "number" ? slotsTotal : 0,
+    profiles_running: asNumber(body.profiles_running),
+    engine_slots_used: asNumber(body.engine_slots_used),
+    engine_slots_total: asNumber(body.engine_slots_total),
     live_trading_enabled: false,
     kill_switch_engaged: asBoolean(body.kill_switch_engaged),
     generated_at: asString(body.generated_at),

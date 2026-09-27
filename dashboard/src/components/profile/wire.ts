@@ -15,6 +15,10 @@
  * malformed value becomes `null` and the page renders an em dash, so a partial
  * API answer never throws and never puts `NaN` on the screen.
  *
+ * The per-profile `sparkline` and the engine `slot`/`worker_port` of a profile
+ * are published by the API and mapped by `@/lib/api-wire`; the pages read them
+ * from the mapped `ProfileView` and they are never re-read here.
+ *
  * Number conventions of a trade row: `profit_abs` is expressed in USDT,
  * `profit_pct` is **already a percentage** (freqtrade multiplies the ratio by
  * 100 in its REST payload) and `profit_ratio` is a 0..1 ratio. Both percentage
@@ -147,7 +151,10 @@ export function readTrade(source: unknown, defaultOpen: boolean): TradeRow | nul
     openedAt: readText(raw.open_date) ?? readText(raw.open_timestamp),
     closedAt: readText(raw.close_date) ?? readText(raw.close_timestamp),
     openRate: readNumber(raw.open_rate),
-    currentRate: readNumber(raw.current_rate),
+    // An open row carries no mark price once its worker stops: the open rate is
+    // then the only rate the row publishes, and the cell shows it instead of an
+    // em dash.
+    currentRate: readNumber(raw.current_rate) ?? readNumber(raw.open_rate),
     closeRate: readNumber(raw.close_rate),
     amount: readNumber(raw.amount),
     stakeAmount,
@@ -174,7 +181,13 @@ export function readTradeList(source: unknown, defaultOpen: boolean): TradeRow[]
   return rows;
 }
 
-/** Read one daily bar; a row without a date is dropped. */
+/**
+ * Read one daily bar; a row without a date is dropped.
+ *
+ * The state database serves `abs_profit` and `trade_count`; the older
+ * `profit_usdt`/`trades` names are still accepted so a raw payload and the mapped
+ * `DailyBarPoint` both read the same.
+ */
 function readDailyBar(source: unknown): DailyBarPoint | null {
   const raw = readRecord(source);
   if (raw === null) {
@@ -186,8 +199,8 @@ function readDailyBar(source: unknown): DailyBarPoint | null {
   }
   return {
     date,
-    profit_usdt: readNumber(raw.profit_usdt) ?? Number.NaN,
-    trades: readNumber(raw.trades) ?? 0,
+    profit_usdt: readNumber(raw.abs_profit) ?? readNumber(raw.profit_usdt) ?? Number.NaN,
+    trades: readNumber(raw.trade_count) ?? readNumber(raw.trades) ?? 0,
   };
 }
 

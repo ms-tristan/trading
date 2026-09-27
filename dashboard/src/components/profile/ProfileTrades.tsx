@@ -192,7 +192,7 @@ export function OpenTradesCard({ trades, className }: TradesCardProps) {
         rows={trades}
         rowKey={(row) => `${row.tradeId}-${row.pair}-${row.openedAt ?? ""}`}
         caption="Open trades of this profile"
-        emptyMessage="This profile holds no open trade."
+        emptyMessage="No open position"
       />
     </Card>
   );
@@ -212,7 +212,7 @@ export function ClosedTradesCard({ trades, className }: TradesCardProps) {
         rows={trades}
         rowKey={(row) => `${row.tradeId}-${row.pair}-${row.openedAt ?? ""}`}
         caption="Recent closed trades of this profile"
-        emptyMessage="No closed trade in the selected window."
+        emptyMessage="No closed trade yet"
         minWidthClassName="min-w-[1080px]"
       />
     </Card>

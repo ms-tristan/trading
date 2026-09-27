@@ -54,8 +54,8 @@ export default async function OverviewPage({ searchParams }: OverviewPageProps) 
   // pipeline asserts on.
   const performance: AccountPerformance = {
     ...account.data.performance,
-    engine_slots_used: health.data.running_profiles,
-    engine_slots_total: health.data.max_running_profiles,
+    engine_slots_used: health.data.engine_slots_used,
+    engine_slots_total: health.data.engine_slots_total,
   };
 
   return (

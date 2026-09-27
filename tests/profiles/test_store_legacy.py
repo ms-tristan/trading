@@ -6,6 +6,12 @@ fresh database must be created next to it, without parsing, migrating or
 deleting the old file. The cases below are table driven: each one builds a
 different foreign (or already valid) file, boots the store on it and checks both
 what happened to the file and what the fresh database answers.
+
+The other direction matters just as much: a database written by **revision 1 of
+this platform** is migrated in place -- its rows are kept, the two new read-model
+tables are created and ``PRAGMA user_version`` is re-stamped -- and must never be
+archived, while a revision the running platform does not know is foreign and is
+archived as usual.
 """
 
 from __future__ import annotations
@@ -23,12 +29,19 @@ from trading_platform.profiles.store import (
     PROFILE_COLUMNS,
     SCHEMA_VERSION,
     TABLES,
+    ProfileDailyRecord,
+    ProfileTradeRecord,
     StateStore,
     archive_legacy_database,
 )
 
 LEGACY_NAME_PATTERN = re.compile(r"\.legacy-\d{8}T\d{6}Z$")
 LEGACY_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+
+#: The tables revision 1 of this platform created; revision 2 is purely additive.
+REVISION_ONE_TABLES: tuple[str, ...] = tuple(
+    name for name in TABLES if name not in ("profile_trades", "profile_daily")
+)
 
 
 @dataclass(frozen=True)
@@ -86,7 +99,67 @@ def build_newer_schema_revision(path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
         connection.execute("CREATE TABLE profiles (id TEXT PRIMARY KEY, hash TEXT)")
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def build_future_revision_with_platform_columns(path: Path) -> None:
+    """The platform's own columns at a revision the platform does not know.
+
+    A release newer than this one would own these columns; the running platform
+    must not touch a schema it cannot understand, so the file is archived even
+    though it looks familiar.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        columns = ", ".join(f"{name} TEXT" for name in PROFILE_COLUMNS if name != "id")
+        connection.execute(f"CREATE TABLE profiles (id TEXT PRIMARY KEY, {columns})")
+        connection.execute("INSERT INTO profiles (id, name) VALUES ('future', 'Written later')")
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def build_platform_revision_one_database(path: Path) -> None:
+    """The state database of **revision 1 of this platform**: its four tables, its rows.
+
+    This is the file a running deployment upgrades from: it carries the
+    platform's own ``profiles`` columns, so it must be completed in place and
+    never renamed to ``state.db.legacy-*``.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        columns = ", ".join(f"{name} TEXT" for name in PROFILE_COLUMNS if name != "id")
+        connection.execute(f"CREATE TABLE profiles (id TEXT PRIMARY KEY, {columns})")
+        connection.execute(
+            "CREATE TABLE profile_snapshots ("
+            "profile_id TEXT, ts TEXT, portfolio_value REAL, cash REAL, positions_value REAL, "
+            "profit_abs REAL, profit_pct REAL, realized_profit_abs REAL, "
+            "unrealized_profit_abs REAL, open_trades INTEGER, closed_trades INTEGER, "
+            "win_rate REAL, profit_factor REAL, max_drawdown_pct REAL, healthy INTEGER, "
+            "PRIMARY KEY (profile_id, ts))"
+        )
+        connection.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, profile_id TEXT, "
+            "level TEXT, kind TEXT, message TEXT)"
+        )
+        connection.execute("CREATE INDEX idx_profile_snapshots_ts ON profile_snapshots(ts)")
+        connection.execute(
+            "INSERT INTO profiles (id, name, strategy, created_at, updated_at) "
+            "VALUES ('kept', 'Kept by the migration', 'basic', "
+            "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO events (ts, profile_id, level, kind, message) "
+            "VALUES ('2026-01-01T00:00:00Z', 'kept', 'info', 'start', 'written by revision 1')"
+        )
+        connection.execute("PRAGMA user_version = 1")
         connection.commit()
     finally:
         connection.close()
@@ -130,6 +203,10 @@ FOREIGN_DATABASES = [
     ),
     ForeignDatabase("profiles-table-without-id", build_profiles_table_without_id),
     ForeignDatabase("newer-schema-revision", build_newer_schema_revision),
+    ForeignDatabase(
+        "future-revision-with-platform-columns",
+        build_future_revision_with_platform_columns,
+    ),
     ForeignDatabase("platform-names-older-revision", build_platform_prefixed_database),
     ForeignDatabase("not-a-database", build_not_a_database, readable=False),
 ]
@@ -246,6 +323,76 @@ def test_bootstrap_creates_the_tables_around_an_existing_profiles_table(tmp_path
     assert set(TABLES) <= names
 
 
+def test_bootstrap_migrates_a_revision_one_database_in_place(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    build_platform_revision_one_database(db_path)
+
+    store = StateStore(db_path)
+
+    # A database of revision 1 of THIS platform is never a legacy file: it is
+    # completed in place, and not one row written by revision 1 is lost.
+    assert store.bootstrap() is None
+    assert legacy_archives(db_path) == []
+    kept = store.get_profile("kept")
+    assert kept is not None
+    assert kept.name == "Kept by the migration"
+    assert [event.message for event in store.list_events()] == ["written by revision 1"]
+
+    connection = sqlite3.connect(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        names = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        indexes = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+    finally:
+        connection.close()
+
+    assert version == SCHEMA_VERSION
+    assert {"profile_trades", "profile_daily"} <= names
+    assert set(REVISION_ONE_TABLES) <= names
+    assert set(TABLES) <= names
+    assert "idx_profile_trades_open" in indexes
+
+    # The two new tables answer immediately, which is what the next poll writes to.
+    assert (
+        store.upsert_trade_records(
+            [
+                ProfileTradeRecord(
+                    profile_id="kept",
+                    trade_id=1,
+                    pair="BTC/USDT",
+                    is_open=True,
+                    open_date="2026-01-02T00:00:00Z",
+                    updated_at="2026-01-02T00:01:00Z",
+                )
+            ]
+        )
+        == 1
+    )
+    assert [trade.trade_id for trade in store.trade_records("kept")] == [1]
+    assert (
+        store.upsert_daily_records(
+            [
+                ProfileDailyRecord(
+                    profile_id="kept", date="2026-01-02", abs_profit=12.0, trade_count=1
+                )
+            ]
+        )
+        == 1
+    )
+    assert [day.date for day in store.daily_records("kept")] == ["2026-01-02"]
+
+    # The migrated file is a current database now: booting again archives nothing.
+    assert store.bootstrap() is None
+    assert legacy_archives(db_path) == []
+    assert [record.id for record in store.list_profiles()] == ["kept"]
+
+
 def test_bootstrap_keeps_a_foreign_file_without_a_profiles_table(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     connection = sqlite3.connect(db_path)
@@ -312,7 +459,7 @@ def test_archiving_moves_the_stale_sqlite_sidecar_files(tmp_path: Path) -> None:
         writer.close()
 
 
-def test_archive_legacy_database_handles_the_three_states(tmp_path: Path) -> None:
+def test_archive_legacy_database_handles_the_four_states(tmp_path: Path) -> None:
     missing = tmp_path / "absent.db"
     assert archive_legacy_database(missing) is None
 
@@ -321,6 +468,13 @@ def test_archive_legacy_database_handles_the_three_states(tmp_path: Path) -> Non
         store.bootstrap()
     assert archive_legacy_database(platform_db) is None
     assert legacy_archives(platform_db) == []
+
+    # An older revision of this platform is not a legacy database either.
+    revision_one_db = tmp_path / "revision-one.db"
+    build_platform_revision_one_database(revision_one_db)
+    assert archive_legacy_database(revision_one_db) is None
+    assert revision_one_db.is_file()
+    assert legacy_archives(revision_one_db) == []
 
     foreign_db = tmp_path / "foreign.db"
     build_unrelated_profiles_table(foreign_db)

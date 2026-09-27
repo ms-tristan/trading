@@ -100,13 +100,16 @@ only in the browser's `sessionStorage` (never on disk, never rendered back).
 
 The profile set and the platform settings live in **one SQLite database**:
 `/app/data/realtime/state.db`, inside the `trading-state` volume, with schema
-version `1` (`PRAGMA user_version`).
+version `2` (`PRAGMA user_version`). It owns six tables and three indexes
+(`idx_profile_snapshots_ts`, `idx_events_ts`, `idx_profile_trades_open`).
 
 | What | Where |
 | --- | --- |
 | Profiles and their state, ports, pids | the `profiles` table, one row per profile |
-| Platform settings | the `settings` key/value table |
+| Platform settings | the `settings` table, one `platform_settings` row holding the whole settings document |
 | Minute snapshots (portfolio value, cash, profit, trades, health) | the `profile_snapshots` table |
+| Trades of every profile, open and closed, mirrored from its worker | the `profile_trades` table |
+| Daily profit rows of every profile, mirrored from its worker | the `profile_daily` table |
 | Engine journal (start, stop, crash, restart, cap reached, kill switch, legacy archive) | the `events` table |
 
 Consequences an operator must know:
@@ -125,13 +128,21 @@ Consequences an operator must know:
   `state.db` from an earlier platform (a different schema), the boot renames it to
   `state.db.legacy-<UTC timestamp>` in the same directory and creates a fresh
   database; the archive is never deleted automatically and an `events` row
-  records it. This is what the deployment this repository replaces leaves behind,
+  records it. A database of *this* platform at revision `1` is not foreign: it is
+  **migrated in place** to revision `2`, the file is never archived and no data is
+  lost. This is what the deployment this repository replaces leaves behind,
   and it is why the first boot of the new stack is deterministic.
 
-The settings are seeded from the built-in configuration defaults the first time
-the database is opened and read back from the database on every later boot. The
-only thing that stays outside the database is the **path** of the database
-itself: it comes from `--state-db` (the image passes
+The settings are resolved at boot with this precedence, weakest first: the
+defaults the supervisor was constructed with, then the keys actually present in
+`config/platform.json`, then the persisted `platform_settings` row of the
+`settings` table, then the `TB_*` environment variables — the environment always
+wins, because it is the only input an operator changes without writing to the
+state volume. An operator change made through `POST /api/settings` is written as
+that one `platform_settings` row and survives a restart; the route accepts
+`max_running_profiles`, `snapshot_interval_seconds` and
+`worker_start_stagger_seconds`. The only thing that stays outside the database is
+the **path** of the database itself: it comes from `--state-db` (the image passes
 `/app/data/realtime/state.db`), from `TB_REALTIME_STATE_DB`, or from the model
 default. A host that never customises anything behaves exactly as documented.
 
@@ -190,19 +201,39 @@ file alone is enough).
 ### Why the fleet is capped
 
 One running `freqtrade trade` process costs about **390 MiB RSS** (measured: 8
-instances = 3.13 GiB, linear), and the Docker VM has **11.65 GiB**. The platform
-therefore runs at most **12 concurrent workers** by default
-(`max_running_profiles`, overridable by `TB_MAX_RUNNING_PROFILES`), which is
-roughly 4.6 GiB of workers and leaves the rest of the VM to the supervisor, the
-dashboard and the image builds. Profiles beyond the cap are **queued**: they are
-reported with the state `queued` and a reason naming the cap, they appear in the
-dashboard's ranking like every other profile, and the next one is promoted
-automatically as soon as a slot frees.
+instances = 3.13 GiB, linear), and the Docker VM has **12 GiB** on a 16 GiB host
+that already swaps heavily. The platform therefore runs at most **6 concurrent
+workers** by default (`max_running_profiles`, overridable by
+`TB_MAX_RUNNING_PROFILES`), which is roughly **2.3 GiB** of workers and leaves the
+rest of the VM to the supervisor, the dashboard and the image builds. Profiles
+beyond the cap are **queued**: they are reported with the state `queued` and a
+reason naming the cap, they appear in the dashboard's ranking like every other
+profile, and the next one is promoted automatically as soon as a slot frees.
 
 The cap is a memory guard, not a trading decision. Raise it with
 `TB_MAX_RUNNING_PROFILES`, with `max_running_profiles` in `config/platform.json`,
 or at run time through `POST /api/settings` — and only if the host has the memory
 to back it (`docker stats`).
+
+### Why the fleet also starts gradually
+
+Filling the six slots at once is exactly what killed the guest: a simultaneous
+cold start of many workers spiked memory and CPU together and made the VM
+unresponsive — reproduced twice on this host. The supervisor therefore starts **at
+most one new worker per stagger interval**, controlled by
+`worker_start_stagger_seconds` (integer, default **10**, minimum `0`,
+`TB_WORKER_START_STAGGER_SECONDS`; `config/platform.json` carries the default and
+`POST /api/settings` changes it at run time). After a worker starts, the gate
+closes for that interval, and every other profile that is eligible to run but has
+to wait stays in the state `queued` with the reason
+`queued: starting workers gradually (N of M slots in use)`, where N is the number
+of workers alive and M is `max_running_profiles`. A stagger of `0` restores the
+immediate behaviour. Staggering only delays promotions, it never reorders them:
+the order stays priority descending, then id ascending, so a high-priority profile
+is still promoted before a low-priority one.
+
+That is why `deploy/docker-compose.yml` sets `TB_MAX_RUNNING_PROFILES=6` and
+`TB_WORKER_START_STAGGER_SECONDS=10` for the `trading-realtime` service.
 
 ### Live-trading preconditions
 
@@ -233,8 +264,11 @@ true in this order:
    `state.db.legacy-<timestamp>` and creates a fresh one (an unrelated schema can
    therefore never abort the boot);
 2. it seeds the **22-profile catalogue** and computes the schedule;
-3. it promotes the highest-priority profiles up to the cap of **12** and spawns
-   one `freqtrade trade` worker for each; the rest are `queued` with their reason;
+3. it promotes the highest-priority profiles up to the cap of **6**, one new
+   worker per stagger interval (`worker_start_stagger_seconds`, 10 s by default),
+   and spawns one `freqtrade trade` worker for each; the rest are `queued` with
+   their reason — the profiles that are eligible but still waiting for the gate
+   carry `queued: starting workers gradually (N of M slots in use)`;
 4. the API starts serving as soon as the supervisor is up, and `/api/health`
    reports `status == "ok"` with `profiles_running > 0` as soon as **one** worker
    is alive and healthy — which is what the smoke test waits for.
@@ -461,8 +495,10 @@ must run on the host itself:
 
 The deploy **restarts every freqtrade worker**, because it restarts the
 supervisor container; the fleet is scheduled again from the state database, the
-queued profiles are promoted in priority order, and the snapshot history keeps
-the before/after in one table. The reason the smoke assertions hold on a first
+queued profiles are promoted in priority order but at most one new worker per
+`worker_start_stagger_seconds`, so the cold start never spikes memory and CPU at
+once, and the snapshot history keeps the before/after in one table. The reason
+the smoke assertions hold on a first
 boot — legacy database archived, catalogue seeded, workers spawned, API answering
 as soon as one worker is healthy — is §1bis.
 
@@ -528,7 +564,8 @@ Operational notes:
   nginx authentication, never published on a public interface;
 - **no shared state between the containers**: the dashboard holds no database
   and no volume; everything it shows comes from the JSON API at request time;
-- **no more than 12 workers by default**: the fleet cap is a memory guard
+- **no more than 6 workers by default, and they start one at a time**: the fleet
+  cap is a memory guard and the stagger protects the guest from a cold-start spike
   (§1bis); the remaining profiles of the catalogue are queued, not dropped;
 - **no live trading by default**: the two live catalogue entries stay `blocked`
   (in the API) and `refused_live` (in provisioning) until an operator provides

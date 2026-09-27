@@ -10,7 +10,7 @@ well as the defaults an operator profile is created with.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +28,11 @@ from trading_platform.models import (
     utc_now,
 )
 from trading_platform.profiles.catalogue import StrategyCatalogue, load_profile_catalogue
-from trading_platform.profiles.store import StateStore
+from trading_platform.profiles.store import (
+    ProfileDailyRecord,
+    ProfileTradeRecord,
+    StateStore,
+)
 
 TOKEN = "operator-token-of-the-test"
 
@@ -84,12 +88,15 @@ class _StubSupervisor:
         *,
         max_running_profiles: int | None = None,
         snapshot_interval_seconds: int | None = None,
+        worker_start_stagger_seconds: int | None = None,
     ) -> PlatformSettings:
         changes: dict[str, int] = {}
         if max_running_profiles is not None:
             changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
+        if worker_start_stagger_seconds is not None:
+            changes["worker_start_stagger_seconds"] = int(worker_start_stagger_seconds)
         self.settings = self.settings.with_overrides(**changes)
         return self.settings
 
@@ -141,6 +148,107 @@ def _snapshot(
     }
     fields.update(overrides)
     return ProfileSnapshot(**fields)
+
+
+def _daily_date(day: int) -> str:
+    """Return the ISO day ``day`` days after 2026-08-01."""
+    return (datetime(2026, 8, 1) + timedelta(days=day)).date().isoformat()
+
+
+def _daily_row(profile_id: str, day: int, **overrides: Any) -> ProfileDailyRecord:
+    """Build one stored daily row for the day ``day`` days after 2026-08-01."""
+    fields: dict[str, Any] = {
+        "profile_id": profile_id,
+        "date": _daily_date(day),
+        "abs_profit": 1.0 + day,
+        "rel_profit": 0.001 * day,
+        "starting_balance": 1000.0,
+        "trade_count": day,
+    }
+    fields.update(overrides)
+    return ProfileDailyRecord(**fields)
+
+
+def _trade_row(profile_id: str, trade_id: int, **overrides: Any) -> ProfileTradeRecord:
+    """Build one stored trade row; ``trade_id`` also orders the read model."""
+    fields: dict[str, Any] = {
+        "profile_id": profile_id,
+        "trade_id": trade_id,
+        "pair": "BTC/USDT",
+        "is_open": False,
+        "open_date": f"2026-09-{trade_id:02d}T08:00:00Z",
+        "close_date": f"2026-09-{trade_id:02d}T09:00:00Z",
+        "amount": 0.5,
+        "open_rate": 100.0,
+        "close_rate": 110.0,
+        "stake_amount": 50.0,
+        "profit_abs": 5.0,
+        "profit_pct": 1.25,
+        "exit_reason": "roi",
+    }
+    fields.update(overrides)
+    return ProfileTradeRecord(**fields)
+
+
+#: Keys of one ``daily`` row of ``GET /api/profiles/{id}``.
+DAILY_KEYS = {"date", "abs_profit", "rel_profit", "starting_balance", "trade_count"}
+
+#: Keys of one ``open_trades`` row.
+OPEN_TRADE_KEYS = {
+    "trade_id",
+    "pair",
+    "open_date",
+    "amount",
+    "open_rate",
+    "current_rate",
+    "stake_amount",
+    "profit_abs",
+    "profit_pct",
+}
+
+#: Keys of one ``recent_trades`` row.
+RECENT_TRADE_KEYS = {
+    "trade_id",
+    "pair",
+    "open_date",
+    "close_date",
+    "amount",
+    "open_rate",
+    "close_rate",
+    "stake_amount",
+    "profit_abs",
+    "profit_pct",
+    "exit_reason",
+}
+
+
+def _seed_read_model(store: StateStore, profile_id: str) -> None:
+    """Seed 35 days, 21 closed trades and two open ones for one profile."""
+    store.upsert_daily_records([_daily_row(profile_id, day) for day in range(35)])
+    store.upsert_trade_records(
+        [_trade_row(profile_id, trade_id) for trade_id in range(1, 22)]
+        + [
+            _trade_row(
+                profile_id,
+                90,
+                is_open=True,
+                open_date="2026-09-27T11:00:00Z",
+                close_date=None,
+                close_rate=None,
+                exit_reason=None,
+            ),
+            _trade_row(
+                profile_id,
+                91,
+                is_open=True,
+                open_date="2026-09-27T12:00:00Z",
+                close_date=None,
+                close_rate=None,
+                exit_reason=None,
+                profit_pct=2.5,
+            ),
+        ]
+    )
 
 
 def _make_engine(
@@ -317,7 +425,7 @@ def test_profiles_without_a_snapshot_are_shown_at_their_initial_capital(tmp_path
 # One profile
 # ---------------------------------------------------------------------------
 def test_detail_returns_the_documented_payload(tmp_path: Path) -> None:
-    client, _supervisor, _store = _make_engine(
+    client, _supervisor, store = _make_engine(
         tmp_path,
         profiles=[_profile("alpha", strategy="basic")],
         states={"alpha": "running"},
@@ -327,6 +435,7 @@ def test_detail_returns_the_documented_payload(tmp_path: Path) -> None:
             _snapshot("alpha", 1200.0, open_trades=1, closed_trades=3),
         ],
     )
+    _seed_read_model(store, "alpha")
 
     payload = client.get("/api/profiles/alpha").json()
 
@@ -345,9 +454,128 @@ def test_detail_returns_the_documented_payload(tmp_path: Path) -> None:
     assert payload["strategy"]["profile_count"] == 1
     assert payload["strategy"]["profiles_running"] == 1
     assert [point["value"] for point in payload["equity_curve"]] == [1100.0, 1200.0]
-    assert payload["daily"] == []
-    assert payload["open_trades"] == []
-    assert payload["recent_trades"] == []
+
+    # ``daily``: the 30 most recent days, chronological with the newest last.
+    daily = payload["daily"]
+    assert len(daily) == 30
+    assert [row["date"] for row in daily] == [_daily_date(day) for day in range(5, 35)]
+    assert set(daily[0]) == DAILY_KEYS
+    assert daily[-1] == {
+        "date": _daily_date(34),
+        "abs_profit": 35.0,
+        "rel_profit": pytest.approx(0.034),
+        "starting_balance": 1000.0,
+        "trade_count": 34,
+    }
+
+    # ``open_trades``: every open row, newest first, and exactly nine keys.
+    open_trades = payload["open_trades"]
+    assert [trade["trade_id"] for trade in open_trades] == [91, 90]
+    assert set(open_trades[0]) == OPEN_TRADE_KEYS
+    assert open_trades[0]["pair"] == "BTC/USDT"
+    assert open_trades[0]["open_date"] == "2026-09-27T12:00:00Z"
+    assert open_trades[0]["amount"] == 0.5
+    assert open_trades[0]["open_rate"] == 100.0
+    # The stored row carries no live rate, so current_rate is the entry price.
+    assert open_trades[0]["current_rate"] == open_trades[0]["open_rate"]
+    assert open_trades[0]["stake_amount"] == 50.0
+    assert open_trades[0]["profit_abs"] == 5.0
+    assert open_trades[0]["profit_pct"] == 2.5
+
+    # ``recent_trades``: the 20 most recent closed rows, newest first.
+    recent = payload["recent_trades"]
+    assert len(recent) == 20
+    assert [trade["trade_id"] for trade in recent] == list(range(21, 1, -1))
+    assert set(recent[0]) == RECENT_TRADE_KEYS
+    assert recent[0]["open_date"] == "2026-09-21T08:00:00Z"
+    assert recent[0]["close_date"] == "2026-09-21T09:00:00Z"
+    assert recent[0]["close_rate"] == 110.0
+    assert recent[0]["stake_amount"] == 50.0
+    assert recent[0]["profit_abs"] == 5.0
+    assert recent[0]["profit_pct"] == 1.25
+    assert recent[0]["exit_reason"] == "roi"
+
+
+def test_detail_serves_the_read_model_of_a_stopped_profile(tmp_path: Path) -> None:
+    client, supervisor, store = _make_engine(
+        tmp_path,
+        profiles=[_profile("alpha")],
+        states={"alpha": "stopped"},
+    )
+    store.upsert_daily_records([_daily_row("alpha", 0), _daily_row("alpha", 1)])
+    store.upsert_trade_records(
+        [
+            _trade_row(
+                "alpha",
+                5,
+                is_open=True,
+                open_date="2026-09-27T10:00:00Z",
+                close_date=None,
+                close_rate=None,
+                exit_reason=None,
+            ),
+            _trade_row("alpha", 6),
+        ]
+    )
+
+    payload = client.get("/api/profiles/alpha").json()
+
+    # Nothing runs, yet the route answers: the rows come from the state DB.
+    assert supervisor.is_running("alpha") is False
+    assert payload["profile"]["slot"] is None
+    assert payload["profile"]["worker_port"] is None
+    assert [row["date"] for row in payload["daily"]] == [_daily_date(0), _daily_date(1)]
+    assert [trade["trade_id"] for trade in payload["open_trades"]] == [5]
+    assert [trade["trade_id"] for trade in payload["recent_trades"]] == [6]
+
+
+def test_profiles_publish_the_sparkline_the_slot_and_the_worker_port(tmp_path: Path) -> None:
+    client, _supervisor, store = _make_engine(
+        tmp_path,
+        profiles=[
+            _profile("alpha", priority=10),
+            _profile("beta", priority=30),
+            _profile("gamma", priority=20),
+        ],
+        states={"alpha": "running", "beta": "running"},
+        alive=["alpha", "beta"],
+        snapshots=[
+            _snapshot("alpha", 1000.0 + index, days_ago=(61 - index) / 1440.0)
+            for index in range(61)
+        ],
+    )
+    # The runtime columns keep the port of a worker that stopped as well.
+    store.set_profile_runtime("alpha", api_port=8101)
+    store.set_profile_runtime("beta", api_port=8102)
+    store.set_profile_runtime("gamma", api_port=8103)
+
+    profiles = {row["id"]: row for row in client.get("/api/profiles").json()["profiles"]}
+
+    # ``sparkline``: the 60 most recent snapshots, oldest first.
+    sparkline = profiles["alpha"]["sparkline"]
+    assert len(sparkline) == 60
+    assert set(sparkline[0]) == {"t", "value", "profit_pct"}
+    assert [point["value"] for point in sparkline] == [1000.0 + index for index in range(1, 61)]
+    assert sparkline[0]["t"] < sparkline[-1]["t"]
+    assert sparkline[0]["profit_pct"] == pytest.approx(0.001)
+    # A profile without a snapshot publishes no point at all.
+    assert profiles["beta"]["sparkline"] == []
+
+    # ``slot``: the running profiles in scheduler order (priority DESC, id ASC).
+    assert profiles["beta"]["slot"] == 1
+    assert profiles["alpha"]["slot"] == 2
+    assert profiles["gamma"]["slot"] is None
+
+    # ``worker_port``: only while the worker is alive.
+    assert profiles["alpha"]["worker_port"] == 8101
+    assert profiles["beta"]["worker_port"] == 8102
+    assert profiles["gamma"]["worker_port"] is None
+
+    # The detail route publishes the very same profile view.
+    detail = client.get("/api/profiles/alpha").json()["profile"]
+    assert detail["slot"] == 2
+    assert detail["worker_port"] == 8101
+    assert len(detail["sparkline"]) == 60
 
 
 def test_detail_equity_curve_follows_the_window(tmp_path: Path) -> None:

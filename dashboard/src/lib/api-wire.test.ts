@@ -16,6 +16,7 @@ import {
   asRecord,
   toAccountResponse,
   toCatalogueApplyResponse,
+  toDailyBar,
   toDashboardSettings,
   toEventItem,
   toEventsResponse,
@@ -77,6 +78,12 @@ const PROFILE = {
   rank: 1,
   uptime_seconds: 3600,
   best_pair: "BTC/USDT",
+  sparkline: [
+    { t: "2026-09-27T17:05:00Z", value: 1020.0, profit_pct: 0.02 },
+    { t: "2026-09-27T17:06:00Z", value: 1040.0, profit_pct: 0.04 },
+  ],
+  slot: 1,
+  worker_port: 8081,
   last_updated: "2026-09-27T17:07:00Z",
 };
 
@@ -97,8 +104,45 @@ describe("toProfileView", () => {
     expect(view.positions_value).toBe(1000);
   });
 
-  it("leaves the fields the API never publishes empty instead of inventing them", () => {
+  it("reduces the sparkline to its values, oldest first", () => {
     const [view] = toProfilesResponse({ profiles: [PROFILE] }).profiles;
+
+    expect(view.sparkline).toEqual([1020, 1040]);
+  });
+
+  it("keeps the order of the series and drops a malformed point", () => {
+    const [view] = toProfilesResponse({
+      profiles: [
+        {
+          ...PROFILE,
+          sparkline: [
+            { t: "2026-09-27T17:03:00Z", value: 3, profit_pct: null },
+            { t: "2026-09-27T17:04:00Z", value: "not a number" },
+            { t: "2026-09-27T17:05:00Z" },
+            7,
+            { t: "2026-09-27T17:06:00Z", value: 0, profit_pct: null },
+            { t: "2026-09-27T17:07:00Z", value: 1, profit_pct: 0.1 },
+          ],
+        },
+      ],
+    }).profiles;
+
+    // The two readable values survive in order, a real zero is a value and not a
+    // hole, and the malformed entries are dropped instead of becoming zeroes.
+    expect(view.sparkline).toEqual([3, 0, 1]);
+  });
+
+  it("maps the engine slot and the worker port of a running profile", () => {
+    const [view] = toProfilesResponse({ profiles: [PROFILE] }).profiles;
+
+    expect(view.engine_slot).toBe(1);
+    expect(view.api_port).toBe(8081);
+  });
+
+  it("answers null and an empty series for a profile the engine does not run", () => {
+    const [view] = toProfilesResponse({
+      profiles: [{ ...PROFILE, state: "stopped", slot: null, worker_port: null, sparkline: [] }],
+    }).profiles;
 
     expect(view.engine_slot).toBeNull();
     expect(view.api_port).toBeNull();
@@ -124,9 +168,19 @@ describe("toHealthStatus", () => {
     const health = toHealthStatus(HEALTH);
 
     expect(health.status).toBe("ok");
-    expect(health.running_profiles).toBe(10);
-    expect(health.max_running_profiles).toBe(2);
+    expect(health.profiles_running).toBe(10);
+    expect(health.engine_slots_used).toBe(10);
+    expect(health.engine_slots_total).toBe(2);
     expect(health.kill_switch_engaged).toBe(false);
+  });
+
+  it("degrades every missing counter to zero, never to NaN", () => {
+    const health = toHealthStatus({ status: "degraded" });
+
+    expect(health.profiles_running).toBe(0);
+    expect(health.engine_slots_used).toBe(0);
+    expect(health.engine_slots_total).toBe(0);
+    expect(Number.isNaN(health.engine_slots_used)).toBe(false);
   });
 
   it("reports live trading as disabled: the health payload never publishes the gate", () => {
@@ -207,7 +261,15 @@ describe("toProfileDetail", () => {
       win_rate: 0.0,
     },
     equity_curve: [{ t: "2026-09-27T17:07:00Z", value: 1040.0, profit_pct: 0.04 }],
-    daily: [],
+    daily: [
+      {
+        date: "2026-09-27",
+        abs_profit: 15.5,
+        rel_profit: 0.0155,
+        starting_balance: 1000.0,
+        trade_count: 2,
+      },
+    ],
     open_trades: [{ trade_id: 12, pair: "BTC/USDT", is_open: true }],
     recent_trades: [{ trade_id: 41, pair: "BTC/USDT", is_open: false }],
   };
@@ -229,6 +291,12 @@ describe("toProfileDetail", () => {
     expect(detail.recent_trades).toHaveLength(1);
   });
 
+  it("maps the state-database daily series of a stopped profile too", () => {
+    const detail = toProfileDetail(DETAIL, "24h");
+
+    expect(detail.daily_profit).toEqual([{ date: "2026-09-27", profit_usdt: 15.5, trades: 2 }]);
+  });
+
   it("renders an empty but well-formed detail for an empty body", () => {
     const detail = toProfileDetail({}, "7d");
 
@@ -237,6 +305,35 @@ describe("toProfileDetail", () => {
     expect(detail.daily_profit).toEqual([]);
     expect(detail.open_trades).toEqual([]);
     expect(detail.strategy).toBeUndefined();
+  });
+});
+
+describe("toDailyBar", () => {
+  it("reads the `abs_profit` and `trade_count` keys of the state database", () => {
+    const bar = toDailyBar({
+      date: "2026-09-27",
+      abs_profit: 15.5,
+      rel_profit: 0.0155,
+      starting_balance: 1000.0,
+      trade_count: 2,
+    });
+
+    expect(bar).toEqual({ date: "2026-09-27", profit_usdt: 15.5, trades: 2 });
+  });
+
+  it("still accepts the older `profit_abs`/`trades` pair", () => {
+    expect(toDailyBar({ date: "2026-09-26", profit_abs: 4, trades: 1 })).toEqual({
+      date: "2026-09-26",
+      profit_usdt: 4,
+      trades: 1,
+    });
+  });
+
+  it("prefers the real keys when a row carries both", () => {
+    const bar = toDailyBar({ date: "2026-09-26", abs_profit: 7, profit_abs: 4, trade_count: 3, trades: 1 });
+
+    expect(bar.profit_usdt).toBe(7);
+    expect(bar.trades).toBe(3);
   });
 });
 
@@ -291,6 +388,7 @@ describe("toDashboardSettings", () => {
     const settings = toDashboardSettings({
       max_running_profiles: 2,
       snapshot_interval_seconds: 60,
+      worker_start_stagger_seconds: 12,
       kill_switch_engaged: false,
       allow_live_trading: false,
       catalogue_profile_count: 22,
@@ -301,9 +399,17 @@ describe("toDashboardSettings", () => {
 
     expect(settings.max_running_profiles).toBe(2);
     expect(settings.snapshot_interval_seconds).toBe(60);
+    expect(settings.worker_start_stagger_seconds).toBe(12);
     expect(settings.allow_live_trading).toBe(false);
     // The API publishes no dashboard refresh interval: the documented default.
     expect(settings.refresh_interval_seconds).toBe(15);
+  });
+
+  it("leaves the stagger undefined when the payload carries none", () => {
+    expect(toDashboardSettings({ max_running_profiles: 4 }).worker_start_stagger_seconds)
+      .toBeUndefined();
+    expect(toDashboardSettings({ worker_start_stagger_seconds: "12" }).worker_start_stagger_seconds)
+      .toBeUndefined();
   });
 });
 

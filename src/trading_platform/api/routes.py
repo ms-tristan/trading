@@ -58,6 +58,7 @@ from ..models import (
     SUPPORTED_TIMEFRAMES,
     AccountResponse,
     CatalogueApplyResult,
+    DailyRow,
     DashboardSettings,
     EventsResponse,
     HealthStatus,
@@ -90,7 +91,13 @@ from .schemas import (
 )
 from .security import require_operator_token
 
-__all__ = ["API_PREFIX", "router"]
+__all__ = [
+    "API_PREFIX",
+    "DAILY_DETAIL_LIMIT",
+    "PROFILE_SPARKLINE_POINTS",
+    "RECENT_TRADES_LIMIT",
+    "router",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +123,18 @@ CATALOGUE_MUTABLE_FIELDS: tuple[str, ...] = (
     "priority",
     "enabled",
 )
+
+#: Number of equity points ``ProfileView.sparkline`` publishes: the 60 most
+#: recent snapshots of the profile, oldest first.
+PROFILE_SPARKLINE_POINTS = 60
+
+#: Number of days ``GET /api/profiles/{id}`` publishes in ``daily``, the most
+#: recent ones, chronological (most recent last).
+DAILY_DETAIL_LIMIT = 30
+
+#: Number of closed trades ``GET /api/profiles/{id}`` publishes in
+#: ``recent_trades``, the most recent ones, newest first.
+RECENT_TRADES_LIMIT = 20
 
 #: The documented mutating dependency, spelled once.
 OPERATOR_ONLY = [Depends(require_operator_token)]
@@ -177,15 +196,45 @@ def _views(request: Request) -> list[ProfileView]:
     The ranking happens here, once, before any filter: ``GET /api/profiles``
     then only filters and re-sorts, so the ``rank`` of a profile never depends on
     the query string that asked for it.
+
+    The monitoring read model is attached here as well, so every route that
+    serves a :class:`ProfileView` (``/api/profiles``, ``/api/account``,
+    ``/api/profiles/{id}``, ``/api/strategies``) publishes the same three extra
+    fields:
+
+    * ``sparkline`` -- the last :data:`PROFILE_SPARKLINE_POINTS` equity points of
+      the profile, oldest first, ``[]`` without a snapshot. Every element is the
+      documented :class:`~trading_platform.models.EquityPoint`, so it carries
+      ``t`` (ISO-8601 UTC), ``value`` and the optional ``profit_pct``;
+    * ``slot`` -- the 1-based position of the profile among the running ones.
+      ``store.list_profiles()`` already answers priority DESC then id ASC, which
+      is the scheduler order, and ``supervisor.is_running`` is the same liveness
+      test ``GET /api/health`` uses: the slot of a profile whose worker is dead
+      is ``None`` even when the stored state still says ``running``;
+    * ``worker_port`` -- the private REST port of the worker, published only
+      while the worker is alive: a stopped profile keeps its last port in the
+      runtime columns, and the liveness test is what makes the field honest.
     """
     store = _store(request)
+    supervisor = _supervisor(request)
     catalogue = _strategy_catalogue(request)
     snapshots = store.latest_snapshots()
+    records = store.list_profiles()
+    alive = [record.id for record in records if supervisor.is_running(record.id)]
     views = [
         build_profile_view(record, snapshots.get(record.id), catalogue.get(record.strategy))
-        for record in store.list_profiles()
+        for record in records
     ]
     rank_views(views)
+    records_by_id = {record.id: record for record in records}
+    for view in views:
+        record = records_by_id[view.id]
+        view.sparkline = equity_curve_from_snapshots(
+            store.list_snapshots(view.id, limit=PROFILE_SPARKLINE_POINTS),
+            record.initial_capital,
+        )
+        view.slot = alive.index(view.id) + 1 if view.id in alive else None
+        view.worker_port = record.api_port if view.id in alive and record.api_port else None
     return views
 
 
@@ -319,10 +368,21 @@ def get_profile(
 ) -> ProfileDetail:
     """Return one profile with its equity curve, its strategy and its trades.
 
-    ``daily``, ``open_trades`` and ``recent_trades`` are served empty: those rows
-    come from the REST reads of the worker itself, which only the poller performs
-    and the engine does not expose to the API yet. The fields stay in the payload
-    so the dashboard shape is stable.
+    The three lists are served from the **state database**, never from an HTTP
+    call inside the request path: the poller persists what the worker published,
+    so this route answers for a stopped profile as well -- which is exactly what
+    the dashboard needs.
+
+    * ``daily`` -- the last :data:`DAILY_DETAIL_LIMIT` days, chronological with
+      the most recent day last, each row carrying exactly ``date``,
+      ``abs_profit``, ``rel_profit``, ``starting_balance`` and ``trade_count``;
+    * ``open_trades`` -- every open row, newest first, with exactly ``trade_id``,
+      ``pair``, ``open_date``, ``amount``, ``open_rate``, ``current_rate``,
+      ``stake_amount``, ``profit_abs`` and ``profit_pct``;
+    * ``recent_trades`` -- the :data:`RECENT_TRADES_LIMIT` most recent closed
+      rows, newest first, with exactly ``trade_id``, ``pair``, ``open_date``,
+      ``close_date``, ``amount``, ``open_rate``, ``close_rate``,
+      ``stake_amount``, ``profit_abs``, ``profit_pct`` and ``exit_reason``.
     """
     store = _store(request)
     record = store.get_profile(profile_id)
@@ -338,13 +398,60 @@ def get_profile(
         else StrategyView(id=record.strategy, title=record.strategy)
     )
     snapshots = store.list_snapshots(profile_id, since=window_start(window))
+    trades = store.trade_records(profile_id)
     return ProfileDetail(
         profile=views_by_id[profile_id],
         strategy=strategy,
         equity_curve=equity_curve_from_snapshots(snapshots, record.initial_capital),
-        daily=[],
-        open_trades=[],
-        recent_trades=[],
+        daily=[
+            DailyRow(
+                date=row.date,
+                abs_profit=row.abs_profit,
+                rel_profit=row.rel_profit,
+                starting_balance=row.starting_balance,
+                trade_count=row.trade_count,
+            )
+            # The store answers newest first; a chart wants the other way round.
+            for row in reversed(store.daily_records(profile_id, DAILY_DETAIL_LIMIT))
+        ],
+        open_trades=[
+            {
+                "trade_id": trade.trade_id,
+                "pair": trade.pair,
+                "open_date": trade.open_date,
+                "amount": trade.amount,
+                "open_rate": trade.open_rate,
+                # The frozen ``profile_trades`` DDL carries no live rate, so the
+                # documented "current_rate falls back to open_rate when the
+                # worker did not publish one" always applies here. This is not a
+                # bug: the row keeps the entry price until the trade closes.
+                "current_rate": trade.open_rate,
+                "stake_amount": trade.stake_amount,
+                "profit_abs": trade.profit_abs,
+                "profit_pct": trade.profit_pct,
+            }
+            for trade in trades
+            if trade.is_open
+        ],
+        recent_trades=[
+            {
+                "trade_id": trade.trade_id,
+                "pair": trade.pair,
+                "open_date": trade.open_date,
+                "close_date": trade.close_date,
+                "amount": trade.amount,
+                "open_rate": trade.open_rate,
+                "close_rate": trade.close_rate,
+                "stake_amount": trade.stake_amount,
+                "profit_abs": trade.profit_abs,
+                # The percentage wp-1's normalisation produced (profit_ratio *
+                # 100), which is the scale the dashboard's trade reader assumes.
+                "profit_pct": trade.profit_pct,
+                "exit_reason": trade.exit_reason,
+            }
+            for trade in trades
+            if not trade.is_open
+        ][:RECENT_TRADES_LIMIT],
     )
 
 
@@ -639,11 +746,17 @@ def post_kill_switch(request: Request, payload: KillSwitchRequest) -> KillSwitch
     summary="Change the run-time settings",
 )
 def post_settings(request: Request, payload: SettingsUpdateRequest) -> DashboardSettings:
-    """Persist the settings sent by the operator and reschedule the fleet at once."""
+    """Persist the settings sent by the operator and reschedule the fleet at once.
+
+    The three fields of the body are optional: a field left out is not written by
+    the supervisor, so a partial update never clears a setting the operator did
+    not mention.
+    """
     supervisor = _supervisor(request)
     settings = supervisor.apply_settings(
         max_running_profiles=payload.max_running_profiles,
         snapshot_interval_seconds=payload.snapshot_interval_seconds,
+        worker_start_stagger_seconds=payload.worker_start_stagger_seconds,
     )
     request.app.state.settings = settings
     return _dashboard_settings(request)
@@ -675,6 +788,7 @@ def _dashboard_settings(request: Request) -> DashboardSettings:
     return DashboardSettings(
         max_running_profiles=int(settings.max_running_profiles),
         snapshot_interval_seconds=int(settings.snapshot_interval_seconds),
+        worker_start_stagger_seconds=int(settings.worker_start_stagger_seconds),
         kill_switch_engaged=bool(supervisor.kill_switch_engaged()),
         allow_live_trading=allow_live_trading(),
         catalogue_profile_count=int(counts.get("catalogue", 0)),

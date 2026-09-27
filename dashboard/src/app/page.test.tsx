@@ -17,11 +17,31 @@ import OverviewPage, { normaliseWindow } from "./page";
  *
  * The page consumes `@/lib/api`, which maps the JSON the Python API serves onto
  * the view model: the doubles below are therefore the payloads of the API
- * (`profit_abs`, `t`/`value`, `engine_slots_total`), never the view model.
+ * (`profit_abs`, `t`/`value`, `sparkline: [{t, value}]`, `slot`, `worker_port`,
+ * `engine_slots_used`/`engine_slots_total`), never the view model.
  */
 const PAPER_ROWS = [
-  apiProfile({ id: "bravo", name: "Bravo", portfolio_value: 1300, profit_usdt: 300, profit_pct: 0.3 }),
-  apiProfile({ id: "alpha", name: "Alpha", portfolio_value: 1100, profit_usdt: 100, profit_pct: 0.1 }),
+  apiProfile({
+    id: "bravo",
+    name: "Bravo",
+    portfolio_value: 1300,
+    profit_usdt: 300,
+    profit_pct: 0.3,
+    // A running profile: it holds slot 1 and its worker REST port, and its
+    // snapshot series is long enough to be drawn.
+    engine_slot: 1,
+    api_port: 8081,
+    sparkline: [1000, 1300],
+  }),
+  apiProfile({
+    id: "alpha",
+    name: "Alpha",
+    portfolio_value: 1100,
+    profit_usdt: 100,
+    profit_pct: 0.1,
+    // A single snapshot: the cell must say "no data" instead of drawing a chart.
+    sparkline: [1000],
+  }),
 ];
 
 const LIVE_ROW = apiProfile({
@@ -76,7 +96,11 @@ const ACCOUNT = {
   },
 };
 
-const HEALTH = apiHealth({ running_profiles: 2, max_running_profiles: 4 });
+const HEALTH = apiHealth({
+  profiles_running: 2,
+  engine_slots_used: 2,
+  engine_slots_total: 4,
+});
 
 const SETTINGS = apiSettings({ allow_live_trading: false });
 
@@ -166,8 +190,32 @@ describe("OverviewPage", () => {
     expect(screen.getByText(/\+400\.00 USDT \(\+5\.71%\)/)).toBeInTheDocument();
     expect(screen.getByText("Profiles running")).toBeInTheDocument();
     expect(screen.getByText("2 of 3")).toBeInTheDocument();
+  });
+
+  it("reads the engine-slot KPI from the wire pair of /api/health", async () => {
+    await renderOverview();
+
     expect(screen.getByText("Engine slots")).toBeInTheDocument();
+    // `engine_slots_used` of `engine_slots_total`, straight from `/api/health`.
     expect(screen.getByText("2 of 4")).toBeInTheDocument();
+    expect(screen.queryByText("0 of 4")).not.toBeInTheDocument();
+  });
+
+  it("draws the equity cell of a two-point sparkline and says no data below that", async () => {
+    await renderOverview();
+
+    const bravo = screen.getByRole("link", { name: "Bravo" }).closest("tr");
+    expect(bravo).not.toBeNull();
+    const svg = (bravo as HTMLElement).querySelector("svg");
+    expect(svg).not.toBeNull();
+    expect(svg).toHaveAttribute("aria-label", "Bravo portfolio value");
+    expect(svg?.querySelector("title")).toHaveTextContent("Bravo portfolio value");
+    expect(screen.getByRole("img", { name: "Bravo portfolio value" })).toBeInTheDocument();
+
+    const alpha = screen.getByRole("link", { name: "Alpha" }).closest("tr");
+    expect(alpha).not.toBeNull();
+    expect((alpha as HTMLElement).querySelector("svg")).toBeNull();
+    expect(within(alpha as HTMLElement).getByText("no data")).toBeInTheDocument();
   });
 
   it("ranks the paper profiles in the order the API returned them", async () => {

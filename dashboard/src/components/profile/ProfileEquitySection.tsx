@@ -32,6 +32,10 @@ export interface ProfileEquitySectionProps {
  * full page reload, works without JavaScript and keeps the operator's scroll
  * position. Both charts are hand-rolled SVG from the design system and both are
  * doubled by a real table, so the numbers survive a narrow screen.
+ *
+ * The daily series is the `daily` array of `GET /api/profiles/{id}`, read from
+ * the state database: it answers for a stopped profile too, so the day table does
+ * not empty out when the worker is down.
  */
 export function ProfileEquitySection({
   profileId,

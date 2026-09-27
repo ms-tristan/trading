@@ -17,6 +17,9 @@ const SETTINGS = {
   allow_live_trading: false,
   max_running_profiles: 4,
   snapshot_interval_seconds: 60,
+  // Published by `GET /api/settings`; the console holds it like any other engine
+  // setting of the view model even though it renders no control for it.
+  worker_start_stagger_seconds: 12,
 };
 
 let fetchMock: ReturnType<typeof vi.fn>;

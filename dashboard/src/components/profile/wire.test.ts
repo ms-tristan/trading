@@ -108,6 +108,20 @@ describe("readTrade", () => {
     expect(readTrade(tradeRow({ is_open: undefined }), false)?.isOpen).toBe(false);
   });
 
+  it("falls back to the open rate when the row carries no current rate", () => {
+    const row = readTrade(tradeRow({ current_rate: undefined }), true);
+
+    expect(row?.currentRate).toBe(60000);
+    expect(row?.openRate).toBe(60000);
+  });
+
+  it("keeps both rates unknown when the row carries neither", () => {
+    const row = readTrade(tradeRow({ current_rate: null, open_rate: null }), true);
+
+    expect(row?.currentRate).toBeNull();
+    expect(row?.openRate).toBeNull();
+  });
+
   it("keeps a row that carries nothing readable", () => {
     const row = readTrade({ pair: "ETH/USDT" }, false);
 
@@ -134,6 +148,20 @@ describe("readDailyBars", () => {
 
     expect(bars).toHaveLength(1);
     expect(bars[0]).toEqual({ date: "2026-09-26", profit_usdt: 15, trades: 2 });
+  });
+
+  it("reads the state-database keys `abs_profit` and `trade_count` first", () => {
+    const bars = readDailyBars([
+      { date: "2026-09-26", abs_profit: 15, rel_profit: 0.015, starting_balance: 1000, trade_count: 2 },
+    ]);
+
+    expect(bars).toEqual([{ date: "2026-09-26", profit_usdt: 15, trades: 2 }]);
+  });
+
+  it("still accepts the older `profit_usdt`/`trades` pair", () => {
+    const bars = readDailyBars([{ date: "2026-09-25", profit_usdt: -4, trades: 1 }]);
+
+    expect(bars).toEqual([{ date: "2026-09-25", profit_usdt: -4, trades: 1 }]);
   });
 
   it("answers an empty series for a non-array", () => {

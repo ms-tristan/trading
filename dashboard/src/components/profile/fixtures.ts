@@ -1,11 +1,16 @@
 /**
  * API-shaped fixtures of the dashboard pages of this package.
  *
- * The builders produce exactly what the monitoring API publishes, including the
- * wire fields `@/lib/types` does not declare yet (`open_trades`,
- * `recent_trades`, `strategy`, `exchange`, `priority`). Colocated tests import
- * them so that a page or a component can be pinned without a network call, and
- * no test has to spell out a full payload again.
+ * Two families live here. The view builders (`profile`, `health`, `detail`, ...)
+ * produce the mapped view model the components render. The `api*` builders below
+ * produce **the JSON the monitoring API really serves**, wire field names
+ * included (`profit_abs`, `sparkline: [{t, value}]`, `slot`, `worker_port`,
+ * `daily.abs_profit`, `daily.trade_count`, `engine_slots_used`): the page tests
+ * mock `fetch` with them, so a page is pinned against the payload the Python API
+ * answers and not against the model it is mapped onto.
+ *
+ * Colocated tests import them so that a page or a component can be pinned without
+ * a network call, and no test has to spell out a full payload again.
  */
 
 import type {
@@ -156,7 +161,12 @@ export function tradeRow(overrides: Record<string, unknown> = {}): Record<string
   };
 }
 
-/** One engine health answer. */
+/**
+ * One engine health answer, as the view model of `GET /api/health`.
+ *
+ * The counters mirror the wire names: a caller that wants a different slot pair
+ * overrides `engine_slots_used`/`engine_slots_total`, exactly like the payload.
+ */
 export function health(
   overrides: Partial<HealthStatus> & Record<string, unknown> = {},
 ): HealthStatus {
@@ -164,8 +174,9 @@ export function health(
     status: "ok",
     version: "2026.8",
     uptime_seconds: 3670,
-    running_profiles: 2,
-    max_running_profiles: 4,
+    profiles_running: 2,
+    engine_slots_used: 2,
+    engine_slots_total: 4,
     live_trading_enabled: false,
     kill_switch_engaged: false,
     generated_at: "2026-09-27T12:00:00Z",
@@ -230,6 +241,17 @@ export function jsonResponse(body: unknown, status = 200): Response {
 // its view-model twin, so a test keeps speaking in `profit_usdt` terms while the
 // body carries `profit_abs`.
 
+/**
+ * Timestamps of a fixture sparkline: one minute apart, oldest first, ending on
+ * the fixture "now" of this module (`2026-09-27T12:00:00Z`).
+ */
+function sparklineTimestamps(count: number): string[] {
+  const end = Date.UTC(2026, 8, 27, 12, 0, 0);
+  return Array.from({ length: count }, (_, index) =>
+    new Date(end - (count - 1 - index) * 60_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+  );
+}
+
 /** One row of `GET /api/profiles`. */
 export function apiProfile(
   overrides: Partial<ProfileView> & Record<string, unknown> & { id: string },
@@ -266,6 +288,24 @@ export function apiProfile(
     best_pair: view.best_pair ?? null,
     last_updated: view.updated_at,
   };
+  // The three fields the API publishes about the worker of a profile are only
+  // sent when the caller declares them: a fixture that declares no series and no
+  // slot reproduces a stopped profile, whose payload carries none of them.
+  if (overrides.sparkline !== undefined) {
+    const timestamps = sparklineTimestamps(view.sparkline.length);
+    const first = view.sparkline[0];
+    row.sparkline = view.sparkline.map((value, index) => ({
+      t: timestamps[index],
+      value,
+      profit_pct: first !== undefined && first !== 0 ? (value - first) / first : null,
+    }));
+  }
+  if (overrides.engine_slot !== undefined) {
+    row.slot = view.engine_slot;
+  }
+  if (overrides.api_port !== undefined) {
+    row.worker_port = view.api_port;
+  }
   // `rank` and `uptime_seconds` are only published when the caller declares
   // them: the profile page derives the rank from the ranked list and the uptime
   // from `/api/health` when the profile row carries none.
@@ -293,26 +333,50 @@ export function apiProfiles(
 }
 
 /** `GET /api/health` */
-export function apiHealth(overrides: Partial<HealthStatus> & Record<string, unknown> = {}): Record<
-  string,
-  unknown
-> {
-  const view = health(overrides);
+export function apiHealth(overrides: ApiHealthOverrides = {}): Record<string, unknown> {
+  const profilesRunning = overrides.profiles_running ?? 2;
   return {
-    status: view.status,
-    version: view.version,
-    uptime_seconds: view.uptime_seconds,
+    status: overrides.status ?? "ok",
+    version: overrides.version ?? "2026.8",
+    uptime_seconds: overrides.uptime_seconds ?? 3670,
     profiles_total: overrides.profiles_total ?? 3,
-    profiles_running: view.running_profiles,
-    profiles_healthy: overrides.profiles_healthy ?? view.running_profiles,
-    profiles_paper: overrides.profiles_paper ?? view.running_profiles,
+    profiles_running: profilesRunning,
+    profiles_healthy: overrides.profiles_healthy ?? profilesRunning,
+    profiles_paper: overrides.profiles_paper ?? profilesRunning,
+    profiles_running_paper: overrides.profiles_running_paper ?? profilesRunning,
     profiles_live: overrides.profiles_live ?? 0,
+    profiles_running_live: overrides.profiles_running_live ?? 0,
     profiles_queued: overrides.profiles_queued ?? 0,
-    engine_slots_used: view.running_profiles,
-    engine_slots_total: view.max_running_profiles,
-    kill_switch_engaged: view.kill_switch_engaged,
-    generated_at: view.generated_at,
+    engine_slots_used: overrides.engine_slots_used ?? profilesRunning,
+    engine_slots_total: overrides.engine_slots_total ?? 4,
+    kill_switch_engaged: overrides.kill_switch_engaged ?? false,
+    generated_at: overrides.generated_at ?? "2026-09-27T12:00:00Z",
   };
+}
+
+/**
+ * Overrides of {@link apiHealth}.
+ *
+ * They are the real keys of `GET /api/health`: a test that renames one back to
+ * the view model (`running_profiles`, `max_running_profiles`) does not compile,
+ * which is what keeps the doubles of the page tests on the wire.
+ */
+export interface ApiHealthOverrides {
+  status?: string;
+  version?: string;
+  uptime_seconds?: number;
+  profiles_total?: number;
+  profiles_running?: number;
+  profiles_healthy?: number;
+  profiles_paper?: number;
+  profiles_running_paper?: number;
+  profiles_live?: number;
+  profiles_running_live?: number;
+  profiles_queued?: number;
+  engine_slots_used?: number;
+  engine_slots_total?: number;
+  kill_switch_engaged?: boolean;
+  generated_at?: string;
 }
 
 /** `GET /api/settings` */
@@ -399,10 +463,17 @@ export function apiStrategy(
   return row;
 }
 
-/** `GET /api/profiles/{id}` */
+/**
+ * `GET /api/profiles/{id}`.
+ *
+ * The daily series carries the real state-database keys (`abs_profit`,
+ * `rel_profit`, `starting_balance`, `trade_count`); the trade rows are the
+ * freqtrade payloads the caller passes, relayed unchanged.
+ */
 export function apiDetail(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const view = detail(overrides as Partial<ProfileDetail>);
   const raw = overrides;
+  const startingBalance = view.profile.initial_capital;
   return {
     profile: apiProfile(view.profile as Partial<ProfileView> & { id: string }),
     strategy:
@@ -416,8 +487,10 @@ export function apiDetail(overrides: Record<string, unknown> = {}): Record<strin
     })),
     daily: view.daily_profit.map((bar) => ({
       date: bar.date,
-      profit_abs: bar.profit_usdt,
-      trades: bar.trades,
+      abs_profit: bar.profit_usdt,
+      rel_profit: startingBalance !== 0 ? bar.profit_usdt / startingBalance : 0,
+      starting_balance: startingBalance,
+      trade_count: bar.trades,
     })),
     open_trades: raw.open_trades ?? [],
     recent_trades: raw.recent_trades ?? [],

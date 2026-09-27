@@ -1,18 +1,21 @@
-"""Tests of the SQLite state store: schema, profiles, snapshots, events, settings.
+"""Tests of the SQLite state store: schema, profiles, snapshots, trades, days, events, settings.
 
 Every test runs against a temporary database file, so the suite never touches
 ``data/realtime/state.db``. The store is the only writer of the platform, and
 these tests pin the exact column semantics the rest of the platform relies on:
 ``priority DESC, id ASC`` ordering, the declarative-only upsert, the
-``(profile_id, ts)`` snapshot replacement and the string comparison of the event
-timeline.
+``(profile_id, ts)`` snapshot replacement, the in-place flip of a trade keyed by
+``(profile_id, trade_id)``, the newest-first day series and the string
+comparison of the event timeline.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -21,9 +24,14 @@ import pytest
 from trading_platform.models import ProfileConfig, ProfileSnapshot, format_ts, utc_now
 from trading_platform.profiles.store import (
     EVENT_LEVELS,
+    MIGRATABLE_SCHEMA_VERSIONS,
+    PROFILE_DAILY_COLUMNS,
+    PROFILE_TRADE_COLUMNS,
     PROFILE_UPDATE_FIELDS,
     SCHEMA_VERSION,
     TABLES,
+    ProfileDailyRecord,
+    ProfileTradeRecord,
     StateStore,
 )
 
@@ -90,8 +98,16 @@ def snapshot_at(store: StateStore, profile_id: str, minutes_ago: int, **override
 # Schema
 # ---------------------------------------------------------------------------
 def test_schema_constants() -> None:
-    assert SCHEMA_VERSION == 1
-    assert TABLES == ("profiles", "profile_snapshots", "settings", "events")
+    assert SCHEMA_VERSION == 2
+    assert MIGRATABLE_SCHEMA_VERSIONS == (1,)
+    assert TABLES == (
+        "profiles",
+        "profile_snapshots",
+        "profile_trades",
+        "profile_daily",
+        "settings",
+        "events",
+    )
     assert EVENT_LEVELS == ("info", "warning", "error")
     assert PROFILE_UPDATE_FIELDS == (
         "name",
@@ -151,6 +167,31 @@ EXPECTED_COLUMNS = {
         ("max_drawdown_pct", "REAL"),
         ("healthy", "INTEGER"),
     ],
+    "profile_trades": [
+        ("profile_id", "TEXT"),
+        ("trade_id", "INTEGER"),
+        ("pair", "TEXT"),
+        ("is_open", "INTEGER"),
+        ("open_date", "TEXT"),
+        ("close_date", "TEXT"),
+        ("amount", "REAL"),
+        ("open_rate", "REAL"),
+        ("close_rate", "REAL"),
+        ("stake_amount", "REAL"),
+        ("profit_abs", "REAL"),
+        ("profit_pct", "REAL"),
+        ("exit_reason", "TEXT"),
+        ("updated_at", "TEXT"),
+    ],
+    "profile_daily": [
+        ("profile_id", "TEXT"),
+        ("date", "TEXT"),
+        ("abs_profit", "REAL"),
+        ("rel_profit", "REAL"),
+        ("starting_balance", "REAL"),
+        ("trade_count", "INTEGER"),
+        ("updated_at", "TEXT"),
+    ],
     "settings": [("key", "TEXT"), ("value", "TEXT"), ("updated_at", "TEXT")],
     "events": [
         ("id", "INTEGER"),
@@ -165,9 +206,16 @@ EXPECTED_COLUMNS = {
 EXPECTED_PRIMARY_KEYS = {
     "profiles": ["id"],
     "profile_snapshots": ["profile_id", "ts"],
+    "profile_trades": ["profile_id", "trade_id"],
+    "profile_daily": ["profile_id", "date"],
     "settings": ["key"],
     "events": ["id"],
 }
+
+
+def test_exported_column_tuples_match_the_documented_ddl() -> None:
+    assert list(PROFILE_TRADE_COLUMNS) == [name for name, _ in EXPECTED_COLUMNS["profile_trades"]]
+    assert list(PROFILE_DAILY_COLUMNS) == [name for name, _ in EXPECTED_COLUMNS["profile_daily"]]
 
 
 @pytest.mark.parametrize("table", sorted(EXPECTED_COLUMNS))
@@ -214,7 +262,7 @@ def test_bootstrap_creates_the_schema(store: StateStore, db_path: Path) -> None:
         connection.close()
 
     assert set(TABLES) <= names
-    assert {"idx_profile_snapshots_ts", "idx_events_ts"} <= indexes
+    assert {"idx_profile_snapshots_ts", "idx_events_ts", "idx_profile_trades_open"} <= indexes
     assert version == SCHEMA_VERSION
     assert store.list_profiles() == []
 
@@ -695,6 +743,237 @@ def test_prune_snapshots_deletes_the_rows_outside_the_retention_window(store: St
 
 
 # ---------------------------------------------------------------------------
+# Trade read model
+# ---------------------------------------------------------------------------
+def trade_count(db_path: Path, table: str) -> int:
+    """Return the number of rows physically stored in ``table``."""
+    connection = sqlite3.connect(db_path)
+    try:
+        return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def test_upsert_trade_records_round_trips_every_column(store: StateStore) -> None:
+    trade = ProfileTradeRecord(
+        profile_id="alpha-btc-1h",
+        trade_id=17,
+        pair="ETH/USDT",
+        is_open=False,
+        open_date="2026-01-02T03:04:05Z",
+        close_date="2026-01-02T07:08:09Z",
+        amount=1.5,
+        open_rate=2410.5,
+        close_rate=2450.25,
+        stake_amount=3615.75,
+        profit_abs=59.625,
+        profit_pct=1.65,
+        exit_reason="roi",
+        updated_at="2026-01-02T07:09:00Z",
+    )
+
+    assert store.upsert_trade_records([trade]) == 1
+
+    assert store.trade_records("alpha-btc-1h") == [trade]
+    assert store.trade_records("absent") == []
+
+
+def test_upsert_trade_records_keeps_the_empty_columns_of_an_open_trade(store: StateStore) -> None:
+    open_trade = ProfileTradeRecord(
+        profile_id="alpha-btc-1h",
+        trade_id=3,
+        pair="BTC/USDT",
+        is_open=True,
+        open_date="2026-01-02T00:00:00Z",
+        amount=0.5,
+        open_rate=60000.0,
+        stake_amount=30000.0,
+        updated_at="2026-01-02T00:01:00Z",
+    )
+
+    store.upsert_trade_records([open_trade])
+
+    stored = store.trade_records("alpha-btc-1h")[0]
+    assert stored == open_trade
+    assert stored.close_date is None
+    assert stored.exit_reason is None
+    assert stored.close_rate == 0.0
+    assert stored.profit_abs == 0.0
+    assert stored.is_open is True
+
+
+def test_upsert_trade_records_stamps_a_missing_updated_at(store: StateStore) -> None:
+    store.upsert_trade_records([ProfileTradeRecord(profile_id="alpha-btc-1h", trade_id=1)])
+
+    stored = store.trade_records("alpha-btc-1h")[0]
+    assert stored.updated_at.endswith("Z")
+    assert stored.updated_at != ""
+
+
+def test_upserting_a_closing_trade_flips_it_instead_of_duplicating_it(
+    store: StateStore, db_path: Path
+) -> None:
+    opened = ProfileTradeRecord(
+        profile_id="alpha-btc-1h",
+        trade_id=7,
+        pair="BTC/USDT",
+        is_open=True,
+        open_date="2026-01-02T00:00:00Z",
+        amount=1.0,
+        open_rate=60000.0,
+        stake_amount=60000.0,
+        updated_at="2026-01-02T00:00:00Z",
+    )
+    closed = replace(
+        opened,
+        is_open=False,
+        close_date="2026-01-02T06:00:00Z",
+        close_rate=61000.0,
+        profit_abs=1000.0,
+        profit_pct=1.6667,
+        exit_reason="roi",
+        updated_at="2026-01-02T06:00:00Z",
+    )
+
+    assert store.upsert_trade_records([opened]) == 1
+    assert store.upsert_trade_records([closed]) == 1
+
+    rows = store.trade_records("alpha-btc-1h")
+    assert len(rows) == 1
+    assert rows[0] == closed
+    assert rows[0].is_open is False
+    assert trade_count(db_path, "profile_trades") == 1
+
+
+def test_trade_records_puts_the_newest_open_date_first(store: StateStore) -> None:
+    store.upsert_trade_records(
+        [
+            ProfileTradeRecord(
+                profile_id="alpha-btc-1h", trade_id=1, open_date="2026-01-02T00:00:00Z"
+            ),
+            ProfileTradeRecord(
+                profile_id="alpha-btc-1h", trade_id=3, open_date="2026-01-05T00:00:00Z"
+            ),
+            ProfileTradeRecord(profile_id="alpha-btc-1h", trade_id=2, open_date=None),
+            ProfileTradeRecord(
+                profile_id="alpha-btc-1h", trade_id=4, open_date="2026-01-02T00:00:00Z"
+            ),
+            ProfileTradeRecord(profile_id="other", trade_id=9, open_date="2026-01-09T00:00:00Z"),
+        ]
+    )
+
+    # Newest first, the shared date broken by trade id DESC, the undated last.
+    assert [item.trade_id for item in store.trade_records("alpha-btc-1h")] == [3, 4, 1, 2]
+    assert [item.trade_id for item in store.trade_records("other")] == [9]
+
+
+def test_upsert_daily_records_round_trips_every_column(store: StateStore) -> None:
+    day = ProfileDailyRecord(
+        profile_id="alpha-btc-1h",
+        date="2026-01-02",
+        abs_profit=42.5,
+        rel_profit=4.25,
+        starting_balance=1000.0,
+        trade_count=7,
+        updated_at="2026-01-02T23:59:00Z",
+    )
+
+    assert store.upsert_daily_records([day]) == 1
+
+    assert store.daily_records("alpha-btc-1h") == [day]
+    assert store.daily_records("absent") == []
+
+
+def test_upserting_a_day_twice_updates_it_in_place(store: StateStore, db_path: Path) -> None:
+    store.upsert_daily_records(
+        [ProfileDailyRecord(profile_id="alpha-btc-1h", date="2026-01-02", abs_profit=1.0)]
+    )
+    store.upsert_daily_records(
+        [
+            ProfileDailyRecord(
+                profile_id="alpha-btc-1h",
+                date="2026-01-02",
+                abs_profit=25.0,
+                rel_profit=2.5,
+                starting_balance=1000.0,
+                trade_count=4,
+                updated_at="2026-01-02T23:59:00Z",
+            )
+        ]
+    )
+
+    rows = store.daily_records("alpha-btc-1h")
+    assert len(rows) == 1
+    assert rows[0].abs_profit == 25.0
+    assert rows[0].trade_count == 4
+    assert rows[0].updated_at == "2026-01-02T23:59:00Z"
+    assert trade_count(db_path, "profile_daily") == 1
+
+
+def test_daily_records_is_newest_first_and_honours_the_limit(store: StateStore) -> None:
+    store.upsert_daily_records(
+        [
+            ProfileDailyRecord(profile_id="alpha-btc-1h", date="2026-01-01", abs_profit=1.0),
+            ProfileDailyRecord(profile_id="alpha-btc-1h", date="2026-01-03", abs_profit=3.0),
+            ProfileDailyRecord(profile_id="alpha-btc-1h", date="2026-01-02", abs_profit=2.0),
+        ]
+    )
+
+    assert [day.date for day in store.daily_records("alpha-btc-1h")] == [
+        "2026-01-03",
+        "2026-01-02",
+        "2026-01-01",
+    ]
+    assert [day.date for day in store.daily_records("alpha-btc-1h", limit=2)] == [
+        "2026-01-03",
+        "2026-01-02",
+    ]
+    assert store.daily_records("alpha-btc-1h", limit=0) == []
+    assert store.daily_records("alpha-btc-1h", limit=-5) == []
+    assert store.daily_records("absent", limit=2) == []
+
+
+def test_upserting_an_empty_sequence_writes_nothing(store: StateStore, db_path: Path) -> None:
+    assert store.upsert_trade_records([]) == 0
+    assert store.upsert_daily_records([]) == 0
+
+    assert trade_count(db_path, "profile_trades") == 0
+    assert trade_count(db_path, "profile_daily") == 0
+
+
+def test_delete_profile_removes_its_trades_and_days_only(store: StateStore, db_path: Path) -> None:
+    store.upsert_profile(make_profile("alpha-btc-1h"))
+    store.upsert_profile(make_profile("beta-btc-1h"))
+    store.upsert_trade_records(
+        [
+            ProfileTradeRecord(
+                profile_id="alpha-btc-1h", trade_id=1, open_date="2026-01-02T00:00:00Z"
+            ),
+            ProfileTradeRecord(
+                profile_id="beta-btc-1h", trade_id=1, open_date="2026-01-02T00:00:00Z"
+            ),
+        ]
+    )
+    store.upsert_daily_records(
+        [
+            ProfileDailyRecord(profile_id="alpha-btc-1h", date="2026-01-02"),
+            ProfileDailyRecord(profile_id="beta-btc-1h", date="2026-01-02"),
+        ]
+    )
+
+    assert store.delete_profile("alpha-btc-1h") is True
+
+    assert store.get_profile("alpha-btc-1h") is None
+    assert store.trade_records("alpha-btc-1h") == []
+    assert store.daily_records("alpha-btc-1h") == []
+    assert [trade.trade_id for trade in store.trade_records("beta-btc-1h")] == [1]
+    assert [day.date for day in store.daily_records("beta-btc-1h")] == ["2026-01-02"]
+    assert trade_count(db_path, "profile_trades") == 1
+    assert trade_count(db_path, "profile_daily") == 1
+    assert store.delete_profile("absent") is False
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 def test_record_event_returns_the_stored_event(store: StateStore) -> None:
@@ -790,3 +1069,55 @@ def test_all_settings_is_sorted_by_key(store: StateStore) -> None:
         "platform_settings",
         "snapshot_interval_seconds",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Thread safety: one connection, several threads
+# ---------------------------------------------------------------------------
+def test_concurrent_readers_and_a_writer_never_break_the_shared_connection(
+    db_path: Path,
+) -> None:
+    """Drive the store from several threads at once, as the running platform does.
+
+    The state store is a single instance shared by the API thread pool -- every
+    request of the dashboard reads the profiles, their snapshots and their read
+    model from it -- and by the poller, which writes a tick from the event loop.
+    One ``sqlite3.Connection`` must never be used by two threads at the same
+    time: without the store serialising its own access this test fails with
+    ``sqlite3.InterfaceError``, which is exactly what a dashboard page load did
+    before the store took its lock.
+    """
+    store = StateStore(db_path)
+    store.bootstrap()
+    store.upsert_profile(make_profile("alpha-btc-1h"))
+    for index in range(20):
+        snapshot_at(store, "alpha-btc-1h", minutes_ago=index)
+
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(9)
+
+    def read() -> None:
+        barrier.wait()
+        try:
+            for _ in range(80):
+                store.list_snapshots("alpha-btc-1h", limit=60)
+                store.list_profiles()
+        except BaseException as exc:  # noqa: BLE001 - reported to the assertion
+            errors.append(exc)
+
+    def write() -> None:
+        barrier.wait()
+        try:
+            for index in range(80):
+                snapshot_at(store, "alpha-btc-1h", minutes_ago=index)
+        except BaseException as exc:  # noqa: BLE001 - reported to the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=read) for _ in range(8)]
+    threads.append(threading.Thread(target=write))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []

@@ -1,6 +1,6 @@
 """The SQLite state store: the single source of truth of a running platform.
 
-One file, one writer, four tables (:data:`TABLES`), schema version
+One file, one writer, six tables (:data:`TABLES`), schema version
 :data:`SCHEMA_VERSION` tracked with ``PRAGMA user_version``:
 
 * ``profiles`` -- one row per profile: its declarative fields, its runtime state
@@ -8,6 +8,11 @@ One file, one writer, four tables (:data:`TABLES`), schema version
   ever stored here;
 * ``profile_snapshots`` -- one minute-rounded measurement per profile and
   timestamp, replaced in place (``INSERT OR REPLACE`` on ``(profile_id, ts)``);
+* ``profile_trades`` -- the trade read model of a profile, one row per
+  ``(profile_id, trade_id)``, refreshed in place so an open trade becomes a
+  closed one without ever being duplicated;
+* ``profile_daily`` -- the per-day profit read model of a profile, one row per
+  ``(profile_id, date)``, refreshed in place as the day unfolds;
 * ``settings`` -- the persisted platform settings, JSON-encoded under the
   ``platform_settings`` key;
 * ``events`` -- the engine journal read by ``GET /api/events``.
@@ -16,7 +21,9 @@ The store also owns the **legacy-database archive**. The previous product left
 its own ``state.db`` in the ``trading-state`` volume; a foreign file is renamed
 to ``state.db.legacy-<UTC timestamp>`` and a fresh database is created next to
 it, so a deployment boots deterministically and the old file is never parsed,
-never migrated and never overwritten. See :meth:`StateStore.bootstrap` and the
+never migrated and never overwritten. A database written by an **older revision
+of this platform** is not foreign: it is migrated in place, because the schema
+of every revision is additive. See :meth:`StateStore.bootstrap` and the
 standalone :func:`archive_legacy_database`.
 """
 
@@ -24,6 +31,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -48,10 +56,15 @@ from ..models import (
 __all__ = [
     "EVENT_LEVELS",
     "LEGACY_SUFFIX",
+    "MIGRATABLE_SCHEMA_VERSIONS",
     "PROFILE_COLUMNS",
+    "PROFILE_DAILY_COLUMNS",
+    "PROFILE_TRADE_COLUMNS",
     "PROFILE_UPDATE_FIELDS",
     "SCHEMA_VERSION",
     "TABLES",
+    "ProfileDailyRecord",
+    "ProfileTradeRecord",
     "StateStore",
     "archive_legacy_database",
 ]
@@ -60,10 +73,24 @@ __all__ = [
 ProfileMode = Literal["paper", "live"]
 
 #: Schema revision of the state database (``PRAGMA user_version``).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-#: The four tables the platform owns; anything else in the file is foreign.
-TABLES: tuple[str, ...] = ("profiles", "profile_snapshots", "settings", "events")
+#: Older revisions of **this platform** that :meth:`StateStore.bootstrap`
+#: migrates in place instead of archiving: the schema of every revision is
+#: additive, so a database written by revision 1 of this platform is completed
+#: with the tables and the index it misses and re-stamped :data:`SCHEMA_VERSION`
+#: -- it is never renamed to ``state.db.legacy-*`` and never loses a row.
+MIGRATABLE_SCHEMA_VERSIONS: tuple[int, ...] = (1,)
+
+#: The six tables the platform owns; anything else in the file is foreign.
+TABLES: tuple[str, ...] = (
+    "profiles",
+    "profile_snapshots",
+    "profile_trades",
+    "profile_daily",
+    "settings",
+    "events",
+)
 
 #: Every column of the ``profiles`` table, in DDL order.
 PROFILE_COLUMNS: tuple[str, ...] = (
@@ -88,6 +115,35 @@ PROFILE_COLUMNS: tuple[str, ...] = (
     "started_at",
     "last_error",
     "created_at",
+    "updated_at",
+)
+
+#: Every column of the ``profile_trades`` table, in DDL order.
+PROFILE_TRADE_COLUMNS: tuple[str, ...] = (
+    "profile_id",
+    "trade_id",
+    "pair",
+    "is_open",
+    "open_date",
+    "close_date",
+    "amount",
+    "open_rate",
+    "close_rate",
+    "stake_amount",
+    "profit_abs",
+    "profit_pct",
+    "exit_reason",
+    "updated_at",
+)
+
+#: Every column of the ``profile_daily`` table, in DDL order.
+PROFILE_DAILY_COLUMNS: tuple[str, ...] = (
+    "profile_id",
+    "date",
+    "abs_profit",
+    "rel_profit",
+    "starting_balance",
+    "trade_count",
     "updated_at",
 )
 
@@ -175,8 +231,38 @@ CREATE TABLE IF NOT EXISTS events (
     message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS profile_trades (
+    profile_id TEXT NOT NULL,
+    trade_id INTEGER NOT NULL,
+    pair TEXT NOT NULL,
+    is_open INTEGER NOT NULL DEFAULT 0,
+    open_date TEXT,
+    close_date TEXT,
+    amount REAL,
+    open_rate REAL,
+    close_rate REAL,
+    stake_amount REAL,
+    profit_abs REAL,
+    profit_pct REAL,
+    exit_reason TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, trade_id)
+);
+
+CREATE TABLE IF NOT EXISTS profile_daily (
+    profile_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    abs_profit REAL NOT NULL DEFAULT 0,
+    rel_profit REAL NOT NULL DEFAULT 0,
+    starting_balance REAL NOT NULL DEFAULT 0,
+    trade_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, date)
+);
+
 CREATE INDEX IF NOT EXISTS idx_profile_snapshots_ts ON profile_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_profile_trades_open ON profile_trades(profile_id, is_open);
 """
 
 _INSERT_PROFILE_SQL = """
@@ -217,6 +303,56 @@ JOIN (
 ORDER BY snapshot.profile_id ASC
 """
 
+_UPSERT_TRADE_SQL = """
+INSERT INTO profile_trades (
+    profile_id, trade_id, pair, is_open, open_date, close_date, amount,
+    open_rate, close_rate, stake_amount, profit_abs, profit_pct, exit_reason,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(profile_id, trade_id) DO UPDATE SET
+    pair = excluded.pair,
+    is_open = excluded.is_open,
+    open_date = excluded.open_date,
+    close_date = excluded.close_date,
+    amount = excluded.amount,
+    open_rate = excluded.open_rate,
+    close_rate = excluded.close_rate,
+    stake_amount = excluded.stake_amount,
+    profit_abs = excluded.profit_abs,
+    profit_pct = excluded.profit_pct,
+    exit_reason = excluded.exit_reason,
+    updated_at = excluded.updated_at
+"""
+
+#: The trades of a profile, newest ``open_date`` first; a trade without an
+#: ``open_date`` is the oldest thing the store knows and comes last.
+_TRADE_RECORDS_SQL = """
+SELECT * FROM profile_trades
+WHERE profile_id = ?
+ORDER BY (open_date IS NULL) ASC, open_date DESC, trade_id DESC
+"""
+
+_UPSERT_DAILY_SQL = """
+INSERT INTO profile_daily (
+    profile_id, date, abs_profit, rel_profit, starting_balance, trade_count,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(profile_id, date) DO UPDATE SET
+    abs_profit = excluded.abs_profit,
+    rel_profit = excluded.rel_profit,
+    starting_balance = excluded.starting_balance,
+    trade_count = excluded.trade_count,
+    updated_at = excluded.updated_at
+"""
+
+#: The days of a profile, newest ``date`` first; the API layer reverses the list
+#: when it wants the chronological order of a chart.
+_DAILY_RECORDS_SQL = """
+SELECT * FROM profile_daily
+WHERE profile_id = ?
+ORDER BY date DESC
+"""
+
 
 class _Unset:
     """Sentinel type of a keyword argument that was not passed at all."""
@@ -235,6 +371,49 @@ UNSET = _Unset()
 # ---------------------------------------------------------------------------
 # Rows
 # ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProfileTradeRecord:
+    """One trade of a profile, as stored in the ``profile_trades`` read model.
+
+    ``trade_id`` is the freqtrade trade id of the worker; ``(profile_id,
+    trade_id)`` is the primary key, so re-upserting a trade that just closed
+    flips ``is_open`` in place instead of appending a second row.
+    """
+
+    profile_id: str
+    trade_id: int
+    pair: str = ""
+    is_open: bool = False
+    open_date: str | None = None
+    close_date: str | None = None
+    amount: float = 0.0
+    open_rate: float = 0.0
+    close_rate: float = 0.0
+    stake_amount: float = 0.0
+    profit_abs: float = 0.0
+    profit_pct: float = 0.0
+    exit_reason: str | None = None
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class ProfileDailyRecord:
+    """One day of trading of a profile, as stored in the ``profile_daily`` read model.
+
+    ``date`` is the ``YYYY-MM-DD`` day reported by the worker and ``(profile_id,
+    date)`` is the primary key, so the current day is refreshed in place as its
+    numbers move.
+    """
+
+    profile_id: str
+    date: str
+    abs_profit: float = 0.0
+    rel_profit: float = 0.0
+    starting_balance: float = 0.0
+    trade_count: int = 0
+    updated_at: str = ""
+
+
 def _encode_pairs(pairs: Sequence[Any] | str) -> str:
     """Encode the declarative pair list as the JSON array stored in the column."""
     if isinstance(pairs, str):
@@ -323,6 +502,39 @@ def _event_from_row(row: sqlite3.Row) -> Event:
     )
 
 
+def _trade_record_from_row(row: sqlite3.Row) -> ProfileTradeRecord:
+    """Build the record of a ``profile_trades`` row."""
+    return ProfileTradeRecord(
+        profile_id=str(row["profile_id"]),
+        trade_id=int(row["trade_id"]),
+        pair=str(row["pair"] or ""),
+        is_open=bool(row["is_open"]),
+        open_date=row["open_date"],
+        close_date=row["close_date"],
+        amount=finite_float(row["amount"]),
+        open_rate=finite_float(row["open_rate"]),
+        close_rate=finite_float(row["close_rate"]),
+        stake_amount=finite_float(row["stake_amount"]),
+        profit_abs=finite_float(row["profit_abs"]),
+        profit_pct=finite_float(row["profit_pct"]),
+        exit_reason=row["exit_reason"],
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _daily_record_from_row(row: sqlite3.Row) -> ProfileDailyRecord:
+    """Build the record of a ``profile_daily`` row."""
+    return ProfileDailyRecord(
+        profile_id=str(row["profile_id"]),
+        date=str(row["date"]),
+        abs_profit=finite_float(row["abs_profit"]),
+        rel_profit=finite_float(row["rel_profit"]),
+        starting_balance=finite_float(row["starting_balance"]),
+        trade_count=int(row["trade_count"] or 0),
+        updated_at=str(row["updated_at"]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Foreign-database detection
 # ---------------------------------------------------------------------------
@@ -350,17 +562,23 @@ class _DatabaseInfo:
         """Whether the file belongs to the previous product or to a broken schema.
 
         A ``profiles`` table written by another product is foreign even when it
-        happens to advertise the platform's revision, because a single
-        ``CREATE TABLE IF NOT EXISTS`` statement would then leave it in place and
-        every later write would fail. A file that cannot be parsed as SQLite at
-        all is foreign too: it must not abort the boot, and it must not be
-        silently overwritten either.
+        happens to advertise a known revision, because a single ``CREATE TABLE IF
+        NOT EXISTS`` statement would then leave it in place and every later write
+        would fail. A file that cannot be parsed as SQLite at all is foreign too:
+        it must not abort the boot, and it must not be silently overwritten
+        either. A revision listed in :data:`MIGRATABLE_SCHEMA_VERSIONS` carrying
+        the platform's own ``profiles`` columns is **not** foreign -- that is a
+        database of an older release of this platform, and it is completed in
+        place by :meth:`StateStore.bootstrap` instead of being archived.
         """
         if not self.readable:
             return True
         if not self.has_profiles_table:
             return False
-        return self.user_version != SCHEMA_VERSION or not self.has_profile_columns
+        return (
+            self.user_version not in (*MIGRATABLE_SCHEMA_VERSIONS, SCHEMA_VERSION)
+            or not self.has_profile_columns
+        )
 
     @property
     def is_own_schema(self) -> bool:
@@ -438,7 +656,13 @@ def archive_legacy_database(path: Path) -> Path | None:
 
     Returns the archive path, or ``None`` when the file does not exist or
     already belongs to the platform, that is a ``profiles`` table with the
-    platform's columns at ``PRAGMA user_version == SCHEMA_VERSION``.
+    platform's columns at ``PRAGMA user_version == SCHEMA_VERSION``. A database
+    of an older revision of this platform is not foreign either -- see
+    :data:`MIGRATABLE_SCHEMA_VERSIONS` -- so it is returned untouched and
+    migrated in place by :meth:`StateStore.bootstrap`. Only a genuinely foreign
+    file (another product, an unknown revision, a database without the
+    platform's profile columns, or a file that is not SQLite at all) is moved
+    aside.
     """
     target = Path(path)
     if not target.exists():
@@ -461,25 +685,37 @@ class StateStore:
         with StateStore(state_db) as store:
             store.bootstrap()
             store.upsert_profile(profile)
+
+    One instance is shared by several threads: the API serves its requests from a
+    thread pool while the poller writes a tick from the event loop. One
+    ``sqlite3.Connection`` may not be used by two threads at the same time, so
+    every statement -- read or write -- is issued under :attr:`_lock`. The lock
+    is re-entrant and held for the duration of a single statement only, so the
+    WAL journal still lets a reader and the writer of *other* connections work in
+    parallel.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
         self._conn: sqlite3.Connection | None = None
         self._ready = False
+        #: Serialises the use of the shared connection across threads.
+        self._lock = threading.RLock()
 
     # -- lifecycle ---------------------------------------------------------
     def open(self) -> None:
         """Open the database file, creating its parent directory and schema when needed."""
-        self._raw_connection()
-        self._ensure_schema()
+        with self._lock:
+            self._raw_connection()
+            self._ensure_schema()
 
     def close(self) -> None:
         """Close the connection; a later call reopens the store lazily."""
-        connection, self._conn = self._conn, None
-        self._ready = False
-        if connection is not None:
-            connection.close()
+        with self._lock:
+            connection, self._conn = self._conn, None
+            self._ready = False
+            if connection is not None:
+                connection.close()
 
     def __enter__(self) -> StateStore:
         self.open()
@@ -497,29 +733,33 @@ class StateStore:
         """Prepare the state database for this revision of the platform.
 
         A file that exists and carries a ``profiles`` table the platform does not
-        own -- a ``PRAGMA user_version`` other than :data:`SCHEMA_VERSION`, or a
-        table without the platform's columns -- is the state database of the
-        product this one replaces: it is renamed to ``<name>.legacy-<UTC
-        timestamp>`` in the same directory and a fresh database is created next
-        to it. The archive path is returned in that case, ``None`` otherwise. A
-        file that is not a SQLite database at all is archived the same way, so a
-        corrupt leftover cannot abort the boot.
+        own -- a ``PRAGMA user_version`` other than :data:`SCHEMA_VERSION` and
+        other than a revision of :data:`MIGRATABLE_SCHEMA_VERSIONS`, or a table
+        without the platform's columns -- is the state database of the product
+        this one replaces: it is renamed to ``<name>.legacy-<UTC timestamp>`` in
+        the same directory and a fresh database is created next to it. The
+        archive path is returned in that case, ``None`` otherwise. A file that is
+        not a SQLite database at all is archived the same way, so a corrupt
+        leftover cannot abort the boot.
 
-        The four tables and their indexes are created when missing, and
-        ``PRAGMA user_version`` is set to :data:`SCHEMA_VERSION`.
+        A database written by an **older revision of this platform** is not
+        archived: it is migrated in place -- the six tables and their indexes are
+        created when missing, its existing rows are kept, and ``PRAGMA
+        user_version`` is re-stamped :data:`SCHEMA_VERSION`.
         """
-        self.close()
-        archived: Path | None = None
-        if self.path.exists() and _inspect_database(self.path).is_foreign:
-            archived = _move_legacy_database(self.path)
-        self._create_schema()
-        if archived is not None:
-            self.record_event(
-                "warning",
-                "legacy_db_archived",
-                f"archived the foreign state database as {archived.name}",
-            )
-        return archived
+        with self._lock:
+            self.close()
+            archived: Path | None = None
+            if self.path.exists() and _inspect_database(self.path).is_foreign:
+                archived = _move_legacy_database(self.path)
+            self._create_schema()
+            if archived is not None:
+                self.record_event(
+                    "warning",
+                    "legacy_db_archived",
+                    f"archived the foreign state database as {archived.name}",
+                )
+            return archived
 
     # -- connection helpers ------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
@@ -543,49 +783,56 @@ class StateStore:
 
     def _raw_connection(self) -> sqlite3.Connection:
         """Return the connection, opening it when necessary."""
-        if self._conn is None:
-            self._conn = self._connect()
-        return self._conn
+        with self._lock:
+            if self._conn is None:
+                self._conn = self._connect()
+            return self._conn
 
     def _connection(self) -> sqlite3.Connection:
         """Return the connection of a database that carries the platform schema."""
-        self._raw_connection()
-        self._ensure_schema()
-        return self._raw_connection()
+        with self._lock:
+            self._raw_connection()
+            self._ensure_schema()
+            return self._raw_connection()
 
     def _ensure_schema(self) -> None:
         """Adopt a current schema, or bootstrap the file when it is not one."""
-        if self._ready:
-            return
-        try:
-            info: _DatabaseInfo | None = _inspect_connection(self._raw_connection())
-        except sqlite3.Error:
-            info = None
-        if info is not None and info.is_own_schema:
-            self._ready = True
-            return
-        self.bootstrap()
+        with self._lock:
+            if self._ready:
+                return
+            try:
+                info: _DatabaseInfo | None = _inspect_connection(self._raw_connection())
+            except sqlite3.Error:
+                info = None
+            if info is not None and info.is_own_schema:
+                self._ready = True
+                return
+            self.bootstrap()
 
     def _create_schema(self) -> None:
         """Create the missing tables and indexes, then stamp the schema version."""
-        connection = self._raw_connection()
-        connection.executescript(_SCHEMA_SQL)
-        connection.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
-        connection.commit()
-        self._ready = True
+        with self._lock:
+            connection = self._raw_connection()
+            connection.executescript(_SCHEMA_SQL)
+            connection.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+            connection.commit()
+            self._ready = True
 
     # -- statements --------------------------------------------------------
     def _fetch_all(self, statement: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        return self._connection().execute(statement, params).fetchall()
+        with self._lock:
+            return self._connection().execute(statement, params).fetchall()
 
     def _fetch_one(self, statement: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
-        return self._connection().execute(statement, params).fetchone()
+        with self._lock:
+            return self._connection().execute(statement, params).fetchone()
 
     def _write(self, statement: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
-        connection = self._connection()
-        cursor = connection.execute(statement, params)
-        connection.commit()
-        return cursor
+        with self._lock:
+            connection = self._connection()
+            cursor = connection.execute(statement, params)
+            connection.commit()
+            return cursor
 
     # -- profiles ----------------------------------------------------------
     def list_profiles(self) -> list[ProfileRecord]:
@@ -705,8 +952,17 @@ class StateStore:
         return record
 
     def delete_profile(self, profile_id: str) -> bool:
-        """Delete the profile row; ``True`` when a row was removed."""
-        cursor = self._write("DELETE FROM profiles WHERE id = ?", (str(profile_id),))
+        """Delete the profile and its trade and daily read models.
+
+        ``True`` when a ``profiles`` row was removed. The two read models are
+        cleared first so a deleted profile never leaves an orphan series behind;
+        their own return values are deliberately ignored, because a profile
+        without history is the normal case.
+        """
+        key = str(profile_id)
+        self._write("DELETE FROM profile_trades WHERE profile_id = ?", (key,))
+        self._write("DELETE FROM profile_daily WHERE profile_id = ?", (key,))
+        cursor = self._write("DELETE FROM profiles WHERE id = ?", (key,))
         return cursor.rowcount > 0
 
     def set_profile_state(
@@ -867,6 +1123,98 @@ class StateStore:
         cutoff = format_ts(utc_now() - timedelta(days=int(retention_days)))
         cursor = self._write("DELETE FROM profile_snapshots WHERE ts < ?", (cutoff,))
         return max(int(cursor.rowcount), 0)
+
+    # -- trade read model --------------------------------------------------
+    def upsert_trade_records(self, records: Sequence[ProfileTradeRecord]) -> int:
+        """Create or refresh the trades of ``records``, keyed by ``(profile_id, trade_id)``.
+
+        One statement per record on the ``(profile_id, trade_id)`` primary key,
+        so a trade first seen open is *flipped* in place when it closes instead
+        of being appended a second time. ``updated_at`` is written as the record
+        carries it and stamped with :func:`format_ts` when it is empty. Returns
+        the number of rows written; an empty sequence writes nothing and returns
+        ``0`` without touching the database.
+        """
+        rows = [
+            (
+                str(record.profile_id),
+                int(record.trade_id),
+                str(record.pair),
+                int(bool(record.is_open)),
+                record.open_date,
+                record.close_date,
+                finite_float(record.amount),
+                finite_float(record.open_rate),
+                finite_float(record.close_rate),
+                finite_float(record.stake_amount),
+                finite_float(record.profit_abs),
+                finite_float(record.profit_pct),
+                record.exit_reason,
+                str(record.updated_at or format_ts()),
+            )
+            for record in records
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            connection = self._connection()
+            cursor = connection.executemany(_UPSERT_TRADE_SQL, rows)
+            connection.commit()
+            return max(int(cursor.rowcount), 0)
+
+    def upsert_daily_records(self, records: Sequence[ProfileDailyRecord]) -> int:
+        """Create or refresh the days of ``records``, keyed by ``(profile_id, date)``.
+
+        Same discipline as :meth:`upsert_trade_records` on the ``(profile_id,
+        date)`` primary key, so a day that is still unfolding is replaced in
+        place as its numbers move. Returns the number of rows written; an empty
+        sequence writes nothing and returns ``0``.
+        """
+        rows = [
+            (
+                str(record.profile_id),
+                str(record.date),
+                finite_float(record.abs_profit),
+                finite_float(record.rel_profit),
+                finite_float(record.starting_balance),
+                int(record.trade_count),
+                str(record.updated_at or format_ts()),
+            )
+            for record in records
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            connection = self._connection()
+            cursor = connection.executemany(_UPSERT_DAILY_SQL, rows)
+            connection.commit()
+            return max(int(cursor.rowcount), 0)
+
+    def trade_records(self, profile_id: str) -> list[ProfileTradeRecord]:
+        """Return every trade of a profile, newest ``open_date`` first.
+
+        A row without an ``open_date`` is the oldest thing the store knows and
+        therefore comes last; rows sharing an ``open_date`` are ordered by
+        ``trade_id`` DESC. An unknown profile simply has no rows.
+        """
+        rows = self._fetch_all(_TRADE_RECORDS_SQL, (str(profile_id),))
+        return [_trade_record_from_row(row) for row in rows]
+
+    def daily_records(self, profile_id: str, limit: int | None = None) -> list[ProfileDailyRecord]:
+        """Return the days of a profile, newest ``date`` first.
+
+        ``limit`` keeps the ``limit`` most recent days; a non-positive limit
+        returns nothing without querying. The API layer reverses the list when it
+        wants the chronological order of a chart.
+        """
+        if limit is not None and int(limit) <= 0:
+            return []
+        statement = _DAILY_RECORDS_SQL
+        params: list[Any] = [str(profile_id)]
+        if limit is not None:
+            statement += " LIMIT ?"
+            params.append(int(limit))
+        return [_daily_record_from_row(row) for row in self._fetch_all(statement, params)]
 
     # -- events ------------------------------------------------------------
     def record_event(

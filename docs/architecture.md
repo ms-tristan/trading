@@ -33,19 +33,24 @@ report what they say.
 
 On boot, `python -m trading_platform realtime run` performs this sequence:
 
-1. **load the platform settings** — `config/platform.json`, then the environment
-   overrides (`TB_*` variables win);
+1. **load the platform settings** — the documented defaults, the keys present in
+   `config/platform.json`, and the `TB_*` environment overrides, which win (§3.3
+   resolves the whole order);
 2. **open the state database** at `--state-db` (the image passes
    `/app/data/realtime/state.db`, `TB_REALTIME_STATE_DB` overrides the default)
-   and verify its schema version; a foreign database is archived first (§3);
-3. **seed the state** — `settings` rows from the platform defaults, and, on a
-   fresh database, the profiles of `config/profiles.json`;
+   and verify its schema version; a foreign database is archived first, a
+   database of this platform at revision `1` is migrated in place (§3);
+3. **seed the state** — on a fresh database, the profiles of
+   `config/profiles.json`; the settings are **not** seeded key by key, they are
+   resolved at every boot by the precedence of §3.3;
 4. **compute the schedule** — every enabled profile, sorted by `priority`
-   descending then `id` ascending; the first `max_running_profiles` get a worker,
-   the rest are marked `queued` with a `state_reason` naming the cap;
+   descending then `id` ascending; the first `max_running_profiles` (default
+   **6**) get a worker, the rest are marked `queued` with a `state_reason` naming
+   the cap;
 5. **generate one freqtrade configuration per scheduled profile** under
    `<state_dir>/profiles/<id>/config.json`, mode `0600` (§5);
-6. **spawn one `freqtrade trade` subprocess per scheduled profile** and record
+6. **spawn one `freqtrade trade` subprocess per scheduled profile** — at most one
+   new worker per `worker_start_stagger_seconds` (default **10**, §2) — and record
    its `pid`, its private API port and its start time in the `profiles` table;
 7. **poll** every running profile on the snapshot interval and write snapshots
    and events (§4, §6);
@@ -54,7 +59,8 @@ On boot, `python -m trading_platform realtime run` performs this sequence:
 Scheduling continues while the platform runs: when a worker dies and its profile
 is restarted the restart keeps its slot; when the operator stops a profile (or a
 profile reaches the terminal state `error`) its slot is released and the next
-`queued` profile — same order — is promoted automatically.
+`queued` profile — same order, still subject to the stagger gate of §2 — is
+promoted automatically.
 
 On `SIGTERM`/`SIGINT` the supervisor terminates every child gracefully (SIGTERM,
 then SIGKILL after 15 s) before exiting, so a container stop never leaves an
@@ -122,10 +128,34 @@ operator actually put in the profile.
 | State | Meaning |
 | --- | --- |
 | `running` | a worker process is alive and its last REST read succeeded |
-| `queued` | enabled, but beyond the fleet cap; `state_reason` names the cap |
+| `queued` | enabled and eligible, but beyond the fleet cap or waiting for the stagger gate; `state_reason` names which |
 | `stopped` | not running on purpose (operator action, disabled profile, kill switch) |
 | `blocked` | refused by a safety gate; `state_reason` names the missing precondition (live trading) |
 | `error` | the supervisor stopped restarting it; `last_error` carries the reason |
+
+### Gradual start: `worker_start_stagger_seconds`
+
+A cold start of the whole fleet is the one moment where memory and CPU peak
+together. `worker_start_stagger_seconds` (integer, default **10**, minimum `0`,
+in `config/platform.json` and in `PlatformSettings`, overridable through
+`TB_WORKER_START_STAGGER_SECONDS`) bounds how fast the supervisor fills its slots:
+
+* the supervisor starts **at most one new worker per stagger interval**; after a
+  worker starts, the gate closes for that interval;
+* every other profile that is **eligible to run but has to wait** stays in the
+  state `queued` with a `state_reason` of exactly the form
+  `queued: starting workers gradually (N of M slots in use)`, where N is the
+  number of workers alive and M is `max_running_profiles`;
+* a stagger of `0` restores the immediate behaviour: every eligible profile is
+  started on the same pass;
+* staggering only **delays promotions, it never reorders them** — the scheduling
+  order stays `priority` descending, then `id` ascending.
+
+The setting exists because one running worker costs about **390 MiB RSS**, the
+Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily, and a
+simultaneous cold start of many workers spiked memory and CPU together and made
+the guest unresponsive (reproduced twice). `deploy/docker-compose.yml` therefore
+sets `TB_MAX_RUNNING_PROFILES=6` and `TB_WORKER_START_STAGGER_SECONDS=10`.
 
 ---
 
@@ -133,7 +163,15 @@ operator actually put in the profile.
 
 SQLite, one file, one writer: `/app/data/realtime/state.db` inside the
 `trading-state` volume. The schema version is tracked with **`PRAGMA user_version
-= 1`**.
+= 2`**. The database owns **six tables** — `profiles`, `profile_snapshots`,
+`profile_trades`, `profile_daily`, `settings`, `events` — and three indexes:
+`idx_profile_snapshots_ts`, `idx_events_ts` and `idx_profile_trades_open`.
+
+One `StateStore` instance is shared by the API thread pool — a dashboard page
+load fires several requests at once — and by the poller, which writes a tick from
+the event loop. The single connection therefore issues every statement under an
+internal lock, so two threads can never use it at the same time; the WAL journal
+still lets the readers of another connection work while the poller writes.
 
 ### 3.1 `profiles` — one row per profile
 
@@ -182,22 +220,38 @@ SQLite, one file, one writer: `/app/data/realtime/state.db` inside the
 | `max_drawdown_pct` | REAL | worst drawdown reported by the worker |
 | `healthy` | INTEGER | `1` when the last poll of this profile succeeded |
 
-Primary key: **`(profile_id, ts)`**. Index: **`profile_snapshots(ts)`** (the
-cross-profile time series the aggregated equity curve reads).
+Primary key: **`(profile_id, ts)`**. Index: **`idx_profile_snapshots_ts`** on
+`profile_snapshots(ts)` — the cross-profile time series the aggregated equity
+curve reads.
 
 ### 3.3 `settings` — platform settings
 
 | Column | Type | Meaning |
 | --- | --- | --- |
-| `key` | TEXT PRIMARY KEY | setting name (`max_running_profiles`, `snapshot_interval_seconds`, …) |
-| `value` | TEXT | JSON-encoded value |
+| `key` | TEXT PRIMARY KEY | setting document name — the platform uses one key, `platform_settings` |
+| `value` | TEXT | JSON-encoded value: the whole settings document |
 | `updated_at` | TEXT | ISO-8601 UTC timestamp of the last write |
 
-Settings are seeded from `config/platform.json` the first time the database is
-opened and read back from it afterwards, so an operator change made through
-`POST /api/settings` survives a restart. The environment (`TB_MAX_RUNNING_PROFILES`,
-`TB_SNAPSHOT_INTERVAL_SECONDS`, `TB_PROFILE_API_PORT_BASE`) overrides a setting at
-boot, which is the documented way to change the fleet cap in Docker.
+There is **no per-key seeding**. `POST /api/settings` writes **one document row**
+into this table under the key `platform_settings`, whose `value` is the entire
+JSON settings document and whose `updated_at` moves on every write — so an
+operator change survives a restart. `GET /api/settings` renders the **effective**
+values (what the engine actually acts on) plus the path of the state database.
+
+At boot the effective settings are resolved from four inputs, from weakest to
+strongest:
+
+1. the settings the supervisor was **constructed with** — the documented defaults;
+2. the keys **actually present in `config/platform.json`**;
+3. the **persisted `platform_settings` row**, when there is one;
+4. the **`TB_*` environment variables** — they always win, because the environment
+   is the only input an operator changes without writing to the state volume
+   (`TB_MAX_RUNNING_PROFILES`, `TB_SNAPSHOT_INTERVAL_SECONDS`,
+   `TB_WORKER_START_STAGGER_SECONDS`, `TB_PROFILE_API_PORT_BASE`, …). That is the
+   documented way to change the fleet cap in Docker.
+
+`POST /api/settings` accepts `max_running_profiles`, `snapshot_interval_seconds`
+and `worker_start_stagger_seconds` (§2).
 
 ### 3.4 `events` — the engine journal
 
@@ -210,28 +264,50 @@ boot, which is the documented way to change the fleet cap in Docker.
 | `kind` | TEXT | event kind: `start`, `stop`, `crash`, `restart`, `cap_reached`, `kill_switch`, `legacy_db_archived`, … |
 | `message` | TEXT | human-readable, English, credential-free description |
 
-Index: **`events(ts DESC)`** — the read model behind `GET /api/events?limit=` and
-the operations page of the dashboard always wants the newest rows first.
+Index: **`idx_events_ts`** on `events(ts DESC)` — the read model behind
+`GET /api/events?limit=` and the operations page of the dashboard always wants the
+newest rows first.
 
-### 3.5 Schema versioning and the legacy-database archive
+### 3.5 `profile_trades` and `profile_daily` — the per-profile read model
+
+Two tables carry what each worker reported about its own trades, so that the
+profile detail endpoint answers from the state database instead of from a live
+worker and therefore also answers for a profile that is stopped:
+
+| Table | Content | Index |
+| --- | --- | --- |
+| `profile_trades` | one row per trade of a profile as its worker reported it, open and closed; the read behind `open_trades` and `recent_trades` of `GET /api/profiles/{id}` | `idx_profile_trades_open` |
+| `profile_daily` | one row per daily profit report of a profile; the read behind `daily` of `GET /api/profiles/{id}` | — |
+
+Both are scoped by `profile_id` and are written by the poller alongside the
+snapshots, so they follow the same lifecycle as `profile_snapshots`: they grow
+with the fleet and are dropped with the state volume.
+
+### 3.6 Schema versioning and the legacy-database archive
 
 The schema version lives in **`PRAGMA user_version`**, and the supported value is
-**`1`**.
+**`2`**.
 
 On boot the store inspects the file before touching it:
 
-* **no file, or an empty file** → create the four tables and their indexes, set
-  `user_version = 1`;
-* **`user_version = 1`** → normal start;
-* **a `profiles` table exists and `user_version != 1`** → the file is a **foreign
-  schema** (typically the state database of the platform this one replaces,
-  which the `trading-state` volume still holds). It is **renamed** to
+* **no file, or an empty file** → create the six tables and their indexes, set
+  `user_version = 2`;
+* **`user_version = 1` with the platform's `profiles` columns** → the database is
+  **migrated in place**: the two new tables (`profile_trades`, `profile_daily`)
+  and their index are created and the version is stamped `2`. The file is **never
+  archived, never renamed and no data is lost**;
+* **`user_version = 2`** → normal start;
+* **a `profiles` table that is not the platform's, or a `user_version` that is
+  neither `1` nor `2`** → the file is a **foreign schema** (typically the state
+  database of the platform this one replaces, which the `trading-state` volume
+  still holds). It is **renamed** to
 
   ```
   state.db.legacy-<UTC timestamp>      e.g. state.db.legacy-20260927T173000Z
   ```
 
-  in the same directory and a **fresh** database is created next to it. The old
+  in the same directory with its `-wal`, `-shm` and `-journal` sidecars, and a
+  **fresh** database is created next to it. The old
   file is never parsed, never migrated and never deleted, and an event of kind
   `legacy_db_archived` records what happened. This is what makes the first boot
   of a deployment deterministic: an unrelated `state.db` cannot abort the
@@ -264,7 +340,7 @@ The poller (`src/trading_platform/engine/poller.py`) runs every
 
 The aggregated equity curve of `GET /api/account` is built from
 `profile_snapshots` over the requested window (`24h`, `7d`, `30d`, `all`) — the
-reason the `profile_snapshots(ts)` index exists. Retention follows
+reason the `idx_profile_snapshots_ts` index exists. Retention follows
 `equity_retention_days` in `config/platform.json`.
 
 ---
@@ -409,11 +485,43 @@ header is `401`, a **wrong** one is `403`.
 | `POST /api/profiles/{id}/actions` | `start`, `stop`, `restart` |
 | `POST /api/catalogue/apply` | idempotent upsert of `config/profiles.json` |
 | `POST /api/kill-switch` | engage or release the global kill switch |
-| `POST /api/settings` | change the fleet cap and the snapshot interval at run time |
+| `POST /api/settings` | change the fleet cap, the snapshot interval and the worker start stagger at run time |
 
 `GET /api/health` is the surface the container healthcheck and the deploy smoke
 test use: it answers as soon as the API serves, and `profiles_running > 0` as
 soon as one worker is alive and healthy.
+
+`POST /api/settings` accepts `max_running_profiles`, `snapshot_interval_seconds`
+and `worker_start_stagger_seconds`; what an operator writes there is what
+`GET /api/settings` renders as effective, and it is what the engine acts on
+(§3.3).
+
+### The profile view: `sparkline`, `slot`, `worker_port`
+
+Three additive fields complete the `ProfileView` the profile routes return:
+
+| Field | Meaning |
+| --- | --- |
+| `sparkline` | the last **60** equity points of the profile, oldest first; `[]` when the profile has no snapshot yet |
+| `slot` | the **1-based** position of the profile among the running profiles in scheduler order; `null` when it is not running |
+| `worker_port` | the private worker REST port while the profile runs; `null` otherwise |
+
+They are read-model conveniences, not new state: `slot` is derived from the same
+`priority` descending, `id` ascending order the fleet scheduler uses, and
+`sparkline` is a window over `profile_snapshots`.
+
+### The profile detail payload comes from the state database
+
+`GET /api/profiles/{id}` reads its three per-profile collections from the state
+database, so they answer for a profile that is **stopped** as well — not only
+while a worker is alive:
+
+* `daily` — up to **30** daily rows, chronological, most recent last;
+* `open_trades` — the trades currently open, **newest first**;
+* `recent_trades` — the **20** most recent closed rows, newest first.
+
+This is what `profile_trades` and `profile_daily` exist for (§3.5): the API never
+has to reach a worker that may be gone.
 
 ---
 

@@ -31,13 +31,25 @@ export type SortKey = "value" | "profit" | "name" | "strategy";
 /** Action accepted by `POST /api/profiles/{id}/actions/{action}`. */
 export type ProfileAction = "start" | "stop" | "restart";
 
-/** `GET /api/health` */
+/**
+ * `GET /api/health`
+ *
+ * Every counter mirrors the wire name one for one: the engine-slot pair the KPI
+ * rows render is `engine_slots_used`/`engine_slots_total`, and the fleet size is
+ * `profiles_running`. `live_trading_enabled` is the one exception - the health
+ * payload does not publish the live gate, `GET /api/settings` does - so the
+ * mapper reports the fail-safe default (`false`) until a page merges the gate in.
+ */
 export interface HealthStatus {
   status: string;
   version: string;
   uptime_seconds: number;
-  running_profiles: number;
-  max_running_profiles: number;
+  /** Profiles holding an engine slot right now. */
+  profiles_running: number;
+  /** Engine slots the running profiles hold: the wire `engine_slots_used`. */
+  engine_slots_used: number;
+  /** Engine slots the fleet may hand out: the wire `engine_slots_total`. */
+  engine_slots_total: number;
   live_trading_enabled: boolean;
   kill_switch_engaged: boolean;
   generated_at: string;
@@ -76,11 +88,21 @@ export interface ProfileView {
   profit_factor: number;
   /** 0..1 ratio. */
   max_drawdown_pct: number;
-  /** Engine slot (1..fleet cap) when the profile holds one, else `null`. */
+  /**
+   * View model of the wire `slot`: the 1-based position of the profile among the
+   * running profiles (priority descending, then id ascending), `null` when the
+   * profile is not running.
+   */
   engine_slot: number | null;
-  /** Loopback port of the profile's freqtrade REST API, when it holds one. */
+  /**
+   * View model of the wire `worker_port`: the private freqtrade REST port of the
+   * profile while its worker runs, `null` otherwise.
+   */
   api_port: number | null;
-  /** Tiny portfolio-value series, oldest first. */
+  /**
+   * View model of the wire `sparkline`: the portfolio-value series of the
+   * profile, oldest first (at most 60 points), empty when it has no snapshot.
+   */
   sparkline: number[];
   updated_at: string;
   /** Position of the profile in the ranking the API returned, 1-based. */
@@ -273,6 +295,8 @@ export interface DashboardSettings {
   allow_live_trading: boolean;
   max_running_profiles?: number;
   snapshot_interval_seconds?: number;
+  /** Delay the supervisor keeps between two worker starts, in seconds. */
+  worker_start_stagger_seconds?: number;
   engine_api_port_base?: number;
   kill_switch_engaged?: boolean;
   updated_at?: string;
@@ -315,6 +339,7 @@ export interface SettingsUpdateRequest {
   allow_live_trading?: boolean;
   max_running_profiles?: number;
   snapshot_interval_seconds?: number;
+  worker_start_stagger_seconds?: number;
 }
 
 /** `POST /api/kill-switch` */
