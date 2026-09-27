@@ -60,7 +60,16 @@ from trading_platform.strategy.freqtrade_adapter import (
     make_freqtrade_strategy,
     validate_freqtrade_adapter_class,
 )
-from trading_platform.strategy.indicators import atr, ema, rsi, true_range
+from trading_platform.strategy.indicators import (
+    atr,
+    bollinger_bands,
+    ema,
+    rolling_max,
+    rolling_min,
+    rolling_std,
+    rsi,
+    true_range,
+)
 from trading_platform.strategy.registry import (
     STRATEGIES,
     get_strategy,
@@ -81,6 +90,7 @@ __all__ = [
     "Strategy",
     "StrategyParams",
     "atr",
+    "bollinger_bands",
     "ema",
     "ensure_signal_frame",
     "freqtrade_adapter",
@@ -91,6 +101,9 @@ __all__ = [
     "make_runner",
     "register_strategy",
     "require_ohlcv_frame",
+    "rolling_max",
+    "rolling_min",
+    "rolling_std",
     "rsi",
     "run_backtest",
     "run_backtest_on_config",
