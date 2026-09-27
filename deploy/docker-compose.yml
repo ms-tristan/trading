@@ -41,6 +41,22 @@ services:
       - .env
     environment:
       TB_LOG_LEVEL: INFO
+      # Fleet cap: how many Freqtrade workers may run at the same time.
+      #
+      # A worker costs about 390 MiB RSS (measured: eight workers, 3.13 GiB,
+      # linear), so ten of them hold roughly 3.9 GiB inside the Docker VM, on
+      # top of the supervisor and the other stacks on this machine. The host has
+      # 16 GiB of RAM and the VM is limited to 12 GiB; pushing the fleet higher
+      # makes the host swap hard and the VM unresponsive, which is exactly the
+      # failure this cap exists to prevent.
+      #
+      # Ten is also the number that keeps ONE profile of EVERY strategy running
+      # at the same time: the catalogue gives the primary profile of each
+      # strategy priority 100 and its secondary profile priority 50, and the
+      # scheduler starts the highest priorities first. Raise it here -- and only
+      # after checking free memory -- to run more profiles concurrently.
+      TB_MAX_RUNNING_PROFILES: "10"
+      TB_SNAPSHOT_INTERVAL_SECONDS: "60"
 
     ports:
       - "127.0.0.1:3030:8080"
