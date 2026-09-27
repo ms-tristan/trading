@@ -1018,8 +1018,11 @@ AUDIT_EVIDENCE_COMMANDS = (
 )
 
 #: The per-profile tick bound the page derives for the default profile from the
-#: single arithmetic authority: ``max(10 s timeout, 5 s poll, 15 s backoff)``.
-DEFAULT_PROFILE_TICK_BOUND = "~15.8 s"
+#: single arithmetic authority: every attempt the retry budget allows, each paying
+#: one bounded read, plus the whole backoff series -- ``5 * (10.0 + 0.25) + 15.0``.
+DEFAULT_PROFILE_DECLARED_WAIT = "66.25 s"
+DEFAULT_PROFILE_TICK_BOUND = "~69.6 s"
+DEFAULT_PROFILE_ONCE_BUDGET = "~79.6 s"
 
 
 def test_realtime_page_documents_the_blocking_call_audit() -> None:
@@ -1076,7 +1079,7 @@ def test_realtime_page_documents_the_blocking_call_audit() -> None:
     assert "fetch_my_trades" in section
     assert "_strategy_run" in section
     assert "GIL" in section
-    assert "store.py:1047" in section
+    assert "store.py:1045" in section
     assert "check_same_thread=False" in section
 
     # the dashboard was audited, not rewritten, and its verdict is explicit
@@ -1115,9 +1118,19 @@ def test_realtime_page_no_longer_sells_the_margin_as_the_guarantee() -> None:
     assert "names the call and its budget" in flattened
     # ... with the deterministic reproduction that proves the mechanism
     assert "TimeoutError('')" in flattened
-    # the declared wait still derives the tick budget, and its value is pinned
+    # the declared wait still derives the tick budget, and its value is pinned:
+    # every attempt of the retry path, each paying one bounded read, plus the
+    # whole backoff series -- never the backoff series alone
+    assert DEFAULT_PROFILE_DECLARED_WAIT in flattened
     assert DEFAULT_PROFILE_TICK_BOUND in flattened
+    assert DEFAULT_PROFILE_ONCE_BUDGET in flattened
     assert "stream_max_wait_seconds" in flattened
+    # the three components the declaration folds in, named one by one
+    assert "per-attempt read cost" in flattened
+    assert "pacing idle wait" in flattened
+    assert "full retry path" in flattened
+    # ... and the under-statement it replaces is recorded, not silently dropped
+    assert "the `15.0 s` the backoff series" in flattened
 
 
 # ---------------------------------------------------------------------------
@@ -1214,4 +1227,240 @@ def test_realtime_page_documents_the_optional_warmup_override() -> None:
     assert "ERROR" in section
     # ``realtime check`` reports the RESOLVED value now
     assert "RESOLVED value" in flattened
+
+
+# ---------------------------------------------------------------------------
+# 13. the closed-row head-room and the defect-class audit (§2.2, §3.1, §3.2, §8)
+# ---------------------------------------------------------------------------
+
+#: The three names of the closed-row rule, all owned by ``realtime.warmup``: the
+#: row of a requested window that can never be used, the count to ask the stream
+#: for, and what a window of N requested rows really serves.
+CLOSED_ROW_TOKENS = (
+    "CLOSED_CANDLE_HEADROOM",
+    "history_request_candles",
+    "usable_closed_candles",
+)
+
+#: The evidence of the incident §2.2 now has to carry: a frame one row short of
+#: the requirement, on every profile, with zero candles ever processed.
+CLOSED_ROW_INCIDENT_EVIDENCE = (
+    "rows=168",
+    "warmup_candles=169",
+    "required_candles=169",
+    "candles_processed=0",
+)
+
+#: The verdict vocabulary of the defect-class audit rows (classes 1 to 5).
+DEFECT_CLASS_VERDICTS = ("FIXED IN THIS DELIVERY", "REPORTED", "DELIBERATELY LEFT")
+
+#: The audit rows this delivery adds to §3.2, as the literal ``path:line`` plus the
+#: class of the finding.  One entry per row: a row that disappears, or a line that
+#: moves, must change this list with it.
+DEFECT_CLASS_SITES = (
+    ("src/trading_platform/realtime/runner.py:1050", "class 1"),
+    ("src/trading_platform/realtime/runner.py:1487", "class 1"),
+    ("src/trading_platform/realtime/warmup.py:365", "class 1"),
+    ("src/trading_platform/realtime/runner.py:1343", "class 1"),
+    ("src/trading_platform/realtime/runner.py:1376", "class 1"),
+    ("src/trading_platform/realtime/stream.py:867", "class 1"),
+    ("src/trading_platform/realtime/stream.py:598", "class 1"),
+    ("src/trading_platform/realtime/runner.py:859-861", "class 2"),
+    ("src/trading_platform/realtime/runner.py:2135", "class 2"),
+    ("src/trading_platform/realtime/runner.py:923", "class 2"),
+    ("src/trading_platform/realtime/runner.py:890", "class 2"),
+    ("src/trading_platform/realtime/stream.py:858", "class 2"),
+    ("src/trading_platform/realtime/orchestrator.py:1897", "class 2"),
+    ("src/trading_platform/realtime/stream.py:988", "class 3"),
+    ("src/trading_platform/realtime/runner.py:309", "class 3"),
+    ("src/trading_platform/cli.py:1754", "class 3"),
+    ("src/trading_platform/realtime/stream.py:1426", "class 3"),
+    ("src/trading_platform/realtime/orchestrator.py:1905", "class 3"),
+    ("src/trading_platform/cli.py:1946", "class 3"),
+    ("src/trading_platform/web/routes.py:831", "class 2"),
+    ("src/trading_platform/cli.py", "class 5"),
+    ("src/trading_platform/cli.py:1975", "class 4"),
+    ("src/trading_platform/realtime/stream.py:802-807", "class 4"),
+    ("src/trading_platform/realtime/runner.py:1460", "class 4"),
+    ("src/trading_platform/realtime/stream.py:193", "class 5"),
+)
+
+#: The four line references of the *existing* §3.2 rows, corrected by this
+#: delivery: a site that moved must have its row moved with it.  ``runner.py``
+#: carries the tick edits of this delivery (the head-room request, the transient
+#: read seam), so every runner row is re-measured against the shipped tree.
+CORRECTED_AUDIT_REFERENCES = (
+    "runner.py:1141",
+    "runner.py:1412",
+    "orchestrator.py:1959",
+    "store.py:1045",
+)
+
+
+def test_realtime_page_documents_the_closed_row_headroom() -> None:
+    """§2.2 states the requested-vs-usable window rule and its arithmetic owner.
+
+    The whole defect A is one sentence: a requested window always carries one row
+    the venue is still forming, so asking for the warm-up itself is one closed
+    candle short.  The page has to say it, name the three helpers that implement
+    it, and carry the incident's own evidence.
+    """
+    text = read(REALTIME)
+    section = text.split("### 2.2 Real-time / backtest equivalence", 1)[1].split("\n### 2.3", 1)[0]
+    flattened = " ".join(section.split())
+
+    assert "A requested window is not a usable window" in flattened
+    assert "still forming" in flattened or "still-forming" in flattened
+    assert "history[index < stamp]" in flattened or "`history[index < stamp]`" in flattened
+    for token in CLOSED_ROW_TOKENS:
+        assert token in flattened, f"§2.2 does not name {token!r}"
+    for evidence in CLOSED_ROW_INCIDENT_EVIDENCE:
+        assert evidence in flattened, f"§2.2 does not carry the incident evidence {evidence!r}"
+    # the frame budget is asked for with the head-room, and the rule has one owner
+    assert "history_request_candles(warmup_candles)" in flattened
+    assert "realtime.warmup" in flattened
+    assert "No other module may restate that arithmetic" in flattened
+
+
+def test_realtime_page_documents_the_declared_wait_of_a_retrying_read() -> None:
+    """§3.1 derives the declared wait from the whole call, not from its backoff.
+
+    A retrying read pays one bounded read per attempt *plus* the backoff series *plus*
+    (when it idles) one poll interval: the page must state the three components, give
+    the deployment's own number and record the under-statement it replaces.
+    """
+    text = read(REALTIME)
+    section = text.split(IDLE_BOUND_HEADING, 1)[1].split("\n### 3.2", 1)[0]
+    flattened = " ".join(section.split())
+
+    assert "declared_read_worst_case_seconds" in flattened
+    assert "per-attempt read cost" in flattened
+    assert "pacing idle wait" in flattened
+    assert "full retry path" in flattened
+    assert DEFAULT_PROFILE_DECLARED_WAIT in flattened
+    assert DEFAULT_PROFILE_TICK_BOUND in flattened
+    assert DEFAULT_PROFILE_ONCE_BUDGET in flattened
+    assert "5 * (10.0 + 0.25) + 15.0" in flattened
+    # a retrying stream declares the retry path, and the table says so per class
+    assert "`PollingMarketStream`" in section
+    assert "`CcxtProMarketStream`" in section
+    assert "a read that found nothing" in flattened or "found nothing new" in flattened
+
+
+def test_realtime_page_documents_every_new_defect_class_row() -> None:
+    """§3.2 carries one row per finding of the five classes, with its verdict.
+
+    Every new row names a real ``path:line``, a defect class (1 to 5) and one of the
+    three verdicts of the delivery; a row without a verdict, or a row whose site
+    does not exist, is exactly the drift this test catches.
+    """
+    text = read(REALTIME)
+    section = text.split(BLOCKING_AUDIT_HEADING, 1)[1].split("\n## 4.", 1)[0]
+
+    for path, defect_class in DEFECT_CLASS_SITES:
+        row = f"`{path}`"
+        assert row in section, f"§3.2 does not carry the audit row for {path!r}"
+        assert (REPO_ROOT / path.split(":")[0]).is_file(), f"§3.2 audits a missing file: {path!r}"
+        class_marker = f"**{defect_class}**"
+        matching = [line for line in section.splitlines() if row in line]
+        assert any(class_marker in line for line in matching), (
+            f"the §3.2 row of {path!r} does not carry {class_marker!r}"
+        )
+    for verdict in DEFECT_CLASS_VERDICTS:
+        assert verdict in section, f"§3.2 does not use the verdict {verdict!r}"
+
+    # the five classes are named as classes, so a row can be re-read by class
+    for number in ("1", "2", "3", "4", "5"):
+        assert f"**class {number}**" in section, f"§3.2 carries no class-{number} row"
+
+
+def test_realtime_page_pins_the_corrected_audit_line_references() -> None:
+    """The four references this delivery corrected name lines that really hold.
+
+    The page promises every row names a site of the tree it ships, so the corrected
+    line numbers are checked against the code itself -- not against a second copy of
+    the number.
+    """
+    text = read(REALTIME)
+    section = text.split(BLOCKING_AUDIT_HEADING, 1)[1].split("\n## 4.", 1)[0]
+
+    for reference in CORRECTED_AUDIT_REFERENCES:
+        assert reference in section, f"§3.2 does not carry the corrected reference {reference!r}"
+
+    # the same file:line pairs, verified against the code: the symbol the row names
+    # is on the line the row cites
+    expected = {
+        "runner.py:1141": "self._gateway.poll()",
+        "runner.py:1412": "def _strategy_run",
+        "orchestrator.py:1959": "gateway.poll()",
+        "store.py:1045": "def _new_connection",
+    }
+    for reference, symbol in expected.items():
+        relative, line = reference.split(":")
+        path = REPO_ROOT / "src" / "trading_platform" / "realtime" / relative
+        lines = read(path).splitlines()
+        assert symbol in lines[int(line) - 1], (
+            f"§3.2 cites {reference} for {symbol!r}, but that line is {lines[int(line) - 1]!r}"
+        )
+
+    # the first evidence command answers nothing, and the page says so
+    flattened = " ".join(section.split())
+    assert "no `requests.` match at all" in flattened
+
+
+def test_every_audited_line_reference_points_into_a_real_file() -> None:
+    """Every ``src/...py:NNN`` of §3.2 resolves to an existing, non-empty line.
+
+    An audit row is a pointer, and a pointer into a file that shrank -- or into a
+    blank line -- is the drift the section promises to avoid.  The check is
+    deliberately structural (the file exists, the line exists and carries code):
+    the symbol of each row is pinned by the tests above, which would otherwise
+    have to duplicate the whole table.
+    """
+    text = read(REALTIME)
+    section = text.split(BLOCKING_AUDIT_HEADING, 1)[1].split("\n## 4.", 1)[0]
+    references = re.findall(r"`(src/[A-Za-z0-9_./]+\.py):(\d+)(?:-(\d+))?`", section)
+
+    assert references, "§3.2 carries no src/...py:line reference at all"
+    for relative, first, last in references:
+        path = REPO_ROOT / relative
+        assert path.is_file(), f"§3.2 audits a path that does not exist: {relative!r}"
+        lines = read(path).splitlines()
+        start, end = int(first), int(last or first)
+        assert 1 <= start <= end <= len(lines), (
+            f"§3.2 cites {relative}:{first}{'-' + last if last else ''}, "
+            f"but the file has {len(lines)} lines"
+        )
+        for number in range(start, end + 1):
+            assert lines[number - 1].strip(), (
+                f"§3.2 cites {relative}:{number}, which is a blank line"
+            )
+
+
+def test_realtime_page_documents_one_window_one_verdict() -> None:
+    """§8 states the warm-up contract on CLOSED rows, for all three surfaces.
+
+    The create-time verdict, the start-time verdict and ``realtime check`` must be
+    taken on the window the profile is really served: one window, one verdict.  The
+    page carries the rule, its owner, the head-room of the tick request and the
+    transient-read semantics at start time.
+    """
+    text = read(REALTIME)
+    section = text.split("## 8. Profile lifecycle and candle history", 1)[1].split("## 9.", 1)[0]
+    flattened = " ".join(section.split())
+
+    assert "counts of CLOSED candles" in flattened or "counts of **CLOSED** candles" in flattened
+    for token in CLOSED_ROW_TOKENS:
+        assert token in flattened, f"§8 does not name {token!r}"
+    assert "One window, one verdict" in flattened
+    assert "effective_history_candles" in flattened
+    # the tick asks for the head-room and re-appends the candle it decides on
+    assert "warmup_candles + CLOSED_CANDLE_HEADROOM" in flattened
+    assert "history_request_candles(warmup_candles)" in flattened
+    # a slow or failed read is a TICK failure, and the profile keeps running
+    assert "tick* failure" in flattened or "**tick** failure" in flattened
+    assert "stays `RUNNING`" in flattened or "stays `RUNNING`" in section
+    # ... while the never-warm-up branch stays fatal and refused
+    assert "strategy-warmup-impossible" in section
+    assert "REPORTED" in section or "live" in section
     assert "realtime check" in section

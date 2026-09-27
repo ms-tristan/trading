@@ -953,21 +953,27 @@ def test_the_tick_budget_covers_every_legitimate_per_profile_wait(
 def test_the_tick_budget_covers_the_declared_wait_of_the_stream_it_builds() -> None:
     """The budget must dominate the bound of the stream the CLI really builds.
 
-    The stream this command builds is a ``PollingMarketStream``, which declares
-    ``max(poll_interval_seconds, the whole retry backoff series)``: with the shipped
-    ``reconnect_backoff_seconds = 1.0`` and ``max_stream_reconnects = 5`` that series
-    is 15 s, so a profile pacing at 5 s under a 10 s stream timeout still gets a
-    runner bound of ``stream_wait_bound(10, 15) = 15.8 s`` -- larger than the stream
-    timeout, and larger than any budget derived from the poll interval and the
-    timeout alone.  The tick budget therefore has to be the sum of the per-profile
-    bounds the runners apply, not one shared wait multiplied by the profile count:
-    a bound narrower than the waits it wraps is the very defect this package fixes.
+    The stream this command builds is a ``PollingMarketStream``, which declares the
+    whole retrying call through ``declared_read_worst_case_seconds``: the pacing idle
+    wait, one bounded read per attempt (the read timeout plus the late grace window)
+    and the full retry backoff series.  With the shipped
+    ``reconnect_backoff_seconds = 1.0`` and ``max_stream_reconnects = 5`` that is
+    ``5 * (10 + 0.25) + 15 = 66.25 s`` -- not the 15 s backoff series alone, and
+    certainly not the 10 s stream timeout.  The tick budget therefore has to be the sum
+    of the per-profile bounds the runners apply, not one shared wait multiplied by the
+    profile count: a bound narrower than the waits it wraps is the very defect this
+    package fixes.
 
     Pure arithmetic on the real seam members: no clock, no tick, no duration.
     """
     from trading_platform.cli import _realtime_tick_budget
+    from trading_platform.realtime import waits
     from trading_platform.realtime.runner import stream_wait_bound
-    from trading_platform.realtime.stream import PollingMarketStream
+    from trading_platform.realtime.stream import (
+        PollingMarketStream,
+        declared_read_worst_case_seconds,
+        max_backoff_seconds,
+    )
 
     class IdleProvider:
         """Minimal provider: this test only reads the stream's declared wait."""
@@ -998,15 +1004,29 @@ def test_the_tick_budget_covers_the_declared_wait_of_the_stream_it_builds() -> N
         )
     profiles = [ProfileConfig.model_validate(document) for document in documents]
 
-    # The retry series, not the cadence, is what these streams declare.
+    # The declaration of the very streams the CLI builds, derived from the shared
+    # authority so this expectation cannot drift from it.
+    expected_wait = declared_read_worst_case_seconds(
+        read_timeout_seconds=float(realtime.stream_poll_timeout_seconds),
+        poll_interval_seconds=5.0,
+        max_reconnects=int(realtime.max_stream_reconnects),
+        reconnect_backoff_seconds=float(realtime.reconnect_backoff_seconds),
+    )
     declared = [stream.max_wait_seconds for stream in streams]
-    assert declared == [15.0, 15.0]
+    assert declared == [expected_wait, expected_wait]
+    # The backoff series alone is what these streams used to declare, and it is short
+    # by one bounded read per attempt.
+    assert expected_wait == 5 * (10.0 + waits.LATE_GRACE_SECONDS) + max_backoff_seconds(1.0, 5)
+    assert expected_wait > max_backoff_seconds(1.0, 5)
 
     # The bound each of those profiles' runners applies, from the public seam.
     per_profile_bounds = [
         stream_wait_bound(float(realtime.stream_poll_timeout_seconds), wait) for wait in declared
     ]
-    assert per_profile_bounds == [stream_wait_bound(10.0, 15.0)] * 2
+    assert (
+        per_profile_bounds
+        == [stream_wait_bound(float(realtime.stream_poll_timeout_seconds), expected_wait)] * 2
+    )
 
     budget = _realtime_tick_budget(profiles, realtime)
 
@@ -1020,6 +1040,88 @@ def test_the_tick_budget_covers_the_declared_wait_of_the_stream_it_builds() -> N
     timeout_only = 2 * stream_wait_bound(max(5.0, float(realtime.stream_poll_timeout_seconds)))
     assert timeout_only + float(realtime.stream_poll_timeout_seconds) < sum(per_profile_bounds)
     assert budget > timeout_only
+
+
+def test_the_tick_budget_is_never_narrower_than_the_bounds_the_runners_inside_it_apply() -> None:
+    """FAILING-FIRST: the outer tick bound wraps the inner runner bounds, with margin.
+
+    The whole-tick budget used to be restated here from the retry backoff series
+    alone, while each runner inside it bounds its own call by the stream's *declared*
+    wait -- the backoff series plus one bounded read per attempt, plus the idle pace.
+    The outer deadline was therefore narrower than the per-profile bounds it contains
+    and became the crash: the tick was cut before the profile it wrapped could answer.
+
+    The invariant is checked against the streams the command really builds: for every
+    one of them, ``budget`` must dominate the sum of the runner bounds plus the bare
+    stream timeout that pays for the shutdown -- *and* the declared wait those bounds
+    are derived from must itself be the full legitimate worst case, or the bounds the
+    runners apply are the wrong ones.  The second assertion is what fails on the
+    previous code, where the stream declared the bare backoff series while one call of
+    it may pay a bounded read per attempt on top: the two restatements agreed with each
+    other on a value that was one read per attempt too small, so the outer deadline was
+    narrower than the work it wrapped.  Pure arithmetic, no tick.
+    """
+    from trading_platform.cli import _realtime_tick_budget
+    from trading_platform.realtime.runner import stream_wait_bound
+    from trading_platform.realtime.stream import (
+        PollingMarketStream,
+        declared_read_worst_case_seconds,
+        max_backoff_seconds,
+    )
+
+    class IdleProvider:
+        """Minimal provider: this test only reads the stream's declared wait."""
+
+        def fetch_ohlcv(self, symbol: str, timeframe: str, since: Any, until: Any) -> Any:
+            return make_ohlcv(2)
+
+    realtime = RealtimeConfig(
+        stream_poll_timeout_seconds=10.0,
+        reconnect_backoff_seconds=1.0,
+        max_stream_reconnects=5,
+    )
+
+    documents = []
+    streams = []
+    for position, poll_interval in enumerate((5.0, 30.0)):
+        document = profile(f"profile-{position}", BTC, "1h", 10000.0, 1000.0)
+        document["poll_interval_seconds"] = poll_interval
+        documents.append(document)
+        streams.append(
+            PollingMarketStream(
+                IdleProvider(),
+                clock=ManualClock(),
+                poll_interval_seconds=poll_interval,
+                timeout_seconds=float(realtime.stream_poll_timeout_seconds),
+                max_reconnects=int(realtime.max_stream_reconnects),
+                reconnect_backoff_seconds=float(realtime.reconnect_backoff_seconds),
+            )
+        )
+
+    # The declared wait of each built stream IS the whole retrying call: one bounded
+    # read per attempt (timeout plus late grace) and the full backoff series on top.
+    for stream in streams:
+        assert stream.max_wait_seconds == declared_read_worst_case_seconds(
+            read_timeout_seconds=float(realtime.stream_poll_timeout_seconds),
+            poll_interval_seconds=stream.poll_interval_seconds,
+            max_reconnects=int(realtime.max_stream_reconnects),
+            reconnect_backoff_seconds=float(realtime.reconnect_backoff_seconds),
+        )
+        assert stream.max_wait_seconds > max_backoff_seconds(
+            float(realtime.reconnect_backoff_seconds), int(realtime.max_stream_reconnects)
+        )
+
+    budget = _realtime_tick_budget([ProfileConfig.model_validate(d) for d in documents], realtime)
+
+    runner_bounds = [
+        stream_wait_bound(float(realtime.stream_poll_timeout_seconds), stream.max_wait_seconds)
+        for stream in streams
+    ]
+    assert budget >= sum(runner_bounds) + float(realtime.stream_poll_timeout_seconds)
+    # Each inner bound strictly exceeds the wait it wraps, so the outer budget does too.
+    for stream, bound in zip(streams, runner_bounds, strict=True):
+        assert bound > stream.max_wait_seconds
+    assert budget > sum(stream.max_wait_seconds for stream in streams)
 
 
 # ---------------------------------------------------------------------------
@@ -1616,6 +1718,57 @@ def test_check_reports_an_explicit_under_requirement_override_as_impossible(
         for finding in entry["warmup"]["findings"]
         if finding["severity"] == "error"
     ]
+
+
+def test_check_takes_the_warm_up_verdict_on_the_profile_effective_window(
+    tmp_path: Path,
+) -> None:
+    """FAILING-FIRST: ``realtime check`` judges the window the profile is really served.
+
+    The per-profile ``history_candles`` override wins over the realtime-level value in
+    :meth:`ProfileConfig.effective_history_candles`, and that effective window is what
+    the create-time verdict (``control``) and the start-time verdict (orchestrator ->
+    runner) judge the warm-up against.  ``realtime check`` used to judge the
+    platform-level value instead, so a profile with a *larger* override was reported as
+    ``warmup-exceeds-history`` while the engine served it happily -- a pre-flight
+    finding the deployment would never produce.
+
+    The numbers leave a wide margin on both sides of the window, so no +-1 candle
+    refinement of the rule can flip either verdict: a 400-candle warm-up under a
+    500-candle override is coherent, the same warm-up under the realtime-level 300 is
+    not.
+    """
+    database = seed_profiles(
+        tmp_path,
+        profiles=[
+            momentum_profile("momentum-wider", "4h", warmup_candles=400, history_candles=500),
+            momentum_profile("momentum-platform", "4h", warmup_candles=400),
+        ],
+        realtime={"history_candles": 300},
+    )
+
+    result = invoke("realtime", "check", "--state-db", str(database), "--json")
+    payload = payload_of(result)
+    by_id = {entry["id"]: entry for entry in payload["profiles"]}
+
+    assert result.exit_code == 0
+    assert payload["ok"] is True
+
+    wider = by_id["momentum-wider"]
+    assert wider["warmup"]["history_candles"] == 500, "the override is the window it is served"
+    assert wider["warmup"]["findings"] == []
+    assert wider["ok"] is True
+    assert wider["issues"] == []
+
+    platform = by_id["momentum-platform"]
+    assert platform["warmup"]["history_candles"] == 300, "no override: the realtime window"
+    assert [finding["code"] for finding in platform["warmup"]["findings"]] == [
+        "warmup-exceeds-history"
+    ]
+    assert [finding["severity"] for finding in platform["warmup"]["findings"]] == ["warning"]
+    # A warning is never an issue: the profile is merely not warm yet, so it stays ok.
+    assert platform["ok"] is True
+    assert platform["issues"] == []
 
 
 def test_serve_reads_each_mode_ledger_independently(tmp_path: Path) -> None:

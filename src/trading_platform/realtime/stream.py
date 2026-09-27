@@ -44,7 +44,15 @@ Declared wait and the caller's bound
 Every implementation declares the longest wait a single :meth:`MarketStream.next_candle`
 call may legitimately block on through :attr:`MarketStream.max_wait_seconds`, and a
 caller looping on ``next_candle`` derives its own bound from that value plus its own
-margin.  The invariant is binding: the bound the runner applies around a call that may
+margin.  That declaration has one authority:
+:func:`declared_read_worst_case_seconds`, which folds in the pacing idle wait, the
+bounded read cost of **every** attempt the retry budget allows (the read timeout plus
+one late grace window each) and the full backoff series.  Declaring the backoff series
+alone under-states a retrying call by every read it pays; deriving a bound from the
+stream timeout alone ignores the idle poll.  Both omissions are how an external bound
+came to cut a wait the stream was entitled to take.
+
+The invariant is binding: the bound the runner applies around a call that may
 legitimately idle must be STRICTLY GREATER than the longest wait that call can take, for
 ANY (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including equal
 ones and the 30 s / 10 s pair the Docker deployment ships.  Deriving that bound from the
@@ -127,6 +135,7 @@ __all__ = [
     "MarketStream",
     "PollingMarketStream",
     "ReplayMarketStream",
+    "declared_read_worst_case_seconds",
     "max_backoff_seconds",
 ]
 
@@ -209,14 +218,16 @@ def max_backoff_seconds(base: float, max_reconnects: int) -> float:
     ``max_reconnects = 5``.  Its last term is exactly
     ``base * 2 ** (max_reconnects - 2)``, which the value returned here --
     ``base * (2 ** (max_reconnects - 1) - 1)`` -- dominates, so a caller deriving
-    its own bound from it never cuts a retry the stream is entitled to take.
+    its own bound from it never cuts the *last* retry sleep of the loop.
 
-    Both retrying streams fold it into
-    :attr:`~trading_platform.realtime.stream.MarketStream.max_wait_seconds`, and a
-    caller that has to derive a bound for a stream it is about to build (the
-    ``realtime run --once`` tick budget) reads it here instead of restating the
-    arithmetic, so the declared wait and the budget that wraps it cannot drift
-    apart.
+    It is a component, not the whole declaration: a retrying call also pays a full
+    bounded read per attempt and may idle one poll interval, which this series says
+    nothing about.  Both retrying streams therefore fold it into
+    :attr:`~trading_platform.realtime.stream.MarketStream.max_wait_seconds` through
+    :func:`declared_read_worst_case_seconds` -- the single authority -- and any
+    caller deriving its own bound for a stream it is about to build (the
+    ``realtime run --once`` tick budget) reads that function rather than this series,
+    so the declared wait and the budget that wraps it cannot drift apart.
 
     A budget below two attempts never reaches a delay at all, so the answer is
     ``0.0``.
@@ -224,6 +235,56 @@ def max_backoff_seconds(base: float, max_reconnects: int) -> float:
     if max_reconnects < 2:
         return 0.0
     return max(0.0, float(base)) * float(2 ** (int(max_reconnects) - 1) - 1)
+
+
+def declared_read_worst_case_seconds(
+    *,
+    read_timeout_seconds: float,
+    poll_interval_seconds: float,
+    max_reconnects: int,
+    reconnect_backoff_seconds: float,
+) -> float:
+    """Return the longest duration ONE call of a retrying read may legitimately take.
+
+    This is the single authority for the declared wait of a retrying stream
+    (:attr:`MarketStream.max_wait_seconds`) and for every external bound derived
+    from it, so the two can no longer be restated and drift apart.
+
+    **The backoff series alone is not the worst case.**  That omission is exactly
+    why an external bound cut a retry a stream was entitled to take: the retry loop
+    sleeps its series *after* a read that already burned its own budget, and it
+    sleeps it *before* the next read burns another one, so a call that retries pays
+    ``max_reconnects`` full bounded reads in addition to the backoff series.  A
+    successful call may additionally pay one pacing idle wait (the poll interval) at
+    the end, which the backoff series does not cover either.  The declared wait is
+    therefore the longer of:
+
+    * ``idle_path`` -- one bounded attempt plus the pacing idle wait of a stream
+      that found nothing new (``0.0`` for a stream that never paces itself, like the
+      ``ccxt.pro`` one, which answers ``None`` immediately);
+    * ``retry_path`` -- every attempt the retry budget allows, each of them bounded
+      by ``read_timeout_seconds + waits.LATE_GRACE_SECONDS`` (a read goes through
+      :func:`~trading_platform.realtime.waits.awaited_within`, which grants the
+      timeout and then one late grace window before it gives up), plus the whole
+      bounded backoff series of :func:`max_backoff_seconds`.
+
+    For the deployment pair (5 s poll, 10 s read timeout, 5 reconnects, 1 s backoff)
+    that is ``5 * (10.0 + 0.25) + 15.0 = 66.25 s``, not the ``15.0 s`` the backoff
+    series alone announced -- which is what made a 15.8 s external bound cut a
+    legitimate retry mid-flight and kill the profile.
+
+    The function is **total and never raises**: negative inputs are clamped to
+    ``0.0``, ``max_reconnects`` below one still pays one attempt, and a stream that
+    declares no read cost, no backoff and no idle pace declares the single late grace
+    window its one attempt still pays -- never a negative value.
+    """
+    per_attempt = max(0.0, float(read_timeout_seconds)) + waits.LATE_GRACE_SECONDS
+    attempts = max(1, int(max_reconnects))
+    retry_path = attempts * per_attempt + max_backoff_seconds(
+        reconnect_backoff_seconds, max_reconnects
+    )
+    idle_path = per_attempt + max(0.0, float(poll_interval_seconds))
+    return max(idle_path, retry_path)
 
 
 #: Message raised when the optional ``exchange`` extra (ccxt/ccxt.pro) is missing.
@@ -375,7 +436,11 @@ class MarketStream(Protocol):
         The bound the runner applies around a call that may legitimately idle must be
         STRICTLY GREATER than the longest wait that call can take, for ANY
         (``poll_interval_seconds``, ``stream_poll_timeout_seconds``) pair, including
-        equal ones and the deployment's 30 s / 10 s.
+        equal ones and the deployment's 30 s / 10 s.  A retrying implementation
+        declares that value through :func:`declared_read_worst_case_seconds`, the one
+        authority for it: the backoff series alone under-states the call by every
+        bounded read the retry budget pays, and an idle-able stream adds one poll
+        interval on top.
 
         That ordering keeps a healthy wait from being cut; it is not what makes the
         stream survive a delayed loop.  What makes it survive is that a pacing wait
@@ -923,19 +988,33 @@ class PollingMarketStream:
     def max_wait_seconds(self) -> float:
         """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
 
-        An idle poll sleeps exactly :attr:`poll_interval_seconds`, which is the same
-        value :meth:`_idle` sleeps, and a retry may instead sleep the whole bounded
-        backoff series of :meth:`_backoff`.  Whichever is longer is what a caller has
-        to accommodate: bounding this call by ``timeout_seconds`` alone cut a healthy
-        idle poll into a ``TimeoutError`` and crash-looped the deployment.
+        Delegated to :func:`declared_read_worst_case_seconds`, the single authority
+        for this declaration, so the stream and the bounds derived from it cannot
+        drift apart.  Three components are folded in, and none of them can be
+        dropped:
+
+        * the pacing **idle wait** the call may sleep after a poll that found nothing
+          new (:attr:`poll_interval_seconds`);
+        * the **per-attempt read cost**, bounded by ``timeout_seconds`` plus one late
+          grace window (every attempt goes through
+          :func:`~trading_platform.realtime.waits.awaited_within`);
+        * the **full backoff series** of :meth:`_backoff`, which a failing poll pays
+          on top of the reads it already burned.
+
+        The backoff series alone is *not* this value: a retrying call pays
+        ``max_reconnects`` bounded reads as well, so declaring 15 s for a stream that
+        may legitimately spend ~66 s is what let an external bound cut a retry
+        mid-flight.
 
         Exceeding this declared wait anyway is survivable and is not a failure: the
         pacing wait is abandoned, the delay is reported once and the stream stays
         connected with ``last_error is None``.
         """
-        return max(
-            self._poll_interval_seconds,
-            max_backoff_seconds(self._reconnect_backoff_seconds, self._max_reconnects),
+        return declared_read_worst_case_seconds(
+            read_timeout_seconds=self._timeout_seconds,
+            poll_interval_seconds=self._poll_interval_seconds,
+            max_reconnects=self._max_reconnects,
+            reconnect_backoff_seconds=self._reconnect_backoff_seconds,
         )
 
 
@@ -1219,17 +1298,24 @@ class CcxtProMarketStream:
     def max_wait_seconds(self) -> float:
         """Longest wait a single ``next_candle`` call may legitimately block on, in seconds.
 
-        The ``watch_ohlcv`` read is bounded by :attr:`timeout_seconds`, and a failed
-        read may then sleep the whole bounded backoff series of :meth:`_backoff`, so
-        the longest legitimate wait is the longer of the two -- a caller bound by the
-        read timeout alone would cut a retry the stream is entitled to take.
+        The same authority as the polling stream
+        (:func:`declared_read_worst_case_seconds`), with
+        ``poll_interval_seconds = 0.0`` because this stream never paces itself: a
+        ``watch_ohlcv`` read that has nothing new answers ``None`` immediately, so no
+        idle wait is folded in.  The declaration still carries all three components
+        that matter -- the per-attempt read cost bounded by :attr:`timeout_seconds`
+        plus one late grace window, and the full backoff series of :meth:`_backoff`
+        on top of every attempt it pays -- because a caller bound by the read timeout
+        alone would cut a retry the stream is entitled to take.
 
         Exceeding this declared wait anyway is survivable and is not a failure: the
         pacing wait is abandoned, the delay is reported once and the stream stays up.
         """
-        return max(
-            self._timeout_seconds,
-            max_backoff_seconds(self._reconnect_backoff_seconds, self._max_reconnects),
+        return declared_read_worst_case_seconds(
+            read_timeout_seconds=self._timeout_seconds,
+            poll_interval_seconds=0.0,
+            max_reconnects=self._max_reconnects,
+            reconnect_backoff_seconds=self._reconnect_backoff_seconds,
         )
 
 

@@ -14,6 +14,15 @@ runs.  It used to ask for 200, which the frame could never grow into -- no
 refusal and no warning, just a profile that polled for ever with zero signals.
 A refusal now requires an **explicit** ``warmup_candles`` below the requirement.
 
+A fourth case is closed-row head-room, and it is the one that made all of the
+above moot: every live window ends on the candle the venue is still forming, so a
+request of exactly ``warmup`` rows can only ever serve ``warmup - 1`` closed
+candles.  The runner therefore asks the stream for
+:func:`~trading_platform.realtime.warmup.history_request_candles` rows, and
+:class:`VenueShapedStream` below is the venue shape that proves it -- ``momentum``
+on ``4h`` with **no** override reaches its strategy with exactly the 169 closed
+candles it needs.
+
 Everything is offline and deterministic: the four foreign seams (stream, gateway,
 store, clock) are local fakes, the frames are hand-built from an explicit
 arithmetic series, and time is a :class:`ManualClock`.
@@ -45,7 +54,7 @@ from trading_platform.realtime.models import (
 )
 from trading_platform.realtime.observability import LOGGER_NAME
 from trading_platform.realtime.runner import ProfileRunner
-from trading_platform.realtime.warmup import required_candles_for
+from trading_platform.realtime.warmup import history_request_candles, required_candles_for
 
 TIMEOUT = 5.0
 SYMBOL = "BTC/USDT"
@@ -57,10 +66,12 @@ COHERENCE_EVENT = "warmup_coherence"
 #: The existing, "not warm YET" event of the tick.
 INCOMPLETE_EVENT = "warmup_incomplete"
 
-#: Candles a default ``momentum`` needs on a 1h grid / on a 1m grid / on a 1d grid.
+#: Candles a default ``momentum`` needs on a 1h grid / on a 1m grid / on a 1d grid
+#: / on the ``4h`` grid of the incident.
 REQUIRED_1H = 673
 REQUIRED_1M = 40321
 REQUIRED_1D = 29
+REQUIRED_4H = 169
 
 #: The warm-up the incident's profile was created with, as an explicit override.
 LEGACY_OVERRIDE = 200
@@ -71,17 +82,15 @@ def run(coro: Any) -> Any:
     return asyncio.run(asyncio.wait_for(coro, timeout=TIMEOUT))
 
 
-def rising_frame(rows: int, *, freq: str = "h") -> pd.DataFrame:
-    """Return a deterministic, strictly rising OHLCV frame of ``rows`` candles.
+def rising_series(index: pd.DatetimeIndex, *, first_close: float = 100.0) -> pd.DataFrame:
+    """Return a deterministic, strictly rising OHLCV frame on ``index``.
 
     Every close is higher than the previous one by the same amount, so the
     momentum score is exactly ``1.0`` on every row where it is defined: the frame
     isolates the warm-up from the signal rule.
     """
-    index = pd.date_range(
-        start="2024-01-01T00:00:00Z", periods=rows, freq=freq, tz="UTC", name="timestamp"
-    )
-    close = 100.0 + 0.5 * np.arange(rows, dtype="float64")
+    rows = len(index)
+    close = first_close + 0.5 * np.arange(rows, dtype="float64")
     opens = np.concatenate(([close[0]], close[:-1])) if rows else close
     return pd.DataFrame(
         {
@@ -93,6 +102,14 @@ def rising_frame(rows: int, *, freq: str = "h") -> pd.DataFrame:
         },
         index=index,
     )
+
+
+def rising_frame(rows: int, *, freq: str = "h") -> pd.DataFrame:
+    """Return a deterministic, strictly rising OHLCV frame of ``rows`` candles."""
+    index = pd.date_range(
+        start="2024-01-01T00:00:00Z", periods=rows, freq=freq, tz="UTC", name="timestamp"
+    )
+    return rising_series(index)
 
 
 def candle_at(frame: pd.DataFrame, position: int) -> CandleEvent:
@@ -180,6 +197,83 @@ class FrameStream:
     def max_wait_seconds(self) -> float:
         """Longest wait a ``next_candle`` call of this fake may legitimately take."""
         return self._max_wait_seconds
+
+
+#: The grid of the incident's profile, the candle it decides on and the one the
+#: venue is still forming one grid step later.
+VENUE_GRID = "4h"
+VENUE_STEP = pd.Timedelta(hours=4)
+VENUE_CLOSED = pd.Timestamp("2024-06-01T08:00:00Z")
+VENUE_FORMING = VENUE_CLOSED + VENUE_STEP
+
+#: The anchor of the venue series.  A candle's close depends only on its own
+#: timestamp, so the row :meth:`VenueShapedStream.history` serves for a stamp *is*
+#: the candle :meth:`VenueShapedStream.next_candle` emits for it: a stream that
+#: disagreed with itself would pin nothing.
+VENUE_ORIGIN = pd.Timestamp("2020-01-01T00:00:00Z")
+VENUE_FIRST_CLOSE = 100.0
+VENUE_CLOSE_STEP = 0.5
+
+
+def venue_series(rows: int, *, end: pd.Timestamp) -> pd.DataFrame:
+    """Return ``rows`` rising venue candles ending at ``end``, priced by timestamp."""
+    index = pd.date_range(end=end, periods=rows, freq=VENUE_GRID, tz="UTC", name="timestamp")
+    offset = (index[0] - VENUE_ORIGIN) / VENUE_STEP
+    return rising_series(index, first_close=VENUE_FIRST_CLOSE + VENUE_CLOSE_STEP * float(offset))
+
+
+class VenueShapedStream:
+    """A stream shaped like the venue: every window ends on the still-forming candle.
+
+    A live provider answers ``limit=count`` rows whose **last** row is the candle
+    the venue is still forming -- the shape measured on the incident, where a
+    request of 169 rows came back with a last close time in the future.  So
+    :meth:`history` answers exactly ``count`` rows ending one grid step after the
+    emitted candle, and :meth:`next_candle` emits the newest **closed** candle, as
+    the polling stream does after filtering the forming row out.  A window of
+    ``count`` requested rows therefore holds ``count - 1`` closed ones, which is
+    the whole of defect A: asking for the warm-up itself is one closed candle short
+    for ever, on every profile, whatever the symbol.
+    """
+
+    def __init__(self, *, closed: pd.Timestamp = VENUE_CLOSED, emissions: int = 1) -> None:
+        self.closed = pd.Timestamp(closed)
+        self.forming = self.closed + VENUE_STEP
+        self.remaining = int(emissions)
+        self.history_calls: list[int] = []
+        self.started = 0
+        self.stopped = 0
+
+    async def start(self) -> None:
+        self.started += 1
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def next_candle(self, symbol: str, timeframe: str) -> CandleEvent | None:
+        if self.remaining <= 0:
+            return None
+        self.remaining -= 1
+        return self._candle(self.closed)
+
+    async def history(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+        self.history_calls.append(int(count))
+        frame = self._window(int(count), end=self.forming)
+        frame.attrs["timeframe"] = VENUE_GRID
+        return frame
+
+    def _window(self, rows: int, *, end: pd.Timestamp) -> pd.DataFrame:
+        return venue_series(rows, end=end)
+
+    def _candle(self, stamp: pd.Timestamp) -> CandleEvent:
+        frame = self._window(1, end=stamp)
+        frame.attrs["timeframe"] = VENUE_GRID
+        return candle_at(frame, 0)
+
+    @property
+    def max_wait_seconds(self) -> float:
+        """Longest wait a ``next_candle`` call of this fake may legitimately take."""
+        return 0.0
 
 
 class RecordingGateway:
@@ -338,7 +432,7 @@ def context_of(record: logging.LogRecord) -> dict[str, Any]:
 
 def build(
     *,
-    stream: FrameStream,
+    stream: FrameStream | VenueShapedStream,
     profile_config: ProfileConfig,
     gateway: RecordingGateway | None = None,
     store: RecordingStore | None = None,
@@ -465,9 +559,10 @@ def test_the_incident_profile_runs_and_reports_the_coherence_warning(logs: Any) 
 
     run(runner.start())
 
-    # The stream really is asked for the resolved requirement, not for 200.
+    # The stream really is asked for the resolved requirement plus the closed-row
+    # head-room, not for 200 -- and not for the bare requirement either.
     run(runner.run_once())
-    assert stream.history_calls == [REQUIRED_1M]
+    assert stream.history_calls == [history_request_candles(REQUIRED_1M)]
 
     reported = records_of(logs, COHERENCE_EVENT)
     assert len(reported) == 1
@@ -480,6 +575,62 @@ def test_the_incident_profile_runs_and_reports_the_coherence_warning(logs: Any) 
     assert ProfileStatus.ERROR.value not in store.status_values()
     assert store.last_status is ProfileStatus.RUNNING
     assert runner.health().status is ProfileStatus.RUNNING
+
+
+def test_a_profile_whose_warmup_is_never_overridden_reaches_the_strategy(
+    logs: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEFECT A regression: a profile that overrides nothing really runs its strategy.
+
+    ``momentum`` on the ``4h`` grid needs 169 candles, and the profile declares no
+    ``warmup_candles`` at all, so the runner resolves that requirement itself and
+    asks the stream for the closed-row head-room on top of it.  The stream answers
+    the venue's own shape -- **exactly** as many rows as it was asked for, the last
+    one still forming -- so a request of ``169`` rows could only ever yield 168
+    closed ones: the tick logged ``warmup_incomplete`` (rows=168, warmup_candles=169,
+    required_candles=169), returned ``None`` before the strategy and left the profile
+    silent for ever, on every profile and whatever the symbol.  The tick must reach
+    :meth:`ProfileRunner._strategy_run` with a frame of exactly 169 rows ending at
+    the candle it decides on.
+    """
+    target = profile(id="momentum-4h", timeframe="4h", warmup_candles=None)
+    assert target.warmup_candles is None
+    assert required_candles_for(target) == REQUIRED_4H
+    stream = VenueShapedStream()
+    runner, gateway, _store = build(stream=stream, profile_config=target, history_candles=300)
+
+    frames: list[pd.DataFrame] = []
+    strategy_run = runner._strategy_run
+
+    def spy(frame: pd.DataFrame) -> Any:
+        """Record the frame the strategy is handed, then really run it."""
+        frames.append(frame.copy())
+        return strategy_run(frame)
+
+    monkeypatch.setattr(runner, "_strategy_run", spy)
+
+    decision = run(runner.run_once())
+
+    # (i) the tick decided instead of doing nothing
+    assert decision is not None
+    assert decision.blocked is False
+    assert decision.action is SignalAction.ENTER_LONG
+    assert len(gateway.submissions) == 1
+    # (ii) the strategy really ran -- on a frame the venue window can serve
+    assert len(frames) == 1
+    frame = frames[0]
+    assert len(frame) == REQUIRED_4H, "one row less and momentum could not emit a signal"
+    assert frame.index[-1] == VENUE_CLOSED
+    assert frame.index[0] == VENUE_CLOSED - (REQUIRED_4H - 1) * VENUE_STEP
+    # (iii) no "not warm yet" warning on the way: the frame IS warm
+    assert records_of(logs, INCOMPLETE_EVENT) == []
+    assert records_of(logs, IMPOSSIBLE_EVENT) == []
+    # (iv) the request really carries the closed-row head-room ...
+    assert stream.history_calls == [history_request_candles(REQUIRED_4H)]
+    assert stream.history_calls == [170]
+    assert stream.history_calls[0] > REQUIRED_4H
+    # (v) and the tick completed: the candle is processed, not refused
+    assert runner.counters().candles_processed == 1
 
 
 def test_no_tick_ever_asks_for_fewer_candles_than_the_strategy_needs(logs: Any) -> None:
@@ -505,14 +656,14 @@ def test_no_tick_ever_asks_for_fewer_candles_than_the_strategy_needs(logs: Any) 
     assert refused_stream.history_calls == []
     assert len(records_of(logs, IMPOSSIBLE_EVENT)) == 1
 
-    # -- no override: the requirement itself is asked for -------------------------
+    # -- no override: the requirement itself (plus its head-room) is asked for -----
     served_stream = FrameStream(rising_frame(10, freq="min"))
     served, _gateway, _store = build(
         stream=served_stream, profile_config=profile(warmup_candles=None), history_candles=300
     )
     run(served.run_once())
-    assert served_stream.history_calls == [required]
-    assert all(count >= required for count in served_stream.history_calls)
+    assert served_stream.history_calls == [history_request_candles(required)]
+    assert all(count >= history_request_candles(required) for count in served_stream.history_calls)
     assert len(records_of(logs, COHERENCE_EVENT)) == 1
 
 
@@ -625,13 +776,16 @@ def test_a_warmup_wider_than_the_stream_window_only_warns(logs: Any) -> None:
 
 
 def test_an_absent_stream_window_falls_back_to_the_resolved_warmup(logs: Any) -> None:
-    """``history_candles=None`` means "no window resolved": compared against the resolution.
+    """``history_candles=None`` means "no window resolved": compared against the request.
 
-    Without a resolved window the coherence rule cannot fire -- the resolved
-    warm-up is compared against itself -- and the runner behaves exactly as it did
-    before the override existed.  The profile here has **no** override at all, so
-    what is compared against itself is the 40321 candles its strategy needs, not
-    the ``None`` the field holds.
+    Without a resolved window the coherence rule cannot fire -- the window the
+    runner asks the stream for is compared against itself -- and the runner behaves
+    exactly as it did before the override existed.  The profile here has **no**
+    override at all, so what is compared against itself is the 40321 candles its
+    strategy needs, plus the closed-row head-room the tick asks for on top, and not
+    the ``None`` the field holds.  Comparing the resolved warm-up against itself
+    *without* that head-room is the same off-by-one as the tick's: it would warn
+    coherence for ever on a profile nothing is wrong with.
     """
     target = profile(warmup_candles=None)
     stream = FrameStream(rising_frame(10, freq="min"))
@@ -642,18 +796,19 @@ def test_an_absent_stream_window_falls_back_to_the_resolved_warmup(logs: Any) ->
     assert records_of(logs, COHERENCE_EVENT) == []
     assert runner.health().status is ProfileStatus.RUNNING
 
-    # The fallback really is the resolved value: it is what the stream is asked for.
+    # The fallback really is the window the stream is asked for: the request.
     run(runner.run_once())
-    assert stream.history_calls == [REQUIRED_1M]
+    assert stream.history_calls == [history_request_candles(REQUIRED_1M)]
 
 
-def test_the_window_the_stream_is_asked_for_is_the_resolved_warmup() -> None:
-    """A profile with NO override asks the stream for its strategy's requirement.
+def test_the_window_the_stream_is_asked_for_is_the_warmup_plus_the_closed_row_headroom() -> None:
+    """A profile with NO override asks for its requirement *plus* the head-room row.
 
-    ``momentum`` on ``1m`` needs 40321 candles; the field itself holds ``None``.
+    ``momentum`` on ``1m`` needs 40321 candles and the field itself holds ``None``.
     Asking for the raw field (or for the 200 it used to default to) is exactly the
-    silent no-op this pins against: the frame could never reach the requirement, so
-    the profile would poll for ever and emit nothing.
+    silent no-op this pins against; asking for the requirement alone is the other
+    half of it, because the venue's answer always ends on a candle that is still
+    forming and can never be part of the frame.
     """
     target = profile(warmup_candles=None)
     assert target.warmup_candles is None
@@ -662,7 +817,8 @@ def test_the_window_the_stream_is_asked_for_is_the_resolved_warmup() -> None:
 
     run(runner.run_once())
 
-    assert stream.history_calls == [REQUIRED_1M]
+    assert stream.history_calls == [history_request_candles(REQUIRED_1M)]
+    assert stream.history_calls == [REQUIRED_1M + 1]
 
 
 def test_an_explicit_warmup_candles_still_wins_verbatim() -> None:
@@ -670,8 +826,9 @@ def test_an_explicit_warmup_candles_still_wins_verbatim() -> None:
 
     The constructor argument is the seam the orchestrator and the tests drive the
     runner through, so it keeps its historical meaning: the value handed in is the
-    value asked for -- clamped to at least one candle -- whatever the profile
-    declares or would resolve to.
+    number of CLOSED candles served -- clamped to at least one candle -- whatever
+    the profile declares or would resolve to.  It is the *request* that carries the
+    head-room, so an override of 700 closed candles asks the stream for 701 rows.
     """
     target = profile(timeframe="1h", warmup_candles=None)
     stream = FrameStream(rising_frame(800), cursor=REQUIRED_1H - 1)
@@ -681,12 +838,13 @@ def test_an_explicit_warmup_candles_still_wins_verbatim() -> None:
 
     run(runner.run_once())
 
-    assert stream.history_calls == [700]
+    assert stream.history_calls == [history_request_candles(700)]
+    assert stream.history_calls == [701]
     assert REQUIRED_1H != 700
 
 
 def test_an_explicit_zero_candle_argument_is_still_clamped_to_one() -> None:
-    """The clamp is part of the unchanged seam: ``>= 1``, never an empty window."""
+    """The clamp is part of the unchanged seam: ``>= 1`` closed candle, never empty."""
     target = profile(timeframe="1h", warmup_candles=None)
     stream = FrameStream(rising_frame(800), cursor=2)
     runner, _gateway, _store = build(
@@ -695,4 +853,5 @@ def test_an_explicit_zero_candle_argument_is_still_clamped_to_one() -> None:
 
     run(runner.run_once())
 
-    assert stream.history_calls == [1]
+    assert stream.history_calls == [history_request_candles(1)]
+    assert stream.history_calls == [2]

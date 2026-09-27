@@ -9,6 +9,10 @@ incident), naming the strategy, the timeframe, the candles required and the
 candles available, and listing the timeframes that would work instead.  A
 profile that is merely incoherent (it asks for more candles than the stream
 serves) is reported, never refused: refusing it would refuse working profiles.
+Its verdict is taken on the window the profile is **really** served -- the
+per-profile ``history_candles`` override when it declares one, the realtime-level
+setting otherwise -- which is the window the runner receives at start and the one
+``realtime check`` reports: one window, one verdict.
 
 *Delivery*: the per-profile ``history_candles`` override must reach the stream
 the profile is really fed from -- the window ``PollingMarketStream`` asks its
@@ -595,3 +599,91 @@ def test_the_default_window_stays_the_documented_three_hundred_candles() -> None
     assert RealtimeConfig().history_candles == 300
     assert ProfileConfig(id="x", symbol=SYMBOL).history_candles is None
     assert ProfileConfig(id="x", symbol=SYMBOL).effective_history_candles(300) == 300
+
+
+# ---------------------------------------------------------------------------
+# 3. the create verdict is taken on the window the profile is really served
+# ---------------------------------------------------------------------------
+
+
+def test_the_verdict_runs_on_the_profile_override_not_on_the_realtime_setting(
+    logs: Any,
+) -> None:
+    """A profile served 500 candles is judged on 500, never on the realtime 300.
+
+    ``momentum`` needs 169 candles on 4h and this profile asks for 400, which fits
+    in the 500-candle window it overrides for itself: there is nothing to report.
+    Judging it against the realtime-level 300 would invent a finding about a window
+    the profile never polls -- while the start-time verdict and ``realtime check``
+    both use the effective one.
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake, history_candles=DEFAULT_HISTORY)
+    with EngineThread() as engine:
+        engine.bind(control)
+        created = control.create_profile(
+            payload(timeframe="4h", profile_id="op-4h", warmup_candles=400, history_candles=500)
+        )
+
+    assert created == "op-4h"
+    forwarded = fake.calls[-1][1]
+    assert isinstance(forwarded, ProfileConfig)
+    assert forwarded.effective_history_candles(DEFAULT_HISTORY) == 500
+    # no finding on the window really served, and a finding on the narrower one:
+    # the test is vacuous if the two windows agreed.
+    assert profile_warmup_findings(forwarded, history_candles=500) == []
+    assert profile_warmup_findings(forwarded, history_candles=DEFAULT_HISTORY) != []
+    assert records_of(logs, "profile_warmup_coherence") == []
+
+
+def test_the_coherence_report_carries_the_effective_window(logs: Any) -> None:
+    """The logged ``history_candles`` is the window the verdict was taken on.
+
+    A 600-candle warm-up is wider than both windows, so the warning fires either
+    way; the context must name 500 -- the window this profile really polls -- and
+    the message must be the very sentence the authority renders for 500.
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake, history_candles=DEFAULT_HISTORY)
+    with EngineThread() as engine:
+        engine.bind(control)
+        created = control.create_profile(
+            payload(timeframe="4h", profile_id="op-4h", warmup_candles=600, history_candles=500)
+        )
+
+    assert created == "op-4h"
+    reported = records_of(logs, "profile_warmup_coherence")
+    assert len(reported) == 1
+    context = dict(reported[0].context)
+    assert context["history_candles"] == 500
+    assert context["warmup_candles"] == 600
+    forwarded = fake.calls[-1][1]
+    assert context["message"] == profile_warmup_findings(forwarded, history_candles=500)[0].message
+
+
+def test_an_absent_override_keeps_the_realtime_window_byte_for_byte(logs: Any) -> None:
+    """No override means the realtime-level window, to the candle and to the byte.
+
+    ``effective_history_candles`` resolves ``None`` to the value the controller was
+    configured with, so the finding is exactly the one the warm-up authority
+    produces for that very number: the create-time behaviour of every profile that
+    declares no window is unchanged.
+    """
+    fake = FakeOrchestrator()
+    control = controller(fake, history_candles=DEFAULT_HISTORY)
+    with EngineThread() as engine:
+        engine.bind(control)
+        created = control.create_profile(
+            payload(timeframe="4h", profile_id="op-4h", warmup_candles=400)
+        )
+
+    assert created == "op-4h"
+    forwarded = fake.calls[-1][1]
+    assert forwarded.history_candles is None
+    assert forwarded.effective_history_candles(DEFAULT_HISTORY) == DEFAULT_HISTORY
+    expected = profile_warmup_findings(forwarded, history_candles=DEFAULT_HISTORY)
+    reported = records_of(logs, "profile_warmup_coherence")
+    assert len(reported) == 1
+    context = dict(reported[0].context)
+    assert context["history_candles"] == DEFAULT_HISTORY
+    assert context["message"] == expected[0].message

@@ -27,11 +27,15 @@ the *cadence*: read a candle, warm the frame, decide, route, poll, persist.
 Frozen order of one tick (each step numbered as in the delivery brief)
 ---------------------------------------------------------------------
 1. read the next candle, bounded by
-   :func:`~trading_platform.realtime.waits.awaited_within`;
+   :func:`~trading_platform.realtime.waits.awaited_within` and classified by the
+   transient-read contract below;
 2. skip a candle that is not strictly newer than the persisted watermark, so a
    restart neither replays nor skips one;
 3. rebuild the frame ending at that candle (``history`` + the candle), through
-   ``ensure_ohlcv``; fewer rows than ``max(MIN_FRAME_ROWS,
+   ``ensure_ohlcv``.  The stream is asked for ``warmup + CLOSED_CANDLE_HEADROOM``
+   rows -- never for ``warmup`` -- because every live window ends on the candle the
+   venue is still forming: a request of exactly ``warmup`` rows can only ever serve
+   ``warmup - 1`` closed candles.  Fewer rows than ``max(MIN_FRAME_ROWS,
    strategy.required_candles(grid))`` means the warm-up is **not satisfied yet**
    -- a warning, never fatal, because the frame grows with every candle;
 4. run the strategy -- ``prepare`` then ``signals`` -- and read the **last** row,
@@ -64,6 +68,53 @@ appends its candle, its equity point and its watermark, exactly like any other t
 The gate is plain in-memory state of the runner and never touches the store, the
 status, the strategy or the gateway; ``resume()`` clears it.
 
+A slow or failed READ is a tick failure, never a dead profile
+-------------------------------------------------------------
+Both reads of a tick -- ``next_candle`` and ``history`` -- are *calls that must
+answer*, and a call that fails to is a failure of **that tick**, not of the profile:
+it is counted (:attr:`ProfileRunner.transient_read_failures`), reported as
+``tick_read_failed`` at WARNING and simply retried on the next tick, with no store
+write, no status write, no watermark, no equity point and no counter increment.  The
+live incident is the reason: one slow provider read -- on a ``4h`` profile polled
+every 5 s, an ordinary network hiccup -- raised the bounded call's ``TimeoutError``,
+``run`` recorded it as a fatal ``profile_error`` and the profile was dead for ever.
+Four of the five live profiles died exactly once each that way and none ever came
+back.
+
+The classification covers :data:`TRANSIENT_READ_ERRORS` -- the built-in
+``TimeoutError`` the bound raises for a call that never answered, and the
+:class:`~trading_platform.core.errors.MarketStreamError` a retrying stream raises
+once its own budget is spent -- and it does **not** delete the hang detector: a
+genuinely stuck seam is still detected, because the strike limit counts TICKS and
+each of those ticks already consumed the stream's full declared retry budget.  After
+:data:`TRANSIENT_READ_STRIKE_LIMIT` consecutive failing ticks the runner reports
+``tick_read_stuck`` at ERROR and re-raises the original failure, so the fatal path
+runs unchanged end to end (``run`` -> :meth:`ProfileRunner._record_error` ->
+``ProfileStatus.ERROR`` -> the orchestrator's ``mark_crashed`` supervision).
+
+One consequence is deliberate and documented: a tick that fails **after**
+``next_candle`` emitted its candle loses that one candle, because the stream's
+in-memory watermark already moved past it.  The next tick emits the newest closed
+candle and the stream reports ``market_data.candles_skipped``; replaying a stale
+candle is forbidden (see ``docs/realtime.md`` section 2.2), so the runner lets it go
+rather than trading a candle the venue has already left behind.
+
+The closed-row head-room of the warm-up request
+-----------------------------------------------
+Every window a live venue answers ends on the candle it is **still forming**, and
+:meth:`ProfileRunner._build_frame` keeps ``history[index < stamp]`` then re-appends
+``stamp`` itself: a request of exactly ``warmup`` rows therefore yields
+``warmup - 1`` usable rows, for ever.  That is defect A of the incident -- 168 rows
+against the 169 ``momentum`` needs on ``4h``, ``warmup_incomplete`` on every tick,
+``candles_processed = 0`` and no position ever opened, on every profile.  The tick
+asks for :func:`~trading_platform.realtime.warmup.history_request_candles` rows
+(``warmup + CLOSED_CANDLE_HEADROOM``) and that arithmetic has exactly one owner in
+:mod:`trading_platform.realtime.warmup`; nothing here restates it.  The tick guard
+itself is unchanged -- a genuinely short history is still "not warm yet" (a warning,
+never fatal), because only a request that can never reach the requirement is a
+refusal, and that one is decided at start time by
+:meth:`ProfileRunner._check_warmup` on the very same window.
+
 Every wait this module owns goes through
 :mod:`trading_platform.realtime.waits`, so no tick can hang **and** no healthy
 wait can be turned into a fatal error by a delayed event loop:
@@ -73,14 +124,19 @@ wait can be turned into a fatal error by a delayed event loop:
   from the longest wait that call may legitimately take: the configured timeout
   *and* the wait the stream itself declares (see :func:`stream_wait_bound`).  The
   budget is strictly greater than that wait, and it is derived from the wait
-  rather than from the timeout alone.  Head-room is nevertheless **not** a
-  guarantee -- a shared loop frozen by a blocking call overruns any margin -- so
-  the *behaviour* is what carries the tick: a call that answers late is returned
-  as its own result, and only a call still pending after the budget **plus**
+  rather than from the timeout alone -- which is what keeps it from cutting a
+  retry the stream is entitled to take, because the stream's declared wait folds
+  in the per-attempt read cost, the pacing idle wait and the whole backoff series.
+  Head-room is nevertheless **not** a guarantee -- a shared loop frozen by a
+  blocking call overruns any margin -- so the *behaviour* is what carries the tick:
+  a call that answers late is returned as its own result, and only a call still
+  pending after the budget **plus**
   :data:`~trading_platform.realtime.waits.LATE_GRACE_SECONDS` is abandoned, with a
   :class:`TimeoutError` naming the call and its budget.  The hang detector is
-  intact; a late answer is no longer a failure, and the persisted error of a
-  failed call is never the empty ``"TimeoutError: "`` of the incident;
+  intact; a late answer is no longer a failure, a failed read is a **tick** failure
+  (``tick_read_failed``, retried on the next tick) rather than a dead profile, and
+  the persisted error of a failed call is never the empty ``"TimeoutError: "`` of
+  the incident;
 * the pacing wait between two ticks runs through
   :func:`~trading_platform.realtime.waits.paced_wait`, which can **not** raise
   ``TimeoutError`` at all: a sleep the frozen loop could not honour in time is
@@ -104,6 +160,7 @@ from trading_platform.config.models import MAX_ENTRY_LOOKBACK_CANDLES, ProfileCo
 from trading_platform.core.constants import OHLCV_INDEX_NAME, UTC
 from trading_platform.core.errors import (
     KillSwitchActiveError,
+    MarketStreamError,
     OrderRejectedError,
     RealtimeError,
     RiskLimitExceededError,
@@ -144,21 +201,67 @@ from trading_platform.realtime.warmup import (
     SEVERITY_ERROR,
     candles_per_day,
     effective_warmup_candles,
+    history_request_candles,
     profile_warmup_findings,
 )
 from trading_platform.strategy.base import Strategy
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from trading_platform.realtime.gateway import ExecutionGateway
     from trading_platform.realtime.store import StateStore
     from trading_platform.realtime.stream import MarketStream
 
-__all__ = ["ProfileRunner", "stream_wait_bound"]
+__all__ = [
+    "TRANSIENT_READ_ERRORS",
+    "TRANSIENT_READ_STRIKE_LIMIT",
+    "ProfileRunner",
+    "stream_wait_bound",
+]
 
 _LOGGER = logging.getLogger(LOGGER_NAME)
 
 #: Lowest number of rows a frame must hold before a strategy may decide.
 MIN_FRAME_ROWS = 2
+
+#: Failures of ONE read of a tick that the next tick may simply retry.
+#:
+#: A read is a call that must answer, and the two ways it can fail to are the two
+#: members of this tuple:
+#:
+#: * the built-in :class:`TimeoutError` raised by
+#:   :func:`~trading_platform.realtime.waits.awaited_within` after the bound **and**
+#:   its late grace window -- a read that never answered, which is what killed four
+#:   of the five live profiles of the incident;
+#: * :class:`~trading_platform.core.errors.MarketStreamError`, which is what a
+#:   retrying stream raises once its own reconnect budget is spent.
+#:
+#: Everything else -- a bug in the runner, a programming error of a strategy -- is
+#: **not** in here and stays fatal on the very first tick.
+TRANSIENT_READ_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, MarketStreamError)
+
+#: Consecutive failing TICKS after which a read failure is no longer a hiccup.
+#:
+#: The limit counts *ticks*, and that is the whole reason three of them is already a
+#: stuck seam rather than bad luck: each failing tick already consumed the stream's
+#: **full declared retry budget** (``max_reconnects`` attempts, each bounded by the
+#: read timeout plus one late grace window, plus the entire backoff series).  A
+#: single slow read is therefore retried on the next tick and costs the profile
+#: nothing; the third one in a row is a seam that really is down, and the fatal path
+#: (``run`` -> :meth:`ProfileRunner._record_error` -> ``ProfileStatus.ERROR``) is
+#: preserved for it.  The value is a named constant rather than a widened timeout:
+#: widening the bound is what let an external budget cut a retry the stream was
+#: entitled to take.
+TRANSIENT_READ_STRIKE_LIMIT: int = 3
+
+#: Structured event of one transient read failure, and of the escalation.
+TICK_READ_FAILED_EVENT = "tick_read_failed"
+TICK_READ_STUCK_EVENT = "tick_read_stuck"
+
+#: The two reads of a tick, as the ``read`` context of those events names them.
+NEXT_CANDLE_READ = "next_candle"
+HISTORY_READ = "history"
 
 #: Order type every order of the engine uses (the venue decides the fill).
 _ORDER_TYPE = OrderType.MARKET
@@ -343,13 +446,18 @@ class ProfileRunner:
     clock:
         Time seam.  Every duration and timestamp of the runner goes through it.
     warmup_candles:
-        How many candles :meth:`run_once` asks the stream for.  When omitted, the
-        profile's **resolved** warm-up is used
+        How many CLOSED candles :meth:`run_once` serves the strategy.  When omitted,
+        the profile's **resolved** warm-up is used
         (:func:`~trading_platform.realtime.warmup.effective_warmup_candles`): its
         explicit ``warmup_candles`` override when it declares one, and otherwise
         the strategy's own requirement on the profile's timeframe -- so "no
         override" can never mean "warm up for ever".  An explicit argument wins
-        verbatim (clamped to at least one candle).
+        verbatim (clamped to at least one candle).  The stream is asked for
+        ``warmup_candles + CLOSED_CANDLE_HEADROOM`` **rows**
+        (:func:`~trading_platform.realtime.warmup.history_request_candles`) because
+        the last row of every live window is the candle the venue is still forming
+        and can never enter the frame; the value kept here is the count of usable
+        candles, exactly as it always was.
     counters:
         Optional shared counters; a private one is created when omitted.
     timeout_seconds:
@@ -417,6 +525,13 @@ class ProfileRunner:
         self._strategy: Strategy | None = None
         self._warmup_checked = False
         self._started = False
+        # The transient-read tally: how many reads of this runner have failed since
+        # it started, and how many of them are consecutive right now.  It lives here
+        # -- and in the structured ``tick_read_failed`` records -- rather than in
+        # ``EngineCounters``, which is the frozen counter model the dashboard and the
+        # monitor consume and which gains no field for a failure the profile retries.
+        self._transient_failures = 0
+        self._transient_streak = 0
         self._status = ProfileStatus.STOPPED
         self._degraded_detail = ""
         self._last_processed: pd.Timestamp | None = None
@@ -472,6 +587,31 @@ class ProfileRunner:
         not trading?" without reading the log stream.
         """
         return self._last_block_reason
+
+    @property
+    def transient_read_failures(self) -> int:
+        """Return how many reads of this runner failed transiently since it started.
+
+        Monotonic: the tally counts every ``next_candle``/``history`` failure the
+        runner retried instead of dying on, so an operator can read "this profile
+        had N hiccups and is still trading" off the runner itself and not only off
+        the ``tick_read_failed`` records.  It never moves the frozen
+        :class:`~trading_platform.realtime.models.EngineCounters` error counter,
+        which belongs to the fatal path.
+        """
+        return self._transient_failures
+
+    @property
+    def transient_read_streak(self) -> int:
+        """Return the current run of consecutive ticks whose read failed.
+
+        Reset to ``0`` by the first tick whose reads all answered -- a
+        ``next_candle`` that legitimately answers ``None`` counts as answered, and it
+        is the ordinary case of a poll that found nothing new.  The streak is what
+        :data:`TRANSIENT_READ_STRIKE_LIMIT` is compared against before the failure
+        is escalated to the fatal path.
+        """
+        return self._transient_streak
 
     def counters(self) -> EngineCounters:
         """Return the counters of this profile, reconnect count included."""
@@ -694,7 +834,13 @@ class ProfileRunner:
         TradingBacktestError
             An unexpected failure of one tick is logged as ``profile_error``,
             persisted as ``ERROR`` and re-raised: supervision belongs to the
-            caller, which is the only one able to decide what to do about it.
+            caller, which is the only one able to decide what to do about it.  A
+            read that merely failed is **not** an unexpected failure of the tick and
+            never reaches this branch: :meth:`run_once` counts it, returns ``None``
+            and the loop retries on the next iteration -- which is what keeps one
+            slow provider read from ending a profile for good.  Only
+            :data:`TRANSIENT_READ_STRIKE_LIMIT` consecutive failing ticks escalate,
+            and they escalate through this very branch.
         """
         self._prepare()
         iterations = 0
@@ -741,6 +887,92 @@ class ProfileRunner:
 
     # -- one tick -----------------------------------------------------------
 
+    async def _read(self, awaitable: Awaitable[Any], *, read: str, label: str) -> tuple[bool, Any]:
+        """Read one of the two values of a tick, classifying its failure.
+
+        The call runs under the tick's bound (see :meth:`_bound`) and is handed the
+        name the operator and the structured record use for it.  A failure of
+        :data:`TRANSIENT_READ_ERRORS` is a failure of **this tick**: it is counted
+        (:attr:`transient_read_failures`), reported as ``tick_read_failed`` and
+        answered as ``(False, None)`` so :meth:`run_once` returns ``None`` and the
+        next tick simply tries again -- nothing is written, nothing is counted and
+        the profile stays ``RUNNING``.  When the streak reaches
+        :data:`TRANSIENT_READ_STRIKE_LIMIT` the seam is genuinely stuck:
+        ``tick_read_stuck`` is reported at ERROR and the original failure is
+        re-raised untouched, so the fatal path of :meth:`run` runs end to end and
+        the orchestrator's supervision sees it.  Any other failure propagates
+        immediately: a bug of the runner or of a strategy is fatal on the first tick.
+
+        Returns
+        -------
+        tuple[bool, Any]
+            ``(True, value)`` when the read answered -- ``value`` may legitimately be
+            ``None``, which is a poll that found nothing new and counts as answered --
+            and ``(False, None)`` when the read failed transiently and the tick is to
+            be retried.
+
+        Note
+        ----
+        A tick that fails **after** ``next_candle`` emitted its candle loses that one
+        candle: the stream's in-memory watermark has already moved past it, so the
+        next tick emits the newest closed candle and the stream reports
+        ``market_data.candles_skipped``.  Replaying a stale candle is forbidden, so
+        the loss is deliberate and visible.
+        """
+        try:
+            value = await awaited_within(awaitable, bound=self._bound(), label=label)
+        except TRANSIENT_READ_ERRORS as exc:
+            if self._record_transient_read_failure(read, exc):
+                raise
+            return False, None
+        return True, value
+
+    def _record_transient_read_failure(self, read: str, exc: BaseException) -> bool:
+        """Count one transient read failure and report it; answer "escalate?".
+
+        The tally and the streak move here and nowhere else, and the two records are
+        frozen event names: ``tick_read_failed`` at WARNING for a failure the next
+        tick will retry, ``tick_read_stuck`` at ERROR immediately before the
+        escalation re-raise.  Both carry the same context, so an operator can chart
+        one profile's read seam without a second source of truth.
+
+        Returns
+        -------
+        bool
+            ``True`` when the streak reached :data:`TRANSIENT_READ_STRIKE_LIMIT` --
+            the caller must then re-raise -- and ``False`` for an ordinary retryable
+            failure.
+        """
+        self._transient_failures += 1
+        self._transient_streak += 1
+        stuck = self._transient_streak >= TRANSIENT_READ_STRIKE_LIMIT
+        log_event(
+            _LOGGER,
+            TICK_READ_STUCK_EVENT if stuck else TICK_READ_FAILED_EVENT,
+            level=logging.ERROR if stuck else logging.WARNING,
+            profile_id=self.profile_id,
+            symbol=str(self._profile.symbol),
+            timeframe=str(self._profile.timeframe),
+            read=str(read),
+            error=failure_text(exc),
+            consecutive_failures=self._transient_streak,
+            transient_failures=self._transient_failures,
+            strike_limit=TRANSIENT_READ_STRIKE_LIMIT,
+            bound_seconds=self._bound(),
+        )
+        return stuck
+
+    def _reads_answered(self) -> None:
+        """Note that every read of this tick answered, ending the failing streak.
+
+        Called on the three ways a tick's read phase can end without a transient
+        failure -- a candle to decide on, a poll that answered ``None``, and a candle
+        already processed -- because the streak counts *consecutive ticks whose read
+        failed*: one answered read proves the seam is alive and the next failure
+        starts again from one.  Nothing is logged here, and nothing else changes.
+        """
+        self._transient_streak = 0
+
     async def run_once(self) -> TradeSignalDecision | None:
         """Process the next candle and return the decision it produced.
 
@@ -748,33 +980,50 @@ class ProfileRunner:
         -------
         TradeSignalDecision | None
             ``None`` when there is nothing to do: no new candle, a candle already
-            processed, or an incomplete warm-up.
+            processed, an incomplete warm-up -- or a read that failed transiently,
+            which is retried on the next tick (see :meth:`_read`).
+
+        Raises
+        ------
+        TimeoutError
+            When the read that failed has already failed
+            :data:`TRANSIENT_READ_STRIKE_LIMIT` ticks in a row: the seam really is
+            stuck and the failure belongs to the fatal path of :meth:`run`.
         """
         self._prepare()
         symbol = str(self._profile.symbol)
         timeframe = str(self._profile.timeframe)
 
-        # 1. the next candle, always bounded.  The budget carries the same
-        #    head-room as the pacing sleep, plus the stream's own declared wait:
-        #    a stream that is idle legitimately waits a whole poll interval, which
-        #    may equal -- or exceed -- ``self._timeout``.  The call is a call that
-        #    must answer, so it goes through ``awaited_within``: it hangs the tick
-        #    when it never answers (with a message naming it), and it is *returned*
-        #    when it answers late because another profile froze the shared loop.
-        candle = await awaited_within(
+        # 1. the next candle, always bounded and always classified.  The budget
+        #    carries the same head-room as the pacing sleep, plus the stream's own
+        #    declared wait: a stream that is idle legitimately waits a whole poll
+        #    interval, which may equal -- or exceed -- ``self._timeout``.  The call is
+        #    a call that must answer, so it goes through ``awaited_within``: it hangs
+        #    the tick when it never answers (with a message naming it), and it is
+        #    *returned* when it answers late because another profile froze the shared
+        #    loop.  A failure is a failure of THIS tick -- counted, reported as
+        #    ``tick_read_failed`` and retried -- unless the streak already reached
+        #    the strike limit, in which case it is re-raised and the profile dies.
+        answered, candle = await self._read(
             self._stream.next_candle(symbol, timeframe),
-            bound=self._bound(),
+            read=NEXT_CANDLE_READ,
             label=(
                 f"the market stream next_candle for {symbol} {timeframe} "
                 f"of profile {self.profile_id}"
             ),
         )
+        if not answered:
+            return None
         if candle is None:
+            # A poll that found nothing new is an answered read: the seam is not
+            # stuck, and the streak of failing ticks ends here.
+            self._reads_answered()
             return None
         stamp = _as_utc(candle.timestamp)
 
         # 2. a restart neither replays nor skips a candle.
         if self._last_processed is not None and stamp <= self._last_processed:
+            self._reads_answered()
             log_event(
                 _LOGGER,
                 "candle_skipped",
@@ -788,14 +1037,25 @@ class ProfileRunner:
             self._sequence = 0
             self._sequence_stamp = stamp
 
-        # 3. the frame ending at this candle.
-        history = await awaited_within(
-            self._stream.history(symbol, timeframe, self._warmup),
-            bound=self._bound(),
+        # 3. the frame ending at this candle.  The stream is asked for the
+        #    closed-row head-room on top of the warm-up -- ``warmup +
+        #    CLOSED_CANDLE_HEADROOM`` rows -- through the single arithmetic
+        #    authority of ``realtime.warmup``: every live window ends on the candle
+        #    the venue is still forming, and ``_build_frame`` keeps
+        #    ``history[index < stamp]`` then re-appends ``stamp``, so a request of
+        #    exactly ``warmup`` rows can only ever yield ``warmup - 1`` of them --
+        #    168 of the 169 ``momentum`` needs on ``4h``, for ever, on every profile,
+        #    which is exactly why no profile ever ran its strategy.
+        answered, history = await self._read(
+            self._stream.history(symbol, timeframe, history_request_candles(self._warmup)),
+            read=HISTORY_READ,
             label=(
                 f"the market stream history for {symbol} {timeframe} of profile {self.profile_id}"
             ),
         )
+        if not answered:
+            return None
+        self._reads_answered()
         frame = ensure_ohlcv(
             self._build_frame(history, candle, stamp), name=f"realtime:{self.profile_id}"
         )
@@ -1034,8 +1294,10 @@ class ProfileRunner:
 
         Once the strategy is resolved, the warm-up contract is applied **once**
         per runner (see :meth:`_check_warmup`): a profile whose strategy needs more
-        candles than the profile ever asks the stream for goes to ``ERROR`` here,
-        before the first tick, instead of polling for ever with zero signals.
+        CLOSED candles than the profile serves it -- the resolved warm-up, which the
+        tick asks the stream for with the closed-row head-room on top -- goes to
+        ``ERROR`` here, before the first tick, instead of polling for ever with zero
+        signals.
         """
         if self._strategy is None:
             self._strategy = resolve_strategy(self._profile)
@@ -1049,8 +1311,8 @@ class ProfileRunner:
         The arithmetic belongs to :mod:`trading_platform.realtime.warmup`; this is
         the runner's side of it, and the two halves are deliberately different:
 
-        * an **impossible** profile -- the strategy needs more candles than the
-          profile asks the stream for, so the frame can *never* warm up -- is
+        * an **impossible** profile -- the strategy needs more CLOSED candles than
+          the resolved warm-up serves, so the frame can *never* warm up -- is
           logged as ``warmup_impossible``, persisted as
           :attr:`~trading_platform.realtime.models.ProfileStatus.ERROR` with the
           actionable message as its detail, and re-raised as a
@@ -1069,10 +1331,18 @@ class ProfileRunner:
         The check is idempotent and runs once per healthy runner: the guard is
         armed only after a passing check, so a runner that raises here keeps
         raising on every later call instead of silently starting to trade.
+
+        The window handed to the findings is the window the runner really asks the
+        stream for: the resolved ``history_candles`` when the deployment declared
+        one, and otherwise the tick's own request --
+        ``history_request_candles(self._warmup)``, never ``self._warmup``.  Comparing
+        the warm-up against a window that does not carry the closed-row head-room
+        would warn coherence for ever, on every profile whose stream window was never
+        resolved, for a defect that does not exist.
         """
         findings = profile_warmup_findings(
             self._profile,
-            history_candles=self._warmup if self._history is None else self._history,
+            history_candles=self._warmup_request(),
         )
         for finding in findings:
             if finding.severity == SEVERITY_ERROR:
@@ -1099,9 +1369,22 @@ class ProfileRunner:
                 symbol=str(self._profile.symbol),
                 timeframe=str(self._profile.timeframe),
                 warmup_candles=self._warmup,
-                history_candles=self._warmup if self._history is None else self._history,
+                history_candles=self._warmup_request(),
                 message=finding.message,
             )
+
+    def _warmup_request(self) -> int:
+        """Return the window the runner asks the stream for, in ROWS.
+
+        The resolved ``history_candles`` of the deployment when it declared one, and
+        otherwise the tick's own warm-up request --
+        :func:`~trading_platform.realtime.warmup.history_request_candles` of the
+        resolved warm-up, which is ``warmup + CLOSED_CANDLE_HEADROOM``.  The warm-up
+        is a count of CLOSED candles while a window is a count of requested rows, so
+        this is the only value the coherence rule may be compared against; the
+        arithmetic itself is never restated here.
+        """
+        return history_request_candles(self._warmup) if self._history is None else self._history
 
     def _required_candles(self) -> int:
         """Return the candles the resolved strategy needs on this profile's grid.
@@ -1176,9 +1459,15 @@ class ProfileRunner:
     ) -> pd.DataFrame:
         """Return the frame of the strategy window, ending at ``stamp``.
 
-        The history rows are the candles already emitted strictly *before* the
-        candle being decided on, so the frame ends exactly at ``stamp`` and the
-        strategy only ever sees the close of ``t`` as its last row.
+        ``history`` is the raw provider window: it carries the candle being decided
+        on and ends with the still-forming one.  Everything at or after ``stamp`` is
+        dropped, then ``stamp`` itself is appended back, so the frame ends exactly at
+        ``stamp`` -- the strategy only sees the close of ``t`` as its last row -- and
+        holds one row fewer than the window it was handed.  That is why the tick asks
+        the stream for the closed-row head-room
+        (:func:`~trading_platform.realtime.warmup.history_request_candles`): the
+        request, not this slice, is what makes the frame hold the ``warmup_candles``
+        CLOSED rows the strategy requires.
         """
         row = pd.DataFrame(
             {

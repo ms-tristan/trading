@@ -865,6 +865,26 @@ class LiveLikeProvider:
         return window.copy()
 
 
+def seed_live_store(directory: Path, document: dict[str, Any]) -> Path:
+    """Persist the profiles and the settings of ``document``, return the database path."""
+    database = directory / "state.db"
+    store = SqliteStateStore(database, clock=ManualClock(LIVE_NOW.to_pydatetime()))
+    store.initialize()
+    try:
+        for definition in document["profiles"]:
+            store.save_profile(ProfileConfig.model_validate(definition))
+        save_settings(
+            store,
+            PlatformSettings(
+                realtime=RealtimeConfig.model_validate(document["realtime"]),
+                monitoring=MonitoringConfig.model_validate(document["monitoring"]),
+            ),
+        )
+    finally:
+        store.close()
+    return database
+
+
 def write_live_scenario(directory: Path) -> Path:
     """Seed the deployment-shaped store of the live scenario and return its path."""
     document = {
@@ -893,22 +913,7 @@ def write_live_scenario(directory: Path) -> Path:
         "realtime": {"start_at": None, "history_candles": 300, "csv_dir": None},
         "monitoring": {"port": 0},
     }
-    database = directory / "state.db"
-    store = SqliteStateStore(database, clock=ManualClock(LIVE_NOW.to_pydatetime()))
-    store.initialize()
-    try:
-        for definition in document["profiles"]:
-            store.save_profile(ProfileConfig.model_validate(definition))
-        save_settings(
-            store,
-            PlatformSettings(
-                realtime=RealtimeConfig.model_validate(document["realtime"]),
-                monitoring=MonitoringConfig.model_validate(document["monitoring"]),
-            ),
-        )
-    finally:
-        store.close()
-    return database
+    return seed_live_store(directory, document)
 
 
 def test_a_live_polling_stream_trades_its_first_tick_with_a_full_warmup(
@@ -968,6 +973,162 @@ def test_a_live_polling_stream_trades_its_first_tick_with_a_full_warmup(
         # and the warm-up window really was the provider window ending now
         assert provider.calls, "the live stream never asked the provider for candles"
         assert provider.calls[0][3] == LIVE_NOW
+    finally:
+        store.close()
+
+
+#: The wall-clock instant of the 4h deployment shape, and the newest CLOSED 4h
+#: candle of that instant: the candle the ``momentum`` tick decides on.
+MOMENTUM_NOW = pd.Timestamp("2024-06-01 12:00:00", tz="UTC")
+MOMENTUM_CLOSED = pd.Timestamp("2024-06-01 08:00:00", tz="UTC")
+MOMENTUM_STEP = pd.Timedelta(hours=4)
+
+#: The warm-up the ``4h`` ``momentum`` profile really needs -- its strategy's own
+#: requirement on that grid, which the profile does not override.
+MOMENTUM_REQUIRED = 169
+
+#: The window the deployment streams serve the profile with.
+MOMENTUM_HISTORY_CANDLES = 300
+
+
+class ExactWindowMomentumProvider:
+    """A provider answering the venue's ``limit`` window: exactly what was asked for.
+
+    The polling stream reads ``[until - count * 4h, until]`` and a venue answers the
+    grid points of ``(since, until]``: **exactly** ``count`` rows, whose last one is
+    the candle it is still forming (its close time is in the future).  It is the
+    shape measured on the incident -- 169 rows for a request of 169, the last close
+    time in the future -- and the reason a request of the warm-up itself is one
+    closed candle short for ever.
+    """
+
+    def __init__(self, *, seed: int = 11) -> None:
+        self._seed = seed
+        self.calls: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, since: Any, until: Any) -> pd.DataFrame:
+        self.calls.append((symbol, timeframe, pd.Timestamp(since), pd.Timestamp(until)))
+        end = pd.Timestamp(until).floor("4h")
+        steps = int((end - pd.Timestamp(since)) // MOMENTUM_STEP)
+        if steps <= 0:
+            return make_ohlcv(0, start=end.isoformat(), timeframe="4h")
+        start = end - (steps - 1) * MOMENTUM_STEP
+        return make_ohlcv(steps, start=start.isoformat(), timeframe="4h", seed=self._seed)
+
+
+def write_momentum_live_scenario(directory: Path) -> Path:
+    """Seed the store of the incident's deployment shape: ``momentum`` on ``4h``, no override."""
+    document = {
+        "profiles": [
+            {
+                "id": "momentum-4h-live-shape",
+                "symbol": BTC,
+                "timeframe": "4h",
+                "strategy": "momentum",
+                "mode": "paper",
+                "initial_balance": 10000.0,
+                "stake_amount": 1000.0,
+                # the incident's profile: no warm-up override at all
+                "warmup_candles": None,
+                "poll_interval_seconds": 30.0,
+                "risk": {
+                    "max_position_notional": 5000.0,
+                    "max_order_notional": 2000.0,
+                    "max_open_positions": 1,
+                    "max_daily_loss": 500.0,
+                    "max_drawdown_pct": 0.5,
+                    "max_daily_trades": 10,
+                },
+            }
+        ],
+        # no anchor: this is the wall-clock deployment shape
+        "realtime": {
+            "start_at": None,
+            "history_candles": MOMENTUM_HISTORY_CANDLES,
+            "csv_dir": None,
+        },
+        "monitoring": {"port": 0},
+    }
+    return seed_live_store(directory, document)
+
+
+def test_a_deployment_shaped_momentum_profile_processes_its_first_candle(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """DEFECT A, deployment-shaped: a 4h ``momentum`` profile with NO override trades.
+
+    ``momentum`` on the ``4h`` grid needs 169 closed candles, the profile declares no
+    ``warmup_candles`` at all, and the provider answers the venue's own ``limit``
+    window -- exactly as many rows as the runner asked for, the last one still
+    forming.  Every live profile of the incident was silenced by exactly this: the
+    runner asked for 169 rows, ``_build_frame`` dropped the forming candle and the
+    decided candle, re-appended the latter, and the 168-row frame never reached the
+    169 the strategy requires -- ``warmup_incomplete`` on every tick, for ever, on
+    every profile.  The tick must reach the strategy and process the candle now.
+    """
+    database = write_momentum_live_scenario(tmp_path)
+    clock = ManualClock(MOMENTUM_NOW.to_pydatetime())
+    provider = ExactWindowMomentumProvider()
+    store = SqliteStateStore(database, clock=clock)
+    store.initialize()
+
+    def factory(profile: Any) -> Any:
+        return PollingMarketStream(
+            provider,
+            clock=clock,
+            exchange=str(profile.exchange),
+            history_candles=MOMENTUM_HISTORY_CANDLES,
+            poll_interval_seconds=30.0,
+            timeout_seconds=30.0,
+            max_reconnects=3,
+            reconnect_backoff_seconds=1.0,
+        )
+
+    try:
+        # the module-level autouse fixture mutes the structured logs; this test
+        # asserts on them, so logging is re-enabled for its own duration only
+        logging.disable(logging.NOTSET)
+        try:
+            with caplog.at_level(logging.WARNING):
+                orchestrator = RealtimeOrchestrator(
+                    profiles=store.load_profiles(),
+                    store=store,
+                    clock=clock,
+                    realtime=settings_from_store(
+                        store,
+                        bootstrap=PlatformSettings(
+                            realtime=RealtimeConfig(state_db=database),
+                            monitoring=MonitoringConfig(),
+                        ),
+                    ).realtime,
+                    monitoring=MonitoringConfig(port=0),
+                    stream_factory=factory,
+                    version="e2e",
+                )
+                asyncio.run(orchestrator.run_once())
+                runner = orchestrator.runner("momentum-4h-live-shape")
+                assert runner is not None
+                live = runner.health()
+                assert runner.counters().errors == 0
+                assert runner.transient_read_failures == 0
+        finally:
+            logging.disable(logging.CRITICAL)
+
+        # the strategy ran: the newest CLOSED 4h candle is the processed one
+        assert store.last_processed_candle("momentum-4h-live-shape") == MOMENTUM_CLOSED
+        assert live.counters.candles_processed == 1
+        assert "warmup_incomplete" not in caplog.text
+        assert "warmup_impossible" not in caplog.text
+        # and the tick really asked the provider for the head-room row: the warm-up
+        # request is a window of 170 rows, one row above the 169 the strategy needs
+        assert provider.calls, "the live stream never asked the provider for candles"
+        assert provider.calls[0][3] == MOMENTUM_NOW
+        requests = [call[3] - call[2] for call in provider.calls]
+        assert (MOMENTUM_REQUIRED + 1) * MOMENTUM_STEP in requests, requests
+        assert MOMENTUM_REQUIRED * MOMENTUM_STEP not in requests, (
+            "the warm-up request carries the closed-row head-room, never the bare "
+            f"requirement: {requests!r}"
+        )
     finally:
         store.close()
 

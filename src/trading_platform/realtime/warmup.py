@@ -3,8 +3,8 @@
 A strategy declares how many candles a frame must hold before it can emit **any**
 signal (:meth:`trading_platform.strategy.base.Strategy.required_candles`).  A
 profile declares how many candles it asks the stream for
-(``ProfileConfig.warmup_candles``, an **optional override**) and how long a window
-the engine serves (``realtime.history_candles``, or the profile's own
+(``ProfileConfig.warmup_candles``, an **optional override**) and how many rows the
+engine's window holds (``realtime.history_candles``, or the profile's own
 ``history_candles`` override).  Those three numbers are the whole contract, and
 this module is the **only** place that compares them:
 
@@ -15,18 +15,31 @@ this module is the **only** place that compares them:
   "no override" can never mean "warm up for ever";
 * :func:`profile_warmup_findings` -- the impossible profile (``required >
   warmup``: it can **never** warm up, the silent no-op of the incident) and the
-  incoherent one (``warmup > history_candles``: it asks for more than the stream
-  is configured to serve);
+  incoherent one (``warmup > usable_closed_candles(history_candles)``: the window,
+  once its still-forming row is discounted, cannot serve the CLOSED candles the
+  warm-up needs);
 * :func:`warmup_report` -- the same numbers and findings as a JSON-ready mapping,
   consumed by ``realtime check``;
 * :func:`working_timeframes` -- the timeframes that *would* work with the same
   parameters, so a refusal can tell the operator what to do instead.
 
+The headroom rule (the whole of it)
+-----------------------------------
+**To serve N CLOSED candles the stream must be asked for N +
+CLOSED_CANDLE_HEADROOM rows, and every finding below reasons about CLOSED rows.**
+A live venue appends the candle it is still forming to every answer it returns, so
+a requested window of ``N`` rows holds only ``N - CLOSED_CANDLE_HEADROOM`` closed
+ones: :func:`history_request_candles` and :func:`usable_closed_candles` are that
+arithmetic, they are the only place it may be restated, and a warm-up -- a count
+of CLOSED candles -- must never be compared against a raw requested row count.
+
 Every comparison below is made on the **resolved** warm-up
 (:func:`effective_warmup_candles`), never on the raw field: a profile that
-overrides nothing is coherent by construction, and
-:data:`WARMUP_CODE_IMPOSSIBLE` stays reachable **only** when an operator
-explicitly asks for fewer candles than the strategy needs.
+overrides nothing can never be **impossible** -- it is served the strategy's own
+requirement -- and :data:`WARMUP_CODE_IMPOSSIBLE` stays reachable **only** when an
+operator explicitly asks for fewer candles than the strategy needs.  A defaulted
+profile can still be *incoherent* (its window may be narrower than its strategy's
+requirement), and that is reported, never refused.
 
 Layer direction (frozen)
 ------------------------
@@ -58,10 +71,12 @@ Severity semantics (frozen)
     ``warmup_candles`` override below the requirement: without one, the profile is
     served the requirement itself and this severity is unreachable.
 ``warning``
-    The profile asks for more candles than the stream window holds.  It is a
-    real misconfiguration worth naming, but not a refusal: the frame the strategy
-    receives is bounded by ``warmup_candles``, so a smaller window does not by
-    itself silence the profile.
+    The configured window cannot serve the CLOSED candles the warm-up needs: one
+    of its rows is the still-forming candle.  It is a real misconfiguration worth
+    naming, but not a refusal: the frame the strategy receives is bounded by
+    ``warmup_candles``, so a smaller window does not by itself silence the
+    profile -- but a window of exactly ``warmup_candles`` rows is structurally one
+    closed candle short, which is the off-by-one of the incident.
 
 Every public function of this module is **total**: it never raises for a profile
 whose strategy cannot be built (that failure is reported by ``resolve_strategy``
@@ -82,6 +97,7 @@ from trading_platform.realtime.strategies import resolve_strategy
 from trading_platform.strategy.registry import get_strategy
 
 __all__ = [
+    "CLOSED_CANDLE_HEADROOM",
     "DEFAULT_WARMUP_CANDLES",
     "SEVERITY_ERROR",
     "SEVERITY_WARNING",
@@ -90,8 +106,10 @@ __all__ = [
     "WarmupFinding",
     "candles_per_day",
     "effective_warmup_candles",
+    "history_request_candles",
     "profile_warmup_findings",
     "required_candles_for",
+    "usable_closed_candles",
     "warmup_report",
     "working_timeframes",
 ]
@@ -109,6 +127,22 @@ __all__ = [
 #: failure mode of its own.
 DEFAULT_WARMUP_CANDLES: int = 200
 
+#: Rows of a live provider window that can **never** be used: the still-forming candle.
+#:
+#: A live venue appends the candle it is currently building to every kline answer,
+#: and that row's close time is in the future -- it is not a closed candle and no
+#: strategy may read it.  A requested window of ``N`` rows therefore serves at most
+#: ``N - CLOSED_CANDLE_HEADROOM`` closed candles.  Measured on the live incident:
+#: the runner asked Binance for 169 4h klines and got 169 rows back, whose last close
+#: time (1790452799999) was still ahead of the clock (1790448040610) -- 168 closed
+#: candles for a strategy that needs 169, so the frame held 168 rows on every tick
+#: and the strategy was never reached.
+#:
+#: Any comparison against a **requested window** must go through
+#: :func:`history_request_candles` (or :func:`usable_closed_candles`) instead of
+#: comparing against the raw row count.
+CLOSED_CANDLE_HEADROOM: int = 1
+
 #: Severity of a finding that must stop the profile (it can never warm up).
 SEVERITY_ERROR = "error"
 
@@ -118,7 +152,7 @@ SEVERITY_WARNING = "warning"
 #: Code of the "the strategy needs more candles than the profile asks for" finding.
 WARMUP_CODE_IMPOSSIBLE = "strategy-warmup-impossible"
 
-#: Code of the "the profile asks for more candles than the stream serves" finding.
+#: Code of the "the configured window cannot serve the warm-up's CLOSED rows" finding.
 WARMUP_CODE_COHERENCE = "warmup-exceeds-history"
 
 #: Minutes of one 24-hour day, the numerator of the candle grid.
@@ -138,9 +172,12 @@ class WarmupFinding:
         :data:`SEVERITY_ERROR` (the profile can never warm up) or
         :data:`SEVERITY_WARNING` (it is misconfigured but still runs).
     message:
-        The operator-facing sentence, self-contained: it names the profile, the
-        strategy, the timeframe, the candles required, the candles available and
-        -- for an error -- the timeframes that would work instead.
+        The operator-facing sentence, self-contained: it names the profile and the
+        numbers behind the verdict.  For an error: the strategy, the timeframe, the
+        candles required and the candles the profile asks for, plus the timeframes
+        that would work instead.  For a warning: the resolved warm-up, the
+        configured window, the CLOSED candles that window can serve and the minimum
+        window to configure.
     """
 
     code: str
@@ -196,8 +233,11 @@ def required_candles_for(profile: ProfileConfig) -> int:
 def effective_warmup_candles(profile: ProfileConfig) -> int:
     """Return the warm-up ``profile`` is **actually** served, as a plain ``int >= 1``.
 
-    ``ProfileConfig.warmup_candles`` is optional, exactly like its sibling
-    ``history_candles``, and this is its resolution helper -- the mirror of
+    The number is a count of **CLOSED** candles -- the candles the strategy may
+    read, and the ones :func:`history_request_candles` turns into the rows the
+    stream must be asked for.  ``ProfileConfig.warmup_candles`` is optional,
+    exactly like its sibling ``history_candles``, and this is its resolution helper
+    -- the mirror of
     :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`.
     The rule is the whole point of the field being optional:
 
@@ -226,27 +266,78 @@ def effective_warmup_candles(profile: ProfileConfig) -> int:
     return max(1, int(required))
 
 
+def history_request_candles(warmup_candles: int) -> int:
+    """Return the rows to ask the stream for so ``warmup_candles`` CLOSED candles are served.
+
+    A live provider window always ends with the candle the venue is still forming
+    (:data:`CLOSED_CANDLE_HEADROOM`, a row whose close time is in the future), so
+    asking for the warm-up itself is always exactly one row short: the frame the
+    runner builds then holds one closed candle fewer than the strategy requires and
+    ``run_once`` logs ``warmup_incomplete`` for ever instead of running it.  This
+    helper is the arithmetic authority for that request -- the runner asks the
+    stream for ``history_request_candles(warmup)`` rows, never ``warmup``.
+
+    Any check that compares something against a **requested window** -- a warm-up
+    matrix, a catalogue rule, a create-time guard -- must go through this helper or
+    :func:`usable_closed_candles`.  A warm-up is a count of CLOSED candles, so
+    ``required_candles <= warmup_candles`` is the correct rule and a comparison of
+    ``required_candles`` against a raw row count is one row short by construction.
+
+    The function is **total**: it never raises and always answers at least
+    ``1 + CLOSED_CANDLE_HEADROOM``.  A non-number-like argument is read as ``0``,
+    exactly like the other total helpers of this module, so a validation path can
+    always ask "how many rows would this need?".
+    """
+    return max(1, _as_int(warmup_candles)) + CLOSED_CANDLE_HEADROOM
+
+
+def usable_closed_candles(window_candles: int) -> int:
+    """Return the CLOSED candles a window of ``window_candles`` requested rows can serve.
+
+    The inverse of :func:`history_request_candles` for every value that helper can
+    produce: ``usable_closed_candles(history_request_candles(n)) == max(1, n)``.  A
+    window narrower than the headroom serves nothing at all.
+
+    The function is **total**: it never raises and never answers a negative number,
+    so a comparison against a warm-up is always well defined -- even for the
+    nonsense a hand-edited configuration may hold.
+    """
+    return max(0, _as_int(window_candles) - CLOSED_CANDLE_HEADROOM)
+
+
 def profile_warmup_findings(profile: ProfileConfig, *, history_candles: int) -> list[WarmupFinding]:
     """Return the warm-up verdicts about ``profile`` -- at most one per severity.
 
-    ``history_candles`` is the window the engine is configured to serve this
-    profile (``RealtimeConfig.history_candles``, or the profile's own
+    ``history_candles`` is the window the engine is configured to ask the stream
+    for this profile (``RealtimeConfig.history_candles``, or the profile's own
     ``history_candles`` override -- see
-    :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`).
+    :meth:`~trading_platform.config.models.ProfileConfig.effective_history_candles`):
+    a count of **requested rows**, one of which the venue is still forming, so it
+    holds ``usable_closed_candles(history_candles)`` closed candles at most.
 
     The two rules, and there are exactly two -- both stated on the **resolved**
     warm-up (``warmup = effective_warmup_candles(profile)``, never the raw optional
-    field):
+    field) and both reasoned about in **CLOSED** candles:
 
     * :data:`WARMUP_CODE_IMPOSSIBLE` (**error**) iff
       ``required_candles_for(profile) > warmup``: the frame the runner builds can
       never reach the strategy's warm-up, so the profile would run for ever with
-      zero signals.  With no explicit override ``warmup`` **is** the requirement,
-      so this is false by construction: the finding stays reachable only when an
-      operator deliberately sets ``warmup_candles`` below it;
-    * :data:`WARMUP_CODE_COHERENCE` (**warning**) iff ``warmup > history_candles``:
-      the profile asks the stream for more candles than the engine is configured
-      to serve.
+      zero signals.  ``warmup`` counts **CLOSED** candles, so
+      ``required_candles <= warmup_candles`` is the **correct** rule for any
+      external check (a catalogue, a warm-up matrix, a create-time guard): a
+      comparison of ``required_candles`` against a raw requested window -- a
+      provider row count, which carries the still-forming candle -- is one row
+      short by construction and must go through :func:`history_request_candles` or
+      :func:`usable_closed_candles` instead.  With no explicit override ``warmup``
+      **is** the requirement, so this is false by construction: the finding stays
+      reachable only when an operator deliberately sets ``warmup_candles`` below it;
+    * :data:`WARMUP_CODE_COHERENCE` (**warning**) iff
+      ``history_request_candles(warmup) > history_candles`` -- equivalently
+      ``warmup > usable_closed_candles(history_candles)``: the configured window
+      cannot serve the CLOSED rows the warm-up needs, because one of its rows is
+      the still-forming candle.  ``warmup == history_candles`` is therefore **not**
+      coherent: that window serves ``warmup - 1`` closed candles, exactly the
+      one-row shortfall that silenced every profile of the incident.
 
     Both can hold at once, and each is reported at most once.  The function is
     **total and never raises**: a profile whose strategy cannot be built (unknown
@@ -271,7 +362,7 @@ def profile_warmup_findings(profile: ProfileConfig, *, history_candles: int) -> 
                 _impossible_message(profile, required=required, per_day=per_day, warmup=warmup),
             )
         )
-    if warmup > window:
+    if history_request_candles(warmup) > window:
         findings.append(
             WarmupFinding(
                 WARMUP_CODE_COHERENCE,
@@ -333,6 +424,13 @@ def working_timeframes(
     refusal must list them in, so the cheapest grid comes first.  The strategy is
     built through the registry with its own parameter model, exactly like
     :func:`required_candles_for` builds the profile's.
+
+    The comparison is exact because ``warmup_candles`` here counts **CLOSED**
+    candles -- the same unit as the strategy's requirement -- and not provider rows:
+    the rows a stream would have to be asked for are
+    ``history_request_candles(warmup_candles)`` (:data:`CLOSED_CANDLE_HEADROOM`
+    more).  A caller that compares a warm-up against a **requested window** must
+    convert it through :func:`usable_closed_candles` first.
 
     The function is **total and never raises**: ``[]`` means "nothing works" --
     the strategy is unknown, its parameters are rejected, or no supported
@@ -405,19 +503,25 @@ def _impossible_message(
 
 
 def _coherence_message(profile: ProfileConfig, *, warmup: int, window: int) -> str:
-    """Render the frozen "warm-up wider than the stream window" sentence.
+    """Render the frozen "the window cannot serve the warm-up" sentence.
 
     A warning, never a refusal: the frame the strategy receives is bounded by
     ``warmup_candles``, so a smaller stream window does not by itself silence the
-    profile -- but the operator asked for more history than the engine will serve,
-    and that has to be visible.
+    profile -- but the operator asks for more CLOSED candles than the window can
+    serve once its still-forming row is discounted, and that has to be visible.
+
+    The sentence names the resolved warm-up, the configured window, the closed rows
+    that window can serve and the minimum window (in rows) to configure -- which is
+    the warm-up plus the headroom, never the warm-up itself.
     """
     return (
         f"profile {str(profile.id)!r} asks for {warmup} warm-up candles "
         f"(warmup_candles={warmup}) but the live stream is configured to serve a "
-        f"{window}-candle window (history_candles={window}); raise history_candles to at "
-        f"least {warmup} (realtime setting or the per-profile override) or lower "
-        "warmup_candles"
+        f"{window}-candle window (history_candles={window}), which holds only "
+        f"{usable_closed_candles(window)} closed candles (the venue always appends one "
+        "still-forming candle); raise history_candles to at least "
+        f"{history_request_candles(warmup)} (realtime setting or the per-profile "
+        "override) or lower warmup_candles"
     )
 
 
