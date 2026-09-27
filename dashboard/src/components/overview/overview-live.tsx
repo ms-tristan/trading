@@ -4,8 +4,9 @@ import { useCallback, useState } from 'react';
 
 import Link from 'next/link';
 
-import { PlusCircle, ShieldAlert } from 'lucide-react';
+import { ArrowDownWideNarrow, Banknote, PlusCircle, ShieldAlert } from 'lucide-react';
 
+import { AccountPerformance } from '@/components/overview/account-performance';
 import { ModeToggle } from '@/components/overview/mode-toggle';
 import { ProfileCard } from '@/components/overview/profile-card';
 import { OrphanWarning } from '@/components/overview/orphan-warning';
@@ -17,13 +18,14 @@ import { fetchHealth, fetchKillSwitch, fetchOrphans, fetchProfiles } from '@/lib
 import { failureReport } from '@/lib/api-failure';
 import { cn } from '@/lib/cn';
 import { EMPTY_PLACEHOLDER, formatInteger, formatTimestamp } from '@/lib/format';
+import { resolveModeWallet } from '@/lib/performance';
+import { sortProfilesByPortfolioValue } from '@/lib/ranking';
 import type {
   HealthPayload,
   KillSwitchPayload,
   OrphanReport,
   ProfilesPayload,
   RunMode,
-  WalletSnapshot,
 } from '@/lib/types';
 import { usePolling } from '@/lib/use-polling';
 
@@ -63,27 +65,6 @@ const MODE_WORDS: Record<RunMode, string> = {
   live: 'real trading',
 };
 
-/**
- * The ledger of one mode out of the profiles payload.
- *
- * `wallets` is the mode-keyed view and is the source of truth as soon as the
- * server emits it — including when one of its two entries is an explicit `null`,
- * which means "that mode was never traded and holds no ledger row yet" and must
- * NOT fall back to the other mode's figures.
- *
- * Only when the whole `wallets` object is `null` — an older server that does not
- * emit the key at all — does the payload fall back to `wallet`. That fallback is
- * for **paper only**, because `wallet` *is* the paper/default ledger by contract:
- * handing it to the real mode would show paper money under a real heading.
- */
-function resolveWallet(profiles: ProfilesPayload, mode: RunMode): WalletSnapshot | null {
-  const ledgers = profiles.wallets ?? null;
-  if (ledgers === null) {
-    return mode === 'paper' ? profiles.wallet ?? null : null;
-  }
-  return ledgers[mode] ?? null;
-}
-
 /** How many profiles each mode holds, for the counts of the toggle. */
 function countByMode(profiles: ProfilesPayload): Record<RunMode, number> {
   return {
@@ -91,6 +72,29 @@ function countByMode(profiles: ProfilesPayload): Record<RunMode, number> {
     live: profiles.profiles.filter((profile) => profile.mode === 'live').length,
   };
 }
+
+/**
+ * The note that states the ordering of the list.
+ *
+ * The cards are sorted by portfolio value (highest first) so the ranking is
+ * visible without sorting by hand — and a reordering an operator did not ask for
+ * must never be silent, so the section says what the order is. The icon matches
+ * the direction of the sort and is decorative: the sentence carries the meaning.
+ */
+const ORDER_NOTE = 'Ordered by portfolio value, highest first';
+
+/**
+ * What a real-trading profile needs before the platform will run it.
+ *
+ * The credentials are read from the **engine environment**, never from the
+ * dashboard: the monitoring server cannot invent a venue account, and a live
+ * profile it cannot authenticate is quarantined as a boot failure rather than
+ * started half-configured. The wording names the exact variables so the operator
+ * knows what to set, and the variables are split per line so each one stays
+ * greppable.
+ */
+const LIVE_CREDENTIALS_NOTE =
+  'A real-trading profile needs venue API credentials in the engine environment: either the per-profile TB_PROFILE_<ID>_API_KEY / TB_PROFILE_<ID>_API_SECRET pair or the shared TB_LIVE_API_KEY / TB_LIVE_API_SECRET pair, plus TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK. The platform refuses to run a live profile it cannot authenticate — such a profile is quarantined as a boot failure, never traded blind.';
 
 /**
  * Classes of the profile creation action.
@@ -118,28 +122,43 @@ const NEW_PROFILE_ACTION_CLASSES = cn(
  * therefore performs no request, and the first refresh happens on the documented
  * cadence (2 s by default).
  *
- * The wallet panel is the first block of the live region, seeded with the wallet
- * of the server payload: it is the one instance of the panel on the page, so the
- * overview never shows the shared wallet twice. It is immediately followed by
- * the orphan sweep warning, whose own absence renders nothing.
+ * The region **leads with the global performance of the account**
+ * ({@link AccountPerformance}): what the shared ledger of the selected mode is
+ * worth, what it has returned, which profiles run and which one leads. It is
+ * part of this region — and not a page-level block — precisely so that it
+ * refreshes on the cycle that is already running and follows the selected mode
+ * without a request of its own; it starts no second poll and fetches nothing.
+ *
+ * The wallet panel comes next, seeded with the wallet of the server payload: it
+ * is the one instance of the panel on the page, so the overview never shows the
+ * shared wallet twice. It is immediately followed by the orphan sweep warning,
+ * whose own absence renders nothing.
+ *
+ * The profile list is a **ranking**: the profiles of the selected mode are
+ * ordered by portfolio value, highest first, with `lib/ranking.ts` — the same
+ * pure comparator the Server Component uses for the first paint, so the server
+ * markup and the hydrated client agree and the list never reorders on
+ * hydration. The order is never silent: the heading area states it and every
+ * card shows the ordinal position it holds.
  *
  * **This component owns the selected run mode.** The mode is a filter over the
- * one payload the cycle refreshes, so the profile list, the wallet panel and the
- * counts of the toggle all read the *same* object: switching modes re-reads it
- * and issues **no request**. The default is `paper`, which is what the Server
- * Component renders before this component mounts. Switching is therefore never a
- * navigation, never a URL parameter and never a second fetch.
+ * one payload the cycle refreshes, so the account performance block, the profile
+ * list, the wallet panel and the counts of the toggle all read the *same*
+ * object: switching modes re-reads it and issues **no request**. The default is
+ * `paper`, which is what the Server Component renders before this component
+ * mounts. Switching is therefore never a navigation, never a URL parameter and
+ * never a second fetch.
  *
  * Robustness: a failed cycle is caught by `usePolling`, shows the non-blocking
  * banner of the toolbar — in the shared operator-facing vocabulary, never as a
  * raw proxy status — and keeps the last known good bundle on screen (the shared
- * wallet included); a card is keyed by `profile_id`, so a refresh updates it in
- * place instead of remounting it. Accessibility: the toolbar carries the polite
- * live region with the "checked at" stamp and the paused / running state, and
- * the Pause control is a plain, keyboard-operable button. The creation action of
- * the section ("New profile") is injected into that same control cluster, so the
- * action sits with the list it creates into and stays the last tab stop of the
- * cluster.
+ * wallet and the performance figures included); a card is keyed by `profile_id`,
+ * so a refresh updates it in place instead of remounting it. Accessibility: the
+ * toolbar carries the polite live region with the "checked at" stamp and the
+ * paused / running state, and the Pause control is a plain, keyboard-operable
+ * button. The creation action of the section ("New profile") is injected into
+ * that same control cluster, so the action sits with the list it creates into
+ * and stays the last tab stop of the cluster.
  */
 export function OverviewLive({
   initialProfiles,
@@ -195,15 +214,35 @@ export function OverviewLive({
 
   const allProfiles = data.profiles.profiles;
   // The whole page follows the toggle, read out of the SAME payload the cycle
-  // refreshes: the profile list keeps only the profiles of the selected mode.
-  const profiles = allProfiles.filter((profile) => profile.mode === mode);
+  // refreshes: the profile list keeps only the profiles of the selected mode,
+  // ordered by portfolio value (highest first) so the list reads as a ranking.
+  // The sort is the shared pure helper — the Server Component ordered the first
+  // paint with it too, so hydration cannot reorder anything.
+  const profiles = sortProfilesByPortfolioValue(
+    allProfiles.filter((profile) => profile.mode === mode),
+  );
   const counts = countByMode(data.profiles);
-  const wallet = resolveWallet(data.profiles, mode);
+  // The ledger of the mode, resolved by the shared helper the account
+  // performance block uses too: the mode-keyed `wallets` object is the source of
+  // truth as soon as the server emits it — including when one of its entries is
+  // an explicit `null` — and only a payload *without* that object falls back to
+  // `wallet`, for **paper only**. One implementation, so the wallet panel and the
+  // performance hero can never disagree about which ledger is on screen.
+  const wallet = resolveModeWallet(data.profiles, mode);
   const isEngaged = data.killSwitch.kill_switch;
   const reason = data.killSwitch.reason.trim();
 
   return (
     <>
+      {/* The global performance of the account leads the live region: the first
+          question an operator opens this page with is "how is the account
+          doing", not "what is in the wallet". It reads the same payload the
+          cycle refreshes and follows the same selected mode — no request, no
+          second poll. The wallet panel below keeps every cash, position and
+          exposure detail; the only figure the two blocks share is the portfolio
+          value. */}
+      <AccountPerformance profiles={data.profiles} mode={mode} />
+
       {/* The shared wallet of the server payload, refreshed by every cycle and
           kept as the last known good value when a cycle fails. `?? null`
           tolerates a payload without the wallet key at all. */}
@@ -225,6 +264,12 @@ export function OverviewLive({
             </h2>
             <p className="mt-xs text-sm text-muted-foreground">
               One card per configured profile, refreshed by HTTP polling.
+            </p>
+            {/* The ordering is visible, never silent: the list is a ranking and
+                it says so, right above the list itself. */}
+            <p className="mt-xs flex flex-wrap items-center gap-xs text-xs text-muted-foreground">
+              <ArrowDownWideNarrow aria-hidden="true" className="size-3.5 shrink-0" />
+              <span>{ORDER_NOTE}</span>
             </p>
           </div>
         </header>
@@ -270,13 +315,25 @@ export function OverviewLive({
           allProfiles.length > 0 ? (
             // The platform DOES hold profiles — just none in the selected mode.
             // Saying "no profile configured" here would be a lie the operator
-            // would act on, so the two empty cases never share a wording.
-            <EmptyState
-              title="No profile for this mode"
-              description={`The platform holds ${formatInteger(
-                allProfiles.length,
-              )} profile(s), none of them in ${MODE_WORDS[mode]}. Switch the trading mode above to see the other side.`}
-            />
+            // would act on, so the two empty cases never share a wording. The
+            // real-trading side gets its own, actionable sentence: the reason a
+            // live profile is missing is almost always a missing credential, and
+            // "switch to the other side" would send the operator looking in the
+            // wrong place.
+            mode === 'live' ? (
+              <EmptyState
+                title="No real-trading profile configured"
+                description={LIVE_CREDENTIALS_NOTE}
+                icon={<Banknote className="size-5" />}
+              />
+            ) : (
+              <EmptyState
+                title="No profile for this mode"
+                description={`The platform holds ${formatInteger(
+                  allProfiles.length,
+                )} profile(s), none of them in ${MODE_WORDS[mode]}. Switch the trading mode above to see the other side.`}
+              />
+            )
           ) : data.health.profiles_total > 0 ? (
             <EmptyState
               title="No profile reported yet"
@@ -292,8 +349,15 @@ export function OverviewLive({
           )
         ) : (
           <div className="grid gap-xl lg:grid-cols-2 2xl:grid-cols-3">
-            {profiles.map((profile) => (
-              <ProfileCard key={profile.profile_id} profile={profile} />
+            {profiles.map((profile, index) => (
+              <ProfileCard
+                key={profile.profile_id}
+                profile={profile}
+                // The position in the ranking this list IS: the same order the
+                // Server Component rendered for the first paint.
+                rank={index + 1}
+                rankTotal={profiles.length}
+              />
             ))}
           </div>
         )}

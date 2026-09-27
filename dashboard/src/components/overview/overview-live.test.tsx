@@ -883,4 +883,146 @@ describe('OverviewLive', () => {
     expect(screen.getByRole('link', { name: 'live-1' })).toBeInTheDocument();
     expect(within(screen.getByTestId('wallet-tiles')).getByText('$6,000.00')).toBeInTheDocument();
   });
+
+  // -------------------------------------------------------------------------
+  // the global account performance block and the portfolio-value ranking
+  // -------------------------------------------------------------------------
+
+  it('leads the live region with the global account performance, before the wallet', () => {
+    const server = startServer();
+    renderLive(server);
+
+    const performance = screen.getByRole('region', {
+      name: 'Account performance — paper trading',
+    });
+    const walletPanel = screen.getByRole('region', { name: 'Platform wallet — paper trading' });
+
+    // The performance of the account is above the wallet, and mounting it
+    // issues no request of its own.
+    expect(server.calls).toEqual([]);
+    expect(
+      performance.compareDocumentPosition(walletPanel) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // The hero number is the portfolio value of the selected mode's ledger.
+    expect(within(screen.getByTestId('account-performance-hero')).getByText('$25,750.00')).toBeInTheDocument();
+    // And the figures come from the same payload as the wallet below.
+    expect(within(screen.getByTestId('account-performance-ledgers')).getByText('$5,200.00')).toBeInTheDocument();
+  });
+
+  it('orders the cards by portfolio value, highest first, with visible ranks', () => {
+    const server = startServer();
+    // Delivered in an order that is NOT the ranking.
+    server.profiles = {
+      profiles: [
+        makeProfile('bravo', { equity: 9900 }),
+        makeProfile('charlie', { equity: 12000 }),
+        makeProfile('alpha', { equity: 10450.5 }),
+      ],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    const cards = screen.getAllByRole('article');
+    expect(cards.map((element) => element.getAttribute('aria-labelledby'))).toEqual([
+      'profile-charlie',
+      'profile-alpha',
+      'profile-bravo',
+    ]);
+
+    // The reordering is never silent: the section states it and each card
+    // carries the position it holds.
+    expect(screen.getByText('Ordered by portfolio value, highest first')).toBeInTheDocument();
+    expect(screen.getByText('Rank 1 of 3 by portfolio value')).toBeInTheDocument();
+    expect(screen.getByText('Rank 2 of 3 by portfolio value')).toBeInTheDocument();
+    expect(screen.getByText('Rank 3 of 3 by portfolio value')).toBeInTheDocument();
+  });
+
+  it('ranks a profile without a published equity last', () => {
+    const server = startServer();
+    server.profiles = {
+      profiles: [
+        makeProfile('unknown', { equity: null, total_return: null }),
+        makeProfile('alpha', { equity: 10450.5 }),
+      ],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: null },
+    };
+    renderLive(server);
+
+    expect(screen.getAllByRole('article').map((element) => element.getAttribute('aria-labelledby'))).toEqual(
+      ['profile-alpha', 'profile-unknown'],
+    );
+    expect(screen.getByText('Rank 2 of 2 by portfolio value')).toBeInTheDocument();
+  });
+
+  it('re-ranks the cards when a polling cycle moves the values', async () => {
+    const server = startServer();
+    renderLive(server);
+    expect(
+      screen.getAllByRole('article').map((element) => element.getAttribute('aria-labelledby')),
+    ).toEqual(['profile-alpha', 'profile-beta']);
+
+    // The next cycle inverts the two equities: the list follows it, and the
+    // rank badges follow the list.
+    server.profiles = {
+      profiles: [makeProfile('alpha', { equity: 1000 }), makeProfile('beta', { equity: 2000 })],
+      generated_at: '2024-06-01T12:00:02+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: { ...wallet }, live: { ...liveWallet } },
+    };
+    await advance(2000);
+
+    expect(
+      screen.getAllByRole('article').map((element) => element.getAttribute('aria-labelledby')),
+    ).toEqual(['profile-beta', 'profile-alpha']);
+    expect(screen.getByText('Rank 1 of 2 by portfolio value')).toBeInTheDocument();
+    expect(screen.getByText('Rank 2 of 2 by portfolio value')).toBeInTheDocument();
+  });
+
+  it('keeps the paper empty-state wording byte-identical when only the real side holds profiles', () => {
+    const server = startServer();
+    server.profiles = {
+      profiles: [makeProfile('live-1', { mode: 'live' }), makeProfile('live-2', { mode: 'live' })],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: { ...wallet },
+      wallets: { paper: null, live: { ...liveWallet } },
+    };
+    renderLive(server);
+
+    expect(screen.getByText('No profile for this mode')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'The platform holds 2 profile(s), none of them in paper trading. Switch the trading mode above to see the other side.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('makes the empty real-trading state actionable and honest about credentials', async () => {
+    const server = startServer();
+    // The platform holds paper profiles only: a real-trading profile is not
+    // missing because of a filter, it is missing because nothing was provisioned
+    // — and nothing can be provisioned without venue credentials.
+    renderLive(server);
+
+    fireEvent.click(screen.getByRole('radio', { name: /Real trading/i }));
+    await settle();
+
+    expect(screen.getByText('No real-trading profile configured')).toBeInTheDocument();
+
+    const description = screen.getByText(/A real-trading profile needs venue API credentials/);
+    expect(description).toHaveTextContent('TB_PROFILE_<ID>_API_KEY');
+    expect(description).toHaveTextContent('TB_PROFILE_<ID>_API_SECRET');
+    expect(description).toHaveTextContent('TB_LIVE_API_KEY');
+    expect(description).toHaveTextContent('TB_LIVE_API_SECRET');
+    expect(description).toHaveTextContent('TB_ALLOW_LIVE_TRADING=I_UNDERSTAND_THE_RISK');
+    expect(description).toHaveTextContent('quarantined as a boot failure');
+
+    // No live profile is ever invented, and the switch asked for nothing.
+    expect(screen.queryByRole('article')).not.toBeInTheDocument();
+    expect(server.calls).toEqual([]);
+  });
 });

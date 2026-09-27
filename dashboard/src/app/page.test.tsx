@@ -159,13 +159,18 @@ describe('OverviewPage', () => {
     expect(screen.queryByText('BasicStrategy')).not.toBeInTheDocument();
     expect(screen.queryByText('Strategy')).not.toBeInTheDocument();
 
-    // Numbers, signed return and counters.
-    expect(screen.getByText('$10,450.50')).toBeInTheDocument();
-    expect(screen.getByText('+4.50%')).toBeInTheDocument();
+    // Numbers, signed return and counters. The account performance hero leads
+    // the live region now and renders the ledger's own signed figures, so the
+    // numbers that belong to the profile card are asserted on the card itself.
+    const card = screen.getByRole('article', { name: 'alpha' });
+    expect(within(card).getByText('$10,450.50')).toBeInTheDocument();
+    expect(within(card).getByText('+4.50%')).toBeInTheDocument();
     // Every direction on the page carries the same explicit text label: the
     // profile return and the wallet P&L of the shared ledger both read "Up".
     expect(screen.getAllByText('Up').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText('Down')).toBeInTheDocument();
+    // The shared ledger's own direction label is asserted where it lives: the
+    // hero above it carries trend labels of its own.
+    expect(within(screen.getByTestId('wallet-details')).getByText('Down')).toBeInTheDocument();
     // The per-profile trade counter left the homepage with the annex fields: no
     // card renders the bare "12" anymore.
     expect(screen.queryByText('12')).not.toBeInTheDocument();
@@ -174,14 +179,74 @@ describe('OverviewPage', () => {
     expect(screen.getByText('Paper')).toBeInTheDocument();
     expect(screen.getByText('Running')).toBeInTheDocument();
 
-    // Platform summary and the kill-switch control.
-    expect(screen.getByText('0.1.0')).toBeInTheDocument();
-    expect(screen.getByText('01:00:00')).toBeInTheDocument();
-    expect(screen.getByText('1 / 1')).toBeInTheDocument();
+    // Platform summary and the kill-switch control. Scoped to the summary: the
+    // performance hero reports the same shape of count for the selected mode.
+    const platform = screen.getByRole('region', { name: 'Platform' });
+    expect(within(platform).getByText('0.1.0')).toBeInTheDocument();
+    expect(within(platform).getByText('01:00:00')).toBeInTheDocument();
+    expect(within(platform).getByText('1 / 1')).toBeInTheDocument();
     expect(screen.getByRole('heading', { level: 2, name: 'Kill switch' })).toBeInTheDocument();
 
     // The live region starts on the server-rendered stamp.
     expect(screen.getByText(/checked at/i)).toHaveTextContent('2024-01-01 00:00:00 UTC');
+  });
+
+  it('leads the page with the global performance of the account', async () => {
+    render(await OverviewPage());
+
+    // The account performance block is the FIRST thing the operator sees: it
+    // belongs to the live region, which is rendered above the platform summary
+    // and above the kill-switch control, so no status strip pushes "how is the
+    // account doing" below the fold.
+    const performance = screen.getByTestId('account-performance');
+    const platform = screen.getByRole('region', { name: 'Platform' });
+    const killSwitch = screen.getByRole('heading', { level: 2, name: 'Kill switch' });
+
+    expect(
+      performance.compareDocumentPosition(platform) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      performance.compareDocumentPosition(killSwitch) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // Only the visually hidden level-1 heading precedes it, so the hero is the
+    // first *visible* block of the overview.
+    const heading = screen.getByRole('heading', { level: 1, name: 'Overview' });
+    expect(
+      heading.compareDocumentPosition(performance) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('server-renders the profile cards already ranked by portfolio value', async () => {
+    // Three profiles, delivered by the API in an order that is NOT the ranking:
+    // the first paint must already be the ranked order the client renders, so
+    // hydration can never flash a different one.
+    vi.mocked(fetchProfiles).mockResolvedValue({
+      profiles: [
+        { ...profile, profile_id: 'bravo', equity: 9900 },
+        { ...profile, profile_id: 'charlie', equity: 12000 },
+        { ...profile, profile_id: 'alpha', equity: 10450.5 },
+      ],
+      generated_at: '2024-01-01T00:00:00+00:00',
+      wallet: profiles.wallet,
+      wallets: { paper: profiles.wallet ?? null, live: null },
+    });
+
+    render(await OverviewPage());
+
+    // The cards, in DOM order, are labelled by the profile they show.
+    const cards = screen.getAllByRole('article');
+    expect(cards.map((element) => element.getAttribute('aria-labelledby'))).toEqual([
+      'profile-charlie',
+      'profile-alpha',
+      'profile-bravo',
+    ]);
+
+    // The order is stated, and every card carries the position it holds.
+    expect(screen.getByText('Ordered by portfolio value, highest first')).toBeInTheDocument();
+    expect(screen.getByText('Rank 1 of 3 by portfolio value')).toBeInTheDocument();
+    expect(screen.getByText('Rank 2 of 3 by portfolio value')).toBeInTheDocument();
+    expect(screen.getByText('Rank 3 of 3 by portfolio value')).toBeInTheDocument();
   });
 
   it('server-renders the shared platform wallet of the profiles payload', async () => {
