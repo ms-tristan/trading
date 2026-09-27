@@ -110,6 +110,7 @@ EXPECTED_PUBLIC_API = [
     "Strategy",
     "StrategyParams",
     "atr",
+    "bollinger_bands",
     "ema",
     "ensure_signal_frame",
     "freqtrade_adapter",
@@ -120,6 +121,9 @@ EXPECTED_PUBLIC_API = [
     "make_runner",
     "register_strategy",
     "require_ohlcv_frame",
+    "rolling_max",
+    "rolling_min",
+    "rolling_std",
     "rsi",
     "run_backtest",
     "run_backtest_on_config",
@@ -328,7 +332,15 @@ def test_the_shim_carries_a_literal_class_statement() -> None:
     assert "from trading_platform.strategy.freqtrade_basic import BasicFreqtradeStrategy" in source
     assert sorted(path.name for path in SHIM_PATH.parent.glob("*.py")) == [
         "BasicStrategy.py",
+        "BollingerStrategy.py",
+        "DonchianStrategy.py",
+        "DualThrustStrategy.py",
+        "FaberStrategy.py",
+        "KeltnerStrategy.py",
+        "MacdStrategy.py",
         "MomentumStrategy.py",
+        "RsiReversionStrategy.py",
+        "SupertrendStrategy.py",
     ]
     # No rule is recopied in the shim: the class body is the docstring only.
     tree = ast.parse(source)
