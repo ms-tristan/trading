@@ -76,20 +76,10 @@ class _StubSupervisor:
         self.alive.add(profile_id)
         self.calls.append(("restart", profile_id))
 
-    def apply_settings(
-        self,
-        *,
-        max_running_profiles: int | None = None,
-        snapshot_interval_seconds: int | None = None,
-        worker_start_stagger_seconds: int | None = None,
-    ) -> PlatformSettings:
+    def apply_settings(self, *, snapshot_interval_seconds: int | None = None) -> PlatformSettings:
         changes: dict[str, int] = {}
-        if max_running_profiles is not None:
-            changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
-        if worker_start_stagger_seconds is not None:
-            changes["worker_start_stagger_seconds"] = int(worker_start_stagger_seconds)
         self.settings = self.settings.with_overrides(**changes)
         return self.settings
 
@@ -208,7 +198,7 @@ def test_empty_server_token_is_refused(tmp_path: Path, monkeypatch: pytest.Monke
 
     response = client.post(
         "/api/settings",
-        json={"max_running_profiles": 3},
+        json={"snapshot_interval_seconds": 30},
         headers={OPERATOR_TOKEN_HEADER: ""},
     )
 
@@ -252,7 +242,7 @@ def test_the_valid_token_is_accepted(tmp_path: Path) -> None:
         ("post", "/api/profiles/known/actions", {"action": "start"}),
         ("post", "/api/catalogue/apply", {"prune": False}),
         ("post", "/api/kill-switch", {"engaged": False}),
-        ("post", "/api/settings", {"max_running_profiles": 2}),
+        ("post", "/api/settings", {"snapshot_interval_seconds": 30}),
     ],
 )
 def test_every_mutating_route_requires_the_token(

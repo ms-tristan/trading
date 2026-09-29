@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from trading_platform.engine.client import (
+    DEFAULT_TIMEOUT_SECONDS,
     FreqtradeClient,
     FreqtradeClientError,
     normalise_daily_row,
@@ -761,6 +762,19 @@ async def test_fetch_all_propagates_a_failed_read() -> None:
     routes = {**METRICS_ROUTES, "/api/v1/profit": httpx.Response(500, json={"error": "boom"})}
     with pytest.raises(FreqtradeClientError):
         await make_client(routes).fetch_all()
+
+
+def test_client_default_timeout_is_above_the_measured_worst_case() -> None:
+    """The default timeout must outlast the slowest read measured in production.
+
+    ``GET /api/v1/balance`` answered in 19.74 s, 19.77 s and 11.94 s while 22
+    workers shared one CoinGecko rate limit. A timeout is a read failure, and
+    enough read failures make the supervisor restart a worker that was only
+    waiting, so the default stays well above 30 s.
+    """
+    assert DEFAULT_TIMEOUT_SECONDS >= 30.0
+    client = FreqtradeClient(base_url=BASE_URL, username=USERNAME, password=PASSWORD)
+    assert client._client.timeout == httpx.Timeout(DEFAULT_TIMEOUT_SECONDS)
 
 
 def test_make_client_helper_uses_a_mock_transport_only() -> None:

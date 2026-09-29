@@ -62,6 +62,30 @@ describe("LiveTradingNotice", () => {
     );
   });
 
+  it("names the two refusal causes of a blocked live profile", () => {
+    render(<LiveTradingNotice allowLiveTrading={false} profiles={[]} />);
+
+    const note = screen.getByRole("note");
+    // Cause one: the platform gate.
+    expect(note).toHaveTextContent(/allow_live_trading is unset \(false\)/);
+    // Cause two: the exchange credentials of the profile.
+    expect(note).toHaveTextContent(/exchange credentials of the profile are missing/);
+  });
+
+  it("says the blocked profile is NOT running and NOT queued", () => {
+    render(
+      <LiveTradingNotice
+        allowLiveTrading={false}
+        profiles={[liveProfile({ id: "funded", name: "Funded BTC", state: "blocked" })]}
+      />,
+    );
+
+    const note = screen.getByRole("note");
+    expect(note).toHaveTextContent(/it is NOT running/);
+    expect(note).toHaveTextContent(/is not running and it is not waiting in a queue either/);
+    expect(note).toHaveTextContent(/it stays blocked/);
+  });
+
   it("lists every refused profile", () => {
     render(
       <LiveTradingNotice
@@ -79,7 +103,6 @@ describe("LiveTradingNotice", () => {
     expect(screen.getByText(/engine exited/)).toBeInTheDocument();
     expect(screen.queryByText(/Three/)).not.toBeInTheDocument();
   });
-
   it("says when live trading is enabled but nothing is configured", () => {
     render(<LiveTradingNotice allowLiveTrading profiles={[]} />);
 
@@ -113,5 +136,15 @@ describe("LiveTradingNotice", () => {
 
     expect(screen.getByRole("note")).toHaveTextContent("Live trading status unknown");
     expect(screen.getByRole("note")).toHaveTextContent(/could not be read/);
+  });
+
+  it("never says a blocked live profile is queued except to deny it", () => {
+    render(<LiveTradingNotice allowLiveTrading={false} profiles={[]} />);
+
+    const text = screen.getByRole("note").textContent ?? "";
+    const occurrences = text.split(/queued?/i).length - 1;
+    expect(occurrences).toBeGreaterThan(0);
+    expect(text).toMatch(/not waiting in a queue/);
+    expect(text).not.toMatch(/stays queued/);
   });
 });

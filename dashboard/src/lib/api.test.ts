@@ -237,8 +237,8 @@ describe("read endpoints", () => {
   });
 
   it("getProfiles forwards the filters and omits empty ones", async () => {
-    await getProfiles({ mode: "live", state: "queued" });
-    expect(calledUrl()).toBe("/api/profiles?mode=live&state=queued");
+    await getProfiles({ mode: "live", state: "blocked" });
+    expect(calledUrl()).toBe("/api/profiles?mode=live&state=blocked");
 
     await getProfiles();
     expect(calledUrl(1)).toBe("/api/profiles");

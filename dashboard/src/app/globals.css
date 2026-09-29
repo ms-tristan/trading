@@ -6,7 +6,7 @@
    The dashboard is dark-only. Every token below is mapped into the Tailwind
    theme by the `@theme inline` block, so the utilities used by the components
    (`bg-card`, `text-muted-foreground`, `border-border`, `text-profit`,
-   `text-status-queued`, ...) resolve to these values at runtime.
+   `text-status-warning`, ...) resolve to these values at runtime.
 
    Contrast: every foreground/background pair used by the components is at
    least 4.5:1 (`--foreground` on `--background`, `--muted-foreground` on
@@ -34,7 +34,7 @@
   --chart-bear: #ef5350;
   --chart-grid: #1e293b;
   --status-running: #16a34a;
-  --status-queued: #f59e0b;
+  --status-warning: #f59e0b;
   --status-error: #dc2626;
   --status-stopped: #64748b;
   --status-blocked: #8b5cf6;
@@ -70,7 +70,7 @@
   --color-chart-bear: var(--chart-bear);
   --color-chart-grid: var(--chart-grid);
   --color-status-running: var(--status-running);
-  --color-status-queued: var(--status-queued);
+  --color-status-warning: var(--status-warning);
   --color-status-error: var(--status-error);
   --color-status-stopped: var(--status-stopped);
   --color-status-blocked: var(--status-blocked);

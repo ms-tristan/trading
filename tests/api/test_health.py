@@ -85,17 +85,11 @@ class _StubSupervisor:
     def apply_settings(
         self,
         *,
-        max_running_profiles: int | None = None,
         snapshot_interval_seconds: int | None = None,
-        worker_start_stagger_seconds: int | None = None,
     ) -> PlatformSettings:
         changes: dict[str, int] = {}
-        if max_running_profiles is not None:
-            changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
-        if worker_start_stagger_seconds is not None:
-            changes["worker_start_stagger_seconds"] = int(worker_start_stagger_seconds)
         self.settings = self.settings.with_overrides(**changes)
         return self.settings
 
@@ -201,19 +195,19 @@ def test_health_is_degraded_when_no_worker_is_alive(tmp_path: Path) -> None:
     assert health["profiles_total"] == 1
 
 
-def test_health_counts_modes_slots_and_the_kill_switch(tmp_path: Path) -> None:
+def test_health_counts_modes_and_the_kill_switch(tmp_path: Path) -> None:
     """Every documented counter is filled from the store and the settings."""
-    settings = PlatformSettings(max_running_profiles=5, snapshot_interval_seconds=30)
+    settings = PlatformSettings(snapshot_interval_seconds=30)
     client, _supervisor, _store = _make_engine(
         tmp_path,
         profiles=[
             _profile("paper-running"),
-            _profile("paper-queued"),
+            _profile("paper-idle"),
             _profile("live-running", mode="live"),
         ],
         states={
             "paper-running": "running",
-            "paper-queued": "queued",
+            "paper-idle": "stopped",
             "live-running": "running",
         },
         alive=["paper-running", "live-running"],
@@ -228,10 +222,9 @@ def test_health_counts_modes_slots_and_the_kill_switch(tmp_path: Path) -> None:
     assert health["profiles_running_paper"] == 1
     assert health["profiles_live"] == 1
     assert health["profiles_running_live"] == 1
-    assert health["profiles_queued"] == 1
+    # Kept on the wire for the dashboard, and structurally always 0.
+    assert health["profiles_queued"] == 0
     assert health["profiles_healthy"] == 2
-    assert health["engine_slots_used"] == 2
-    assert health["engine_slots_total"] == 5
     assert health["kill_switch_engaged"] is False
     assert health["version"]
     assert health["uptime_seconds"] >= 0.0
@@ -264,7 +257,6 @@ def test_health_on_an_empty_engine_is_degraded(tmp_path: Path) -> None:
     assert health["status"] == "degraded"
     assert health["profiles_running"] == 0
     assert health["profiles_total"] == 0
-    assert health["engine_slots_total"] == PlatformSettings().max_running_profiles
 
 
 def test_health_needs_no_operator_token(tmp_path: Path) -> None:
@@ -322,7 +314,7 @@ def test_the_lifespan_boots_and_stops_the_engine(
     monkeypatch.setattr(app_module, "SnapshotPoller", _Poller)
     store = StateStore(tmp_path / "state.db")
     store.bootstrap()
-    settings = PlatformSettings(max_running_profiles=3)
+    settings = PlatformSettings(snapshot_interval_seconds=30)
 
     class _LifecycleSupervisor(_StubSupervisor):
         def bootstrap(self) -> None:
@@ -344,7 +336,7 @@ def test_the_lifespan_boots_and_stops_the_engine(
     )
 
     with TestClient(app) as client:
-        assert client.get("/api/health").json()["engine_slots_total"] == 3
+        assert client.get("/api/health").json()["status"] == "ok"
 
     assert events[:2] == ["bootstrap", "start"]
     assert "poller" in events

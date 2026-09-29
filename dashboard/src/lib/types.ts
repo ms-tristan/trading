@@ -17,7 +17,7 @@
  */
 
 /** Lifecycle state of one profile, as published by the engine supervisor. */
-export type ProfileState = "running" | "queued" | "stopped" | "error" | "blocked";
+export type ProfileState = "running" | "stopped" | "error" | "blocked";
 
 /** Whether a profile trades on a simulated (paper) or a funded (live) venue. */
 export type ProfileMode = "paper" | "live";
@@ -34,8 +34,7 @@ export type ProfileAction = "start" | "stop" | "restart";
 /**
  * `GET /api/health`
  *
- * Every counter mirrors the wire name one for one: the engine-slot pair the KPI
- * rows render is `engine_slots_used`/`engine_slots_total`, and the fleet size is
+ * Every counter mirrors the wire name one for one: the fleet size is
  * `profiles_running`. `live_trading_enabled` is the one exception - the health
  * payload does not publish the live gate, `GET /api/settings` does - so the
  * mapper reports the fail-safe default (`false`) until a page merges the gate in.
@@ -44,12 +43,8 @@ export interface HealthStatus {
   status: string;
   version: string;
   uptime_seconds: number;
-  /** Profiles holding an engine slot right now. */
+  /** Profiles running right now. */
   profiles_running: number;
-  /** Engine slots the running profiles hold: the wire `engine_slots_used`. */
-  engine_slots_used: number;
-  /** Engine slots the fleet may hand out: the wire `engine_slots_total`. */
-  engine_slots_total: number;
   live_trading_enabled: boolean;
   kill_switch_engaged: boolean;
   generated_at: string;
@@ -159,8 +154,6 @@ export interface AccountPerformance {
   max_drawdown_pct: number;
   profiles_total: number;
   profiles_running: number;
-  engine_slots_used: number;
-  engine_slots_total: number;
   /** Free balance of one profile wallet (per-profile block only). */
   cash?: number;
   /** Value of the open positions of one profile (per-profile block only). */
@@ -293,10 +286,7 @@ export interface DashboardSettings {
   refresh_interval_seconds: number;
   /** Platform-wide gate: when false, no live profile can start. */
   allow_live_trading: boolean;
-  max_running_profiles?: number;
   snapshot_interval_seconds?: number;
-  /** Delay the supervisor keeps between two worker starts, in seconds. */
-  worker_start_stagger_seconds?: number;
   engine_api_port_base?: number;
   kill_switch_engaged?: boolean;
   updated_at?: string;
@@ -337,9 +327,7 @@ export interface CatalogueApplyResponse {
 export interface SettingsUpdateRequest {
   refresh_interval_seconds?: number;
   allow_live_trading?: boolean;
-  max_running_profiles?: number;
   snapshot_interval_seconds?: number;
-  worker_start_stagger_seconds?: number;
 }
 
 /** `POST /api/kill-switch` */
@@ -395,8 +383,6 @@ export const EMPTY_ACCOUNT: AccountResponse = {
     max_drawdown_pct: 0,
     profiles_total: 0,
     profiles_running: 0,
-    engine_slots_used: 0,
-    engine_slots_total: 0,
   },
   equity_curve: [],
 };

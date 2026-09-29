@@ -84,17 +84,11 @@ class _StubSupervisor:
     def apply_settings(
         self,
         *,
-        max_running_profiles: int | None = None,
         snapshot_interval_seconds: int | None = None,
-        worker_start_stagger_seconds: int | None = None,
     ) -> PlatformSettings:
         changes: dict[str, int] = {}
-        if max_running_profiles is not None:
-            changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
-        if worker_start_stagger_seconds is not None:
-            changes["worker_start_stagger_seconds"] = int(worker_start_stagger_seconds)
         self.settings = self.settings.with_overrides(**changes)
         # The real supervisor persists the whole document under SETTINGS_KEY.
         self.store.set_setting(SETTINGS_KEY, json.dumps(self.settings.model_dump()))
@@ -235,19 +229,13 @@ def test_settings_describe_the_engine(tmp_path: Path) -> None:
         tmp_path,
         profiles=[_profile("declared"), _profile("mine")],
         sources={"mine": "operator"},
-        settings=PlatformSettings(
-            max_running_profiles=7,
-            snapshot_interval_seconds=45,
-            worker_start_stagger_seconds=3,
-        ),
+        settings=PlatformSettings(snapshot_interval_seconds=45),
         kill_switch=True,
     )
 
     payload = client.get("/api/settings").json()
 
-    assert payload["max_running_profiles"] == 7
     assert payload["snapshot_interval_seconds"] == 45
-    assert payload["worker_start_stagger_seconds"] == 3
     assert payload["kill_switch_engaged"] is True
     assert payload["catalogue_profile_count"] == 1
     assert payload["operator_profile_count"] == 1
@@ -255,13 +243,15 @@ def test_settings_describe_the_engine(tmp_path: Path) -> None:
     assert payload["version"]
 
 
-def test_settings_publish_the_default_worker_start_stagger(tmp_path: Path) -> None:
+def test_settings_publish_the_documented_defaults(tmp_path: Path) -> None:
     client, _supervisor, _store = _make_engine(tmp_path)
 
     payload = client.get("/api/settings").json()
 
-    assert payload["worker_start_stagger_seconds"] == 10
-    assert payload["max_running_profiles"] == 6
+    assert payload["snapshot_interval_seconds"] == 60
+    # The removed fleet-cap settings are no longer advertised.
+    assert "max_running_profiles" not in payload
+    assert "worker_start_stagger_seconds" not in payload
 
 
 def test_settings_report_the_live_trading_acknowledgement(
@@ -278,28 +268,26 @@ def test_settings_report_the_live_trading_acknowledgement(
 
 def test_settings_update_is_persisted_and_returned(tmp_path: Path) -> None:
     client, supervisor, _store = _make_engine(
-        tmp_path, settings=PlatformSettings(max_running_profiles=2, snapshot_interval_seconds=60)
+        tmp_path, settings=PlatformSettings(snapshot_interval_seconds=60)
     )
 
     response = client.post(
         "/api/settings",
-        json={"max_running_profiles": 9, "snapshot_interval_seconds": 30},
+        json={"snapshot_interval_seconds": 30},
         headers={OPERATOR_TOKEN_HEADER: TOKEN},
     )
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["max_running_profiles"] == 9
     assert payload["snapshot_interval_seconds"] == 30
-    assert supervisor.settings.max_running_profiles == 9
+    assert supervisor.settings.snapshot_interval_seconds == 30
     # The engine acted on it, so the reading route reports the new value too.
-    assert client.get("/api/settings").json()["max_running_profiles"] == 9
-    assert client.get("/api/health").json()["engine_slots_total"] == 9
+    assert client.get("/api/settings").json()["snapshot_interval_seconds"] == 30
 
 
 def test_settings_update_accepts_a_partial_body(tmp_path: Path) -> None:
     client, supervisor, _store = _make_engine(
-        tmp_path, settings=PlatformSettings(max_running_profiles=2, snapshot_interval_seconds=60)
+        tmp_path, settings=PlatformSettings(snapshot_interval_seconds=60)
     )
 
     client.post(
@@ -309,59 +297,45 @@ def test_settings_update_accepts_a_partial_body(tmp_path: Path) -> None:
     )
 
     assert supervisor.settings.snapshot_interval_seconds == 15
-    assert supervisor.settings.max_running_profiles == 2
 
 
-def test_settings_update_persists_and_republishes_the_worker_start_stagger(
-    tmp_path: Path,
-) -> None:
+def test_settings_update_persists_and_republishes_the_snapshot_interval(tmp_path: Path) -> None:
     client, supervisor, store = _make_engine(
-        tmp_path,
-        settings=PlatformSettings(
-            max_running_profiles=4,
-            snapshot_interval_seconds=45,
-            worker_start_stagger_seconds=10,
-        ),
+        tmp_path, settings=PlatformSettings(snapshot_interval_seconds=45)
     )
 
     response = client.post(
         "/api/settings",
-        json={"worker_start_stagger_seconds": 25},
+        json={"snapshot_interval_seconds": 25},
         headers={OPERATOR_TOKEN_HEADER: TOKEN},
     )
 
     assert response.status_code == 200
-    assert response.json()["worker_start_stagger_seconds"] == 25
-    assert supervisor.settings.worker_start_stagger_seconds == 25
+    assert response.json()["snapshot_interval_seconds"] == 25
+    assert supervisor.settings.snapshot_interval_seconds == 25
     stored = json.loads(store.get_setting(SETTINGS_KEY) or "{}")
-    assert stored["worker_start_stagger_seconds"] == 25
-    # The fields the body did not mention are left alone.
-    assert stored["max_running_profiles"] == 4
-    assert stored["snapshot_interval_seconds"] == 45
+    assert stored["snapshot_interval_seconds"] == 25
     published = client.get("/api/settings").json()
-    assert published["worker_start_stagger_seconds"] == 25
-    assert published["max_running_profiles"] == 4
-    assert published["snapshot_interval_seconds"] == 45
+    assert published["snapshot_interval_seconds"] == 25
 
 
-def test_settings_update_accepts_a_zero_worker_start_stagger(tmp_path: Path) -> None:
+def test_settings_update_ignores_the_removed_fleet_cap_fields(tmp_path: Path) -> None:
+    """The body no longer carries them, and sending one changes nothing."""
     client, supervisor, store = _make_engine(tmp_path)
-    assert client.get("/api/settings").json()["worker_start_stagger_seconds"] == 10
+    assert client.get("/api/settings").json()["snapshot_interval_seconds"] == 60
 
     response = client.post(
         "/api/settings",
-        json={"worker_start_stagger_seconds": 0},
+        json={"max_running_profiles": 9, "snapshot_interval_seconds": 30},
         headers={OPERATOR_TOKEN_HEADER: TOKEN},
     )
 
     assert response.status_code == 200
-    assert response.json()["worker_start_stagger_seconds"] == 0
-    assert supervisor.settings.worker_start_stagger_seconds == 0
+    assert response.json()["snapshot_interval_seconds"] == 30
+    assert supervisor.settings.snapshot_interval_seconds == 30
     stored = json.loads(store.get_setting(SETTINGS_KEY) or "{}")
-    assert stored["worker_start_stagger_seconds"] == 0
-    assert stored["max_running_profiles"] == 6
-    assert stored["snapshot_interval_seconds"] == 60
-    assert client.get("/api/settings").json()["worker_start_stagger_seconds"] == 0
+    assert stored["snapshot_interval_seconds"] == 30
+    assert "max_running_profiles" not in response.json()
 
 
 def test_settings_update_refuses_a_bad_type(tmp_path: Path) -> None:
@@ -369,7 +343,7 @@ def test_settings_update_refuses_a_bad_type(tmp_path: Path) -> None:
 
     response = client.post(
         "/api/settings",
-        json={"max_running_profiles": "many"},
+        json={"snapshot_interval_seconds": "many"},
         headers={OPERATOR_TOKEN_HEADER: TOKEN},
     )
 

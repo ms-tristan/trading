@@ -127,7 +127,7 @@ export function KillSwitchControl({ engaged, token, className }: KillSwitchContr
           <p id={descriptionId} className="text-sm">
             {target
               ? "Every running profile is stopped now, and nothing starts until you release it."
-              : "Workers may start again as soon as an engine slot is free."}
+              : "Workers may start again on the next sweep."}
           </p>
           <div className="mt-2 flex flex-wrap gap-2">
             <button

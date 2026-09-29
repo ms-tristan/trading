@@ -44,23 +44,20 @@ On boot, `python -m trading_platform realtime run` performs this sequence:
    `config/profiles.json`; the settings are **not** seeded key by key, they are
    resolved at every boot by the precedence of §3.3;
 4. **compute the schedule** — every enabled profile, sorted by `priority`
-   descending then `id` ascending; the first `max_running_profiles` (documented
-   default **6**, raised to **10** by the deployed compose file) get a worker,
-   the rest are marked `queued` with a `state_reason` naming the cap;
+   descending then `id` ascending, gets a worker in the same pass; nothing caps
+   the fleet and nothing queues a profile;
 5. **generate one freqtrade configuration per scheduled profile** under
    `<state_dir>/profiles/<id>/config.json`, mode `0600` (§5);
-6. **spawn one `freqtrade trade` subprocess per scheduled profile** — at most one
-   new worker per `worker_start_stagger_seconds` (default **10**, §2) — and record
+6. **spawn one `freqtrade trade` subprocess per scheduled profile** and record
    its `pid`, its private API port and its start time in the `profiles` table;
 7. **poll** every running profile on the snapshot interval and write snapshots
    and events (§4, §6);
 8. **serve** the aggregated JSON API on `--host`/`--port`.
 
 Scheduling continues while the platform runs: when a worker dies and its profile
-is restarted the restart keeps its slot; when the operator stops a profile (or a
-profile reaches the terminal state `error`) its slot is released and the next
-`queued` profile — same order, still subject to the stagger gate of §2 — is
-promoted automatically.
+is restarted, or when the operator stops a profile or a profile reaches the
+terminal state `error`, the next pass reconciles the fleet again. A profile that
+is not running is restarted only when it is proven gone (§2).
 
 On `SIGTERM`/`SIGINT` the supervisor terminates every child gracefully (SIGTERM,
 then SIGKILL after 15 s) before exiting, so a container stop never leaves an
@@ -71,12 +68,12 @@ orphan freqtrade process behind.
 * **One aggregated surface.** N freqtrade REST APIs on N ports would have to be
   polled, merged and ranked by the dashboard. The supervisor does that once, in
   Python, and publishes one document.
-* **One source of truth.** The catalogue, the fleet cap, the ranking and the
+* **One source of truth.** The catalogue, the ranking, the health policy and the
   kill switch are decisions that only make sense globally; a per-profile process
   cannot enforce them.
 * **Bounded memory.** A worker is expensive (§11 of the README): only the
-  supervisor knows how many are running, so it is the only place where the cap
-  can be enforced.
+  supervisor knows how many are running, so it is the only place where the fleet
+  can be observed as a whole.
 
 ---
 
@@ -128,39 +125,44 @@ operator actually put in the profile.
 | State | Meaning |
 | --- | --- |
 | `running` | a worker process is alive and its last REST read succeeded |
-| `queued` | enabled and eligible, but beyond the fleet cap or waiting for the stagger gate: it is **waiting for a slot**, not failing; `state_reason` names which |
-| `stopped` | not running on purpose (operator action, disabled profile, kill switch) |
+| `stopped` | not running on purpose (operator action, disabled profile, kill switch) or waiting for its restart backoff |
 | `blocked` | refused by a safety gate; `state_reason` names the missing precondition (live trading) |
 | `error` | the supervisor stopped restarting it; `last_error` carries the reason |
 
-### Gradual start: `worker_start_stagger_seconds`
+Those are the only states. There is no fleet cap, no slot accounting and no
+stagger gate, so no profile is ever held back waiting for a slot: every enabled
+profile is started by the same scheduling pass.
 
-A cold start of the whole fleet is the one moment where memory and CPU peak
-together. `worker_start_stagger_seconds` (integer, default **10**, minimum `0`,
-in `config/platform.json` and in `PlatformSettings`, overridable through
-`TB_WORKER_START_STAGGER_SECONDS`) bounds how fast the supervisor fills its slots:
+### Health: when a worker is restarted
 
-* the supervisor starts **at most one new worker per stagger interval**; after a
-  worker starts, the gate closes for that interval;
-* every other profile that is **eligible to run but has to wait** stays in the
-  state `queued` with a `state_reason` of exactly the form
-  `queued: starting workers gradually (N of M slots in use)`, where N is the
-  number of workers alive and M is `max_running_profiles`;
-* a stagger of `0` restores the immediate behaviour: every eligible profile is
-  started on the same pass;
-* staggering only **delays promotions, it never reorders them** — the scheduling
-  order stays `priority` descending, then `id` ascending;
-* a `queued` profile is therefore **waiting for a slot**: it is not an error and
-  it asks for no operator decision, the supervisor promotes it on its own as soon
-  as the gate reopens or a slot frees.
+The supervisor reads every running worker's REST API once per
+`snapshot_interval_seconds` and counts the failures in that same cadence. Four
+constants of `engine/supervisor.py` and `engine/client.py` define the rule:
 
-The setting exists because one running worker costs about **390 MiB RSS**, the
-Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily, and a
-simultaneous cold start of many workers spiked memory and CPU together and made
-the guest unresponsive (reproduced twice). `deploy/docker-compose.yml` therefore
-sets `TB_MAX_RUNNING_PROFILES=10` — one profile per strategy, i.e. the ten
-priority-100 primaries of the catalogue — and
-`TB_WORKER_START_STAGGER_SECONDS=10`.
+* `DEFAULT_TIMEOUT_SECONDS` (`45.0` s, `engine/client.py`) — the per-request read
+  timeout. It sits above the worst `GET /balance` measured on the live
+  deployment (**19.74 s**, **19.77 s**, **11.94 s** while 22 workers shared one
+  CoinGecko rate limit), so a merely slow worker answers instead of timing out;
+* `WORKER_STARTUP_GRACE_SECONDS` (`90.0` s) — a freshly spawned worker is not
+  judged at all: a failed read inside this window is not counted;
+* `UNHEALTHY_THRESHOLD` (`10`) — consecutive failed reads that **start** the
+  death check. Reaching it no longer restarts anything by itself;
+* `UNHEALTHY_PING_THRESHOLD` (`10`) — consecutive failed `GET /ping` that
+  **prove** the worker is gone.
+
+A worker is restarted only when it is proven gone: either its process handle no
+longer exists, or its own liveness endpoint `GET /ping` has failed
+`UNHEALTHY_PING_THRESHOLD` consecutive times. A worker answering
+`{"status": "pong"}` is alive and is never restarted, however many `/balance`
+reads failed. The restart backoff is `(5, 15, 45)` s and the budget is still 5
+restarts within 15 minutes, after which the profile goes to `error`.
+
+The generated freqtrade configuration sets `fiat_display_currency` to the empty
+string, which makes freqtrade skip the CoinGecko call entirely: `RPC.__init__`
+only builds the converter `if self._config.get("fiat_display_currency")`. The
+worker therefore never waits on CoinGecko, and the `fiat_*` values of
+`GET /balance`, `GET /profit` and `GET /daily` are simply `0` while their field
+set is unchanged.
 
 ---
 
@@ -194,7 +196,7 @@ still lets the readers of another connection work while the poller writes.
 | `priority` | INTEGER | scheduling rank: higher runs first when the fleet is full |
 | `enabled` | INTEGER | `1`/`0`; a disabled profile is never scheduled |
 | `source` | TEXT | `catalogue` (from `config/profiles.json`) or `operator` (API-created) |
-| `state` | TEXT | `running`, `queued`, `stopped`, `blocked`, `error` |
+| `state` | TEXT | `running`, `stopped`, `blocked`, `error` |
 | `state_reason` | TEXT | why the profile is in that state (cap, kill switch, live gate) |
 | `api_port` | INTEGER | private freqtrade REST port of this profile's worker |
 | `api_username` | TEXT | generated REST user of that worker |
@@ -251,19 +253,11 @@ strongest:
 3. the **persisted `platform_settings` row**, when there is one;
 4. the **`TB_*` environment variables** — they always win, because the environment
    is the only input an operator changes without writing to the state volume
-   (`TB_MAX_RUNNING_PROFILES`, `TB_SNAPSHOT_INTERVAL_SECONDS`,
-   `TB_WORKER_START_STAGGER_SECONDS`, `TB_PROFILE_API_PORT_BASE`, …). That is the
-   documented way to change the fleet cap in Docker.
+   (`TB_SNAPSHOT_INTERVAL_SECONDS`, `TB_PROFILE_API_PORT_BASE`). Only those two
+   settings have an environment override; the rest of `config/platform.json` is
+   read from the document.
 
-For the fleet cap the first two inputs therefore disagree by design: the shipped
-`config/platform.json` carries the conservative default **6**, while the deployed
-`deploy/docker-compose.yml` sets `TB_MAX_RUNNING_PROFILES=10` (one profile per
-strategy) — and, being the environment, that 10 is what the running stack
-resolves. Edit `config/platform.json` only for a machine that starts the stack
-without that environment override.
-
-`POST /api/settings` accepts `max_running_profiles`, `snapshot_interval_seconds`
-and `worker_start_stagger_seconds` (§2).
+`POST /api/settings` accepts `snapshot_interval_seconds` only.
 
 ### 3.4 `events` — the engine journal
 
@@ -273,7 +267,7 @@ and `worker_start_stagger_seconds` (§2).
 | `ts` | TEXT | ISO-8601 UTC timestamp |
 | `profile_id` | TEXT | the profile concerned, `NULL` for a platform-wide event |
 | `level` | TEXT | `info`, `warning` or `error` |
-| `kind` | TEXT | event kind: `start`, `stop`, `crash`, `restart`, `cap_reached`, `kill_switch`, `legacy_db_archived`, … |
+| `kind` | TEXT | event kind: `start`, `stop`, `crash`, `restart`, `error`, `kill_switch`, `legacy_db_archived`, … |
 | `message` | TEXT | human-readable, English, credential-free description |
 
 Index: **`idx_events_ts`** on `events(ts DESC)` — the read model behind
@@ -339,16 +333,15 @@ The poller (`src/trading_platform/engine/poller.py`) runs every
    row instead of appending a duplicate, and a restart never creates a second row
    for a minute that already has one;
 2. for a **non-running** profile, write a snapshot only when its state or its
-   value actually changed — so `queued`, `blocked`, `stopped` and `error`
-   profiles appear in the history when something happened to them and stay
-   silent otherwise;
+   value actually changed — so `blocked`, `stopped` and `error` profiles appear
+   in the history when something happened to them and stay silent otherwise;
 3. **never invent a snapshot for a stopped profile.** No row is written for the
    minutes in which a profile was not running, and no value is carried forward.
    The equity curves of the dashboard therefore show gaps for the periods a
    profile was down, which is the honest reading — a flat line would claim the
    capital was still being managed;
 4. record the engine events of the interval (`start`, `stop`, `crash`,
-   `restart`, `cap_reached`, `kill_switch`, `legacy_db_archived`) in `events`.
+   `restart`, `error`, `kill_switch`, `legacy_db_archived`) in `events`.
 
 The aggregated equity curve of `GET /api/account` is built from
 `profile_snapshots` over the requested window (`24h`, `7d`, `30d`, `all`) — the
@@ -405,8 +398,7 @@ where `profile_api_port_base` defaults to **8101**
 **catalogue list sorted by `id` ascending** — not in the scheduling order, not in
 creation order. The rule is therefore stable across restarts, across deploy
 rounds and across machines, and it never depends on which profiles happen to be
-running: a profile that is queued today and promoted tomorrow keeps the port it
-already had.
+running: a profile always keeps the port it already had.
 
 All of those ports are bound by the generated configuration to
 **`127.0.0.1` inside the container** (`api_server.listen_ip_address`) and are
@@ -421,20 +413,28 @@ never published by compose. Only two ports cross the container boundary:
 
 ## 7. Health and restart policy
 
-A worker is considered **healthy** while its REST reads succeed. The supervisor
-keeps a per-profile failure counter:
+A worker is considered **healthy** while its REST reads stay inside the failure
+threshold. The supervisor keeps a per-profile failure counter and a per-profile
+ping counter, and reaching the read threshold only *starts* the death check:
 
 | Condition | Reaction |
 | --- | --- |
-| 3 consecutive failed reads | the profile is **unhealthy** (snapshot `healthy = 0`, state stays `running` until the restart decision) |
-| unhealthy, restart budget available | the worker is terminated and **restarted with exponential backoff: 5 s, 15 s, then 45 s** between attempts |
-| **5 restarts within 15 minutes** | the supervisor gives up on the profile: state **`error`**, `last_error` carries the last failure, and the slot is released for the next `queued` profile |
-| success after a restart | the counter and the backoff reset; the event journal records `restart` |
+| a failed read inside `WORKER_STARTUP_GRACE_SECONDS` (90 s) | not counted at all: a freshly spawned worker is not judged on reads it could not answer yet |
+| **10** (`UNHEALTHY_THRESHOLD`) consecutive failed reads | the profile is **unhealthy** (snapshot `healthy = 0`, state stays `running`) and the death check begins |
+| unhealthy, `GET /ping` answers | the worker is alive: **no restart**, however many reads failed |
+| unhealthy, process handle gone | the worker is proven gone: it is terminated and **restarted with backoff 5 s, 15 s, then 45 s** |
+| unhealthy, **10** (`UNHEALTHY_PING_THRESHOLD`) consecutive failed pings | the worker is proven gone and is restarted the same way |
+| **5 restarts within 15 minutes** | the supervisor gives up on the profile: state **`error`**, `last_error` carries the last failure |
+| success after a restart | the counters and the backoff reset; the event journal records `restart` |
 
-The policy is intentionally impatient at the read level (three failures is a few
-seconds on any timeframe) and patient at the process level (45 s of backoff
-before giving up on a flapping worker), because the usual causes are an exchange
-outage or a rate limit, and both pass.
+The policy is deliberately patient, because the usual cause is an exchange or a
+price-API rate limit and a restart does not fix it: the fleet ran 22 workers
+behind one CoinGecko IP restriction, `GET /balance` answered in 12 to 20 s
+against a 10 s client timeout, and three consecutive timeouts restarted a
+healthy worker forever. The read timeout is now **45 s**
+(`DEFAULT_TIMEOUT_SECONDS`), the generated configuration sets
+`fiat_display_currency` to the empty string so freqtrade never calls CoinGecko
+at all, and a worker is restarted only when it is proven gone.
 
 Supervisor shutdown is the other half of the policy: on `SIGTERM`/`SIGINT` every
 child receives `SIGTERM`, and a child still alive after **15 s** receives
@@ -486,7 +486,7 @@ header is `401`, a **wrong** one is `403`.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/health` | `status` (`ok` when at least one profile runs, `degraded` otherwise), version, uptime, profile counters, slot usage, kill-switch flag |
+| `GET /api/health` | `status` (`ok` when at least one profile runs, `degraded` otherwise), version, uptime, profile counters, kill-switch flag |
 | `GET /api/account?window=` | aggregated paper / live / combined performance and the equity curve |
 | `GET /api/profiles` | the ranked profile list (default sort: portfolio value descending; `rank` is assigned across both modes before filtering) |
 | `GET /api/profiles/{id}` | one profile with its equity curve, daily profit, open and recent trades and strategy |
@@ -497,16 +497,16 @@ header is `401`, a **wrong** one is `403`.
 | `POST /api/profiles/{id}/actions` | `start`, `stop`, `restart` |
 | `POST /api/catalogue/apply` | idempotent upsert of `config/profiles.json` |
 | `POST /api/kill-switch` | engage or release the global kill switch |
-| `POST /api/settings` | change the fleet cap, the snapshot interval and the worker start stagger at run time |
+| `POST /api/settings` | change the snapshot interval at run time |
 
 `GET /api/health` is the surface the container healthcheck and the deploy smoke
 test use: it answers as soon as the API serves, and `profiles_running > 0` as
-soon as one worker is alive and healthy.
+soon as one worker is alive and healthy. It still carries `profiles_queued`,
+pinned to the constant `0`, for wire compatibility with an older dashboard.
 
-`POST /api/settings` accepts `max_running_profiles`, `snapshot_interval_seconds`
-and `worker_start_stagger_seconds`; what an operator writes there is what
-`GET /api/settings` renders as effective, and it is what the engine acts on
-(§3.3).
+`POST /api/settings` accepts `snapshot_interval_seconds` only; what an operator
+writes there is what `GET /api/settings` renders as effective, and it is what the
+engine acts on (§3.3).
 
 ### The profile view: `sparkline`, `slot`, `worker_port`
 

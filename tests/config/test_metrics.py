@@ -272,10 +272,10 @@ def test_filter_views_by_mode_and_state() -> None:
         view("a", mode="paper", state=models.STATE_RUNNING),
         view("b", mode="live", state=models.STATE_RUNNING),
         view("c", mode="live", state=models.STATE_ERROR),
-        view("d", mode="paper", state=models.STATE_QUEUED),
+        view("d", mode="paper", state=models.STATE_BLOCKED),
     ]
     assert [item.id for item in metrics.filter_views(views, mode="live")] == ["b", "c"]
-    assert [item.id for item in metrics.filter_views(views, state="queued")] == ["d"]
+    assert [item.id for item in metrics.filter_views(views, state="blocked")] == ["d"]
     assert [item.id for item in metrics.filter_views(views, mode="live", state="running")] == ["b"]
     assert [item.id for item in metrics.filter_views(views)] == ["a", "b", "c", "d"]
     assert metrics.filter_views(views, mode="live", state="stopped") == []
@@ -566,7 +566,7 @@ def test_aggregate_account_sharpe_needs_a_curve() -> None:
 def test_aggregate_account_counts_running_profiles_by_state() -> None:
     views = [
         view("a", state=models.STATE_RUNNING),
-        view("b", state=models.STATE_QUEUED),
+        view("b", state=models.STATE_BLOCKED),
         view("c", state=models.STATE_ERROR),
     ]
     account = metrics.aggregate_account(views, {}, scope="combined", now=NOW)
@@ -628,7 +628,6 @@ def test_build_health_is_ok_as_soon_as_one_profile_runs() -> None:
         uptime_seconds=90.5,
         views=views,
         profiles_healthy=1,
-        slots_total=12,
         kill_switch_engaged=False,
         now=NOW,
     )
@@ -638,34 +637,32 @@ def test_build_health_is_ok_as_soon_as_one_profile_runs() -> None:
     assert health.profiles_total == 2
     assert health.profiles_running == 1
     assert health.profiles_healthy == 1
-    assert health.engine_slots_used == 1
-    assert health.engine_slots_total == 12
+    # Kept on the wire for the dashboard, and structurally always 0.
+    assert health.profiles_queued == 0
     assert health.kill_switch_engaged is False
     assert health.generated_at == "2026-09-27T18:00:00Z"
 
 
 def test_build_health_is_degraded_without_a_running_profile() -> None:
-    views = [view("a", state=models.STATE_ERROR), view("b", state=models.STATE_QUEUED)]
+    views = [view("a", state=models.STATE_ERROR), view("b", state=models.STATE_BLOCKED)]
     health = metrics.build_health(
         version="1.0.0",
         uptime_seconds=0.0,
         views=views,
         profiles_healthy=0,
-        slots_total=12,
         kill_switch_engaged=True,
         now=NOW,
     )
     assert health.status == "degraded"
     assert health.profiles_running == 0
-    assert health.engine_slots_used == 0
-    assert health.profiles_queued == 1
+    assert health.profiles_queued == 0
     assert health.kill_switch_engaged is True
 
 
 def test_build_health_splits_paper_and_live() -> None:
     views = [
         view("a", mode="paper", state=models.STATE_RUNNING),
-        view("b", mode="paper", state=models.STATE_QUEUED),
+        view("b", mode="paper", state=models.STATE_BLOCKED),
         view("c", mode="live", state=models.STATE_RUNNING),
         view("d", mode="live", state=models.STATE_ERROR),
     ]
@@ -674,7 +671,6 @@ def test_build_health_splits_paper_and_live() -> None:
         uptime_seconds=-1.0,
         views=views,
         profiles_healthy=-3,
-        slots_total=-1,
         kill_switch_engaged=False,
         now=NOW,
     )
@@ -682,7 +678,6 @@ def test_build_health_splits_paper_and_live() -> None:
     assert health.profiles_running_paper == 1
     assert health.profiles_live == 2
     assert health.profiles_running_live == 1
-    assert health.profiles_queued == 1
+    assert health.profiles_queued == 0
     assert health.uptime_seconds == 0.0
     assert health.profiles_healthy == 0
-    assert health.engine_slots_total == 0

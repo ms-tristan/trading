@@ -41,40 +41,6 @@ services:
       - .env
     environment:
       TB_LOG_LEVEL: INFO
-      # Fleet cap and stagger: how many Freqtrade workers may run at the same
-      # time, and how fast the fleet is allowed to grow to that cap.
-      #
-      # How much a slot costs: one running `freqtrade trade` worker uses about
-      # 390 MiB RSS. Measured: 8 workers at 3.13 GiB, linear.
-      #
-      # How much room there is: the Docker VM of this host is limited to 12 GiB
-      # while the host itself has 16 GiB of RAM and already swaps (about 5.9 GiB
-      # of swap in use, and guest page cache counts as host RAM).
-      #
-      # What was measured today at a cap of 6: the `trading-realtime` container
-      # held about 2.4 GiB and the whole VM about 5 GB, with host swap
-      # UNCHANGED. Six slots therefore leave real head-room -- and so do ten.
-      #
-      # Why the cap is now 10: so that every one of the ten strategies runs at
-      # least one profile concurrently. The catalogue gives each strategy's
-      # primary profile priority 100 and its secondary profile 50, so a cap of
-      # 10 promotes exactly the ten priority-100 profiles (priority descending,
-      # then id ascending) and still leaves head-room.
-      #
-      # Why the boot is staggered: what actually wedged the host was a
-      # SIMULTANEOUS cold start of many workers -- reproduced twice, memory and
-      # CPU spiked together and the guest became unresponsive. The fleet
-      # therefore grows at most one new worker per
-      # TB_WORKER_START_STAGGER_SECONDS interval; a profile that is eligible but
-      # not admitted yet stays queued with the gradual-start reason.
-      #
-      # The conservative default stays 6 and is NOT changed: it lives in
-      # config/platform.json ("max_running_profiles": 6) for anyone running this
-      # on a smaller machine, and only this compose environment raises it.
-      # Raise the cap here -- and only after checking free memory -- to run more
-      # profiles concurrently.
-      TB_MAX_RUNNING_PROFILES: "10"
-      TB_WORKER_START_STAGGER_SECONDS: "10"
       TB_SNAPSHOT_INTERVAL_SECONDS: "60"
 
     ports:

@@ -27,8 +27,6 @@ function performance(overrides: Partial<AccountPerformance> = {}): AccountPerfor
     max_drawdown_pct: 0.08,
     profiles_total: 12,
     profiles_running: 8,
-    engine_slots_used: 8,
-    engine_slots_total: 10,
     ...overrides,
   };
 }
@@ -50,7 +48,7 @@ describe("AccountBand", () => {
     expect(screen.getByText(/initial capital 25,000\.00 USDT over 24h/)).toBeInTheDocument();
   });
 
-  it("renders the nine platform KPIs", () => {
+  it("renders the platform KPIs, with no engine-slot capacity", () => {
     render(<AccountBand performance={performance()} equity={EQUITY} window="24h" />);
 
     expect(screen.getByText("Realised P&L")).toBeInTheDocument();
@@ -69,8 +67,7 @@ describe("AccountBand", () => {
     expect(screen.getByText("8.00%")).toBeInTheDocument();
     expect(screen.getByText("Profiles running")).toBeInTheDocument();
     expect(screen.getByText("8 of 12")).toBeInTheDocument();
-    expect(screen.getByText("Engine slots")).toBeInTheDocument();
-    expect(screen.getByText("8 of 10")).toBeInTheDocument();
+    expect(screen.queryByText("Engine slots")).not.toBeInTheDocument();
   });
 
   it("marks the selected aggregation window with aria-current", () => {

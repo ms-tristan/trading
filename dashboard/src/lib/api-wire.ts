@@ -27,8 +27,6 @@
  * | Wire | View model |
  * | --- | --- |
  * | `health.profiles_running` | `HealthStatus.profiles_running` |
- * | `health.engine_slots_used` | `HealthStatus.engine_slots_used` |
- * | `health.engine_slots_total` | `HealthStatus.engine_slots_total` |
  * | `profile.profit_abs` | `ProfileView.profit_usdt` |
  * | `profile.last_updated` | `ProfileView.updated_at` |
  * | `profile.slot` / `.worker_port` | `ProfileView.engine_slot` / `.api_port` |
@@ -83,9 +81,11 @@ export interface ApiHealth {
   profiles_healthy?: unknown;
   profiles_paper?: unknown;
   profiles_live?: unknown;
+  /**
+   * Retained for compatibility with an engine that still publishes it, and
+   * always `0` on the current engine.
+   */
   profiles_queued?: unknown;
-  engine_slots_used?: unknown;
-  engine_slots_total?: unknown;
   kill_switch_engaged?: unknown;
   generated_at?: unknown;
 }
@@ -228,9 +228,7 @@ export interface ApiEvents {
 
 /** `GET /api/settings` */
 export interface ApiSettings {
-  max_running_profiles?: unknown;
   snapshot_interval_seconds?: unknown;
-  worker_start_stagger_seconds?: unknown;
   kill_switch_engaged?: unknown;
   allow_live_trading?: unknown;
   catalogue_profile_count?: unknown;
@@ -315,13 +313,19 @@ export function asMode(value: unknown): ProfileMode {
   return value === "live" ? "live" : "paper";
 }
 
-/** Narrow a wire state onto the five documented lifecycle states. */
+/**
+ * Narrow a wire state onto the four documented lifecycle states.
+ *
+ * The literal `"queued"` is tolerated on purpose: an older engine still
+ * publishes profiles that wait for a worker slot, and a dashboard must degrade
+ * such a row to a readable state instead of crashing the page. Nothing waits for
+ * a slot any more, so the row is reported as `stopped`.
+ */
 export function asState(value: unknown): ProfileState {
-  return value === "running" ||
-    value === "queued" ||
-    value === "stopped" ||
-    value === "error" ||
-    value === "blocked"
+  if (value === "queued") {
+    return "stopped";
+  }
+  return value === "running" || value === "stopped" || value === "error" || value === "blocked"
     ? value
     : "stopped";
 }
@@ -450,10 +454,8 @@ export function toEquityCurve(raw: unknown, initialCapital: number): EquityPoint
 /**
  * The dashboard performance block of one account scope.
  *
- * `engine_slots_used`/`engine_slots_total` are not published by `/api/account`:
- * the caller that also reads `/api/health` overrides them with the real slot
- * pair (see `AccountBand`). Until then the running count stands in for both, so
- * the KPI is never negative and never invents a capacity.
+ * `/api/account` publishes the profile counters and nothing else about the
+ * fleet: every field of this block is mapped one for one.
  */
 export function toAccountPerformance(raw: unknown, window: ApiWindow): AccountPerformance {
   const scope = asRecord(raw);
@@ -473,8 +475,6 @@ export function toAccountPerformance(raw: unknown, window: ApiWindow): AccountPe
     max_drawdown_pct: asNumber(scope.max_drawdown_pct),
     profiles_total: asNumber(scope.profiles_total),
     profiles_running: profilesRunning,
-    engine_slots_used: profilesRunning,
-    engine_slots_total: profilesRunning,
   };
 }
 
@@ -500,16 +500,12 @@ export function toAccountResponse(raw: unknown, window: ApiWindow): AccountRespo
  */
 export function toDashboardSettings(raw: unknown): DashboardSettings {
   const body = asRecord(raw);
-  const maxRunning = body.max_running_profiles;
   const snapshotInterval = body.snapshot_interval_seconds;
-  const stagger = body.worker_start_stagger_seconds;
   const portBase = body.engine_api_port_base;
   return {
     refresh_interval_seconds: DEFAULT_REFRESH_INTERVAL_SECONDS,
     allow_live_trading: asBoolean(body.allow_live_trading),
-    max_running_profiles: typeof maxRunning === "number" ? maxRunning : undefined,
     snapshot_interval_seconds: typeof snapshotInterval === "number" ? snapshotInterval : undefined,
-    worker_start_stagger_seconds: typeof stagger === "number" ? stagger : undefined,
     engine_api_port_base: typeof portBase === "number" ? portBase : undefined,
     kill_switch_engaged: asBoolean(body.kill_switch_engaged),
     updated_at: asOptionalString(body.updated_at) ?? undefined,
@@ -662,8 +658,6 @@ export function toProfilePerformance(profile: ProfileView): AccountPerformance {
     max_drawdown_pct: profile.max_drawdown_pct,
     profiles_total: 1,
     profiles_running: running,
-    engine_slots_used: running,
-    engine_slots_total: running,
     cash: profile.cash,
     positions_value: profile.positions_value,
   };
@@ -740,9 +734,8 @@ export function toKillSwitchResponse(raw: unknown): KillSwitchResponse {
 /**
  * `GET /api/health`.
  *
- * Every counter is read from the wire name it mirrors (`profiles_running`,
- * `engine_slots_used`, `engine_slots_total`); a missing one degrades to `0`, so no
- * page can render `NaN` from this mapper.
+ * Every counter is read from the wire name it mirrors (`profiles_running`); a
+ * missing one degrades to `0`, so no page can render `NaN` from this mapper.
  *
  * `live_trading_enabled` is not part of the health payload: the live gate is
  * published by `GET /api/settings`, and the operations page merges the two. The
@@ -756,8 +749,6 @@ export function toHealthStatus(raw: unknown): HealthStatus {
     version: asString(body.version),
     uptime_seconds: asNumber(body.uptime_seconds),
     profiles_running: asNumber(body.profiles_running),
-    engine_slots_used: asNumber(body.engine_slots_used),
-    engine_slots_total: asNumber(body.engine_slots_total),
     live_trading_enabled: false,
     kill_switch_engaged: asBoolean(body.kill_switch_engaged),
     generated_at: asString(body.generated_at),

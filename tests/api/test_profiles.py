@@ -83,20 +83,10 @@ class _StubSupervisor:
         self.alive.add(profile_id)
         self.calls.append(("restart", profile_id))
 
-    def apply_settings(
-        self,
-        *,
-        max_running_profiles: int | None = None,
-        snapshot_interval_seconds: int | None = None,
-        worker_start_stagger_seconds: int | None = None,
-    ) -> PlatformSettings:
+    def apply_settings(self, *, snapshot_interval_seconds: int | None = None) -> PlatformSettings:
         changes: dict[str, int] = {}
-        if max_running_profiles is not None:
-            changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
-        if worker_start_stagger_seconds is not None:
-            changes["worker_start_stagger_seconds"] = int(worker_start_stagger_seconds)
         self.settings = self.settings.with_overrides(**changes)
         return self.settings
 

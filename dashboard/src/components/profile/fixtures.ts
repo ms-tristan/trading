@@ -5,9 +5,9 @@
  * produce the mapped view model the components render. The `api*` builders below
  * produce **the JSON the monitoring API really serves**, wire field names
  * included (`profit_abs`, `sparkline: [{t, value}]`, `slot`, `worker_port`,
- * `daily.abs_profit`, `daily.trade_count`, `engine_slots_used`): the page tests
- * mock `fetch` with them, so a page is pinned against the payload the Python API
- * answers and not against the model it is mapped onto.
+ * `daily.abs_profit`, `daily.trade_count`): the page tests mock `fetch` with
+ * them, so a page is pinned against the payload the Python API answers and not
+ * against the model it is mapped onto.
  *
  * Colocated tests import them so that a page or a component can be pinned without
  * a network call, and no test has to spell out a full payload again.
@@ -74,8 +74,6 @@ export function performance(
     max_drawdown_pct: 0.03,
     profiles_total: 3,
     profiles_running: 2,
-    engine_slots_used: 2,
-    engine_slots_total: 4,
     ...overrides,
   };
 }
@@ -164,8 +162,7 @@ export function tradeRow(overrides: Record<string, unknown> = {}): Record<string
 /**
  * One engine health answer, as the view model of `GET /api/health`.
  *
- * The counters mirror the wire names: a caller that wants a different slot pair
- * overrides `engine_slots_used`/`engine_slots_total`, exactly like the payload.
+ * The counters mirror the wire names.
  */
 export function health(
   overrides: Partial<HealthStatus> & Record<string, unknown> = {},
@@ -175,8 +172,6 @@ export function health(
     version: "2026.8",
     uptime_seconds: 3670,
     profiles_running: 2,
-    engine_slots_used: 2,
-    engine_slots_total: 4,
     live_trading_enabled: false,
     kill_switch_engaged: false,
     generated_at: "2026-09-27T12:00:00Z",
@@ -347,8 +342,6 @@ export function apiHealth(overrides: ApiHealthOverrides = {}): Record<string, un
     profiles_live: overrides.profiles_live ?? 0,
     profiles_running_live: overrides.profiles_running_live ?? 0,
     profiles_queued: overrides.profiles_queued ?? 0,
-    engine_slots_used: overrides.engine_slots_used ?? profilesRunning,
-    engine_slots_total: overrides.engine_slots_total ?? 4,
     kill_switch_engaged: overrides.kill_switch_engaged ?? false,
     generated_at: overrides.generated_at ?? "2026-09-27T12:00:00Z",
   };
@@ -357,9 +350,9 @@ export function apiHealth(overrides: ApiHealthOverrides = {}): Record<string, un
 /**
  * Overrides of {@link apiHealth}.
  *
- * They are the real keys of `GET /api/health`: a test that renames one back to
- * the view model (`running_profiles`, `max_running_profiles`) does not compile,
- * which is what keeps the doubles of the page tests on the wire.
+ * They are the real keys of `GET /api/health`. `profiles_queued` is retained for
+ * compatibility with an engine that still publishes it: it is always `0` on the
+ * current engine, and a test uses it to prove a stale payload still parses.
  */
 export interface ApiHealthOverrides {
   status?: string;
@@ -373,8 +366,6 @@ export interface ApiHealthOverrides {
   profiles_live?: number;
   profiles_running_live?: number;
   profiles_queued?: number;
-  engine_slots_used?: number;
-  engine_slots_total?: number;
   kill_switch_engaged?: boolean;
   generated_at?: string;
 }
@@ -382,7 +373,6 @@ export interface ApiHealthOverrides {
 /** `GET /api/settings` */
 export function apiSettings(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    max_running_profiles: overrides.max_running_profiles ?? 4,
     snapshot_interval_seconds: overrides.snapshot_interval_seconds ?? 60,
     kill_switch_engaged: overrides.kill_switch_engaged ?? false,
     allow_live_trading: overrides.allow_live_trading ?? false,

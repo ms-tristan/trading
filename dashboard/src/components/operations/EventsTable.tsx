@@ -18,7 +18,7 @@ interface LevelMeta {
 
 const LEVEL_META: Record<EventItem["level"], LevelMeta> = {
   info: { label: "Info", glyph: "i", className: "border-border" },
-  warning: { label: "Warning", glyph: "!", className: "border-status-queued" },
+  warning: { label: "Warning", glyph: "!", className: "border-status-warning" },
   error: { label: "Error", glyph: "\u2715", className: "border-destructive" },
 };
 

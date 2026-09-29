@@ -13,7 +13,6 @@ afterEach(cleanup);
 describe("StateBadge", () => {
   it.each([
     ["running", "Running", "--status-running"],
-    ["queued", "Queued", "--status-queued"],
     ["stopped", "Stopped", "--status-stopped"],
     ["error", "Error", "--status-error"],
     ["blocked", "Blocked", "--status-blocked"],
@@ -63,5 +62,14 @@ describe("StateBadge", () => {
     render(<StateBadge state={"legacy" as ProfileState} />);
 
     expect(screen.getByText("Unknown")).toBeInTheDocument();
+  });
+
+  it("degrades a legacy queued state to an unknown badge instead of crashing", () => {
+    // An older engine may still publish `"queued"`; the badge is typed on the
+    // four documented states, so the defensive fallback answers for it.
+    render(<StateBadge state={"queued" as ProfileState} />);
+
+    expect(screen.getByText("Unknown")).toBeInTheDocument();
+    expect(screen.queryByText("Queued")).not.toBeInTheDocument();
   });
 });

@@ -130,11 +130,6 @@ export function AccountBand({ performance, equity, window: apiWindow, className 
           label="Profiles running"
           value={`${performance.profiles_running} of ${performance.profiles_total}`}
         />
-        <KpiStat
-          className="col-span-6 md:col-span-4 lg:col-span-2"
-          label="Engine slots"
-          value={`${performance.engine_slots_used} of ${performance.engine_slots_total}`}
-        />
       </div>
 
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2">

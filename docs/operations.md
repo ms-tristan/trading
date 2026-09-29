@@ -1,8 +1,9 @@
 # Operations runbook
 
 Day-to-day operation of the deployed platform: starting and inspecting the
-stack, checking health, provisioning the profile catalogue, changing the fleet
-cap, engaging the kill switch, reading the logs and querying the state database.
+stack, checking health, provisioning the profile catalogue, keeping workers
+healthy, engaging the kill switch, reading the logs and querying the state
+database.
 
 Everything below assumes the host repository `/Users/mac/Projects/Trading` and
 the compose file `deploy/docker-compose.yml`.
@@ -69,12 +70,11 @@ What to read in `GET /api/health`:
 | Field | Meaning when it is wrong |
 | --- | --- |
 | `status` | `degraded` means the API serves but **no** profile is running |
-| `profiles_running` | `0` → nothing is trading; see `profiles_queued` and the events |
+| `profiles_running` | `0` → nothing is trading; see `profiles_stopped`, `profiles_blocked`, `profiles_error` and the events |
 | `profiles_healthy` | lower than `profiles_running` → at least one worker is failing its REST reads |
-| `profiles_queued` | profiles waiting for a slot, held back by the fleet cap or by the stagger gate; `state_reason` names which. Not an error |
-| `engine_slots_used` / `engine_slots_total` | the fleet cap, how much of it is used and (with `profiles_queued`) how many profiles are waiting for a slot; the overview and the operations page print the same three figures as visible text |
+| `profiles_queued` | **always `0`**. The field is kept on the wire for compatibility with older dashboards; there is no fleet cap and no queue, so no profile can ever wait for a slot |
 | `kill_switch_engaged` | `true` → the kill switch is engaged, nothing will start |
-| per-profile `state` / `state_reason` (`GET /api/profiles`) | `blocked` names a safety gate a live profile did not pass |
+| per-profile `state` / `state_reason` (`GET /api/profiles`) | a profile that is not `running` is `stopped`, `blocked` or `error` — there is no fourth outcome. `blocked` names a safety gate a live profile did not pass |
 
 The deploy pipeline asserts exactly these numbers after a deploy:
 `status == "ok"` and `profiles_running > 0` within 60 s, `3031/` answering 200 and
@@ -129,129 +129,150 @@ docker exec trading-realtime trading realtime status --api-url http://127.0.0.1:
 
 ---
 
-## 4. Raising the fleet cap
+## 4. The fleet has no cap and no queue
 
-The cap is `max_running_profiles`. It exists because one running `freqtrade trade`
-worker costs about **390 MiB RSS** (8 workers measured at 3.13 GiB, linear) and
-the Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily.
-Profiles beyond the cap are `queued` with a `state_reason` naming the cap, and
-the next one is promoted automatically when a slot frees.
+**Every enabled profile runs.** The supervisor starts one `freqtrade trade`
+worker per enabled profile, in `priority` descending then `id` ascending order,
+and nothing holds a profile back: there is no fleet cap, no slot accounting and
+no stagger gate.
 
-**The deployed cap is 10, the shipped default is 6.** Two numbers, one meaning —
-a smaller machine is safe straight from the repository, while this host runs the
-ten priority-100 primaries:
+Consequences an operator has to know:
 
-* `config/platform.json` keeps the conservative default **6** — roughly
-  **2.3 GiB** of workers — so a machine that only starts the stack from the
-  repository is safe;
-* only `deploy/docker-compose.yml` raises it, through
-  `TB_MAX_RUNNING_PROFILES=10`, which is what this host actually runs. Ten is
-  **one profile per strategy**: the ten priority-100 primary profiles of the
-  catalogue, taken priority descending then id ascending.
+* a profile that is not `running` is in exactly one of three other states —
+  `stopped` (disabled, stopped by the operator, stopped by the kill switch, or
+  waiting for its restart backoff), `blocked` (a live profile that did not pass
+  the live-trading gate) or `error` (the restart budget is spent). Nothing is
+  ever "waiting for a slot";
+* `GET /api/settings` no longer carries the fleet-cap setting or the gradual-start
+  setting. Both were removed from `config/platform.json`, from the compose
+  environment and from `POST /api/settings`; a `POST` that still sends one of
+  those keys simply ignores it (unknown body keys are dropped);
+* `GET /api/health` still carries `profiles_queued`, pinned to the constant `0`,
+  so an older dashboard reading that field keeps working. The slot-usage pair
+  that used to accompany it is gone from the payload;
+* the effective settings the engine acts on are therefore:
+  `snapshot_interval_seconds` and `profile_api_port_base`, plus the
+  `config/platform.json` values that have no environment override.
 
-Nothing here needs to be changed to run the deployed stack: compose already
-supplies the environment variable, and the environment wins over every other
-input.
-
-Why 10 is safe here: measured at a cap of 6, the `trading-realtime` container
-held about **2.4 GiB**, the whole guest about **5 GB**, and the host swap did not
-move. Scaling linearly to ten workers leaves head-room on the 12 GiB guest
-(roughly 3.9 GiB of workers plus the supervisor, the API and the dashboard), and
-the boot staggers the cold start (§`worker_start_stagger_seconds`), which is what
-keeps that head-room from being spent all at once.
-
-Three ways to change it, in increasing order of permanence — the third one is a
-repository edit for a larger machine, not something this deployment needs:
-
-```bash
-# 1. at run time, through the API (persisted in the settings table of state.db)
-curl -fsS -X POST http://127.0.0.1:3030/api/settings \
-  -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"max_running_profiles": 10}'
-
-# 2. as an environment override, for one deployment (compose `environment:` or deploy/.env)
-#    -- this is what the deployed stack does, and 10 is the value it ships
-TB_MAX_RUNNING_PROFILES=10
-
-# 3. as a larger machine's default, in config/platform.json ("max_running_profiles": 10)
-#    -- the shipped file keeps the conservative 6
-```
-
-Precedence for every platform setting: the **environment**
-(`TB_MAX_RUNNING_PROFILES`) wins at boot, then the value stored in the `settings`
-table, then `config/platform.json`, then the built-in default. On the deployed
-stack the environment supplies 10, so the `config/platform.json` default of 6
-never applies there — it is the fallback for a machine whose compose file does
-not set the variable. Raising the cap starts queued profiles on the next
-scheduling pass — no restart needed when it is done through the API. Before
-raising it, check the available memory:
+Because all enabled profiles start together, the container's memory footprint is
+the sum of every worker. On this host that is the whole catalogue, and the
+figure that used to justify a cap — **~390 MiB RSS per worker** — no longer
+bounds anything. Check the real numbers before and after a deploy rather than
+scaling that figure by hand:
 
 ```bash
 docker stats --no-stream trading-realtime
 sysctl -n hw.memsize | awk '{printf "%.2f GiB\n", $1/1024/1024/1024}'
 ```
 
-Margin to keep: at least ~1 GiB for the supervisor, the dashboard, Docker itself
-and the image builds. A cap that exceeds the available memory shows up as workers
-being killed by the OOM killer and profiles landing in the state `error`.
-
-The cap is only half of the guard: a **simultaneous cold start** of many workers
-is what actually made the guest unresponsive (reproduced twice on this host), not
-the steady-state footprint of the fleet. That is why the boot is staggered to at
-most one new worker per `worker_start_stagger_seconds` — see below.
-
-The same arithmetic applies to `snapshot_interval_seconds`
-(`TB_SNAPSHOT_INTERVAL_SECONDS`, default 60): a shorter interval gives finer
-equity curves and more REST traffic per worker.
-
-### `worker_start_stagger_seconds` — starting the fleet gradually
-
-A third setting, `worker_start_stagger_seconds` (integer, default **10**, minimum
-`0`, environment override `TB_WORKER_START_STAGGER_SECONDS`), controls how fast
-the fleet fills its slots. It exists because a simultaneous cold start of many
-workers spiked memory and CPU together and made the Docker VM unresponsive —
-reproduced twice on this host. It is changed exactly like the cap, and
-`POST /api/settings` accepts it:
-
-```bash
-# start at most one new worker every 30 s
-curl -fsS -X POST http://127.0.0.1:3030/api/settings \
-  -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"worker_start_stagger_seconds": 30}'
-
-# 0 restores the immediate behaviour (every eligible profile starts at once)
-curl -fsS -X POST http://127.0.0.1:3030/api/settings \
-  -H "X-Operator-Token: $TB_OPERATOR_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"worker_start_stagger_seconds": 0}'
-```
-
-What it does, and what it does not do:
-
-* the supervisor starts **at most one new worker per stagger interval**; after a
-  worker starts, the gate closes for that interval;
-* every other profile that is **eligible to run but has to wait** stays in the
-  state `queued` with a `state_reason` of exactly the form
-  `queued: starting workers gradually (N of M slots in use)`, where N is the
-  number of workers alive and M is `max_running_profiles`;
-* a `queued` profile is **waiting for a slot**. It is not an error, it needs no
-  operator decision and nothing has to be fixed: the supervisor promotes it on its
-  own as soon as the gate reopens or a running profile releases its slot;
-* staggering only **delays promotions, it never reorders them**: the order stays
-  priority descending, then id ascending;
-* it therefore changes *when* a queued profile starts, never *whether* it does —
-  a fleet that is genuinely beyond the cap stays queued until a slot frees.
-
-The dashboard says the same thing in visible text, so the operator never has to
-guess: the overview and the operations page print the cap, the slots in use
-(`engine_slots_used` of `engine_slots_total`) and how many profiles are waiting
-for a slot, all derived from `GET /api/settings` and `GET /api/health`.
+`snapshot_interval_seconds` (`TB_SNAPSHOT_INTERVAL_SECONDS`, default 60) is
+still a run-time setting: a shorter interval gives finer equity curves and more
+REST traffic per worker. It is also the poll cadence the health rule of §5 is
+counted in.
 
 ---
 
-## 5. Kill switch
+## 5. The worker crash loop, and why workers are no longer restarted on a slow read
+
+### What the loop was
+
+The workers were **healthy**. Their `GET /balance` took **12 to 20 s** because
+CoinGecko rate-limits the whole fleet behind one IP — the platform ran 22
+workers, and each `freqtrade` worker refreshed a USD fiat conversion on every
+API request. Our REST client gave up at **10 s**, so a slow answer was recorded
+as a read failure. Three consecutive timeouts declared a worker unhealthy and
+the supervisor killed and restarted it. A restarted worker immediately joined
+the same queue and hit the same rate limit, so the fleet restarted forever and
+never finished its warm-up.
+
+### What changed
+
+1. **The generated freqtrade configuration no longer asks for a fiat
+   conversion.** `engine/config_builder.py` now writes
+   `"fiat_display_currency": ""`. Freqtrade treats an empty conversion currency
+   as "no conversion requested" and never builds the converter — from
+   `freqtrade/rpc/rpc.py`, `RPC.__init__`:
+
+   ```python
+   if self._config.get("fiat_display_currency"):
+       self._fiat_converter = CryptoToFiatConverter(self._config)
+   ```
+
+   With `_fiat_converter` left as `None`, `_rpc_balance` takes its own fallback
+   and answers `value = 0` without calling CoinGecko at all:
+
+   ```python
+   value = (
+       self._fiat_converter.convert_amount(total, stake_currency, fiat_display_currency)
+       if self._fiat_converter
+       else 0
+   )
+   ```
+
+   The consequence for the operator: `GET /balance`, `GET /profit` and
+   `GET /daily` still answer with their **full field set**, and their `fiat_*`
+   values are simply `0`. No field disappears from the payload.
+
+2. **The read timeout was raised above the measured worst case.**
+   `DEFAULT_TIMEOUT_SECONDS` in `engine/client.py` is **45.0 s**. The values the
+   constant is sized against are the worst `GET /balance` durations recorded on
+   the live deployment while 22 workers shared one CoinGecko rate limit:
+   **19.74 s**, **19.77 s** and **11.94 s**. They are recorded in the source
+   comment of the constant, not re-measured for this document; a worker that is
+   merely slow now answers instead of timing out.
+
+3. **A worker is restarted only when it is proven gone.** The health rule is
+   counted in poll cycles (`snapshot_interval_seconds`, 60 s by default) and it
+   is defined by five named constants in `engine/supervisor.py` and
+   `engine/client.py`:
+
+   | Constant | Value | What it does |
+   | --- | --- | --- |
+   | `DEFAULT_TIMEOUT_SECONDS` | `45.0` s | per-request read timeout of every worker call |
+   | `WORKER_STARTUP_GRACE_SECONDS` | `90.0` s | a freshly spawned worker is not judged at all: a failed read inside this window is not even counted |
+   | `UNHEALTHY_THRESHOLD` | `10` | consecutive failed reads that merely **start** the death check |
+   | `UNHEALTHY_PING_THRESHOLD` | `10` | consecutive failed `GET /ping` that **prove** the worker is gone |
+   | `RESTART_BACKOFF_SECONDS` | `(5, 15, 45)` s | backoff before a restart, saturating at 45 s |
+
+   Reaching `UNHEALTHY_THRESHOLD` no longer restarts anything by itself. The
+   supervisor then asks two questions, and accepts only two proofs of death: the
+   process handle is gone, or the worker's own liveness endpoint `GET /ping` has
+   failed `UNHEALTHY_PING_THRESHOLD` consecutive times. A worker that answers
+   `{"status": "pong"}` is alive and is **not** restarted, however many
+   `/balance` reads failed. A `GET /ping` that raises counts as a failed ping,
+   never as a crash.
+
+   The restart budget is unchanged: at most **5 restarts within 15 minutes**,
+   then the profile goes to the terminal state `error`.
+
+### How to read the difference in the journal
+
+The loop showed a `restart` event per profile again and again, on a cadence set
+by the supervisor's own poll interval (`snapshot_interval_seconds`, 60 s by
+default): three consecutive timed-out reads at the old 10 s timeout crossed the
+old three-failure threshold within a few poll cycles, and the 5 s backoff did not
+slow the cycle down. After the fix that pattern must be gone — a restart is now
+preceded by `UNHEALTHY_THRESHOLD` failed reads **and** `UNHEALTHY_PING_THRESHOLD`
+failed pings, so it takes a genuinely dead worker:
+
+```bash
+# restart events, newest first: a repeating ~2-minute cadence is the loop
+docker exec trading-realtime python -c "
+import sqlite3
+con = sqlite3.connect('/app/data/realtime/state.db')
+for row in con.execute(\"SELECT ts, kind, profile_id, message FROM events WHERE kind IN ('restart','crash','error') ORDER BY ts DESC LIMIT 40\"):
+    print(row)
+"
+```
+
+If a `restart` row keeps reappearing for the same profile with roughly the same
+gap between rows, the worker is answering `/ping` but failing its reads: read
+`/app/data/realtime/logs/<id>.log` (§7) for the underlying failure instead of
+restarting the fleet again.
+
+---
+
+## 6. Kill switch
 
 Two equivalent forms, one meaning: **stop everything and start nothing**.
 
@@ -281,21 +302,22 @@ Semantics to rely on:
   the reason `kill_switch`, and creates `/app/data/realtime/KILL_SWITCH`;
 * while the file exists, **no worker starts** — not even after a container
   restart, because the file lives in the `trading-state` volume;
-* releasing it removes the file and resumes scheduling; queued profiles are
-  promoted again and stopped profiles stay stopped until they are started;
+* releasing it removes the file and resumes scheduling; every enabled profile
+  that is not stopped by the operator starts again on the next pass, and stopped
+  profiles stay stopped until they are started;
 * the state is reported by `GET /api/settings` (`kill_switch_engaged`) and by
   `GET /api/health` (`kill_switch_engaged`).
 
 ---
 
-## 6. Logs
+## 7. Logs
 
 | What | Where |
 | --- | --- |
 | Supervisor + API (stdout of the container) | `docker compose -f deploy/docker-compose.yml logs -f trading-realtime` |
 | Dashboard | `docker compose -f deploy/docker-compose.yml logs -f trading-dashboard` |
 | One profile's freqtrade worker | `/app/data/realtime/logs/<id>.log` inside the container, e.g. `docker exec trading-realtime tail -50 /app/data/realtime/logs/momentum-btc-1h.log` |
-| Engine journal (structured, queryable) | the `events` table of the state database (§7) |
+| Engine journal (structured, queryable) | the `events` table of the state database (§8) |
 
 ```bash
 # verbosity of the supervisor (INFO by default)
@@ -315,7 +337,7 @@ for row in con.execute('SELECT ts, level, kind, profile_id, message FROM events 
 
 ---
 
-## 7. Reading the state database
+## 8. Reading the state database
 
 One SQLite file: `/app/data/realtime/state.db` (host path: the
 `deploy_trading-state` volume; local runs: `data/realtime/state.db`). Its schema
@@ -330,7 +352,7 @@ so the guaranteed path is Python (always present):
 # the schema version: must print 2
 docker exec trading-realtime python -c "import sqlite3; print(sqlite3.connect('/app/data/realtime/state.db').execute('PRAGMA user_version').fetchone()[0])"
 
-# the fleet at a glance: state, slots, ports
+# the fleet at a glance: state, ports
 docker exec trading-realtime python -c "
 import sqlite3
 con = sqlite3.connect('/app/data/realtime/state.db')
@@ -407,14 +429,15 @@ can be deleted once it has been inspected.
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause and what to do |
 | --- | --- |
-| `status: "degraded"`, `profiles_running: 0` | the fleet has not started a worker yet (wait for the first poll), the kill switch is engaged, or every profile is disabled. Check `GET /api/settings`, then the `events` table for `cap_reached` / `kill_switch` rows |
-| `profiles_running` below the cap, profiles `queued` | the workers are still filling the slots or they failed. The overview and the operations page state the cap, the slots in use and the number of profiles waiting for a slot as visible text; cross-check `engine_slots_used` against `engine_slots_total`, then check `docker stats` for memory pressure |
-| profiles `queued` with the reason `queued: starting workers gradually (N of M slots in use)` | normal right after a boot or a deploy: the profile is **waiting for a slot** while the supervisor starts at most one new worker per `worker_start_stagger_seconds` (10 s by default). Not an error, no operator decision, no fix: wait for the gate to reopen, and lower the setting only if the fleet must fill faster |
-| profiles `queued` with the reason `queued: fleet cap reached (N of M slots in use)` | normal when the fleet is full: the cap is 10 on the deployed stack. The profile is **waiting for a slot** and is promoted automatically as soon as one frees; raise the cap only if the host has the memory to back it |
+| `status: "degraded"`, `profiles_running: 0` | the fleet has not started a worker yet (wait for the first poll), the kill switch is engaged, or every profile is disabled. Check `GET /api/settings`, then the `events` table for `kill_switch` rows |
+| `profiles_running` lower than `profiles_total` | some workers failed to start or died. Every enabled profile is supposed to run, so compare `profiles_total` with `profiles_running` and read the per-profile `state`: `stopped`, `blocked` or `error`. Then check `docker stats` for memory pressure |
+| a profile `stopped` with the reason `restart_backoff: …` | normal for a few seconds: the worker is dead and waits for its backoff (5 s, 15 s or 45 s) before the restart |
+| a worker restarted every ~2 minutes | the worker answers `GET /ping` but fails its reads, so the new rule must **not** restart it — check `docker stats`, the worker log and the disk before looking at the supervisor |
+| all workers restarted at once after a deploy | expected: a deploy restarts every worker. The restart resets the in-memory health counters and clears a stale `error` state |
 | a profile in state `error` | five restarts inside 15 minutes: read `last_error` and `/app/data/realtime/logs/<id>.log`, fix the cause, then `POST /api/profiles/{id}/actions {"action": "restart"}` |
 | a live profile in state `blocked` | a safety gate is unmet: see `state_reason`; `TB_ALLOW_LIVE_TRADING` must equal `I_UNDERSTAND_THE_RISK` and both exchange credentials must be in the environment |
 | `GET /api/profiles` answers `401`/`403` on a mutation | the `X-Operator-Token` header is missing (`401`) or wrong (`403`); the token is `TB_OPERATOR_TOKEN` of `deploy/.env` |
@@ -425,7 +448,7 @@ can be deleted once it has been inspected.
 
 ---
 
-## 9. Restart, upgrade, rollback
+## 10. Restart, upgrade, rollback
 
 ```bash
 # restart the engine only (volumes, profiles and trades are kept)
@@ -442,9 +465,10 @@ git revert <sha> && git push origin main
 An upgrade never touches the `trading-state` volume, so profiles, snapshots,
 trade databases and the kill-switch file survive a rebuild. A deploy **restarts
 every worker**, which resets the in-memory health counters and clears a stale
-`error` state; snapshots keep the before/after history in one table. The workers
-come back one per `worker_start_stagger_seconds`, so a deploy does not spike the
-guest's memory and CPU the way a simultaneous cold start does.
+`error` state; snapshots keep the before/after history in one table. Every
+enabled profile comes back in the same scheduling pass, so a deploy is
+immediately followed by the full fleet's cold start — watch `docker stats` on a
+deploy if the host is tight on memory.
 
 A database of this platform written by an earlier revision (`user_version = 1`,
 current `profiles` columns) is **migrated in place** on the next boot: the two

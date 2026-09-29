@@ -132,7 +132,7 @@ def test_paper_config_matches_the_documented_shape() -> None:
         "stake_currency": "USDT",
         "stake_amount": "unlimited",
         "tradable_balance_ratio": 0.99,
-        "fiat_display_currency": "USD",
+        "fiat_display_currency": "",
         "dry_run": True,
         "dry_run_wallet": 1000.0,
         "trading_mode": "spot",
@@ -177,6 +177,24 @@ def test_paper_config_matches_the_documented_shape() -> None:
         "internals": {"process_throttle_secs": 30},
         "bot_name": "alpha",
     }
+
+
+def test_generated_config_does_not_trigger_a_fiat_conversion() -> None:
+    """No generated worker may ask Freqtrade for a fiat conversion.
+
+    An empty ``fiat_display_currency`` means "no fiat conversion requested", so
+    the worker never calls the CoinGecko price API. ``"USD"`` made every
+    ``/balance`` refresh that conversion through the anonymous rate limit the
+    whole fleet shares, which is what stretched the read to 12-20 s. The key
+    itself stays: it is part of the validated key set and only its value is
+    neutralised.
+    """
+    rendered = json.dumps(make_config(make_profile()))
+
+    assert make_config(make_profile())["fiat_display_currency"] == ""
+    # The stake currency is USDT, which merely contains the letters: what must
+    # be gone is the fiat conversion value itself.
+    assert '"USD"' not in rendered
 
 
 def test_paper_profile_uses_its_initial_capital_as_dry_run_wallet() -> None:

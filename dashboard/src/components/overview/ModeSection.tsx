@@ -157,8 +157,8 @@ const COLUMNS: DataTableColumn<RankedProfileRow>[] = [
  *
  * The profiles keep the order the API returned (portfolio value, descending):
  * the rank column is that order, and the table only re-sorts when an operator
- * clicks a sortable header. Queued, blocked and error rows stay in the ranking
- * and are marked with a tinted background next to their badge and reason.
+ * clicks a sortable header. Blocked and error rows stay in the ranking and are
+ * marked with a tinted background next to their badge and reason.
  */
 export function ModeSection({
   id,

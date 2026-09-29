@@ -43,7 +43,7 @@ describe("actionDisabled", () => {
   it("greys out an action that cannot change anything", () => {
     expect(actionDisabled("running", "start")).toBe(true);
     expect(actionDisabled("running", "stop")).toBe(false);
-    expect(actionDisabled("queued", "stop")).toBe(false);
+    expect(actionDisabled("blocked", "stop")).toBe(true);
 
     for (const state of ["stopped", "error", "blocked"] as const) {
       expect(actionDisabled(state, "stop")).toBe(true);
@@ -109,7 +109,9 @@ describe("ProfileControls", () => {
   it("surfaces a network failure instead of throwing", async () => {
     saveOperatorToken("s3cr3t");
     fetchMock.mockRejectedValueOnce(new Error("connection refused"));
-    render(<ProfileControls profileId="alpha" state="queued" />);
+    // `running` is the state whose Stop button is enabled, so the click really
+    // reaches the API and the failure has something to surface.
+    render(<ProfileControls profileId="alpha" state="running" />);
 
     clickAction("Stop");
 

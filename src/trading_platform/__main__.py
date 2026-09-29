@@ -112,12 +112,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help=f"bind port (default: {DEFAULT_PORT})"
     )
-    run.add_argument(
-        "--max-running-profiles",
-        type=int,
-        default=None,
-        help="fleet cap for this run (default: the platform setting)",
-    )
     run.set_defaults(handler=_run_command)
 
     provision = realtime_commands.add_parser(
@@ -176,8 +170,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run_command(args: argparse.Namespace) -> int:
     """Build the engine over the requested state database and serve the API."""
     settings = PlatformSettings.load()
-    if args.max_running_profiles is not None:
-        settings = settings.with_overrides(max_running_profiles=int(args.max_running_profiles))
     state_db = resolve_state_db_path(args.state_db)
     state_dir = state_dir_for(state_db)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -416,10 +408,7 @@ def _health_line(health: Mapping[str, Any]) -> str:
         f"status: {health.get('status', 'unknown')} | version: {health.get('version', '')} | "
         f"profiles: {_as_int(health.get('profiles_total'))} total, "
         f"{_as_int(health.get('profiles_running'))} running, "
-        f"{_as_int(health.get('profiles_healthy'))} healthy, "
-        f"{_as_int(health.get('profiles_queued'))} queued | "
-        f"slots: {_as_int(health.get('engine_slots_used'))}/"
-        f"{_as_int(health.get('engine_slots_total'))} | "
+        f"{_as_int(health.get('profiles_healthy'))} healthy | "
         f"kill switch: {'engaged' if health.get('kill_switch_engaged') else 'released'} | "
         f"uptime: {_format_duration(health.get('uptime_seconds'))}"
     )

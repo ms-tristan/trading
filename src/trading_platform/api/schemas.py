@@ -117,13 +117,11 @@ class KillSwitchRequest(_RequestBody):
 class SettingsUpdateRequest(_RequestBody):
     """``POST /api/settings``: change the run-time settings.
 
-    The three fields are optional; the ones left out keep their current value.
-    The change is persisted and reschedules the fleet at once.
+    The field is optional; left out it keeps its current value. The change is
+    persisted and reschedules the fleet at once.
     """
 
-    max_running_profiles: int | None = None
     snapshot_interval_seconds: int | None = None
-    worker_start_stagger_seconds: int | None = None
 
 
 class CatalogueApplyRequest(_RequestBody):
