@@ -29,7 +29,7 @@ def test_taxonomy_constants() -> None:
         "1M",
     )
     assert models.PROFILE_MODES == ("paper", "live")
-    assert models.PROFILE_STATES == ("running", "queued", "stopped", "error", "blocked")
+    assert models.PROFILE_STATES == ("running", "stopped", "error", "blocked")
     assert models.PROFILE_SOURCES == ("catalogue", "operator")
     assert models.STRATEGY_CATEGORIES == (
         "baseline",
@@ -44,11 +44,13 @@ def test_taxonomy_constants() -> None:
 def test_state_constants_match_the_state_taxonomy() -> None:
     assert (
         models.STATE_RUNNING,
-        models.STATE_QUEUED,
         models.STATE_STOPPED,
         models.STATE_ERROR,
         models.STATE_BLOCKED,
     ) == models.PROFILE_STATES
+    # The ``queued`` state is gone: with no fleet cap nothing can be held back.
+    assert not hasattr(models, "STATE_QUEUED")
+    assert "queued" not in models.PROFILE_STATES
 
 
 def test_utc_now_is_timezone_aware_utc() -> None:

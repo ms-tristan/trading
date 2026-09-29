@@ -51,8 +51,8 @@ const BRAVO = profile({
   portfolio_value: 900,
   initial_capital: 1000,
   profit_usdt: -100,
-  state: "queued",
-  state_reason: "waiting for an engine slot",
+  state: "stopped",
+  state_reason: "not started",
   open_trades: 0,
   closed_trades: 2,
   win_rate: 1,
@@ -71,7 +71,6 @@ describe("summariseProfiles", () => {
 
     expect(summary.profiles_total).toBe(3);
     expect(summary.profiles_running).toBe(1);
-    expect(summary.profiles_waiting).toBe(1);
     expect(summary.profiles_needing_decision).toBe(1);
     expect(summary.portfolio_value).toBe(3000);
     expect(summary.initial_capital).toBe(3000);
@@ -115,29 +114,28 @@ describe("summariseProfiles", () => {
     expect(summariseProfiles([])).toMatchObject({
       profiles_total: 0,
       profiles_running: 0,
-      profiles_waiting: 0,
       profiles_needing_decision: 0,
       portfolio_value: 0,
       profit_pct: 0,
     });
   });
 
-  it("splits a queue wait from a decision instead of merging them", () => {
-    const queued = summariseProfiles([profile({ id: "queued", state: "queued" })]);
-    expect(queued.profiles_waiting).toBe(1);
-    expect(queued.profiles_needing_decision).toBe(0);
-
+  it("counts only error and blocked as a decision, never a stopped profile", () => {
     const errored = summariseProfiles([profile({ id: "errored", state: "error" })]);
-    expect(errored.profiles_waiting).toBe(0);
     expect(errored.profiles_needing_decision).toBe(1);
 
     const blocked = summariseProfiles([profile({ id: "blocked", state: "blocked" })]);
-    expect(blocked.profiles_waiting).toBe(0);
     expect(blocked.profiles_needing_decision).toBe(1);
 
     const idle = summariseProfiles([profile({ id: "stopped", state: "stopped" })]);
-    expect(idle.profiles_waiting).toBe(0);
     expect(idle.profiles_needing_decision).toBe(0);
+
+    const running = summariseProfiles([profile({ id: "running", state: "running" })]);
+    expect(running.profiles_needing_decision).toBe(0);
+  });
+
+  it("carries no waiting counter any more", () => {
+    expect(Object.keys(summariseProfiles([]))).not.toContain("profiles_waiting");
   });
 });
 
@@ -147,7 +145,6 @@ describe("formatModeSummary", () => {
 
     expect(line).toContain("2 profiles");
     expect(line).toContain("1 running");
-    expect(line).toContain("1 profile is waiting for a slot");
     expect(line).toContain("2,000.00 USDT");
     expect(line).toContain("0.00 USDT (0.00%)");
     expect(line).not.toContain("needing attention");
@@ -160,7 +157,6 @@ describe("formatModeSummary", () => {
     expect(line).toContain("1 profile");
     expect(line).toContain("1 running");
     expect(line).toContain("0.00 USDT (0.00%)");
-    expect(line).not.toContain("waiting for a slot");
     expect(line).not.toContain("needing attention");
     expect(line).not.toContain("1,000.00 USDT");
   });
@@ -169,19 +165,14 @@ describe("formatModeSummary", () => {
     const line = formatModeSummary(summariseProfiles([ALPHA, CHARLIE]));
 
     expect(line).toContain("2 profiles - 1 running - 1 needing attention - 2,100.00 USDT");
-    expect(line).not.toContain("waiting for a slot");
   });
 
-  it("counts several waiting profiles in the plural", () => {
-    const line = formatModeSummary(
-      summariseProfiles([
-        profile({ id: "first", state: "queued" }),
-        profile({ id: "second", state: "queued" }),
-      ]),
-    );
+  it("never mentions a queue or a wait", () => {
+    const line = formatModeSummary(summariseProfiles([ALPHA, BRAVO, CHARLIE]));
 
-    expect(line).toContain("2 profiles are waiting for a slot");
-    expect(line).not.toContain("needing attention");
+    expect(line).not.toContain("waiting");
+    expect(line).not.toContain("queued");
+    expect(line).not.toContain("slot");
   });
 });
 

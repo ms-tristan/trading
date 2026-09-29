@@ -65,8 +65,8 @@ const RANKED: ProfileView[] = [
     portfolio_value: 950,
     profit_usdt: -50,
     profit_pct: -0.05,
-    state: "queued",
-    state_reason: "waiting for an engine slot",
+    state: "stopped",
+    state_reason: "not started",
   }),
 ];
 
@@ -110,26 +110,11 @@ describe("ModeSection", () => {
     expect(heading).toHaveAttribute("id", "paper-trading");
     expect(screen.getByText("3 profiles")).toBeInTheDocument();
     expect(aggregateLine()).toHaveTextContent(
-      /2 running - 1 profile is waiting for a slot - 3,350\.00 USDT - \+350\.00 USDT \(\+11\.67%\)/,
+      /2 running - 3,350\.00 USDT - \+350\.00 USDT \(\+11\.67%\)/,
     );
-  });
-
-  it("describes one waiting profile in the singular", () => {
-    render(<ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />);
-
-    expect(aggregateLine()).toHaveTextContent("1 profile is waiting for a slot");
-  });
-
-  it("describes several waiting profiles in the plural", () => {
-    render(
-      <ModeSection
-        id="paper-trading"
-        title="Paper trading"
-        profiles={[RANKED[2], profile({ id: "delta", name: "Delta", state: "queued" })]}
-      />,
-    );
-
-    expect(aggregateLine()).toHaveTextContent("2 profiles are waiting for a slot");
+    expect(aggregateLine()).not.toHaveTextContent("waiting");
+    expect(aggregateLine()).not.toHaveTextContent("queued");
+    expect(aggregateLine()).not.toHaveTextContent("slot");
   });
 
   it("reserves the 'needing attention' wording for error and blocked profiles", () => {
@@ -144,7 +129,7 @@ describe("ModeSection", () => {
     const line = aggregateLine();
     expect(line).toHaveTextContent("0 running");
     expect(line).toHaveTextContent("1 needing attention");
-    expect(line).not.toHaveTextContent("waiting for a slot");
+    expect(line).not.toHaveTextContent("waiting");
   });
 
   it("renders an explanatory summary as visible text between the header and the table", () => {
@@ -241,29 +226,28 @@ describe("ModeSection", () => {
     );
   });
 
-  it("keeps a queued row in the ranking, visually distinct and with its reason", () => {
+  it("keeps a stopped row in the ranking with its state, without a tinted background", () => {
     render(<ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />);
-    const queued = bodyRows()[2];
+    const stopped = bodyRows()[2];
 
-    expect(queued).toHaveClass("bg-muted/50");
-    expect(within(queued).getByText("Queued")).toBeInTheDocument();
-    expect(within(queued).getByText("waiting for an engine slot")).toBeInTheDocument();
+    expect(stopped).not.toHaveClass("bg-muted/50");
+    expect(within(stopped).getByText("Stopped")).toBeInTheDocument();
+    expect(within(stopped).getByText("not started")).toBeInTheDocument();
+    expect(within(stopped).queryByText("Queued")).not.toBeInTheDocument();
   });
 
-  it("explains a queued row as a wait, never as something needing attention", () => {
+  it("never says a row waits for a slot", () => {
     render(<ModeSection id="paper-trading" title="Paper trading" profiles={RANKED} />);
-    const queued = bodyRows()[2];
 
-    expect(queued).toHaveTextContent("waiting for an engine slot");
-    expect(within(queued).getByText("waiting for an engine slot")).toBeInTheDocument();
-
-    // No rendered text node of the section ever says "needing attention" for a
-    // queued profile. The line break of a text node is normalised away first,
-    // so the phrase cannot hide behind it.
+    // No rendered text node of the section ever mentions a queue or a slot: the
+    // fleet runs in one process and nothing waits for one. The line break of a
+    // text node is normalised away first, so the phrase cannot hide behind it.
     const rendered = textNodes(document.body)
       .join(" ")
       .replace(/\s+/g, " ");
     expect(rendered).not.toContain("needing attention");
+    expect(rendered).not.toContain("waiting for a slot");
+    expect(rendered).not.toContain("queued");
   });
 
   it("marks the trading mode of every row next to its state badge", () => {

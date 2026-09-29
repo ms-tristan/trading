@@ -36,11 +36,21 @@ import httpx
 from ..models import ProfileMetrics, finite_float, normalise_drawdown_pct, normalise_win_rate
 
 __all__ = [
+    "DEFAULT_TIMEOUT_SECONDS",
     "FreqtradeClient",
     "FreqtradeClientError",
     "normalise_daily_row",
     "normalise_trade_row",
 ]
+
+#: Default read timeout of every request, in seconds.
+#:
+#: It is deliberately above the worst case measured on the live deployment:
+#: ``GET /api/v1/balance`` answered in 19.74 s, 19.77 s and 11.94 s while 22
+#: workers shared one CoinGecko rate limit, so a worker that is merely slow must
+#: answer rather than time out. A timeout is a read failure, and enough read
+#: failures make the supervisor restart a worker that was only waiting.
+DEFAULT_TIMEOUT_SECONDS: float = 45.0
 
 
 class FreqtradeClientError(RuntimeError):
@@ -54,7 +64,8 @@ class FreqtradeClient:
     ``http://127.0.0.1:<port>/api/v1``; a missing trailing slash is added, so
     ``.../api/v1`` and ``.../api/v1/`` address exactly the same endpoints.
     ``transport`` exists so that tests can inject an :class:`httpx.MockTransport`;
-    production code never passes it.
+    production code never passes it. ``timeout`` is the per-request read timeout
+    and defaults to :data:`DEFAULT_TIMEOUT_SECONDS`.
     """
 
     def __init__(
@@ -63,7 +74,7 @@ class FreqtradeClient:
         base_url: str,
         username: str,
         password: str,
-        timeout: float = 10.0,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base_url = base_url if base_url.endswith("/") else f"{base_url}/"

@@ -69,15 +69,15 @@ coverage command to remember, and a run that drops below 80 % exits non-zero.
 
 | Area | Module under test | Mandatory cases |
 | --- | --- | --- |
-| Configuration | `trading_platform/config.py` | defaults from `config/platform.json`, the `TB_MAX_RUNNING_PROFILES` / `TB_SNAPSHOT_INTERVAL_SECONDS` / `TB_PROFILE_API_PORT_BASE` overrides, the live-trading gate (both refusals and the accepted case) |
+| Configuration | `trading_platform/config.py` | defaults from `config/platform.json`, the `TB_SNAPSHOT_INTERVAL_SECONDS` / `TB_PROFILE_API_PORT_BASE` overrides, the live-trading gate (both refusals and the accepted case) |
 | Domain models | `trading_platform/models.py` | serialisation of every documented JSON shape, the supported-timeframe set, the window helpers |
 | Aggregation | `trading_platform/metrics.py` | portfolio/profit/win-rate aggregation, `profit_pct = (portfolio_value - initial_capital) / initial_capital`, ranking by portfolio value across both modes before filtering |
 | Catalogue | `trading_platform/profiles/catalogue.py` | metadata load, a strategy file with **no** metadata entry (title derived from the class name), the 22 profile entries |
 | State store | `trading_platform/profiles/store.py` | schema version 1, upserts, snapshots (`INSERT OR REPLACE` per minute), events, settings, and the **legacy-database archive path** (a foreign `state.db` is renamed `state.db.legacy-<ts>` and a fresh database is created) |
 | Engine | `trading_platform/engine/config_builder.py` | every key freqtrade 2026.8 validates, per-timeframe `process_throttle_secs`, file mode `0600`, no `telegram` block |
-| Engine | `trading_platform/engine/client.py` | the documented freqtrade REST response keys, HTTP Basic auth, the platform's own `profit_pct` calculation |
-| Engine | `trading_platform/engine/supervisor.py` | fleet cap and promotion order (priority DESC, id ASC), deterministic API ports, the live refusal, restart backoff, graceful SIGTERM of every child |
-| Engine | `trading_platform/engine/poller.py` | minute-rounded snapshots, "no invented snapshot for a stopped profile", health after 3 failed reads, engine events |
+| Engine | `trading_platform/engine/client.py` | the documented freqtrade REST response keys, HTTP Basic auth, the platform's own `profit_pct` calculation, the documented read timeout |
+| Engine | `trading_platform/engine/supervisor.py` | scheduling order (priority DESC, id ASC) with every enabled profile started, deterministic API ports, the live refusal, the proven-gone restart rule, restart backoff, graceful SIGTERM of every child |
+| Engine | `trading_platform/engine/poller.py` | minute-rounded snapshots, "no invented snapshot for a stopped profile", the health rule (`UNHEALTHY_THRESHOLD` / `UNHEALTHY_PING_THRESHOLD` / `WORKER_STARTUP_GRACE_SECONDS`), engine events |
 | API | `trading_platform/api/**` | every route with `fastapi.testclient.TestClient`, `401` on a missing operator token, `403` on a wrong one, ranking stability, `404`/`409`/`422` cases |
 | CLI | `trading_platform/__main__.py` | `realtime run`, `realtime provision` (token read from the environment, never argv), `realtime status`, `strategies list` |
 | Strategies | `user_data/strategies/*.py` | each of the ten strategies resolved by freqtrade's own `StrategyResolver`, indicators + entry/exit trends run over a deterministic seeded OHLCV frame, the entry column is only `0`/`1`, no NaN in the signal columns, at least one entry signal, the declared timeframe is in freqtrade's own supported set |

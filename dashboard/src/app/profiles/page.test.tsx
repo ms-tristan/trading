@@ -32,8 +32,8 @@ const RANKED = apiProfiles([
     strategy: "MomentumStrategy",
     strategy_title: "Momentum breakout",
     portfolio_value: 950,
-    state: "queued",
-    state_reason: "waiting for an engine slot",
+    state: "stopped",
+    state_reason: "no worker running",
   }),
   apiProfile({
     id: "funded",
@@ -158,7 +158,7 @@ describe("ProfilesPage", () => {
     expect(paperRows).toHaveLength(3); // header + Bravo + Charlie
     expect(paperRows[1]).toHaveTextContent("Bravo");
     expect(paperRows[2]).toHaveTextContent("Charlie");
-    expect(paperRows[2]).toHaveTextContent("waiting for an engine slot");
+    expect(paperRows[2]).toHaveTextContent("no worker running");
 
     const realRows = within(screen.getAllByRole("table")[1]).getAllByRole("row");
     expect(realRows).toHaveLength(2); // header + Funded BTC

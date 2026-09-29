@@ -33,6 +33,9 @@ from trading_platform.engine.poller import (
 )
 from trading_platform.engine.supervisor import (
     RESTART_BACKOFF_SECONDS,
+    UNHEALTHY_PING_THRESHOLD,
+    UNHEALTHY_THRESHOLD,
+    WORKER_STARTUP_GRACE_SECONDS,
     Supervisor,
 )
 from trading_platform.models import ProfileConfig, format_ts
@@ -239,6 +242,9 @@ class ApiStub:
     def __init__(self) -> None:
         self.failures = 0
         self.daily_failures = 0
+        #: Whether ``GET /ping`` answers ``pong``. The supervisor restarts a
+        #: worker only once its reads *and* its pings have failed enough times.
+        self.ping_answers = True
         self.requests: list[str] = []
         self.trades: list[dict[str, Any]] = [dict(row) for row in CLOSED_TRADES]
         self.open_trades: list[dict[str, Any]] = [dict(row) for row in OPEN_TRADES]
@@ -248,6 +254,10 @@ class ApiStub:
         """Answer every endpoint of one poll cycle, or fail as told to."""
         path = request.url.path
         self.requests.append(path)
+        if path.endswith("/ping"):
+            if not self.ping_answers:
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(200, json={"status": "pong"})
         if self.failures > 0:
             self.failures -= 1
             raise httpx.ConnectError("connection refused", request=request)
@@ -489,13 +499,7 @@ async def test_the_minute_is_idempotent(tmp_path: Path) -> None:
 
 async def test_two_running_profiles_get_one_snapshot_each(tmp_path: Path) -> None:
     profiles = [profile_config("alpha"), profile_config("beta")]
-    # The stagger gate starts one worker per pass; this test is about the two
-    # workers of one tick, so the gate is opened.
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     await harness.supervisor.start()
 
     await harness.poller.tick()
@@ -691,28 +695,43 @@ async def test_a_failed_read_writes_no_snapshot(tmp_path: Path) -> None:
     assert supervisor.metrics_for("alpha") is None
 
 
-async def test_three_failed_reads_stop_the_worker_and_leave_a_gap(tmp_path: Path) -> None:
+async def test_a_proven_dead_worker_stops_and_leaves_a_gap(tmp_path: Path) -> None:
+    """A worker whose reads and pings both fail long enough is restarted.
+
+    Failing reads alone no longer stops a worker -- that was the crash loop --
+    so the whole budget is spent here: past the startup grace, the failure
+    threshold and the ping threshold.
+    """
     harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
     supervisor = harness.supervisor
     await supervisor.start()
     await harness.poller.tick()
 
-    harness.stub.failures = 3
-    for _ in range(3):
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    harness.stub.ping_answers = False
+    harness.stub.failures = UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD
+    stopped_at = None
+    for _ in range(UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD):
         harness.clock.advance(60)
         await harness.poller.tick()
+        if not supervisor.is_running("alpha"):
+            # The snapshot of the transition is stamped with the top of the
+            # minute the poller ran in, not with the sub-minute clock.
+            stopped_at = format_ts(harness.clock.now.replace(second=0, microsecond=0))
+            break
+    else:
+        raise AssertionError("the worker survived its whole failure budget")
 
-    assert not supervisor.is_running("alpha")
     work = harness.store.get_profile("alpha")
     assert work is not None
     assert work.state_reason == f"restart_backoff: retrying in {RESTART_BACKOFF_SECONDS[0]}s"
 
     snapshots = harness.snapshots("alpha")
-    # The three failing minutes add no measurement; only the change of state
-    # carries the last known values into the minute the worker stopped.
+    # The failing minutes add no measurement; only the change of state carries
+    # the last known values into the minute the worker stopped.
     assert [snapshot.ts for snapshot in snapshots] == [
         "2026-09-27T12:00:00Z",
-        "2026-09-27T12:03:00Z",
+        stopped_at,
     ]
     assert snapshots[0].healthy is True
     assert snapshots[1].healthy is False
@@ -720,13 +739,9 @@ async def test_three_failed_reads_stop_the_worker_and_leave_a_gap(tmp_path: Path
     assert snapshots[1].profit_pct == snapshots[0].profit_pct
 
 
-async def test_a_profile_that_never_ran_gets_no_snapshot(tmp_path: Path) -> None:
-    profiles = [profile_config("alpha")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=0),
-    )
+async def test_a_disabled_profile_gets_no_snapshot(tmp_path: Path) -> None:
+    profiles = [profile_config("alpha", enabled=False)]
+    harness = make_harness(tmp_path, profiles=profiles)
     supervisor = harness.supervisor
     supervisor.bootstrap()
 
@@ -770,13 +785,16 @@ async def test_a_transition_without_history_writes_nothing(tmp_path: Path) -> No
     harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
     supervisor = harness.supervisor
     await supervisor.start()
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    harness.stub.ping_answers = False
     harness.stub.failures = 99
 
     await harness.poller.tick()
-    harness.clock.advance(60)
-    await harness.poller.tick()
-    harness.clock.advance(60)
-    await harness.poller.tick()
+    for _ in range(UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD):
+        harness.clock.advance(60)
+        await harness.poller.tick()
+        if not supervisor.is_running("alpha"):
+            break
 
     assert not supervisor.is_running("alpha")
     assert supervisor.metrics_for("alpha") is None
@@ -786,18 +804,23 @@ async def test_a_transition_without_history_writes_nothing(tmp_path: Path) -> No
     assert harness.poller.snapshots_written == 0
 
 
-async def test_a_profile_pushed_back_to_the_queue_is_recorded_once(tmp_path: Path) -> None:
+async def test_a_profile_the_health_policy_stopped_is_recorded_once(tmp_path: Path) -> None:
     harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
     supervisor = harness.supervisor
     await supervisor.start()
     await harness.poller.tick()
     assert len(harness.snapshots("alpha")) == 1
 
-    supervisor.apply_settings(max_running_profiles=0)
-    harness.clock.advance(60)
-    await harness.poller.tick()
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    harness.stub.ping_answers = False
+    harness.stub.failures = 99
+    for _ in range(UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD):
+        harness.clock.advance(60)
+        await harness.poller.tick()
+        if not supervisor.is_running("alpha"):
+            break
 
-    assert harness.store.get_profile("alpha").state == "queued"
+    assert not supervisor.is_running("alpha")
     snapshots = harness.snapshots("alpha")
     assert len(snapshots) == 2
     assert snapshots[1].healthy is False

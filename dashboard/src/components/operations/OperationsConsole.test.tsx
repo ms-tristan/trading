@@ -15,20 +15,14 @@ vi.mock("next/navigation", () => ({
 const SETTINGS = {
   refresh_interval_seconds: 15,
   allow_live_trading: false,
-  max_running_profiles: 4,
   snapshot_interval_seconds: 60,
-  // Published by `GET /api/settings`; the console holds it like any other engine
-  // setting of the view model even though it renders no control for it.
-  worker_start_stagger_seconds: 12,
 };
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   window.sessionStorage.clear();
-  fetchMock = vi.fn(async () =>
-    jsonResponse({ ...SETTINGS, max_running_profiles: 6, snapshot_interval_seconds: 60 }),
-  );
+  fetchMock = vi.fn(async () => jsonResponse({ ...SETTINGS, snapshot_interval_seconds: 30 }));
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -50,7 +44,7 @@ describe("OperationsConsole", () => {
   it("does not call the API before the token of the prompt is saved", () => {
     render(<OperationsConsole settings={SETTINGS} killSwitchEngaged={false} />);
 
-    fireEvent.change(screen.getByLabelText(/^Max running profiles/), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText(/^Snapshot interval/), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(fetchMock).not.toHaveBeenCalled();
@@ -68,7 +62,7 @@ describe("OperationsConsole", () => {
     expect(screen.getByText(/An operator token is held for this tab/)).toBeInTheDocument();
     expect(screen.queryByText("s3cr3t")).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText(/^Max running profiles/), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText(/^Snapshot interval/), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     await waitFor(() => {

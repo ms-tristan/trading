@@ -334,13 +334,13 @@ def test_upsert_profile_records_the_requested_source_and_state(store: StateStore
     record = store.upsert_profile(
         make_profile("operator-1"),
         source="operator",
-        state="queued",
-        state_reason="fleet cap reached",
+        state="blocked",
+        state_reason="live trading refused",
     )
 
     assert record.source == "operator"
-    assert record.state == "queued"
-    assert record.state_reason == "fleet cap reached"
+    assert record.state == "blocked"
+    assert record.state_reason == "live trading refused"
 
 
 def test_upsert_profile_updates_the_declarative_fields_only(store: StateStore) -> None:
@@ -365,8 +365,8 @@ def test_upsert_profile_updates_the_declarative_fields_only(store: StateStore) -
             enabled=False,
         ),
         source="catalogue",
-        state="queued",
-        state_reason="fleet cap reached",
+        state="running",
+        state_reason=None,
     )
 
     assert updated.name == "Renamed"
@@ -998,7 +998,7 @@ def test_record_event_defaults_a_blank_level_to_info(store: StateStore) -> None:
 
 def test_list_events_is_newest_first_and_limited(store: StateStore) -> None:
     first = store.record_event("info", "start", "first")
-    second = store.record_event("warning", "cap_reached", "second")
+    second = store.record_event("warning", "blocked_live", "second")
     third = store.record_event("error", "crash", "third")
 
     assert [event.id for event in store.list_events()] == [third.id, second.id, first.id]
@@ -1030,21 +1030,21 @@ def test_list_events_compares_since_as_a_string(store: StateStore, db_path: Path
 # Settings
 # ---------------------------------------------------------------------------
 def test_get_setting_is_none_when_absent(store: StateStore) -> None:
-    assert store.get_setting("max_running_profiles") is None
+    assert store.get_setting("snapshot_interval_seconds") is None
     assert store.all_settings() == {}
 
 
 def test_set_setting_inserts_then_updates(store: StateStore) -> None:
-    store.set_setting("max_running_profiles", "12")
-    assert store.get_setting("max_running_profiles") == "12"
+    store.set_setting("snapshot_interval_seconds", "120")
+    assert store.get_setting("snapshot_interval_seconds") == "120"
 
-    store.set_setting("max_running_profiles", "6")
-    assert store.get_setting("max_running_profiles") == "6"
-    assert store.all_settings() == {"max_running_profiles": "6"}
+    store.set_setting("snapshot_interval_seconds", "60")
+    assert store.get_setting("snapshot_interval_seconds") == "60"
+    assert store.all_settings() == {"snapshot_interval_seconds": "60"}
 
 
 def test_platform_settings_are_stored_as_json(store: StateStore) -> None:
-    document = {"max_running_profiles": 12, "kill_switch_engaged": False}
+    document = {"snapshot_interval_seconds": 120, "kill_switch_engaged": False}
 
     store.set_setting("platform_settings", json.dumps(document))
     raw = store.get_setting("platform_settings")
@@ -1053,10 +1053,10 @@ def test_platform_settings_are_stored_as_json(store: StateStore) -> None:
     assert json.loads(raw) == document
     assert store.all_settings()["platform_settings"] == raw
 
-    store.set_setting("platform_settings", {"max_running_profiles": 6})
+    store.set_setting("platform_settings", {"snapshot_interval_seconds": 60})
     updated = store.get_setting("platform_settings")
     assert updated is not None
-    assert json.loads(updated) == {"max_running_profiles": 6}
+    assert json.loads(updated) == {"snapshot_interval_seconds": 60}
 
 
 def test_all_settings_is_sorted_by_key(store: StateStore) -> None:

@@ -14,8 +14,8 @@ repository does not re-implement exchange connectivity, order management,
 and aggregates what they report.
 
 ```
- 22 profiles in the catalogue   ->  at most 6 freqtrade workers at a time
- (20 paper + 2 live)                (the rest are queued)
+ 22 profiles in the catalogue   ->  one freqtrade worker per enabled profile
+ (20 paper + 2 live)                (no cap, no queue)
 ```
 
 ## Contents
@@ -307,9 +307,7 @@ skips the catalogue-vs-platform coherence refusal.
 | --- | --- | --- |
 | `TB_OPERATOR_TOKEN` | unset | operator token of the mutating API routes (`X-Operator-Token`); a missing header is `401`, a wrong one `403` |
 | `TB_LOG_LEVEL` | `INFO` | log level of the supervisor and the API |
-| `TB_MAX_RUNNING_PROFILES` | `6` | fleet cap: how many `freqtrade trade` workers may run at once |
 | `TB_SNAPSHOT_INTERVAL_SECONDS` | `60` | snapshot loop period (`config/platform.json` sets the default) |
-| `TB_WORKER_START_STAGGER_SECONDS` | `10` | gradual start: at most one new worker every N seconds (`0` starts them immediately) |
 | `TB_PROFILE_API_PORT_BASE` | `8101` | first private worker REST port; the profile at index *i* of the id-sorted catalogue uses `base + i` |
 | `TB_REALTIME_STATE_DB` | `data/realtime/state.db` | path of the SQLite state database (the container passes `/app/data/realtime/state.db` on the command line) |
 | `TB_ALLOW_LIVE_TRADING` | unset | must equal exactly `I_UNDERSTAND_THE_RISK` before any live profile may start |
@@ -411,10 +409,9 @@ docker compose -f deploy/docker-compose.yml up -d --build --wait
 `/app/data/realtime/state.db`; if that file carries a foreign schema (the
 deployment this platform replaced left one behind) it is archived as
 `state.db.legacy-<UTC timestamp>` and a fresh database is created. The 22-profile
-catalogue is then seeded, the fleet scheduler promotes the highest-priority
-profiles up to the cap of 6 — **at most one new worker every
-`worker_start_stagger_seconds` (10 s by default)** — and spawns one
-`freqtrade trade` worker for each. `/api/health` answers as soon as the API is
+catalogue is then seeded, the fleet scheduler starts **every enabled profile in
+the same pass** and spawns one `freqtrade trade` worker for each — there is no
+fleet cap and no queue. `/api/health` answers as soon as the API is
 serving, and reports `profiles_running > 0` as soon as **one** worker is alive
 and healthy — which is what the smoke test waits for, with twelve retries five
 seconds apart.
@@ -427,27 +424,27 @@ runbook is in `docs/operations.md`.
 
 ## 11. Operational limits
 
-* **6 concurrent workers by default.** One running `freqtrade trade` process
-  costs about **390 MiB RSS** (measured: 8 instances = 3.13 GiB, linear), and the
-  Docker VM has **12 GiB** on a 16 GiB host that already swaps heavily. 6 workers
-  therefore sit at roughly **2.3 GiB** and leave room for the supervisor, the API,
-  the dashboard and the build caches. The rest of the catalogue is **queued**:
-  those profiles are reported with the state `queued` and a `state_reason` naming
-  the cap, and the next one is promoted automatically as soon as a slot frees.
-  Raise the cap with `TB_MAX_RUNNING_PROFILES` (or `max_running_profiles` in
-  `config/platform.json`) only if the host has the memory to back it.
-* **Workers start gradually.** `worker_start_stagger_seconds` (default **10**, in
-  `config/platform.json` and overridable with `TB_WORKER_START_STAGGER_SECONDS`)
-  lets the supervisor start **at most one new worker per interval**: after a worker
-  starts, the gate closes for that interval and every other profile that is
-  eligible to run but has to wait stays in the state `queued` with the reason
-  `queued: starting workers gradually (N of M slots in use)` (N = workers alive,
-  M = `max_running_profiles`). A stagger of `0` restores the immediate behaviour.
-  Staggering only delays promotions, it never reorders them: the order stays
-  priority descending, then id ascending. It exists because a simultaneous cold
-  start of many workers spiked memory and CPU together and made the guest
-  unresponsive (reproduced twice), which is why `deploy/docker-compose.yml` pins
-  `TB_MAX_RUNNING_PROFILES=6` and `TB_WORKER_START_STAGGER_SECONDS=10`.
+* **Every enabled profile runs.** The fleet is not capped and has no queue: the
+  supervisor starts one `freqtrade trade` worker per enabled profile, in
+  `priority` descending then `id` ascending order, in the same scheduling pass. A
+  profile that is not `running` is `stopped`, `blocked` (live-trading gate unmet)
+  or `error` (restart budget spent) — never "waiting for a slot".
+* **Memory is the sum of every worker.** One running `freqtrade trade` process
+  cost about **390 MiB RSS** (measured: 8 instances = 3.13 GiB, linear) on this
+  host, and the Docker VM has **12 GiB** on a 16 GiB host that already swaps
+  heavily. That figure is what an earlier revision measured while a cap was in
+  place; it is not a bound now that the whole catalogue starts together. Measure
+  the real footprint with `docker stats --no-stream trading-realtime` instead of
+  scaling it by hand.
+* **A worker is restarted only when it is proven gone.** A failed read does not
+  restart anything: the supervisor waits out `WORKER_STARTUP_GRACE_SECONDS`
+  (90 s) after a start, then requires `UNHEALTHY_THRESHOLD` (10) consecutive
+  failed reads, and even then restarts only when the process handle is gone or
+  `GET /ping` has failed `UNHEALTHY_PING_THRESHOLD` (10) consecutive times. The
+  read timeout is `DEFAULT_TIMEOUT_SECONDS` (45 s), above the worst measured
+  `GET /balance` (19.74 s). The generated freqtrade configuration sets
+  `fiat_display_currency` to the empty string, so freqtrade never calls the
+  CoinGecko price API and a `GET /balance` cannot be rate-limited into a timeout.
 * **One supervisor, one writer.** The state database has a single writer (the
   supervisor process); two supervisors over the same file are unsupported.
 * **One exchange account per mode.** Every profile of a mode trades the same
@@ -464,7 +461,7 @@ runbook is in `docs/operations.md`.
 | --- | --- |
 | `docs/architecture.md` | supervisor/fleet design, the full state-database schema, port allocation, the snapshot model, the health and restart policy, the live-trading safety gates |
 | `docs/strategies.md` | the ten strategies: logic, parameters, suitable timeframes, risk notes |
-| `docs/operations.md` | the runbook: compose commands, health checks, provisioning, raising the fleet cap, the kill switch, log locations, reading the state database |
+| `docs/operations.md` | the runbook: compose commands, health checks, provisioning, the worker crash-loop fix, the kill switch, log locations, reading the state database |
 | `docs/testing-policy.md` | the enforceable test and coverage policy (the gates quoted above) |
 | `deploy/README.md` | the deployment: containers, volumes, nginx, TLS, fail2ban, automatic deploys |
 

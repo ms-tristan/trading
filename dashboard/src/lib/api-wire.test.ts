@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import {
   asNumber,
   asRecord,
+  asState,
   toAccountResponse,
   toCatalogueApplyResponse,
   toDailyBar,
@@ -40,9 +41,9 @@ const HEALTH = {
   profiles_running_paper: 10,
   profiles_live: 2,
   profiles_running_live: 0,
-  profiles_queued: 10,
-  engine_slots_used: 10,
-  engine_slots_total: 2,
+  // Retained for compatibility: the current engine always publishes 0 here, and
+  // the decoder keeps tolerating the key so a stale payload never crashes a page.
+  profiles_queued: 0,
   kill_switch_engaged: false,
   generated_at: "2026-09-27T17:06:09Z",
 };
@@ -157,6 +158,31 @@ describe("toProfileView", () => {
     expect(view.state).toBe("stopped");
   });
 
+  it("degrades the legacy `queued` state of a stale engine instead of crashing", () => {
+    // Nothing waits for a slot any more, but an older engine still publishes
+    // profile rows in that state: they must parse as a readable state.
+    const [view] = toProfilesResponse({
+      profiles: [{ ...PROFILE, state: "queued", state_reason: "waiting for an engine slot" }],
+    }).profiles;
+
+    expect(view.state).toBe("stopped");
+    expect(view.state_reason).toBe("waiting for an engine slot");
+  });
+
+  it("round-trips each of the four documented states", () => {
+    for (const state of ["running", "stopped", "error", "blocked"] as const) {
+      expect(asState(state)).toBe(state);
+    }
+  });
+
+  it("maps the legacy `queued` literal to `stopped` and never returns it", () => {
+    // The one place the removed state is still named on purpose: an older engine
+    // may publish it, and the dashboard degrades the row instead of crashing.
+    expect(asState("queued")).toBe("stopped");
+    expect(asState("wat")).toBe("stopped");
+    expect(asState(undefined)).toBe("stopped");
+  });
+
   it("answers an empty ranking for a body that carries no profile list", () => {
     expect(toProfilesResponse({}).profiles).toEqual([]);
     expect(toProfilesResponse(null).profiles).toEqual([]);
@@ -169,18 +195,38 @@ describe("toHealthStatus", () => {
 
     expect(health.status).toBe("ok");
     expect(health.profiles_running).toBe(10);
-    expect(health.engine_slots_used).toBe(10);
-    expect(health.engine_slots_total).toBe(2);
     expect(health.kill_switch_engaged).toBe(false);
+    expect(Object.keys(health)).not.toContain("engine_slots_used");
+    expect(Object.keys(health)).not.toContain("engine_slots_total");
   });
 
   it("degrades every missing counter to zero, never to NaN", () => {
     const health = toHealthStatus({ status: "degraded" });
 
     expect(health.profiles_running).toBe(0);
-    expect(health.engine_slots_used).toBe(0);
-    expect(health.engine_slots_total).toBe(0);
-    expect(Number.isNaN(health.engine_slots_used)).toBe(false);
+    expect(Number.isNaN(health.profiles_running)).toBe(false);
+  });
+
+  it("still parses a legacy payload that publishes profiles_queued", () => {
+    const health = toHealthStatus({ ...HEALTH, profiles_queued: 11 });
+
+    expect(health.profiles_running).toBe(10);
+    expect(Number.isNaN(health.profiles_running)).toBe(false);
+  });
+
+  it("still parses a legacy payload that publishes the engine-slot pair", () => {
+    // An older engine still publishes `engine_slots_used`/`engine_slots_total`
+    // and legacy profile rows may still say `"queued"`: the extra keys must be
+    // ignored, never crash the page and never resurface in the view model.
+    const health = toHealthStatus({
+      ...HEALTH,
+      profiles_queued: 11,
+      engine_slots_used: 10,
+      engine_slots_total: 10,
+    });
+
+    expect(health.profiles_running).toBe(10);
+    expect(Object.keys(health)).not.toContain("engine_slots_used");
   });
 
   it("reports live trading as disabled: the health payload never publishes the gate", () => {
@@ -366,14 +412,14 @@ describe("toEventItem", () => {
       ts: "2026-09-27T17:06:53Z",
       profile_id: null,
       level: "warning",
-      kind: "cap_reached",
-      message: "fleet cap reached: 2 profile(s) running, 20 profile(s) queued",
+      kind: "profile_refused",
+      message: "the profile was refused",
     });
 
     expect(event.id).toBe("4");
     expect(event.timestamp).toBe("2026-09-27T17:06:53Z");
     expect(event.level).toBe("warning");
-    expect(event.kind).toBe("cap_reached");
+    expect(event.kind).toBe("profile_refused");
     expect(event.profile_id).toBeNull();
   });
 
@@ -381,14 +427,26 @@ describe("toEventItem", () => {
     expect(toEventItem({ id: 1, level: "critical" }).level).toBe("info");
     expect(toEventsResponse({}).events).toEqual([]);
   });
+
+  it("relays a legacy event kind verbatim instead of guessing", () => {
+    const event = toEventItem({
+      id: 9,
+      ts: "2026-09-27T17:06:53Z",
+      profile_id: null,
+      level: "warning",
+      kind: "cap_reached",
+      message: "a legacy row of an older engine",
+    });
+
+    expect(event.kind).toBe("cap_reached");
+    expect(event.message).toBe("a legacy row of an older engine");
+  });
 });
 
 describe("toDashboardSettings", () => {
   it("maps the engine settings the API publishes", () => {
     const settings = toDashboardSettings({
-      max_running_profiles: 2,
       snapshot_interval_seconds: 60,
-      worker_start_stagger_seconds: 12,
       kill_switch_engaged: false,
       allow_live_trading: false,
       catalogue_profile_count: 22,
@@ -397,19 +455,22 @@ describe("toDashboardSettings", () => {
       version: "1.0.0",
     });
 
-    expect(settings.max_running_profiles).toBe(2);
     expect(settings.snapshot_interval_seconds).toBe(60);
-    expect(settings.worker_start_stagger_seconds).toBe(12);
     expect(settings.allow_live_trading).toBe(false);
     // The API publishes no dashboard refresh interval: the documented default.
     expect(settings.refresh_interval_seconds).toBe(15);
   });
 
-  it("leaves the stagger undefined when the payload carries none", () => {
-    expect(toDashboardSettings({ max_running_profiles: 4 }).worker_start_stagger_seconds)
-      .toBeUndefined();
-    expect(toDashboardSettings({ worker_start_stagger_seconds: "12" }).worker_start_stagger_seconds)
-      .toBeUndefined();
+  it("never surfaces the removed fleet settings, even from a legacy payload", () => {
+    const settings = toDashboardSettings({
+      max_running_profiles: 2,
+      worker_start_stagger_seconds: 12,
+      snapshot_interval_seconds: 60,
+    });
+
+    expect(Object.keys(settings)).not.toContain("max_running_profiles");
+    expect(Object.keys(settings)).not.toContain("worker_start_stagger_seconds");
+    expect(settings.snapshot_interval_seconds).toBe(60);
   });
 });
 

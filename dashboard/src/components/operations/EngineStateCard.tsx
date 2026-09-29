@@ -3,7 +3,7 @@ import { KpiStat } from "@/components/ui/KpiStat";
 import { StateBadge } from "@/components/ui/StateBadge";
 import { cn } from "@/lib/cn";
 import { formatDuration, formatTimestamp } from "@/lib/format";
-import { STATE_LABELS, isWaitingForSlot, needsDecision } from "@/lib/states";
+import { STATE_LABELS, needsDecision } from "@/lib/states";
 import type { HealthStatus, ProfileState, ProfileView } from "@/lib/types";
 
 /**
@@ -19,8 +19,6 @@ export const EMPTY_HEALTH: HealthStatus = {
   version: "",
   uptime_seconds: Number.NaN,
   profiles_running: Number.NaN,
-  engine_slots_used: Number.NaN,
-  engine_slots_total: Number.NaN,
   live_trading_enabled: false,
   kill_switch_engaged: false,
   generated_at: "",
@@ -33,7 +31,6 @@ export const STATE_ORDER = Object.keys(STATE_LABELS) as ProfileState[];
 export function countByState(profiles: ProfileView[]): Record<ProfileState, number> {
   const counts: Record<ProfileState, number> = {
     running: 0,
-    queued: 0,
     stopped: 0,
     error: 0,
     blocked: 0,
@@ -50,7 +47,7 @@ export function countByState(profiles: ProfileView[]): Record<ProfileState, numb
 /** Border colour of the three answers `status` can carry. */
 const STATUS_CLASS: Record<string, string> = {
   ok: "border-status-running",
-  degraded: "border-status-queued",
+  degraded: "border-status-warning",
 };
 
 /**
@@ -71,14 +68,12 @@ export interface EngineStateCardProps {
 }
 
 /**
- * State of the supervisor: slot usage, uptime, the platform gates and how many
- * profiles sit in each lifecycle state.
+ * State of the supervisor: uptime, the platform gates and how many profiles sit
+ * in each lifecycle state.
  *
- * The five states are always listed, including the empty ones: an operator
- * checks "is anything queued or in error?" at a glance, and a state that needs a
- * decision says so in words next to its badge, never through colour alone. A
- * queued profile is NOT one of them - it holds no slot yet and simply waits for
- * one - so the two facts are stated separately.
+ * The four states are always listed, including the empty ones: an operator
+ * checks "is anything in error?" at a glance, and a state that needs a decision
+ * says so in words next to its badge, never through colour alone.
  */
 export function EngineStateCard({ health, profiles, className }: EngineStateCardProps) {
   const counts = countByState(profiles);
@@ -88,7 +83,7 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
       className={className}
       headingLevel={2}
       title="Engine state"
-      description="What the supervisor reports right now - the fleet cap is max_running_profiles of GET /api/settings"
+      description="What the supervisor reports right now"
       actions={
         <span
           data-status={health.status}
@@ -102,12 +97,6 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
       }
     >
       <div className="grid grid-cols-12 gap-2">
-        <KpiStat
-          className="col-span-6 md:col-span-4 lg:col-span-3"
-          label="Engine slots"
-          value={`${formatCount(health.engine_slots_used)} of ${formatCount(health.engine_slots_total)}`}
-          hint="profiles holding a worker"
-        />
         <KpiStat
           className="col-span-6 md:col-span-4 lg:col-span-3"
           label="Uptime"
@@ -127,7 +116,7 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
           hint={
             health.kill_switch_engaged
               ? "no worker may start"
-              : "workers may hold slots"
+              : "workers may run"
           }
         />
         <KpiStat
@@ -147,9 +136,6 @@ export function EngineStateCard({ health, profiles, className }: EngineStateCard
               <span className="tabular-nums">{counts[state]}</span>
               {needsDecision(state) && counts[state] > 0 ? (
                 <span className="text-sm text-muted-foreground">needs attention</span>
-              ) : null}
-              {isWaitingForSlot(state) && counts[state] > 0 ? (
-                <span className="text-sm text-muted-foreground">waiting for a slot</span>
               ) : null}
             </li>
           ))}

@@ -491,7 +491,6 @@ def build_health(
     uptime_seconds: float,
     views: Sequence[ProfileView],
     profiles_healthy: int,
-    slots_total: int,
     kill_switch_engaged: bool,
     now: datetime | None = None,
 ) -> HealthStatus:
@@ -511,9 +510,9 @@ def build_health(
         profiles_running_paper=sum(1 for view in paper if view.state == STATE_RUNNING),
         profiles_live=len(live),
         profiles_running_live=sum(1 for view in live if view.state == STATE_RUNNING),
-        profiles_queued=sum(1 for view in selected if view.state == "queued"),
-        engine_slots_used=len(running),
-        engine_slots_total=max(0, _as_int(slots_total)),
+        # With no fleet cap there is no way to hold a profile back, so no profile
+        # can ever be queued: the field stays on the wire pinned to the constant.
+        profiles_queued=0,
         kill_switch_engaged=bool(kill_switch_engaged),
         generated_at=format_ts(now),
     )

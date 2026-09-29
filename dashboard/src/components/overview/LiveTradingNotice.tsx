@@ -19,7 +19,9 @@ export interface LiveTradingNoticeProps {
  *
  * It answers the two questions an operator asks when a live profile does not
  * trade: is live trading enabled at all, and which profiles were refused (with
- * the reason the engine published).
+ * the reason the engine published). Its wording is explicit that a refused live
+ * profile is not running and is not waiting in a queue: the platform has no
+ * queue, a live profile that is not allowed to trade is simply blocked.
  */
 export function LiveTradingNotice({
   allowLiveTrading,
@@ -44,7 +46,10 @@ export function LiveTradingNotice({
   } else {
     headline = "Live trading is not enabled";
     explanation =
-      "The platform reports allow_live_trading = false, so no live profile can start or keep trading; a live profile stays queued or blocked until an operator enables the gate.";
+      "The platform reports allow_live_trading = false, so a live profile is refused: it is NOT running. " +
+      "A live profile is refused for one of two reasons - the platform gate allow_live_trading is unset (false), " +
+      "or the exchange credentials of the profile are missing. A refused live profile is not running and it is not " +
+      "waiting in a queue either: it stays blocked until an operator arms the gate and the credentials are in place.";
   }
 
   return (

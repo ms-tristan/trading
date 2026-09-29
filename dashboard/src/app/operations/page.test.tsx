@@ -22,10 +22,8 @@ vi.mock("next/navigation", () => ({
 const HEALTH = apiHealth({
   kill_switch_engaged: false,
   profiles_running: 2,
-  engine_slots_used: 10,
-  engine_slots_total: 10,
-  // One profile waits for a slot: a queued profile is not a failure.
-  profiles_queued: 11,
+  // Retained for compatibility: the key still exists on the wire, always 0.
+  profiles_queued: 0,
 });
 
 const PROFILES = apiProfiles([
@@ -35,8 +33,7 @@ const PROFILES = apiProfiles([
     state: "running",
     portfolio_value: 1040,
     strategy_title: "EMA cross baseline",
-    // The engine publishes the slot of a running profile and the REST port of its
-    // worker: the two columns of the slot table read exactly those.
+    // The engine publishes the REST port of the worker of a running profile.
     engine_slot: 1,
     api_port: 8081,
   }),
@@ -50,24 +47,14 @@ const PROFILES = apiProfiles([
   apiProfile({
     id: "charlie",
     name: "Charlie",
-    state: "queued",
-    state_reason: "waiting for an engine slot",
+    state: "stopped",
+    state_reason: "no worker running",
     portfolio_value: 950,
     strategy_title: "Momentum breakout",
   }),
 ]);
 
-const SETTINGS = apiSettings({
-  allow_live_trading: false,
-  max_running_profiles: 10,
-});
-
-/**
- * The same payload plus the delay the supervisor keeps between two worker
- * starts: `apiSettings` publishes no such key, so a test that wants the stagger
- * clause of the capacity sentence adds it to the wire body itself.
- */
-const SETTINGS_WITH_STAGGER = { ...SETTINGS, worker_start_stagger_seconds: 12 };
+const SETTINGS = apiSettings({ allow_live_trading: false });
 
 const EVENTS = apiEvents([
   apiEvent({
@@ -80,9 +67,9 @@ const EVENTS = apiEvents([
   apiEvent({
     id: "11",
     level: "warning",
-    kind: "cap_reached",
+    kind: "profile_refused",
     profile_id: "charlie",
-    message: "Charlie waits for an engine slot.",
+    message: "Charlie was refused.",
   }),
   apiEvent({
     id: "10",
@@ -147,33 +134,17 @@ describe("OperationsPage", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/events?limit=50", expect.anything());
   });
 
-  it("reports the engine state, the slot usage and the journal", async () => {
+  it("reports the engine state and the journal", async () => {
     await renderOperations();
 
     expect(screen.getByRole("heading", { level: 2, name: /Operations/ })).toBeInTheDocument();
-    expect(screen.getByText(/engine ok - version 2026\.8 - 10 of 10 engine slots used/))
+    expect(screen.getByText(/engine ok - version 2026\.8 - 2 running - 3 profiles known/))
       .toBeInTheDocument();
 
     const engine = screen.getByRole("heading", { level: 2, name: "Engine state" }).closest("section");
     expect(engine).not.toBeNull();
     expect(within(engine as HTMLElement).getByText("Released")).toBeInTheDocument();
     expect(within(engine as HTMLElement).getByText("Disabled")).toBeInTheDocument();
-
-    const slots = screen.getByRole("heading", { level: 2, name: /Engine slots/ }).closest("section");
-    expect(slots).not.toBeNull();
-    const slotRows = within(within(slots as HTMLElement).getByRole("table")).getAllByRole("row");
-    expect(slotRows).toHaveLength(4); // header + two running + one queued
-    // The engine publishes the slot index and the worker REST port of a running
-    // profile: the two columns print them instead of an em dash.
-    expect(slotRows[1]).toHaveTextContent("#1");
-    expect(slotRows[1]).toHaveTextContent("8081");
-    expect(slotRows[1]).toHaveTextContent("Alpha");
-    // A running profile the engine has given no slot and no port keeps the em
-    // dash, and a waiting profile keeps the "queued" label.
-    expect(slotRows[2]).toHaveTextContent("\u2014");
-    expect(slotRows[2]).toHaveTextContent("Bravo");
-    expect(slotRows[3]).toHaveTextContent("queued");
-    expect(slotRows[3]).toHaveTextContent("waiting for an engine slot");
 
     const journal = screen.getByRole("heading", { level: 2, name: "Recent events" }).closest("section");
     expect(journal).not.toBeNull();
@@ -185,51 +156,21 @@ describe("OperationsPage", () => {
     expect(eventRows[3]).toHaveClass("bg-destructive/10");
   });
 
-  it("states the fleet cap of /api/settings as always-visible text", async () => {
-    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
-      const path = String(input).split("?")[0];
-      switch (path) {
-        case "/api/health":
-          return jsonResponse(HEALTH);
-        case "/api/profiles":
-          return jsonResponse(PROFILES);
-        case "/api/settings":
-          return jsonResponse(SETTINGS_WITH_STAGGER);
-        default:
-          return jsonResponse(EVENTS);
-      }
-    });
-
+  it("renders no slot usage section, no cap and no queue sentence", async () => {
     await renderOperations();
 
-    // The cap comes from `GET /api/settings` and the slot pair from
-    // `GET /api/health`: no figure of this sentence is written in the page.
-    const capacity = screen.getAllByText(/at most 10 profiles/);
-    expect(capacity.length).toBeGreaterThanOrEqual(1);
-    for (const line of capacity) {
-      expect(line).toHaveTextContent("10 of 10 slots in use");
-      expect(line).not.toHaveAttribute("title");
-    }
-    // Both the line and the notice state the stagger the supervisor publishes.
-    expect(
-      screen.getAllByText(/Workers start one at a time, 12 seconds apart/),
-    ).toHaveLength(2);
-    expect(screen.getByText(/1 profiles are known but waiting for a slot\./)).toBeInTheDocument();
-    expect(screen.getByText("waiting for a slot")).toBeInTheDocument();
-    expect(screen.queryByText(/needing attention/)).not.toBeInTheDocument();
-
-    // The subtitle of the slot table carries the same cap, in plain text.
-    const slots = screen.getByRole("heading", { level: 2, name: /Engine slots/ }).closest("section");
-    expect(slots).not.toBeNull();
-    expect(within(slots as HTMLElement).getByText(/2 running, 1 queued/)).toHaveTextContent(
-      "cap 10, 10 of 10 slots in use",
-    );
+    expect(screen.queryByRole("heading", { level: 2, name: /Engine slots/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/slots? (in use|used)/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/at most \d+ profiles/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/waiting for a slot/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cap \d+/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Max running profiles/)).not.toBeInTheDocument();
+    expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });
 
-  it("starts the two mutating controls from the values the API published", async () => {
+  it("starts the mutating controls from the values the API published", async () => {
     await renderOperations();
 
-    expect(screen.getByLabelText(/^Max running profiles/)).toHaveValue(10);
     expect(screen.getByLabelText(/^Snapshot interval/)).toHaveValue(60);
     expect(screen.getByText("refresh every 15 s")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Engage kill switch" })).toBeInTheDocument();
@@ -313,7 +254,7 @@ describe("OperationsPage", () => {
 
     await renderOperations();
 
-    fireEvent.change(screen.getByLabelText(/^Max running profiles/), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText(/^Snapshot interval/), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByText("The engine refused the new settings")).toBeInTheDocument();
@@ -328,11 +269,10 @@ describe("OperationsPage", () => {
     await renderOperations();
 
     expect(screen.getByText("The engine state could not be refreshed")).toBeInTheDocument();
-    expect(screen.getByText("The slot usage could not be refreshed")).toBeInTheDocument();
+    expect(screen.getByText("The profile ranking could not be refreshed")).toBeInTheDocument();
     expect(screen.getByText("The platform settings could not be refreshed")).toBeInTheDocument();
     expect(screen.getByText("The event log could not be refreshed")).toBeInTheDocument();
 
-    expect(screen.getByText(/10 of 10 engine slots used/)).toBeInTheDocument();
     expect(screen.getByText("Alpha started.")).toBeInTheDocument();
     expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });
@@ -344,7 +284,6 @@ describe("OperationsPage", () => {
 
     expect(screen.getByText("The engine state could not be refreshed")).toBeInTheDocument();
     expect(screen.getByText("unknown")).toBeInTheDocument();
-    expect(screen.getByText("No profile holds or waits for an engine slot.")).toBeInTheDocument();
     expect(screen.getByText("The engine journal is empty.")).toBeInTheDocument();
     expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });

@@ -156,6 +156,12 @@ def build_freqtrade_config(
     the credentials of a live profile and leaves them empty for paper trading.
     Fresh values are generated for ``jwt_secret_key`` and ``ws_token`` on every
     call, so two profiles never share an API secret.
+
+    ``fiat_display_currency`` is deliberately empty: Freqtrade answers an empty
+    conversion currency as "no fiat conversion requested" and never calls the
+    CoinGecko price API. A worker set to ``"USD"`` refreshes that conversion on
+    every API request, and the anonymous CoinGecko rate limit shared by the
+    whole fleet is what made ``GET /api/v1/balance`` take 12 to 20 s.
     """
     paper = _is_paper(profile)
     config: dict[str, Any] = {
@@ -163,7 +169,7 @@ def build_freqtrade_config(
         "stake_currency": settings.default_stake_currency,
         "stake_amount": _stake_amount(profile, paper=paper),
         "tradable_balance_ratio": 0.99,
-        "fiat_display_currency": "USD",
+        "fiat_display_currency": "",
         "dry_run": paper,
         "trading_mode": "spot",
         "margin_mode": "",

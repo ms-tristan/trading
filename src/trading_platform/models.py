@@ -31,7 +31,6 @@ __all__ = [
     "PROFILE_STATES",
     "STATE_BLOCKED",
     "STATE_ERROR",
-    "STATE_QUEUED",
     "STATE_RUNNING",
     "STATE_STOPPED",
     "STRATEGY_CATEGORIES",
@@ -91,7 +90,7 @@ SUPPORTED_TIMEFRAMES: tuple[str, ...] = (
 )
 
 PROFILE_MODES: tuple[str, ...] = ("paper", "live")
-PROFILE_STATES: tuple[str, ...] = ("running", "queued", "stopped", "error", "blocked")
+PROFILE_STATES: tuple[str, ...] = ("running", "stopped", "error", "blocked")
 PROFILE_SOURCES: tuple[str, ...] = ("catalogue", "operator")
 STRATEGY_CATEGORIES: tuple[str, ...] = (
     "baseline",
@@ -103,7 +102,6 @@ STRATEGY_CATEGORIES: tuple[str, ...] = (
 WINDOWS: tuple[str, ...] = ("24h", "7d", "30d", "all")
 
 STATE_RUNNING = "running"
-STATE_QUEUED = "queued"
 STATE_STOPPED = "stopped"
 STATE_ERROR = "error"
 STATE_BLOCKED = "blocked"
@@ -481,9 +479,10 @@ class HealthStatus(_Model):
     profiles_running_paper: int = 0
     profiles_live: int = 0
     profiles_running_live: int = 0
+    #: Retained for wire compatibility with the dashboard, which still parses it.
+    #: The state ``queued`` no longer exists, so this counter is structurally
+    #: always ``0`` and is never derived from any profile row.
     profiles_queued: int = 0
-    engine_slots_used: int = 0
-    engine_slots_total: int = 0
     kill_switch_engaged: bool = False
     generated_at: str = Field(default_factory=format_ts)
 
@@ -491,11 +490,7 @@ class HealthStatus(_Model):
 class DashboardSettings(_Model):
     """The operator-facing settings payload."""
 
-    max_running_profiles: int = 6
     snapshot_interval_seconds: int = 60
-    #: Seconds between two worker starts of the same scheduling pass; ``0``
-    #: opens the stagger gate at once.
-    worker_start_stagger_seconds: int = 10
     kill_switch_engaged: bool = False
     allow_live_trading: bool = False
     catalogue_profile_count: int = 0

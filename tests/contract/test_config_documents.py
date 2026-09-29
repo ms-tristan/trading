@@ -5,10 +5,10 @@ dashboard and the operator: this module pins their keys, their documented
 defaults and the exact profile catalogue the specification froze. It reads the
 JSON files only -- no import of ``trading_platform``, no process, no network.
 
-This module pins **eleven** platform keys: the binding specification of the
-fleet-stability delivery raises the documented settings count by adding
-``worker_start_stagger_seconds`` and lowers the documented fleet cap to ``6``, so
-the expectations below follow the specification instead of weakening it.
+This module pins **nine** platform keys: the fleet-stability delivery removes the
+documented fleet cap ``max_running_profiles`` and the gradual-start setting
+``worker_start_stagger_seconds``, so the expectations below follow the
+specification instead of weakening it.
 """
 
 from __future__ import annotations
@@ -20,10 +20,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: ``config/platform.json``: the eleven documented keys and their documented defaults.
+#: ``config/platform.json``: the nine documented keys and their documented defaults.
 PLATFORM_DEFAULTS: dict[str, object] = {
-    "max_running_profiles": 6,
-    "worker_start_stagger_seconds": 10,
     "snapshot_interval_seconds": 60,
     "profile_api_port_base": 8101,
     "default_exchange": "binance",
@@ -108,10 +106,10 @@ def _profiles_by_id() -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # config/platform.json
 # ---------------------------------------------------------------------------
-def test_platform_document_carries_the_eleven_documented_keys() -> None:
+def test_platform_document_carries_the_nine_documented_keys() -> None:
     document = _document("platform.json")
     assert set(document) == set(PLATFORM_DEFAULTS), (
-        "config/platform.json must carry exactly the eleven documented keys; "
+        "config/platform.json must carry exactly the nine documented keys; "
         f"unexpected: {sorted(set(document) - set(PLATFORM_DEFAULTS))}, "
         f"missing: {sorted(set(PLATFORM_DEFAULTS) - set(document))}"
     )

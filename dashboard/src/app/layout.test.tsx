@@ -46,7 +46,7 @@ afterEach(cleanup);
 describe("RootLayout", () => {
   it("renders the shell, the navigation and the children", async () => {
     fetchMock.mockResolvedValue(
-      jsonResponse({ max_running_profiles: 12, snapshot_interval_seconds: 30, allow_live_trading: false }),
+      jsonResponse({ snapshot_interval_seconds: 30, allow_live_trading: false }),
     );
 
     render(await RootLayout({ children: <p>page content</p> }));
@@ -68,7 +68,7 @@ describe("RootLayout", () => {
     // refresh interval: the shell keeps the documented 15 s default whatever
     // `snapshot_interval_seconds` says.
     fetchMock.mockResolvedValue(
-      jsonResponse({ max_running_profiles: 12, snapshot_interval_seconds: 45, allow_live_trading: true }),
+      jsonResponse({ snapshot_interval_seconds: 45, allow_live_trading: true }),
     );
 
     render(await RootLayout({ children: <p>page content</p> }));
@@ -87,7 +87,7 @@ describe("RootLayout", () => {
   });
 
   it("falls back to 15 s when the settings omit the interval", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ max_running_profiles: 12, allow_live_trading: false }));
+    fetchMock.mockResolvedValue(jsonResponse({ allow_live_trading: false }));
 
     render(await RootLayout({ children: <p>page content</p> }));
 
@@ -95,7 +95,7 @@ describe("RootLayout", () => {
   });
 
   it("offers the operator token prompt in the sidebar", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ max_running_profiles: 12 }));
+    fetchMock.mockResolvedValue(jsonResponse({ snapshot_interval_seconds: 60 }));
 
     render(await RootLayout({ children: <p>page content</p> }));
 
@@ -103,7 +103,7 @@ describe("RootLayout", () => {
   });
 
   it("renders the dark theme colour for the browser chrome", async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ max_running_profiles: 12 }));
+    fetchMock.mockResolvedValue(jsonResponse({ snapshot_interval_seconds: 60 }));
 
     render(await RootLayout({ children: <p>page content</p> }));
 

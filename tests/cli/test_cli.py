@@ -121,7 +121,6 @@ def test_realtime_run_defaults() -> None:
     assert args.state_db is None
     assert args.host == "127.0.0.1"
     assert args.port == 8080
-    assert args.max_running_profiles is None
 
 
 def test_realtime_run_options() -> None:
@@ -135,13 +134,11 @@ def test_realtime_run_options() -> None:
             "0.0.0.0",
             "--port",
             "9000",
-            "--max-running-profiles",
-            "4",
         ]
     )
 
     assert args.state_db == Path("/tmp/state.db")
-    assert (args.host, args.port, args.max_running_profiles) == ("0.0.0.0", 9000, 4)
+    assert (args.host, args.port) == ("0.0.0.0", 9000)
 
 
 def test_realtime_provision_defaults() -> None:
@@ -426,9 +423,7 @@ def test_status_prints_the_health_line_and_the_ranked_fleet(
                     "profiles_total": 2,
                     "profiles_running": 1,
                     "profiles_healthy": 1,
-                    "profiles_queued": 1,
-                    "engine_slots_used": 1,
-                    "engine_slots_total": 12,
+                    "profiles_queued": 0,
                     "kill_switch_engaged": False,
                     "uptime_seconds": 3720,
                 },
@@ -439,7 +434,7 @@ def test_status_prints_the_health_line_and_the_ranked_fleet(
                             "basic-eth-4h",
                             rank=2,
                             mode="live",
-                            state="queued",
+                            state="blocked",
                             portfolio_value=980.0,
                             profit_pct=-0.02,
                             open_trades=0,
@@ -457,8 +452,8 @@ def test_status_prints_the_health_line_and_the_ranked_fleet(
     assert exit_code == 0
     printed = capsys.readouterr().out
     assert "status: ok" in printed
-    assert "engine_slots_used" not in printed
-    assert "slots: 1/12" in printed
+    assert "slots" not in printed
+    assert "queued" not in printed
     assert "kill switch: released" in printed
     assert "uptime: 1h 02m" in printed
     assert "RANK" in printed
@@ -645,8 +640,6 @@ def test_run_builds_the_engine_over_the_requested_state_db(
             "0.0.0.0",
             "--port",
             "8099",
-            "--max-running-profiles",
-            "3",
         ]
     )
 
@@ -657,7 +650,7 @@ def test_run_builds_the_engine_over_the_requested_state_db(
     assert kwargs["state_dir"] == state_db.parent
     supervisor = kwargs["supervisor"]
     assert supervisor.store.path == state_db
-    assert supervisor.settings.max_running_profiles == 3
+    assert supervisor.settings.snapshot_interval_seconds == 60
 
 
 def test_run_reports_a_broken_state_db_path(

@@ -43,16 +43,16 @@ describe("ProfileHeader", () => {
     render(
       <ProfileHeader
         profile={profile({
-          id: "queued-one",
-          state: "queued",
-          state_reason: "waiting for an engine slot",
+          id: "blocked-one",
+          state: "blocked",
+          state_reason: "the live gate is closed",
         })}
       />,
     );
 
-    const badge = screen.getByText("Queued");
+    const badge = screen.getByText("Blocked");
     expect(badge).toBeInTheDocument();
-    expect(screen.getByText("waiting for an engine slot")).toBeInTheDocument();
+    expect(screen.getByText("the live gate is closed")).toBeInTheDocument();
     expect(badge.closest("[data-state]")).toHaveAttribute("data-attention", "true");
   });
 

@@ -1,7 +1,7 @@
 """Platform settings, environment overrides and the live-trading safety gate.
 
-``config/platform.json`` holds the eleven documented settings; the environment
-overrides exactly four of them (the ones an operator changes per deployment).
+``config/platform.json`` holds the nine documented settings; the environment
+overrides exactly two of them (the ones an operator changes per deployment).
 The live-trading gate is deliberately painful to open: a live profile needs both
 the acknowledgement string *and* the exchange credentials in the environment.
 """
@@ -24,11 +24,9 @@ __all__ = [
     "ENV_LIVE_EXCHANGE_KEY",
     "ENV_LIVE_EXCHANGE_SECRET",
     "ENV_LOG_LEVEL",
-    "ENV_MAX_RUNNING_PROFILES",
     "ENV_OPERATOR_TOKEN",
     "ENV_PROFILE_API_PORT_BASE",
     "ENV_SNAPSHOT_INTERVAL_SECONDS",
-    "ENV_WORKER_START_STAGGER_SECONDS",
     "LIVE_TRADING_CONFIRMATION",
     "PLATFORM_CONFIG_FILENAME",
     "PlatformSettings",
@@ -37,10 +35,8 @@ __all__ = [
     "operator_token",
 ]
 
-ENV_MAX_RUNNING_PROFILES = "TB_MAX_RUNNING_PROFILES"
 ENV_SNAPSHOT_INTERVAL_SECONDS = "TB_SNAPSHOT_INTERVAL_SECONDS"
 ENV_PROFILE_API_PORT_BASE = "TB_PROFILE_API_PORT_BASE"
-ENV_WORKER_START_STAGGER_SECONDS = "TB_WORKER_START_STAGGER_SECONDS"
 ENV_OPERATOR_TOKEN = "TB_OPERATOR_TOKEN"
 ENV_ALLOW_LIVE_TRADING = "TB_ALLOW_LIVE_TRADING"
 ENV_LIVE_EXCHANGE_KEY = "TB_LIVE_EXCHANGE_KEY"
@@ -84,16 +80,11 @@ def _env_int(
 
 
 def _environment_overrides(env: Mapping[str, str] | None) -> dict[str, int]:
-    """Return the four settings the environment is allowed to override."""
+    """Return the two settings the environment is allowed to override."""
     source = _environment(env)
     candidates: tuple[tuple[str, int | None], ...] = (
-        ("max_running_profiles", _env_int(source, ENV_MAX_RUNNING_PROFILES, minimum=1)),
         ("snapshot_interval_seconds", _env_int(source, ENV_SNAPSHOT_INTERVAL_SECONDS, minimum=1)),
         ("profile_api_port_base", _env_int(source, ENV_PROFILE_API_PORT_BASE, 1, maximum=65535)),
-        (
-            "worker_start_stagger_seconds",
-            _env_int(source, ENV_WORKER_START_STAGGER_SECONDS, minimum=0),
-        ),
     )
     return {field: value for field, value in candidates if value is not None}
 
@@ -103,9 +94,7 @@ class PlatformSettings(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    max_running_profiles: int = 6
     snapshot_interval_seconds: int = 60
-    worker_start_stagger_seconds: int = 10
     profile_api_port_base: int = 8101
     default_exchange: str = "binance"
     default_timeframe: str = "1h"
@@ -127,12 +116,8 @@ class PlatformSettings(BaseModel):
         directory (``TB_CONFIG_DIR``, ``/app/config`` or ``<repo>/config``).
         A missing, unreadable or malformed document is not an error: the
         documented defaults are used instead. Only
-        ``TB_MAX_RUNNING_PROFILES``, ``TB_SNAPSHOT_INTERVAL_SECONDS``,
-        ``TB_PROFILE_API_PORT_BASE`` and ``TB_WORKER_START_STAGGER_SECONDS`` are
-        read from the environment, and an unusable value is ignored rather than
-        fatal -- ``TB_WORKER_START_STAGGER_SECONDS=0`` is a valid value that
-        keeps the immediate boot, while a negative or non-integer one is
-        ignored.
+        ``TB_SNAPSHOT_INTERVAL_SECONDS`` and ``TB_PROFILE_API_PORT_BASE`` are read
+        from the environment, and an unusable value is ignored rather than fatal.
         """
         document_path = (
             resolve_config_dir(env) / PLATFORM_CONFIG_FILENAME if path is None else Path(path)

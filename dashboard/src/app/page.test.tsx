@@ -17,8 +17,8 @@ import OverviewPage, { normaliseWindow } from "./page";
  *
  * The page consumes `@/lib/api`, which maps the JSON the Python API serves onto
  * the view model: the doubles below are therefore the payloads of the API
- * (`profit_abs`, `t`/`value`, `sparkline: [{t, value}]`, `slot`, `worker_port`,
- * `engine_slots_used`/`engine_slots_total`), never the view model.
+ * (`profit_abs`, `t`/`value`, `sparkline: [{t, value}]`, `slot`, `worker_port`),
+ * never the view model.
  */
 const PAPER_ROWS = [
   apiProfile({
@@ -27,7 +27,7 @@ const PAPER_ROWS = [
     portfolio_value: 1300,
     profit_usdt: 300,
     profit_pct: 0.3,
-    // A running profile: it holds slot 1 and its worker REST port, and its
+    // A running profile: it holds its worker REST port, and its
     // snapshot series is long enough to be drawn.
     engine_slot: 1,
     api_port: 8081,
@@ -46,10 +46,10 @@ const PAPER_ROWS = [
     id: "delta",
     name: "Delta",
     portfolio_value: 1000,
-    // A profile that waits for a worker: the engine publishes the reason, and it
-    // must be visible text in the row and counted as waiting, never as a problem.
-    state: "queued",
-    state_reason: "queued: fleet cap reached (10 of 10 slots in use)",
+    // A profile that holds no worker: the engine publishes the reason, and it
+    // must be visible text in the row, never counted as a problem.
+    state: "stopped",
+    state_reason: "no worker running",
   }),
 ];
 
@@ -107,13 +107,11 @@ const ACCOUNT = {
 
 const HEALTH = apiHealth({
   profiles_running: 2,
-  engine_slots_used: 10,
-  engine_slots_total: 10,
-  // One paper profile waits for a slot: a queued profile is not a failure.
-  profiles_queued: 11,
+  // The engine still publishes the key for compatibility; it is always 0.
+  profiles_queued: 0,
 });
 
-const SETTINGS = apiSettings({ allow_live_trading: false, max_running_profiles: 10 });
+const SETTINGS = apiSettings({ allow_live_trading: false });
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -203,43 +201,22 @@ describe("OverviewPage", () => {
     expect(screen.getByText("2 of 3")).toBeInTheDocument();
   });
 
-  it("reads the engine-slot KPI from the wire pair of /api/health", async () => {
+  it("renders no capacity, no queue and no engine-slot KPI any more", async () => {
     await renderOverview();
 
-    expect(screen.getByText("Engine slots")).toBeInTheDocument();
-    // `engine_slots_used` of `engine_slots_total`, straight from `/api/health`.
-    expect(screen.getByText("10 of 10")).toBeInTheDocument();
-    expect(screen.queryByText("0 of 10")).not.toBeInTheDocument();
+    // The fleet runs every profile in one process: there is no cap and no queue,
+    // so the overview states neither. Only the live refusal notice remains.
+    expect(screen.queryByText("Engine slots")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Fleet capacity/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/at most \d+ profiles/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/slots? in use/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/waiting for a slot/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\d+ queued/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cap \d+/)).not.toBeInTheDocument();
+    expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });
 
-  it("states the fleet cap of /api/settings as ordinary text under both sections", async () => {
-    await renderOverview();
-
-    // The cap and the slot pair come from the API, never from a number written
-    // in the page: `max_running_profiles` is 10 and the engine reports 10 slots.
-    // Each section states it twice - the caption under its header and the notice
-    // above its table.
-    const capacity = screen.getAllByText(/at most 10 profiles/);
-    expect(capacity).toHaveLength(4);
-    for (const line of capacity) {
-      expect(line).toHaveTextContent("10 of 10 slots in use");
-      expect(line).not.toHaveAttribute("title");
-    }
-
-    // One paper profile waits for a slot; the live section has none.
-    expect(screen.getByText(/Fleet capacity: 10 of 10 slots in use \(cap 10\), 1 of 3 profiles/))
-      .toBeInTheDocument();
-    expect(screen.getByText(/Fleet capacity: 10 of 10 slots in use \(cap 10\), 0 of 1 profiles/))
-      .toBeInTheDocument();
-    expect(screen.getByText("1 profile is waiting for a slot in this section.")).toBeInTheDocument();
-    expect(screen.getByText("No profile of this section is waiting for a slot.")).toBeInTheDocument();
-    // A waiting profile is counted as waiting, never as an attention count. The
-    // one "needing attention" of the page is the live profile in error state.
-    expect(screen.queryByText(/1 profile is needing attention/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/profiles? are? waiting for a slot\b/)).not.toBeInTheDocument();
-  });
-
-  it("states an honest capacity when the health read fails", async () => {
+  it("does not render a capacity or queue sentence when the health read fails", async () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith("/api/health")) {
@@ -256,18 +233,13 @@ describe("OverviewPage", () => {
 
     await renderOverview();
 
-    expect(screen.getByText("The fleet capacity could not be refreshed")).toBeInTheDocument();
-    expect(screen.getByText(/Fleet capacity: Unknown at the moment\. 1 of 3 profiles/))
-      .toBeInTheDocument();
-    // The degraded line never prints a figure it does not have: the caption says
-    // the capacity is unknown and names no slot pair of the failed read.
-    const captions = screen.getAllByText(/Fleet capacity: Unknown at the moment\./);
-    expect(captions).toHaveLength(2);
-    for (const caption of captions) {
-      expect(caption).not.toHaveTextContent("10 of 10 slots in use");
-      expect(caption).not.toHaveTextContent("cap ");
-      expect(caption).not.toHaveTextContent("NaN");
-    }
+    // No capacity is claimed at all, so a failed health read degrades to a page
+    // that simply does not mention it.
+    expect(screen.queryByText(/Fleet capacity/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Unknown at the moment/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/waiting for a slot/)).not.toBeInTheDocument();
+    expect(screen.queryByText("NaN")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: /Paper trading/ })).toBeInTheDocument();
   });
 
   it("draws the equity cell of a two-point sparkline and says no data below that", async () => {
@@ -298,14 +270,14 @@ describe("OverviewPage", () => {
     expect(screen.getByRole("link", { name: "Bravo" })).toHaveAttribute("href", "/profiles/bravo");
   });
 
-  it("shows the reason a waiting profile published, as visible text", async () => {
+  it("shows the reason a profile without a worker published, as visible text", async () => {
     await renderOverview();
 
     const delta = screen.getByRole("link", { name: "Delta" }).closest("tr");
     expect(delta).not.toBeNull();
-    expect(within(delta as HTMLElement).getByText("Queued")).toBeInTheDocument();
+    expect(within(delta as HTMLElement).getByText("Stopped")).toBeInTheDocument();
     expect(
-      within(delta as HTMLElement).getByText("queued: fleet cap reached (10 of 10 slots in use)"),
+      within(delta as HTMLElement).getByText("no worker running"),
     ).toBeInTheDocument();
   });
 
@@ -321,6 +293,19 @@ describe("OverviewPage", () => {
         note.textContent?.includes("Live trading is not enabled"),
       ),
     ).toBe(true);
+  });
+
+  it("states plainly that a refused live profile is not running and is not queued", async () => {
+    await renderOverview();
+
+    const notice = screen
+      .getAllByRole("note")
+      .find((note) => note.textContent?.includes("Live trading is not enabled"));
+    expect(notice).toBeDefined();
+    // The live-gate notice is the only remaining explanation of a non-running
+    // live profile, and it must not leave the reader thinking a queue exists.
+    expect(notice).toHaveTextContent(/is NOT running/);
+    expect(notice).toHaveTextContent(/not waiting in a queue/);
   });
 
   it("fetches the requested window and marks it as current", async () => {
@@ -350,12 +335,11 @@ describe("OverviewPage", () => {
     await renderOverview();
 
     const banners = screen.getAllByRole("status");
-    expect(banners).toHaveLength(4);
+    expect(banners).toHaveLength(3);
     expect(banners[0]).toHaveTextContent("/api/account?window=24h");
     expect(screen.getByRole("heading", { level: 2, name: /Paper trading/ })).toBeInTheDocument();
     expect(screen.getByText("Live trading status unknown")).toBeInTheDocument();
-    expect(screen.getByText("The fleet capacity could not be refreshed")).toBeInTheDocument();
-    expect(screen.getAllByText(/Fleet capacity: Unknown at the moment\./)).toHaveLength(2);
+    expect(screen.queryByText(/Fleet capacity/)).not.toBeInTheDocument();
   });
 
   it("renders the empty messages when no profile exists", async () => {

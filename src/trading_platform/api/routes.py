@@ -293,7 +293,6 @@ def get_health(request: Request) -> HealthStatus:
         uptime_seconds=_uptime_seconds(request),
         views=views,
         profiles_healthy=supervisor.healthy_count(),
-        slots_total=int(_settings(request).max_running_profiles),
         kill_switch_engaged=supervisor.kill_switch_engaged(),
     )
     return health.model_copy(
@@ -302,7 +301,6 @@ def get_health(request: Request) -> HealthStatus:
             "profiles_running": len(alive),
             "profiles_running_paper": sum(1 for record in alive if record.mode == "paper"),
             "profiles_running_live": sum(1 for record in alive if record.mode == "live"),
-            "engine_slots_used": len(alive),
         }
     )
 
@@ -748,15 +746,13 @@ def post_kill_switch(request: Request, payload: KillSwitchRequest) -> KillSwitch
 def post_settings(request: Request, payload: SettingsUpdateRequest) -> DashboardSettings:
     """Persist the settings sent by the operator and reschedule the fleet at once.
 
-    The three fields of the body are optional: a field left out is not written by
-    the supervisor, so a partial update never clears a setting the operator did
-    not mention.
+    The field of the body is optional: left out it is not written by the
+    supervisor, so a partial update never clears a setting the operator did not
+    mention.
     """
     supervisor = _supervisor(request)
     settings = supervisor.apply_settings(
-        max_running_profiles=payload.max_running_profiles,
         snapshot_interval_seconds=payload.snapshot_interval_seconds,
-        worker_start_stagger_seconds=payload.worker_start_stagger_seconds,
     )
     request.app.state.settings = settings
     return _dashboard_settings(request)
@@ -786,9 +782,7 @@ def _dashboard_settings(request: Request) -> DashboardSettings:
     settings = _settings(request)
     counts = supervisor.store.count_by_source()
     return DashboardSettings(
-        max_running_profiles=int(settings.max_running_profiles),
         snapshot_interval_seconds=int(settings.snapshot_interval_seconds),
-        worker_start_stagger_seconds=int(settings.worker_start_stagger_seconds),
         kill_switch_engaged=bool(supervisor.kill_switch_engaged()),
         allow_live_trading=allow_live_trading(),
         catalogue_profile_count=int(counts.get("catalogue", 0)),

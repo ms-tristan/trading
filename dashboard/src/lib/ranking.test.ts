@@ -5,7 +5,6 @@ import {
   SORT_KEYS,
   hasAttentionProfile,
   isAttentionState,
-  isWaitingForSlot,
   needsDecision,
   sortProfiles,
   splitByMode,
@@ -117,20 +116,17 @@ describe("splitByMode", () => {
 
 describe("ranking vocabulary", () => {
   it("re-exports the attention predicate of the state module", () => {
-    expect(isAttentionState("queued")).toBe(true);
     expect(isAttentionState("blocked")).toBe(true);
     expect(isAttentionState("error")).toBe(true);
     expect(isAttentionState("running")).toBe(false);
     expect(isAttentionState("stopped")).toBe(false);
   });
 
-  it("re-exports the decision and waiting predicates of the state module", () => {
+  it("re-exports the decision predicate of the state module", () => {
     expect(needsDecision("error")).toBe(true);
     expect(needsDecision("blocked")).toBe(true);
-    expect(needsDecision("queued")).toBe(false);
-    expect(isWaitingForSlot("queued")).toBe(true);
-    expect(isWaitingForSlot("error")).toBe(false);
-    expect(isWaitingForSlot("blocked")).toBe(false);
+    expect(needsDecision("stopped")).toBe(false);
+    expect(needsDecision("running")).toBe(false);
   });
 
   it("flags a list holding at least one decision state", () => {
@@ -139,9 +135,9 @@ describe("ranking vocabulary", () => {
     expect(hasAttentionProfile(["running", "blocked"])).toBe(true);
   });
 
-  it("does not treat a queued profile as a decision", () => {
-    expect(hasAttentionProfile(["running", "queued"])).toBe(false);
-    expect(hasAttentionProfile(["queued", "queued"])).toBe(false);
+  it("does not treat a stopped profile as a decision", () => {
+    expect(hasAttentionProfile(["running", "stopped"])).toBe(false);
+    expect(hasAttentionProfile(["stopped", "stopped"])).toBe(false);
   });
 
   it("publishes the sort keys and the mode order", () => {

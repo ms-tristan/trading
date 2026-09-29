@@ -18,7 +18,6 @@ vi.mock("next/navigation", () => ({
 const SETTINGS = {
   refresh_interval_seconds: 15,
   allow_live_trading: false,
-  max_running_profiles: 4,
   snapshot_interval_seconds: 60,
 };
 
@@ -26,9 +25,7 @@ let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   window.sessionStorage.clear();
-  fetchMock = vi.fn(async () =>
-    jsonResponse({ ...SETTINGS, max_running_profiles: 6, snapshot_interval_seconds: 30 }),
-  );
+  fetchMock = vi.fn(async () => jsonResponse({ ...SETTINGS, snapshot_interval_seconds: 30 }));
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -56,20 +53,20 @@ describe("parsePositiveInteger", () => {
 });
 
 describe("SettingsEditor", () => {
-  it("shows the settings the API published", () => {
+  it("shows the setting the API published and renders no fleet cap", () => {
     render(<SettingsEditor settings={SETTINGS} token={null} />);
 
-    expect(field("Max running profiles").value).toBe("4");
     expect(field("Snapshot interval").value).toBe("60");
     expect(screen.getByText("refresh every 15 s")).toBeInTheDocument();
     expect(screen.getByText(/Live trading is disabled/)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Max running profiles/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Fleet cap/)).not.toBeInTheDocument();
   });
 
-  it("saves the two settings with the operator token of the session", async () => {
+  it("saves the setting with the operator token of the session", async () => {
     saveOperatorToken("s3cr3t");
     render(<SettingsEditor settings={SETTINGS} token={null} />);
 
-    fireEvent.change(field("Max running profiles"), { target: { value: "6" } });
     fireEvent.change(field("Snapshot interval"), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
@@ -79,46 +76,40 @@ describe("SettingsEditor", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Operator-Token": "s3cr3t" },
-      body: JSON.stringify({ max_running_profiles: 6, snapshot_interval_seconds: 30 }),
+      body: JSON.stringify({ snapshot_interval_seconds: 30 }),
     });
-    expect(
-      await screen.findByText("Saved: max running profiles 6, snapshot interval 30 s."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Saved: snapshot interval 30 s.")).toBeInTheDocument();
     expect(refreshMock).toHaveBeenCalled();
   });
 
-  it("sends the current value of every filled field", async () => {
+  it("sends the current value of the filled field", async () => {
     render(<SettingsEditor settings={SETTINGS} token="held-token" />);
 
-    fireEvent.change(field("Max running profiles"), { target: { value: "8" } });
+    fireEvent.change(field("Snapshot interval"), { target: { value: "45" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
     expect(fetchMock.mock.calls[0][1]?.body).toBe(
-      JSON.stringify({ max_running_profiles: 8, snapshot_interval_seconds: 60 }),
+      JSON.stringify({ snapshot_interval_seconds: 45 }),
     );
   });
 
-  it("leaves an emptied field out of the request", async () => {
+  it("leaves an emptied field out of the request and says so", async () => {
     render(<SettingsEditor settings={SETTINGS} token="held-token" />);
 
-    fireEvent.change(field("Max running profiles"), { target: { value: "" } });
+    fireEvent.change(field("Snapshot interval"), { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    });
-    expect(fetchMock.mock.calls[0][1]?.body).toBe(
-      JSON.stringify({ snapshot_interval_seconds: 60 }),
-    );
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Nothing to save: fill in the setting.")).toBeInTheDocument();
   });
 
   it("asks for the token instead of calling the API without one", () => {
     render(<SettingsEditor settings={SETTINGS} token={null} />);
 
-    fireEvent.change(field("Max running profiles"), { target: { value: "6" } });
+    fireEvent.change(field("Snapshot interval"), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(fetchMock).not.toHaveBeenCalled();
@@ -139,35 +130,11 @@ describe("SettingsEditor", () => {
     );
   });
 
-  it("rejects an invalid fleet cap too", () => {
-    render(<SettingsEditor settings={SETTINGS} token="held-token" />);
-
-    fireEvent.change(field("Max running profiles"), { target: { value: "2.5" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Max running profiles must be a whole number greater than zero.",
-    );
-  });
-
-  it("says so when there is nothing to save", () => {
-    render(<SettingsEditor settings={{ refresh_interval_seconds: 15, allow_live_trading: false }} token="held-token" />);
-
-    expect(field("Max running profiles").value).toBe("");
-    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(
-      screen.getByText("Nothing to save: fill in at least one of the two settings."),
-    ).toBeInTheDocument();
-  });
-
   it("surfaces the 401 of the API in the banner", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ detail: "missing operator token" }, 401));
     render(<SettingsEditor settings={SETTINGS} token="held-token" />);
 
-    fireEvent.change(field("Max running profiles"), { target: { value: "6" } });
+    fireEvent.change(field("Snapshot interval"), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByText("The engine refused the new settings")).toBeInTheDocument();
@@ -179,7 +146,7 @@ describe("SettingsEditor", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ detail: "wrong operator token" }, 403));
     render(<SettingsEditor settings={SETTINGS} token="wrong" />);
 
-    fireEvent.change(field("Max running profiles"), { target: { value: "6" } });
+    fireEvent.change(field("Snapshot interval"), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByText(/HTTP 403/)).toBeInTheDocument();

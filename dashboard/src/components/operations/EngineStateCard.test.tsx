@@ -22,11 +22,11 @@ describe("countByState", () => {
     const counts = countByState([
       profile({ id: "a", state: "running" }),
       profile({ id: "b", state: "running" }),
-      profile({ id: "c", state: "queued" }),
+      profile({ id: "c", state: "stopped" }),
       profile({ id: "d", state: "error" }),
     ]);
 
-    expect(counts).toEqual({ running: 2, queued: 1, stopped: 0, error: 1, blocked: 0 });
+    expect(counts).toEqual({ running: 2, stopped: 1, error: 1, blocked: 0 });
   });
 
   it("ignores a state the vocabulary does not know", () => {
@@ -37,7 +37,7 @@ describe("countByState", () => {
   });
 
   it("orders the states as the shared vocabulary does", () => {
-    expect(STATE_ORDER).toEqual(["running", "queued", "stopped", "error", "blocked"]);
+    expect(STATE_ORDER).toEqual(["running", "stopped", "error", "blocked"]);
   });
 });
 
@@ -50,14 +50,14 @@ describe("formatCount", () => {
 });
 
 describe("EngineStateCard", () => {
-  it("reports the slots, the uptime, the gates and the state counts", () => {
+  it("reports the uptime, the gates and the state counts", () => {
     render(
       <EngineStateCard
         health={health()}
         profiles={[
           profile({ id: "a", state: "running" }),
-          profile({ id: "b", state: "queued", state_reason: "waiting for an engine slot" }),
-          profile({ id: "c", state: "queued" }),
+          profile({ id: "b", state: "stopped", state_reason: "not started" }),
+          profile({ id: "c", state: "stopped" }),
           profile({ id: "d", state: "stopped" }),
           profile({ id: "e", state: "error", state_reason: "worker exited with code 1" }),
         ]}
@@ -66,7 +66,6 @@ describe("EngineStateCard", () => {
 
     expect(screen.getByRole("heading", { level: 2, name: "Engine state" })).toBeInTheDocument();
     expect(screen.getByText("ok")).toBeInTheDocument();
-    expect(screen.getByText("2 of 4")).toBeInTheDocument();
     expect(screen.getByText("1h 1m")).toBeInTheDocument();
     expect(screen.getByText("2026.8")).toBeInTheDocument();
     expect(screen.getByText("Released")).toBeInTheDocument();
@@ -76,22 +75,20 @@ describe("EngineStateCard", () => {
       .parentElement;
     expect(states).not.toBeNull();
     expect(within(states as HTMLElement).getByText("Running")).toBeInTheDocument();
-    expect(within(states as HTMLElement).getAllByText("2").length).toBeGreaterThanOrEqual(1);
-    // The two queued profiles wait for a slot; the one error profile is the only
-    // entry that needs a decision.
-    expect(within(states as HTMLElement).getByText("waiting for a slot")).toBeInTheDocument();
+    expect(within(states as HTMLElement).getAllByText("3").length).toBeGreaterThanOrEqual(1);
+    // The one error profile is the only entry that needs a decision.
     expect(within(states as HTMLElement).getByText("needs attention")).toBeInTheDocument();
     expect(within(states as HTMLElement).queryByText("needing attention")).not.toBeInTheDocument();
     expect(within(states as HTMLElement).getByText("Blocked")).toBeInTheDocument();
   });
 
-  it("splits a waiting profile from a profile that needs a decision", () => {
+  it("lists exactly the four lifecycle states and never a waiting label", () => {
     render(
       <EngineStateCard
         health={health()}
         profiles={[
-          profile({ id: "a", state: "queued", state_reason: "queued: fleet cap reached" }),
-          profile({ id: "b", state: "queued" }),
+          profile({ id: "a", state: "stopped" }),
+          profile({ id: "b", state: "stopped" }),
           profile({ id: "c", state: "error", state_reason: "worker exited with code 1" }),
         ]}
       />,
@@ -101,28 +98,18 @@ describe("EngineStateCard", () => {
       .parentElement;
     expect(states).not.toBeNull();
     const list = states as HTMLElement;
-    // Exactly one label of each kind: the queued entry is not an attention count.
-    expect(within(list).getAllByText("waiting for a slot")).toHaveLength(1);
     expect(within(list).getAllByText("needs attention")).toHaveLength(1);
-    expect(within(list).getAllByText("2").length).toBeGreaterThanOrEqual(1);
-    expect(within(list).getAllByText("1").length).toBeGreaterThanOrEqual(1);
+    expect(within(list).queryByText(/waiting/)).not.toBeInTheDocument();
+    expect(within(list).queryByText("Queued")).not.toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(4);
   });
 
-  it("states the cap hint and keeps the slots the engine reports", () => {
-    render(
-      <EngineStateCard
-        health={health({ engine_slots_used: 4, engine_slots_total: 4 })}
-        profiles={[]}
-      />,
-    );
+  it("states no capacity of the fleet", () => {
+    render(<EngineStateCard health={health()} profiles={[]} />);
 
-    expect(screen.getByText("4 of 4")).toBeInTheDocument();
-    expect(screen.getByText("profiles holding a worker")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "What the supervisor reports right now - the fleet cap is max_running_profiles of GET /api/settings",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.queryByText("Engine slots")).not.toBeInTheDocument();
+    expect(screen.queryByText("profiles holding a worker")).not.toBeInTheDocument();
+    expect(screen.queryByText(/max_running_profiles/)).not.toBeInTheDocument();
   });
 
   it("reports an engaged kill switch and an enabled live gate", () => {
@@ -139,32 +126,17 @@ describe("EngineStateCard", () => {
     expect(screen.getByText("degraded")).toBeInTheDocument();
   });
 
-  it("reads the engine-slot KPI from the wire pair, not from the fleet size", () => {
-    render(
-      <EngineStateCard
-        health={health({ profiles_running: 3, engine_slots_used: 3, engine_slots_total: 8 })}
-        profiles={[profile({ id: "a", state: "running" })]}
-      />,
-    );
-
-    expect(screen.getByText("3 of 8")).toBeInTheDocument();
-    expect(screen.queryByText("3 of 3")).not.toBeInTheDocument();
-    expect(screen.queryByText("0 of 8")).not.toBeInTheDocument();
-  });
-
   it("renders an honest unknown card when the API answered nothing", () => {
     render(<EngineStateCard health={EMPTY_HEALTH} profiles={[]} />);
 
-    // The fallback keeps the wire names of the slot pair, and both counters stay
-    // unknown so the KPI renders em dashes instead of zeroes.
-    expect(Object.keys(EMPTY_HEALTH)).toContain("engine_slots_used");
-    expect(Object.keys(EMPTY_HEALTH)).toContain("engine_slots_total");
-    expect(Number.isNaN(EMPTY_HEALTH.engine_slots_used)).toBe(true);
-    expect(Number.isNaN(EMPTY_HEALTH.engine_slots_total)).toBe(true);
+    // The fallback keeps the wire names of the counters the card renders, and
+    // the fleet size stays unknown so the page shows no invented number.
+    expect(Object.keys(EMPTY_HEALTH)).toContain("profiles_running");
+    expect(Object.keys(EMPTY_HEALTH)).not.toContain("engine_slots_used");
+    expect(Number.isNaN(EMPTY_HEALTH.profiles_running)).toBe(true);
 
     expect(screen.getByText("unknown")).toBeInTheDocument();
-    expect(screen.getAllByText("\u2014").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("\u2014 of \u2014")).toBeInTheDocument();
+    expect(screen.getAllByText("\u2014").length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText("NaN")).not.toBeInTheDocument();
   });
 });

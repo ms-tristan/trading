@@ -3,10 +3,9 @@
 The supervisor owns three things and nothing else:
 
 * **the fleet** -- it decides which profiles run (the enabled profiles sorted by
-  ``priority`` descending then ``id`` ascending, capped by
-  ``max_running_profiles``), writes their generated configuration, spawns one
-  ``freqtrade trade`` child per scheduled profile and releases the slot when a
-  worker stops or fails for good;
+  ``priority`` descending then ``id`` ascending), writes their generated
+  configuration, spawns one ``freqtrade trade`` child per eligible profile and
+  releases the worker when a profile stops or fails for good;
 * **the journal** -- every decision is written to the ``events`` table of the
   state store with one of the documented engine event kinds, so the operations
   page can explain what happened without reading a log file;
@@ -23,7 +22,7 @@ interval; that is also where the health policy is applied and where the daily
 and trade history of every answering worker is read, for the monitoring read
 model.
 
-Six rules are worth stating because they are easy to get wrong:
+Seven rules are worth stating because they are easy to get wrong:
 
 * a worker the supervisor stopped itself (operator stop, kill switch, restart,
   shutdown) is **never** reported as a crash -- the process handle is dropped
@@ -34,19 +33,27 @@ Six rules are worth stating because they are easy to get wrong:
   rows is exactly what a fresh boot looks like, and the fleet has to start from
   it;
 * an explicit :meth:`Supervisor.start_profile` / :meth:`Supervisor.restart_profile`
-  is honoured even when the fleet is full: the fleet cap governs automatic
-  promotion, not an operator decision made on one profile;
-* the fleet grows gradually: a scheduling pass promotes at most one worker per
-  ``worker_start_stagger_seconds`` interval, and a profile that is inside the
-  cap but not admitted yet is ``queued`` with the gradual-start reason. Slots
-  beyond the cap keep the fleet-cap reason. Staggering delays promotions, it
-  never reorders them, and ``worker_start_stagger_seconds = 0`` keeps the
-  immediate boot;
+  is honoured exactly like an automatic start: an operator decision is never
+  overridden by the scheduler;
+* every eligible candidate starts in the same scheduling pass -- there is no
+  fleet cap, no slot accounting and no gate that holds a profile back, so no
+  profile is ever left waiting for a slot;
 * the restart budget is a sliding window: at most
   :data:`MAX_RESTARTS_IN_WINDOW` restarts inside
   :data:`RESTART_WINDOW_SECONDS`, with the backoff saturating at 45 s. Once the
-  budget is spent the profile goes to ``error`` and its slot is freed for the
-  next queued profile;
+  budget is spent the profile goes to ``error``;
+* a scheduled profile is restarted **only when it is proven gone**. A read
+  failure first spends the startup grace
+  (:data:`WORKER_STARTUP_GRACE_SECONDS`, the fair window a freshly spawned
+  Freqtrade needs to boot and answer); then it must be counted
+  :data:`UNHEALTHY_THRESHOLD` consecutive times; and even then the worker is
+  restarted only if ``GET /ping`` has failed
+  :data:`UNHEALTHY_PING_THRESHOLD` consecutive times or its process handle no
+  longer exists. A worker that is merely slow -- ``/balance`` taking 12 to 20 s
+  while 22 workers share one CoinGecko rate limit -- is healthy and is never
+  restarted. Restarting a live worker is not a cheap decision: it wipes its
+  in-memory state, and a fleet restarted in a loop never gets the chance to
+  finish its warm-up;
 * nothing that reaches a log line or an event ever carries the REST password of
   a worker or an exchange credential -- the generated configuration file is the
   only place a credential is written, and it is written with mode ``0o600``.
@@ -77,7 +84,6 @@ from ..config import (
 from ..models import (
     STATE_BLOCKED,
     STATE_ERROR,
-    STATE_QUEUED,
     STATE_RUNNING,
     STATE_STOPPED,
     ProfileMetrics,
@@ -111,10 +117,8 @@ from .config_builder import (
 
 __all__ = [
     "API_PASSWORD_BYTES",
-    "CAP_QUEUE_REASON_TEMPLATE",
     "CONTAINER_STRATEGIES_DIR",
     "EVENT_BLOCKED_LIVE",
-    "EVENT_CAP_REACHED",
     "EVENT_CATALOGUE_APPLIED",
     "EVENT_CRASH",
     "EVENT_ERROR",
@@ -139,16 +143,32 @@ __all__ = [
     "RESTART_BACKOFF_SECONDS",
     "RESTART_WINDOW_SECONDS",
     "SETTINGS_KEY",
-    "STAGGER_QUEUE_REASON_TEMPLATE",
     "TERMINATE_GRACE_SECONDS",
+    "UNHEALTHY_PING_THRESHOLD",
     "UNHEALTHY_THRESHOLD",
+    "WORKER_STARTUP_GRACE_SECONDS",
     "ProcessLauncher",
     "SubprocessLauncher",
     "Supervisor",
 ]
 
 #: Consecutive failed REST reads that make a worker unhealthy.
-UNHEALTHY_THRESHOLD = 3
+UNHEALTHY_THRESHOLD = 10
+
+#: Consecutive ``GET /ping`` failures that make a worker safe to declare dead.
+#:
+#: Reaching :data:`UNHEALTHY_THRESHOLD` failed reads only *starts* the death
+#: check: ``/balance`` may be slow -- 12 to 20 s measured on the live
+#: deployment -- while the worker is perfectly alive, so the worker is restarted
+#: only once its own liveness endpoint has failed this many consecutive times.
+UNHEALTHY_PING_THRESHOLD: int = 10
+
+#: Fair startup window after a start, in seconds.
+#:
+#: Freqtrade needs tens of seconds to boot, download its warm-up window and
+#: answer its API server, so no failure is counted inside this window: a worker
+#: that has just been spawned is not judged on reads it could not answer yet.
+WORKER_STARTUP_GRACE_SECONDS: float = 90.0
 
 #: Backoff before a restart, indexed by the restart count and saturating on 45 s.
 RESTART_BACKOFF_SECONDS = (5, 15, 45)
@@ -189,19 +209,6 @@ REASON_SHUTDOWN = "shutdown"
 #: Reason prefix recorded while a worker waits for its restart backoff.
 REASON_RESTART_BACKOFF = "restart_backoff"
 
-#: Reason recorded on a profile the stagger gate holds back from starting.
-#: ``used`` is the number of workers alive when the reason is written (the
-#: worker just started counts), ``total`` the fleet cap.
-STAGGER_QUEUE_REASON_TEMPLATE = (
-    "queued: starting workers gradually ({used} of {total} slots in use)"
-)
-
-#: Reason recorded on a profile left beyond the fleet cap.
-#: ``used`` is the number of slots occupied at the end of the scheduling pass
-#: (the running workers, the ones a restart backoff reserves and the ones that
-#: pass started), ``total`` the cap.
-CAP_QUEUE_REASON_TEMPLATE = "queued: fleet cap reached ({used} of {total} slots in use)"
-
 #: Reasons of a ``stopped`` profile the scheduler must not restart by itself:
 #: they record a deliberate operator decision rather than a fleet decision. A
 #: profile that is merely disabled is filtered by its ``enabled`` flag, so
@@ -213,7 +220,6 @@ EVENT_START = "start"
 EVENT_STOP = "stop"
 EVENT_CRASH = "crash"
 EVENT_RESTART = "restart"
-EVENT_CAP_REACHED = "cap_reached"
 EVENT_KILL_SWITCH = "kill_switch"
 EVENT_LEGACY_DB_ARCHIVED = "legacy_db_archived"
 EVENT_CATALOGUE_APPLIED = "catalogue_applied"
@@ -333,6 +339,10 @@ class _WorkerHealth:
 
     #: Consecutive failed REST reads of the current run.
     failures: int = 0
+    #: When the current run was started; the startup grace is measured from it.
+    started_at: datetime | None = None
+    #: Consecutive failed ``GET /ping`` of the current run.
+    ping_failures: int = 0
     #: Timestamps of the restarts of the sliding budget window.
     restarts: list[datetime] = field(default_factory=list)
     #: When set, the worker waits for its backoff and must not be started yet.
@@ -395,8 +405,6 @@ class Supervisor:
         self._running = False
         self._started_at: datetime | None = None
         self._last_poll_at: datetime | None = None
-        self._last_worker_start_at: datetime | None = None
-        self._cap_event_recorded = False
 
     # -- clock -------------------------------------------------------------
     def now(self) -> datetime:
@@ -469,26 +477,21 @@ class Supervisor:
 
     # -- scheduling --------------------------------------------------------
     def schedule(self) -> None:
-        """Reconcile the fleet with the store: start, queue, block or stop.
+        """Reconcile the fleet with the store: start, block or stop.
 
         Candidates are the enabled profiles sorted by ``priority`` descending
-        then ``id`` ascending. The cap bounds the slots occupied at the end of
-        the pass, not the candidate positions: a running worker occupies a slot,
-        a worker waiting for its restart backoff reserves its slot, and a worker
-        this pass starts takes one. A candidate left beyond the cap is ``queued``
-        with :data:`CAP_QUEUE_REASON_TEMPLATE`. A live profile that does not pass
-        :func:`~trading_platform.config.live_trading_gate` is ``blocked``
-        instead and occupies no slot, so the walk goes on to the next candidate;
-        a disabled profile is ``stopped``, and a profile waiting for its restart
-        backoff is left alone until it is due.
+        then ``id`` ascending. Every candidate starts in this very pass when it
+        is not already running, is not inside its restart backoff and its live
+        gate allows it. Nothing else can hold it back: there is no cap, no slot
+        accounting and no stagger gate, so a candidate never waits for another
+        profile to free something.
 
-        Inside the cap the fleet grows gradually: at most one candidate is
-        started per pass, and only when ``worker_start_stagger_seconds`` have
-        elapsed since the last worker started, so a cold start never spawns the
-        whole fleet at once. The candidates the gate holds back are ``queued``
-        with :data:`STAGGER_QUEUE_REASON_TEMPLATE`; they hold no worker yet and
-        consume no slot. With ``worker_start_stagger_seconds = 0`` the gate is
-        always open and the whole pass behaves as it always did.
+        A live profile that does not pass
+        :func:`~trading_platform.config.live_trading_gate` is ``blocked`` with
+        its own reason instead, so the walk goes on to the next candidate; a
+        disabled profile is ``stopped`` with :data:`REASON_DISABLED`, and a
+        profile waiting for its restart backoff is left alone until it is due.
+        An explicit operator start is honoured exactly like an automatic one.
 
         While the kill switch is engaged the method only makes sure that nothing
         runs: it never rewrites a state, so the journal keeps reporting the kill
@@ -506,35 +509,14 @@ class Supervisor:
                     )
             return
 
-        cap = int(self.settings.max_running_profiles)
-        now = self.now()
-        queued: list[ProfileRecord] = []
-        staggered: list[ProfileRecord] = []
-        # Slots occupied at the end of the pass: the workers already running, the
-        # ones a restart backoff reserves and the ones this pass starts.
-        slots_used = 0
         for record in self._candidates(profiles):
-            if slots_used >= cap:
-                queued.append(record)
-                continue
             if self.is_running(record.id):
-                slots_used += 1
                 continue
             if not self._consume_backoff(record.id):
-                slots_used += 1
                 continue
             if self._refuse_live(record):
                 continue
-            if not self._stagger_ready(now):
-                staggered.append(record)
-                continue
-            if self._start(record, event_kind=EVENT_START):
-                slots_used += 1
-                # A successful start closes the gate for the rest of this pass
-                # and for every pass until the interval elapses.
-                self._last_worker_start_at = now
-        self._apply_queue(queued, cap, slots_used)
-        self._apply_stagger(staggered, profiles, cap)
+            self._start(record, event_kind=EVENT_START)
         for record in profiles:
             if not record.enabled:
                 self._apply_disabled(record)
@@ -544,8 +526,6 @@ class Supervisor:
 
         The explicit action clears an operator stop, an ``error`` state and the
         restart budget of the profile, then starts a worker if none is alive.
-        While that worker lives the fleet cap does not take it away again: the
-        cap governs automatic promotion, not an explicit operator start.
         """
         record = self.store.get_profile(profile_id)
         if record is None:
@@ -646,8 +626,9 @@ class Supervisor:
 
         ``running``, ``bootstrapped``, ``uptime_seconds``, ``started_at``,
         ``last_poll_at``, ``kill_switch_engaged``, the ``profiles_*`` counters,
-        the ``slots_*`` pair, the effective settings the engine acts on, and the
-        resolved ``state_dir``/``state_db`` paths.
+        the effective settings the engine acts on, and the resolved
+        ``state_dir``/``state_db`` paths. No capacity is advertised: the fleet
+        has no cap, so there is nothing to report about slots.
         """
         records = self.store.list_profiles()
         running = sum(1 for record in records if record.state == STATE_RUNNING)
@@ -661,41 +642,28 @@ class Supervisor:
             "profiles_total": len(records),
             "profiles_running": running,
             "profiles_healthy": self.healthy_count(),
-            "profiles_queued": sum(1 for r in records if r.state == STATE_QUEUED),
+            # Retained for wire compatibility: with no fleet cap nothing can be
+            # held back, so no profile is ever queued and this is always 0.
+            "profiles_queued": 0,
             "profiles_blocked": sum(1 for r in records if r.state == STATE_BLOCKED),
             "profiles_error": sum(1 for r in records if r.state == STATE_ERROR),
-            "slots_used": running,
-            "slots_total": int(self.settings.max_running_profiles),
-            "max_running_profiles": int(self.settings.max_running_profiles),
             "snapshot_interval_seconds": int(self.settings.snapshot_interval_seconds),
             "profile_api_port_base": int(self.settings.profile_api_port_base),
             "state_dir": str(self.state_dir),
             "state_db": str(self.store.path),
         }
 
-    def apply_settings(
-        self,
-        *,
-        max_running_profiles: int | None = None,
-        snapshot_interval_seconds: int | None = None,
-        worker_start_stagger_seconds: int | None = None,
-    ) -> PlatformSettings:
+    def apply_settings(self, *, snapshot_interval_seconds: int | None = None) -> PlatformSettings:
         """Change the run-time settings, persist them and reschedule at once.
 
         The whole document is stored under the ``platform_settings`` key, so the
         next boot merges the operator's values over ``config/platform.json``.
-        Scheduling runs immediately: raising the cap starts the queued profiles
-        at once -- one per pass while the stagger gate is closed -- lowering it
-        stops the workers that no longer fit, and
-        ``worker_start_stagger_seconds = 0`` opens the stagger gate at once.
+        Scheduling runs immediately, so a profile that is eligible starts at
+        once.
         """
         changes: dict[str, int] = {}
-        if max_running_profiles is not None:
-            changes["max_running_profiles"] = int(max_running_profiles)
         if snapshot_interval_seconds is not None:
             changes["snapshot_interval_seconds"] = int(snapshot_interval_seconds)
-        if worker_start_stagger_seconds is not None:
-            changes["worker_start_stagger_seconds"] = max(0, int(worker_start_stagger_seconds))
         self.settings = self.settings.with_overrides(**changes)
         self.store.set_setting(SETTINGS_KEY, json.dumps(self.settings.model_dump()))
         if changes:
@@ -866,9 +834,8 @@ class Supervisor:
         """Report every profile as stopped by the kill switch when it is engaged.
 
         The process tree of a previous run is gone, so no profile may be left in
-        ``running`` or ``queued`` while the switch is on, and no pid of that run
-        may survive either. A profile the operator stopped on purpose keeps its
-        own reason.
+        ``running`` while the switch is on, and no pid of that run may survive
+        either. A profile the operator stopped on purpose keeps its own reason.
         """
         if not self.kill_switch_engaged():
             return
@@ -890,8 +857,7 @@ class Supervisor:
 
         ``profiles`` arrives sorted by ``priority`` descending then ``id``
         ascending. A disabled profile is not a candidate, and neither is one in
-        the terminal ``error`` state nor one the operator stopped: their slots
-        are released for the next queued profile.
+        the terminal ``error`` state nor one the operator stopped.
         """
         return [
             record
@@ -901,64 +867,6 @@ class Supervisor:
             and record.id not in self._operator_stops
             and not (record.state == STATE_STOPPED and record.state_reason in PINNED_STOP_REASONS)
         ]
-
-    def _stagger_ready(self, now: datetime) -> bool:
-        """Whether the stagger gate is open, that is whether a worker may start.
-
-        The gate is open when ``worker_start_stagger_seconds`` is ``0`` (the
-        immediate boot), when no worker has been started by this supervisor yet,
-        and otherwise once the interval elapsed since the last start. The
-        interval is clamped at ``0``, so a negative value can only mean
-        "immediate" and never "never".
-        """
-        stagger = max(0, int(self.settings.worker_start_stagger_seconds))
-        if stagger == 0:
-            return True
-        if self._last_worker_start_at is None:
-            return True
-        return (now - self._last_worker_start_at).total_seconds() >= stagger
-
-    def _apply_stagger(
-        self,
-        staggered: Sequence[ProfileRecord],
-        profiles: Sequence[ProfileRecord],
-        cap: int,
-    ) -> None:
-        """Mark the candidates the stagger gate held back ``queued``.
-
-        The reason names the workers alive *now*, so the profile started by this
-        very pass is counted. Nothing is stopped here: a staggered profile holds
-        no worker yet, so it journals no stop, and the pass never reports the
-        fleet cap -- the profiles beyond the cap are the only ones that do.
-        """
-        if not staggered:
-            return
-        used = sum(1 for record in profiles if self.is_running(record.id))
-        reason = STAGGER_QUEUE_REASON_TEMPLATE.format(used=used, total=cap)
-        for record in staggered:
-            self._set_state(record, STATE_QUEUED, reason)
-
-    def _apply_queue(self, queued: Sequence[ProfileRecord], cap: int, used: int) -> None:
-        """Mark the profiles beyond the cap ``queued`` and release their workers.
-
-        ``used`` is the number of slots occupied at the end of the scheduling
-        pass and ``cap`` the fleet cap: the reason names both, so the operator
-        reads the exact numbers the cap was enforced with.
-        """
-        reason = CAP_QUEUE_REASON_TEMPLATE.format(used=used, total=cap)
-        for record in queued:
-            if record.id in self._operator_starts and self.is_running(record.id):
-                continue
-            if self._stop_worker(record.id, reason=reason, event_kind=None, state=STATE_QUEUED):
-                continue
-            self._set_state(record, STATE_QUEUED, reason)
-        if queued and not self._cap_event_recorded:
-            self._cap_event_recorded = True
-            self.store.record_event(
-                "warning",
-                EVENT_CAP_REACHED,
-                f"fleet cap reached: {cap} profile(s) running, {len(queued)} profile(s) queued",
-            )
 
     def _apply_disabled(self, record: ProfileRecord) -> None:
         """Make sure a disabled profile holds no worker and says why."""
@@ -994,9 +902,9 @@ class Supervisor:
         """Whether the live-trading gate refuses ``record``; block it when it does.
 
         This is the single live-gate decision point of the supervisor:
-        :meth:`schedule` calls it to leave the slot of a refused profile free,
-        and :meth:`_start` calls it again before it spawns anything, so an
-        explicit operator start is refused exactly like an automatic one.
+        :meth:`schedule` calls it to leave a refused profile alone, and
+        :meth:`_start` calls it again before it spawns anything, so an explicit
+        operator start is refused exactly like an automatic one.
         """
         if not record.is_live:
             return False
@@ -1073,6 +981,8 @@ class Supervisor:
         self._history.pop(profile_id, None)
         health = self._health_for(profile_id)
         health.failures = 0
+        health.started_at = self.now()
+        health.ping_failures = 0
         health.retry_at = None
         health.last_error = None
         pid = self._pid_of(process)
@@ -1085,10 +995,6 @@ class Supervisor:
             profile_id,
         )
         logger.info("started worker %s on port %d (pid %s)", profile_id, port, pid)
-        # The spawn succeeded, so arm the stagger gate: the next automatic
-        # promotion waits for the interval. An explicit operator start is never
-        # refused by the gate, but it does delay the promotions that follow it.
-        self._last_worker_start_at = self.now()
         return True
 
     def _terminate_worker(self, profile_id: str) -> subprocess.Popen[bytes] | None:
@@ -1147,7 +1053,15 @@ class Supervisor:
 
     # -- health and restarts -----------------------------------------------
     async def _poll_running_workers(self) -> None:
-        """Read every running worker and apply the health policy to the failures."""
+        """Read every running worker and apply the health policy to the failures.
+
+        A failed read counts a failure and, once the failure threshold is
+        reached, *starts a death check* instead of restarting the worker on the
+        spot: :meth:`_confirm_death` decides whether the worker is really gone.
+        A worker that is merely slow -- ``/balance`` taking 12 to 20 s while 22
+        workers share one CoinGecko rate limit -- answers ``/ping`` and is left
+        alone.
+        """
         for record in self.store.list_profiles():
             if not self.is_running(record.id):
                 continue
@@ -1155,15 +1069,16 @@ class Supervisor:
             try:
                 metrics = await client.fetch_all()
             except FreqtradeClientError as exc:
-                self._handle_failure(record, str(exc))
+                if self._count_failure(record, str(exc)) and await self._confirm_death(record):
+                    self._handle_unhealthy(record, self._health_for(record.id), str(exc))
             except Exception as exc:  # a client bug must not kill the fleet
-                self._handle_failure(
-                    record,
-                    f"unexpected error while reading profile {record.id!r}: {exc}",
-                )
+                message = f"unexpected error while reading profile {record.id!r}: {exc}"
+                if self._count_failure(record, message) and await self._confirm_death(record):
+                    self._handle_unhealthy(record, self._health_for(record.id), message)
             else:
                 health = self._health_for(record.id)
                 health.failures = 0
+                health.ping_failures = 0
                 health.last_error = None
                 self._metrics[record.id] = metrics
                 try:
@@ -1217,17 +1132,97 @@ class Supervisor:
         """Count one failed read and escalate when the policy says so.
 
         ``fatal`` is used for a child that exited by itself: that is one failure
-        no retry can absorb, so it escalates without waiting for the three-read
-        threshold.
+        no retry can absorb, so it escalates without waiting for the failure
+        threshold -- and therefore without the startup grace, which protects a
+        worker that could not answer yet, never one that is already gone.
+
+        A non-fatal failure inside the startup window is not counted at all:
+        the worker was just spawned, and Freqtrade needs tens of seconds before
+        its API server answers.
         """
+        if fatal:
+            # A child that exited on its own is already gone: no threshold and
+            # no startup window applies to it.
+            self._book_failure(record, message)
+            self._handle_unhealthy(record, self._health_for(record.id), message)
+            return
+        if self._count_failure(record, message):
+            self._handle_unhealthy(record, self._health_for(record.id), message)
+
+    def _book_failure(self, record: ProfileRecord, message: str) -> None:
+        """Count one failure unconditionally, clearing the cached measurements."""
         health = self._health_for(record.id)
         health.failures += 1
         health.last_error = message
         self._metrics.pop(record.id, None)
         self._history.pop(record.id, None)
-        if not fatal and health.failures < UNHEALTHY_THRESHOLD:
-            return
-        self._handle_unhealthy(record, health, message)
+
+    def _count_failure(self, record: ProfileRecord, message: str) -> bool:
+        """Count one failed read; return whether the failure threshold is reached.
+
+        This is the counting half of the policy, and reaching the threshold only
+        *starts* the death check: :meth:`_poll_running_workers` uses it and then
+        asks :meth:`_confirm_death` whether the worker is really gone, while
+        :meth:`_handle_failure` keeps the whole behaviour for the callers that
+        have no client to ping.
+
+        ``True`` is returned from the crossing onwards, so a worker whose reads
+        keep failing is probed on every cycle until it is proven dead or answers
+        again -- that is how ``GET /ping`` accumulates its consecutive failures.
+
+        A failure inside the startup window is not counted at all -- but it
+        still invalidates the cached measurements: the poller must never publish
+        a measurement of a worker that has not just answered.
+        """
+        self._metrics.pop(record.id, None)
+        self._history.pop(record.id, None)
+        if self._within_startup_grace(record.id):
+            return False
+        self._book_failure(record, message)
+        return self._health_for(record.id).failures >= UNHEALTHY_THRESHOLD
+
+    def _within_startup_grace(self, profile_id: str) -> bool:
+        """Whether a worker is still inside its fair startup window.
+
+        A profile the supervisor has never started -- no health, or no
+        ``started_at`` -- is *not* inside the grace: the window protects a fresh
+        child, it never shields an unknown one.
+        """
+        health = self._health.get(profile_id)
+        if health is None or health.started_at is None:
+            return False
+        grace = timedelta(seconds=WORKER_STARTUP_GRACE_SECONDS)
+        return self.now() - health.started_at < grace
+
+    async def _confirm_death(self, record: ProfileRecord) -> bool:
+        """Whether an unhealthy worker is proven gone, so it may be restarted.
+
+        Two proofs are accepted, and nothing else:
+
+        * the process handle is gone -- ``self.is_running(record.id)`` is
+          ``False``, which :meth:`_reap_exited_children` handles as a crash;
+        * the worker's own liveness endpoint, ``GET /ping``, has failed
+          :data:`UNHEALTHY_PING_THRESHOLD` consecutive times. ``/balance`` may
+          be slow, ``/ping`` answering ``{"status": "pong"}`` means the worker is
+          alive and is not restarted, however many reads failed.
+
+        A ping that raises -- :class:`FreqtradeClientError` or anything else --
+        is a failed ping and never a crash. The message of a failed ping is
+        reported through the log only: ``health.last_error`` keeps the read
+        failure that started the death check, which is what the ``error`` state
+        and the journal of the restart must explain.
+        """
+        if not self.is_running(record.id):
+            return True
+        health = self._health_for(record.id)
+        client = self._client_for(record)
+        try:
+            alive = await client.ping()
+        except Exception as exc:  # a failed ping is a failure, never a crash
+            alive = False
+            logger.warning("confirmed-death ping of profile %r failed: %s", record.id, exc)
+        health.ping_failures = 0 if alive else health.ping_failures + 1
+        return health.ping_failures >= UNHEALTHY_PING_THRESHOLD
 
     def _handle_unhealthy(
         self,
@@ -1280,7 +1275,12 @@ class Supervisor:
         return health
 
     def _reset_health(self, profile_id: str) -> None:
-        """Forget the failures and the restart budget of a profile."""
+        """Forget the failures, the ping failures and the restart budget.
+
+        The whole entry is replaced by a fresh :class:`_WorkerHealth`, so the
+        startup window is cleared as well: the next :meth:`_start` opens a new
+        one.
+        """
         self._health[profile_id] = _WorkerHealth()
 
     def _is_healthy(self, profile_id: str) -> bool:

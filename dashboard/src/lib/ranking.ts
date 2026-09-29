@@ -10,7 +10,7 @@ import { needsDecision } from "./states";
 import type { ProfileMode, ProfileState, ProfileView, SortKey } from "./types";
 
 export { isAttentionState } from "./states";
-export { isWaitingForSlot, needsDecision } from "./states";
+export { needsDecision } from "./states";
 
 /** Split the ranked profile list by trading mode, preserving the API order. */
 export function splitByMode(profiles: ProfileView[]): {
@@ -76,7 +76,8 @@ export function sortProfiles(profiles: ProfileView[], key: SortKey): ProfileView
 /**
  * `true` when at least one profile of the list needs an operator decision.
  *
- * A `queued` profile only waits for an engine slot: it is not a decision.
+ * Every profile that is not running a worker either needs a decision (`error`,
+ * `blocked`) or is simply stopped, which is not a decision.
  */
 export function hasAttentionProfile(states: ProfileState[]): boolean {
   return states.some(needsDecision);

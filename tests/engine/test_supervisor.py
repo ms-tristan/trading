@@ -1,4 +1,4 @@
-"""Tests of the fleet supervisor: scheduling, the cap, ports, gates, restarts.
+"""Tests of the fleet supervisor: scheduling, ports, gates and restarts.
 
 Nothing here starts a real ``freqtrade`` process and nothing opens a socket: the
 :class:`ProcessLauncher` is replaced by :class:`RecordingLauncher` (which records
@@ -8,12 +8,11 @@ real SQLite file under ``tmp_path``, because keeping it in sync with the fleet i
 exactly what the supervisor is for.
 
 The clock is injected as well, so the restart backoff and the five-restarts-in-
-fifteen-minutes escalation are driven by hand instead of by ``sleep``. That clock
-is also the stagger clock: the fleet grows gradually by default
-(``worker_start_stagger_seconds``), so :func:`make_harness` disables the stagger
-unless a test asks for it. Every test written before the stagger existed pins the
-immediate boot, and the regression tests of the gradual boot build their own
-settings and move the clock by hand.
+fifteen-minutes escalation are driven by hand instead of by ``sleep``. It is also
+the startup-grace clock: a freshly spawned worker is not judged on reads it could
+not answer yet (``WORKER_STARTUP_GRACE_SECONDS``), so the death tests move it
+past the window first. There is no fleet cap and no queue: every eligible
+candidate starts in the same scheduling pass.
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ from trading_platform.engine.config_builder import (
     profile_runtime_dir,
 )
 from trading_platform.engine.supervisor import (
-    CAP_QUEUE_REASON_TEMPLATE,
     HISTORY_TRADE_LIMIT,
     KILL_SWITCH_FILENAME,
     MAX_RESTARTS_IN_WINDOW,
@@ -51,11 +49,14 @@ from trading_platform.engine.supervisor import (
     RESTART_WINDOW_SECONDS,
     SETTINGS_KEY,
     TERMINATE_GRACE_SECONDS,
+    UNHEALTHY_PING_THRESHOLD,
     UNHEALTHY_THRESHOLD,
+    WORKER_STARTUP_GRACE_SECONDS,
     SubprocessLauncher,
     Supervisor,
 )
-from trading_platform.models import ProfileConfig, ProfileMetrics, format_ts
+from trading_platform.metrics import build_health, build_profile_view
+from trading_platform.models import PROFILE_STATES, ProfileConfig, ProfileMetrics, format_ts
 from trading_platform.paths import STRATEGIES_DIR
 from trading_platform.profiles.store import StateStore
 
@@ -131,13 +132,6 @@ OPEN_TRADE_ROW: dict[str, Any] = {
     "profit_pct": 0.0025,
     "exit_reason": None,
 }
-
-
-def staggered_settings(**overrides: Any) -> PlatformSettings:
-    """Return the gradual-boot settings: three slots, one new worker every 10 s."""
-    values: dict[str, Any] = {"max_running_profiles": 3, "worker_start_stagger_seconds": 10}
-    values.update(overrides)
-    return PlatformSettings(**values)
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +280,22 @@ class FakeClient:
             raise RuntimeError("the transport exploded")
         return self._api.metrics
 
+    async def ping(self) -> bool:
+        """Answer the liveness endpoint, or fail as the test asked.
+
+        ``/ping`` is the endpoint the supervisor uses to *confirm* the death of
+        a worker whose reads keep failing: a worker that answers it is alive and
+        is never restarted, however slow ``/balance`` is.
+        """
+        self._api.pings[self.username] = self._api.pings.get(self.username, 0) + 1
+        remaining = self._api.ping_failures.get(self.username, 0)
+        if remaining > 0:
+            self._api.ping_failures[self.username] = remaining - 1
+            raise FreqtradeClientError(
+                f"Freqtrade API request failed: GET ping (profile {self.username})"
+            )
+        return self._api.ping_answers.get(self.username, True)
+
     async def aclose(self) -> None:
         """Record that the client was released."""
         if self._api.close_error:
@@ -327,6 +337,13 @@ class FakeFreqtradeApi:
         self.history_unexpected: dict[str, int] = {}
         self.history_reads: dict[str, int] = {}
         self.trade_limits: list[int] = []
+        #: Whether a profile answers ``GET /ping`` (``True`` unless a test says
+        #: otherwise), how many pings must raise before that, and how often the
+        #: endpoint was called. ``/ping`` is what turns a run of failed reads
+        #: into a proven death.
+        self.ping_answers: dict[str, bool] = {}
+        self.ping_failures: dict[str, int] = {}
+        self.pings: dict[str, int] = {}
 
     @staticmethod
     def key(profile_id: str) -> str:
@@ -337,6 +354,15 @@ class FakeFreqtradeApi:
         """Make the next ``times`` reads of a profile raise a client error."""
         key = self.key(profile_id)
         self.failures[key] = self.failures.get(key, 0) + times
+
+    def set_ping(self, profile_id: str, answers: bool) -> None:
+        """Make ``GET /ping`` of a profile answer ``pong`` (or not) from now on."""
+        self.ping_answers[self.key(profile_id)] = answers
+
+    def fail_ping_next(self, profile_id: str, times: int = 1) -> None:
+        """Make the next ``times`` pings of a profile raise a client error."""
+        key = self.key(profile_id)
+        self.ping_failures[key] = self.ping_failures.get(key, 0) + times
 
     def fail_unexpectedly(self, profile_id: str, times: int = 1) -> None:
         """Make the next ``times`` reads raise an unexpected (non-client) error."""
@@ -471,10 +497,8 @@ def make_harness(
 ) -> Harness:
     """Build a supervisor whose children and REST calls are entirely faked.
 
-    The default settings carry ``worker_start_stagger_seconds=0``, so a harness
-    that does not ask for the gradual boot starts the whole eligible fleet in one
-    pass: that is the behaviour of every test written before the stagger gate
-    existed. The regression tests of the gradual boot pass their own settings.
+    The default settings are the documented platform defaults; no setting bounds
+    how many profiles may run any more.
     """
     state_dir = tmp_path / "realtime"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -493,7 +517,7 @@ def make_harness(
     resolved_api = api or FakeFreqtradeApi()
     supervisor = Supervisor(
         store=store,
-        settings=settings or PlatformSettings(worker_start_stagger_seconds=0),
+        settings=settings or PlatformSettings(),
         state_dir=state_dir,
         config_dir=config_dir,
         strategies_dir=strategies_dir,
@@ -527,10 +551,34 @@ def live_env(**extra: str) -> dict[str, str]:
 
 
 async def fail_cycle(harness: Harness, profile_id: str, times: int) -> None:
-    """Fail ``UNHEALTHY_THRESHOLD`` reads of a profile, once per refresh."""
-    harness.api.fail_next(profile_id, UNHEALTHY_THRESHOLD * times)
-    for _ in range(UNHEALTHY_THRESHOLD * times):
-        await harness.supervisor.refresh_once()
+    """Prove ``times`` deaths of a profile, one restart at a time.
+
+    Two conditions must be met before a worker is restarted, so this helper
+    drives both:
+
+    * ``UNHEALTHY_THRESHOLD`` consecutive failed reads -- a failure inside
+      ``WORKER_STARTUP_GRACE_SECONDS`` is not counted at all, so the clock is
+      moved past the window first;
+    * ``UNHEALTHY_PING_THRESHOLD`` consecutive failed pings, which only start
+      being probed once the read threshold is reached.
+
+    Failing the reads alone is not enough any more: that is exactly the crash
+    loop the policy exists to prevent. The loop stops as soon as the worker is
+    gone, so a restart is never double-counted, and it raises when the worker
+    survived the whole budget -- that is a test bug, not a supervisor one.
+    """
+    supervisor = harness.supervisor
+    for _ in range(times):
+        harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+        harness.api.fail_next(profile_id, UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD)
+        harness.api.fail_ping_next(profile_id, UNHEALTHY_PING_THRESHOLD)
+        budget = UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD
+        for _ in range(budget):
+            await supervisor.refresh_once()
+            if not supervisor.is_running(profile_id):
+                break
+        else:
+            raise AssertionError(f"worker {profile_id!r} survived its whole failure budget")
 
 
 # ---------------------------------------------------------------------------
@@ -701,33 +749,8 @@ async def test_client_is_built_from_the_generated_credentials(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
-# Fleet cap, ordering and ports
+# Scheduling order and ports
 # ---------------------------------------------------------------------------
-def test_cap_queues_the_profiles_beyond_the_limit(tmp_path: Path) -> None:
-    profiles = [profile_config(f"p{index:02d}") for index in range(22)]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=12, worker_start_stagger_seconds=0),
-    )
-    harness.supervisor.bootstrap()
-
-    records = harness.records()
-    running = sorted(record.id for record in records.values() if record.state == "running")
-    queued = [record for record in records.values() if record.state == "queued"]
-    assert running == [f"p{index:02d}" for index in range(12)]
-    assert len(queued) == 10
-    assert {record.state_reason for record in queued} == {
-        "queued: fleet cap reached (12 of 12 slots in use)"
-    }
-    assert len(harness.launcher.calls) == 12
-    assert harness.kinds().count("cap_reached") == 1
-
-    harness.supervisor.schedule()
-    harness.supervisor.schedule()
-    assert harness.kinds().count("cap_reached") == 1
-
-
 def test_priority_then_id_orders_the_fleet(tmp_path: Path) -> None:
     profiles = [
         profile_config("c-low", priority=50),
@@ -736,17 +759,146 @@ def test_priority_then_id_orders_the_fleet(tmp_path: Path) -> None:
         profile_config("b-low", priority=50),
         profile_config("d-high", priority=100),
     ]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=3, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     harness.supervisor.bootstrap()
 
-    records = harness.records()
     running = [record.id for record in harness.supervisor.profiles() if record.state == "running"]
-    assert running == ["d-high", "e-high", "a-low"]
-    assert records["b-low"].state_reason == "queued: fleet cap reached (3 of 3 slots in use)"
+    assert running == ["d-high", "e-high", "a-low", "b-low", "c-low"]
+
+
+# ---------------------------------------------------------------------------
+# The fleet has no cap and no queue: every enabled profile runs
+# ---------------------------------------------------------------------------
+def test_every_enabled_paper_profile_runs_and_none_is_ever_queued(tmp_path: Path) -> None:
+    """The real 22-profile catalogue: 20 paper profiles run, 2 live are blocked.
+
+    This is the invariant the removal of the fleet cap bought: no profile waits
+    for a slot any more, so every enabled profile is running in one pass. The two
+    live profiles cannot pass the live-trading gate (``TB_ALLOW_LIVE_TRADING`` is
+    unset) and are ``blocked`` -- never queued, never running. The assertions read
+    the *store*, not the supervisor's in-memory records, because the store is what
+    the API and the dashboard see.
+    """
+    state_dir = tmp_path / "realtime"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    store = StateStore(state_dir / "state.db")
+    _OPEN_STORES.append(store)
+    # No config_dir override: the boot reads the real repository catalogue.
+    supervisor = Supervisor(
+        store=store,
+        settings=PlatformSettings(),
+        state_dir=state_dir,
+        strategies_dir=strategies_dir,
+        launcher=RecordingLauncher(),
+        client_factory=FakeFreqtradeApi(),
+        env=dict(BASE_ENV),
+        clock=FakeClock(),
+    )
+
+    supervisor.bootstrap()
+    # A few more passes, to prove the fleet converges and stays converged.
+    for _ in range(3):
+        supervisor.schedule()
+
+    rows = store.list_profiles()
+    assert len(rows) == 22
+    paper = [row for row in rows if row.mode == "paper"]
+    live = [row for row in rows if row.mode == "live"]
+    assert len(paper) == 20
+    assert len(live) == 2
+    assert [row.id for row in paper if row.state != "running"] == []
+    assert [row.id for row in live if row.state != "blocked"] == []
+    assert [row.id for row in rows if row.state == "queued"] == []
+    assert all(row.state != "running" for row in live)
+    assert {row.state for row in rows} == {"running", "blocked"}
+
+
+def test_every_enabled_profile_runs_in_one_pass(tmp_path: Path) -> None:
+    """One pass starts every enabled, gate-permitted profile, with a live child.
+
+    This is the operator requirement -- every activated profile running -- made
+    executable: more than five enabled profiles are seeded, a single
+    :meth:`Supervisor.refresh_once` runs, and the live children the harness
+    actually spawned must cover every one of them. There is no cap to stop the
+    pass, so nothing is left for a later pass.
+    """
+    profiles = [profile_config(f"p{index:02d}") for index in range(6)]
+    harness = make_harness(tmp_path, profiles=profiles)
+    supervisor = harness.supervisor
+
+    supervisor.bootstrap()
+    expected = sorted(record.id for record in profiles)
+
+    # Every enabled candidate holds a live child, and the children are exactly
+    # the ones the launcher really spawned.
+    running = sorted(
+        record.id for record in harness.records().values() if record.state == "running"
+    )
+    assert running == expected
+    assert sorted(harness.spawned_ids()) == expected
+    assert all(supervisor.is_running(profile_id) for profile_id in expected)
+    assert harness.kinds().count("start") == len(expected)
+
+
+def test_the_queued_state_is_unreachable(tmp_path: Path) -> None:
+    """A structural guard: nothing the scheduler writes can be ``queued``.
+
+    The state is gone from the vocabulary and no scheduling pass over the real
+    production catalogue can produce it, whatever the priority order.
+    """
+    assert "queued" not in PROFILE_STATES
+    assert PROFILE_STATES == ("running", "stopped", "error", "blocked")
+
+    state_dir = tmp_path / "realtime"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    store = StateStore(state_dir / "state.db")
+    _OPEN_STORES.append(store)
+    supervisor = Supervisor(
+        store=store,
+        settings=PlatformSettings(),
+        state_dir=state_dir,
+        launcher=RecordingLauncher(),
+        client_factory=FakeFreqtradeApi(),
+        env=dict(BASE_ENV),
+        clock=FakeClock(),
+    )
+
+    supervisor.bootstrap()
+    for _ in range(3):
+        supervisor.schedule()
+        supervisor.schedule()
+
+    for row in store.list_profiles():
+        assert row.state in PROFILE_STATES, row.id
+        assert row.state != "queued"
+    assert [
+        event.kind for event in store.list_events(limit=500) if event.kind == "cap_reached"
+    ] == []
+
+
+def test_health_is_ok_whenever_one_profile_runs(tmp_path: Path) -> None:
+    """The deploy contract: ``status`` is ``ok`` as soon as one profile runs."""
+    profiles = [profile_config("alpha"), profile_config("beta")]
+    harness = make_harness(tmp_path, profiles=profiles)
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+
+    records = supervisor.store.list_profiles()
+    snapshots = supervisor.store.latest_snapshots()
+    views = [build_profile_view(record, snapshots.get(record.id), None) for record in records]
+    health = build_health(
+        version="test",
+        uptime_seconds=1.0,
+        views=views,
+        profiles_healthy=supervisor.healthy_count(),
+        kill_switch_engaged=False,
+    )
+
+    assert health.status == "ok"
+    assert health.profiles_running > 0
+    assert records  # the store really carried both profiles
 
 
 def test_api_ports_follow_the_id_sorted_catalogue(tmp_path: Path) -> None:
@@ -758,7 +910,7 @@ def test_api_ports_follow_the_id_sorted_catalogue(tmp_path: Path) -> None:
     harness = make_harness(
         tmp_path,
         profiles=profiles,
-        settings=PlatformSettings(profile_api_port_base=9000, worker_start_stagger_seconds=0),
+        settings=PlatformSettings(profile_api_port_base=9000),
     )
     harness.supervisor.bootstrap()
 
@@ -766,26 +918,6 @@ def test_api_ports_follow_the_id_sorted_catalogue(tmp_path: Path) -> None:
     assert records["alpha"].api_port == 9000
     assert records["mu"].api_port == 9001
     assert records["zeta"].api_port == 9002
-
-
-def test_promotion_when_a_slot_frees(tmp_path: Path) -> None:
-    profiles = [profile_config(name) for name in ("alpha", "beta", "gamma")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=1, worker_start_stagger_seconds=0),
-    )
-    harness.supervisor.bootstrap()
-    assert harness.supervisor.is_running("alpha")
-
-    harness.supervisor.stop_profile("alpha")
-    assert not harness.supervisor.is_running("alpha")
-    assert harness.records()["alpha"].state == "stopped"
-
-    harness.supervisor.schedule()
-    assert harness.supervisor.is_running("beta")
-    assert not harness.supervisor.is_running("alpha")
-    assert harness.records()["gamma"].state == "queued"
 
 
 def test_operator_stop_survives_the_scheduler(tmp_path: Path) -> None:
@@ -841,25 +973,23 @@ def test_disabled_profile_is_stopped_with_reason(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fleet slots: the cap bounds occupied slots, not candidate positions
+# A refused live profile never holds the fleet back
 # ---------------------------------------------------------------------------
-def test_a_refused_live_profile_does_not_consume_a_slot(tmp_path: Path) -> None:
-    """A live profile the gate refuses is blocked and leaves its slot to the next one.
+def test_a_refused_live_profile_does_not_hold_the_other_candidates_back(
+    tmp_path: Path,
+) -> None:
+    """A live profile the gate refuses is blocked; every other candidate still runs.
 
     The refused profile sorts first, so the two paper profiles behind it must
-    both run in the very same pass: a profile the gate refuses holds no worker
-    and therefore occupies no slot of the fleet cap.
+    both run in the very same pass: there is no cap and no queue any more, so a
+    blocked candidate can never delay another one.
     """
     profiles = [
         profile_config("live-first", mode="live", priority=300),
         profile_config("paper-a", priority=200),
         profile_config("paper-b", priority=100),
     ]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
 
     harness.supervisor.bootstrap()
 
@@ -870,178 +1000,9 @@ def test_a_refused_live_profile_does_not_consume_a_slot(tmp_path: Path) -> None:
     assert records["paper-b"].state == "running"
     assert records["live-first"].state == "blocked"
     assert records["live-first"].state_reason == expected[1]
-    assert [record.id for record in records.values() if record.state == "queued"] == []
     assert harness.spawned_ids() == ["paper-a", "paper-b"]
     assert len(harness.launcher.calls) == 2
     assert harness.kinds().count("blocked_live") == 1
-
-
-def test_the_fleet_converges_to_the_cap_with_a_refused_live_profile_among_the_top_priorities(
-    tmp_path: Path,
-) -> None:
-    """The production catalogue: the refused live profile must not waste a slot.
-
-    ``faber-btc-1d-live`` sorts sixth, inside the six-slot budget, and the gate
-    refuses it. The sixth slot therefore goes to the next candidate,
-    ``keltner-sol-1h``, instead of staying empty: six workers run, the refused
-    profile is blocked and every remaining candidate is queued for the cap.
-    """
-    profiles = [
-        profile_config("basic-btc-1h"),
-        profile_config("bollinger-eth-1h"),
-        profile_config("donchian-eth-4h"),
-        profile_config("dual-thrust-eth-15m"),
-        profile_config("faber-btc-1d"),
-        profile_config("faber-btc-1d-live", mode="live"),
-        profile_config("keltner-sol-1h"),
-        profile_config("basic-eth-4h", priority=50),
-    ]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=6, worker_start_stagger_seconds=0),
-    )
-
-    harness.supervisor.bootstrap()
-
-    records = harness.records()
-    running = sorted(record.id for record in records.values() if record.state == "running")
-    assert len(running) == 6
-    assert "keltner-sol-1h" in running
-    assert records["faber-btc-1d-live"].state == "blocked"
-    assert not harness.supervisor.is_running("faber-btc-1d-live")
-    queued = [record for record in records.values() if record.state == "queued"]
-    assert [record.id for record in queued] == ["basic-eth-4h"]
-    assert {record.state_reason for record in queued} == {
-        "queued: fleet cap reached (6 of 6 slots in use)"
-    }
-    assert len(harness.launcher.calls) == 6
-    assert harness.kinds().count("cap_reached") == 1
-
-
-def test_the_cap_queue_reason_names_the_used_and_total_slots(tmp_path: Path) -> None:
-    """The queued reason carries the occupied slots and the cap, not just the cap."""
-    assert CAP_QUEUE_REASON_TEMPLATE == (
-        "queued: fleet cap reached ({used} of {total} slots in use)"
-    )
-    profiles = [profile_config(f"p{index:02d}") for index in range(8)]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=6, worker_start_stagger_seconds=0),
-    )
-
-    harness.supervisor.bootstrap()
-
-    queued = [record for record in harness.records().values() if record.state == "queued"]
-    expected = CAP_QUEUE_REASON_TEMPLATE.format(used=6, total=6)
-    assert expected == "queued: fleet cap reached (6 of 6 slots in use)"
-    assert len(queued) == 2
-    assert {record.state_reason for record in queued} == {expected}
-
-
-def test_slots_used_equals_the_running_profiles_and_the_fleet_converges(tmp_path: Path) -> None:
-    """The published ``slots_used`` counts the rows in state ``running``.
-
-    Asserted inside the convergence scenario, where six workers run because the
-    refused live profile costs no slot.
-    """
-    profiles = [
-        profile_config("basic-btc-1h"),
-        profile_config("bollinger-eth-1h"),
-        profile_config("donchian-eth-4h"),
-        profile_config("dual-thrust-eth-15m"),
-        profile_config("faber-btc-1d"),
-        profile_config("faber-btc-1d-live", mode="live"),
-        profile_config("keltner-sol-1h"),
-        profile_config("basic-eth-4h", priority=50),
-    ]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=6, worker_start_stagger_seconds=0),
-    )
-    supervisor = harness.supervisor
-    supervisor.bootstrap()
-
-    status = supervisor.status()
-    assert status["slots_used"] == status["profiles_running"] == 6
-    assert status["slots_total"] == 6
-    assert (
-        len([record for record in harness.store.list_profiles() if record.state == "running"]) == 6
-    )
-
-
-def test_a_low_priority_refused_live_profile_costs_no_slot(tmp_path: Path) -> None:
-    """A refused profile releases its slot to the next candidate by priority."""
-    profiles = [
-        profile_config("paper-a", priority=300),
-        profile_config("live-low", mode="live", priority=200),
-        profile_config("paper-b", priority=100),
-        profile_config("paper-c", priority=50),
-    ]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
-    )
-
-    harness.supervisor.bootstrap()
-
-    expected = live_trading_gate("live", harness.env)
-    records = harness.records()
-    assert expected[0] is False
-    assert records["paper-a"].state == "running"
-    assert records["paper-b"].state == "running"
-    assert records["live-low"].state == "blocked"
-    assert records["live-low"].state_reason == expected[1]
-    assert records["paper-c"].state == "queued"
-    assert records["paper-c"].state_reason == ("queued: fleet cap reached (2 of 2 slots in use)")
-    assert harness.spawned_ids() == ["paper-a", "paper-b"]
-
-
-async def test_a_restart_backoff_reserves_its_slot_but_is_not_a_used_slot(tmp_path: Path) -> None:
-    """A reserved backoff slot bounds the fleet without being a published slot.
-
-    ``alpha`` is stopped by the health policy and waits for its restart backoff
-    while the clock is frozen: it holds no worker, yet its slot stays reserved,
-    so ``gamma`` is queued for the cap although only one worker (``beta``) is
-    alive. ``status()`` still reports the rows in state ``running``, so the
-    reserved slot is not published as a used slot.
-    """
-    harness = make_harness(
-        tmp_path,
-        profiles=[
-            profile_config("alpha", priority=300),
-            profile_config("beta", priority=200),
-            profile_config("gamma", priority=100),
-        ],
-        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
-    )
-    supervisor = harness.supervisor
-    await supervisor.start()
-    assert supervisor.is_running("alpha")
-    assert supervisor.is_running("beta")
-    assert harness.records()["gamma"].state == "queued"
-
-    await fail_cycle(harness, "alpha", 1)
-
-    record = harness.records()["alpha"]
-    assert record.state == "stopped"
-    assert record.state_reason == f"restart_backoff: retrying in {RESTART_BACKOFF_SECONDS[0]}s"
-    assert not supervisor.is_running("alpha")
-
-    supervisor.schedule()
-
-    assert supervisor.is_running("beta")
-    assert not supervisor.is_running("alpha")
-    assert harness.records()["gamma"].state == "queued"
-    assert harness.records()["gamma"].state_reason == (
-        "queued: fleet cap reached (2 of 2 slots in use)"
-    )
-    assert len(harness.launcher.running()) == 1
-    status = supervisor.status()
-    assert status["slots_used"] == status["profiles_running"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1103,19 +1064,37 @@ def test_live_gate_is_re_evaluated_on_every_schedule(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Health policy
 # ---------------------------------------------------------------------------
-async def test_three_failed_reads_restart_the_worker_with_backoff(tmp_path: Path) -> None:
+async def test_a_proven_dead_worker_is_restarted_with_backoff(tmp_path: Path) -> None:
     harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
     supervisor = harness.supervisor
     await supervisor.start()
     assert supervisor.is_running("alpha")
 
-    harness.api.fail_next("alpha", UNHEALTHY_THRESHOLD)
+    # A failed read is not a death on its own: the supervisor first spends the
+    # startup grace, then the read threshold, then confirms the death on /ping.
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    # Reads keep failing from now on, so the death check is probed on every
+    # cycle once the read threshold is crossed.
+    harness.api.fail_next("alpha", UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD)
     for _ in range(UNHEALTHY_THRESHOLD - 1):
         await supervisor.refresh_once()
         assert supervisor.is_running("alpha")
         assert supervisor.metrics_for("alpha") is None
 
+    # The crossing read only starts the death check: a worker that still answers
+    # /ping is alive and is left alone.
     await supervisor.refresh_once()
+    assert supervisor.is_running("alpha")
+    assert harness.api.pings[harness.api.key("alpha")] > 0
+
+    harness.api.set_ping("alpha", False)
+    for _ in range(UNHEALTHY_PING_THRESHOLD):
+        await supervisor.refresh_once()
+        if not supervisor.is_running("alpha"):
+            break
+    else:
+        raise AssertionError("the worker survived its whole failure budget")
+
     assert not supervisor.is_running("alpha")
     record = harness.records()["alpha"]
     assert record.state == "stopped"
@@ -1155,17 +1134,13 @@ async def test_restart_backoff_saturates_at_forty_five_seconds(tmp_path: Path) -
     assert harness.kinds().count("restart") == MAX_RESTARTS_IN_WINDOW
 
 
-async def test_five_restarts_in_the_window_give_up_and_free_the_slot(tmp_path: Path) -> None:
+async def test_five_restarts_in_the_window_give_up(tmp_path: Path) -> None:
     profiles = [profile_config("alpha"), profile_config("beta")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=1, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     supervisor = harness.supervisor
     await supervisor.start()
     assert supervisor.is_running("alpha")
-    assert harness.records()["beta"].state == "queued"
+    assert supervisor.is_running("beta")
 
     for _ in range(MAX_RESTARTS_IN_WINDOW):
         await fail_cycle(harness, "alpha", 1)
@@ -1244,14 +1219,125 @@ async def test_unexpected_client_errors_are_counted_like_read_failures(tmp_path:
     supervisor = harness.supervisor
     await supervisor.start()
 
-    harness.api.fail_unexpectedly("alpha", UNHEALTHY_THRESHOLD)
-    for _ in range(UNHEALTHY_THRESHOLD):
+    # An unexpected error is a failed read like any other, and a failed read is
+    # not a death on its own: the whole budget has to be spent.
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    harness.api.set_ping("alpha", False)
+    harness.api.fail_unexpectedly("alpha", UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD)
+    for _ in range(UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD):
         await supervisor.refresh_once()
+        if not supervisor.is_running("alpha"):
+            break
+    else:
+        raise AssertionError("the worker survived its whole failure budget")
 
     record = harness.records()["alpha"]
     assert record.state == "stopped"
     assert "unexpected error" in (record.last_error or "")
     assert not supervisor.is_running("alpha")
+
+
+async def test_a_slow_but_answering_worker_is_never_restarted(tmp_path: Path) -> None:
+    """The regression the crash loop was made of: slow reads are not a death.
+
+    ``/balance`` failed far more often than ``UNHEALTHY_THRESHOLD`` -- the live
+    deployment measured 19.74 s, 19.77 s and 11.94 s while 22 workers shared one
+    CoinGecko rate limit -- but ``GET /ping`` kept answering ``{"status":
+    "pong"}``, so the worker is alive: it is not terminated, it is not
+    restarted, and it stays ``running``.
+    """
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    await supervisor.start()
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    process = harness.launcher.calls[0].process
+
+    harness.api.fail_next("alpha", UNHEALTHY_THRESHOLD + 5)
+    for _ in range(UNHEALTHY_THRESHOLD + 5):
+        await supervisor.refresh_once()
+
+    assert process not in harness.launcher.terminated
+    assert "restart" not in harness.kinds()
+    assert "crash" not in harness.kinds()
+    assert harness.records()["alpha"].state == "running"
+    assert supervisor.is_running("alpha")
+    # The ping double was really asked: the death check ran and answered "alive".
+    assert harness.api.pings[harness.api.key("alpha")] > 0
+    assert supervisor._health["alpha"].ping_failures == 0
+
+
+async def test_a_worker_that_never_answers_ping_past_the_window_is_restarted(
+    tmp_path: Path,
+) -> None:
+    """A worker proven gone -- silent reads *and* silent pings -- is restarted."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    await supervisor.start()
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    harness.api.set_ping("alpha", False)
+    harness.api.fail_next("alpha", UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD)
+
+    # The worker is probed on every cycle from the moment the read threshold is
+    # reached, so the death lands exactly UNHEALTHY_PING_THRESHOLD cycles later.
+    for _ in range(UNHEALTHY_THRESHOLD + UNHEALTHY_PING_THRESHOLD):
+        await supervisor.refresh_once()
+        if not supervisor.is_running("alpha"):
+            break
+    else:
+        raise AssertionError("the worker survived its whole failure budget")
+
+    assert harness.api.pings[harness.api.key("alpha")] >= UNHEALTHY_PING_THRESHOLD
+    assert harness.launcher.terminated
+    assert harness.records()["alpha"].state_reason == (
+        f"restart_backoff: retrying in {RESTART_BACKOFF_SECONDS[0]}s"
+    )
+    assert "restart" in harness.kinds()
+
+
+async def test_a_start_is_not_judged_inside_the_startup_grace(tmp_path: Path) -> None:
+    """A freshly spawned worker is not judged until the grace elapses."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    await supervisor.start()
+    assert supervisor.is_running("alpha")
+
+    # Every read fails from the very first cycle, but Freqtrade needs tens of
+    # seconds before its API server answers, so nothing is counted yet.
+    harness.api.fail_next("alpha", UNHEALTHY_THRESHOLD + 5)
+    harness.api.fail_ping_next("alpha", UNHEALTHY_PING_THRESHOLD + 5)
+    for _ in range(UNHEALTHY_THRESHOLD):
+        harness.clock.advance(1)
+        await supervisor.refresh_once()
+
+    assert supervisor._health["alpha"].failures == 0
+    assert supervisor._health["alpha"].ping_failures == 0
+    assert supervisor.is_running("alpha")
+    assert "restart" not in harness.kinds()
+    assert harness.api.pings.get(harness.api.key("alpha"), 0) == 0
+
+    # Past the grace the very same failures count again.
+    harness.clock.advance(WORKER_STARTUP_GRACE_SECONDS)
+    await supervisor.refresh_once()
+
+    assert supervisor._health["alpha"].failures == 1
+
+
+async def test_the_grace_does_not_shield_a_genuinely_dead_child(tmp_path: Path) -> None:
+    """A child that exited on its own is a crash, grace or no grace."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    await supervisor.start()
+    assert supervisor._within_startup_grace("alpha")
+
+    harness.launcher.calls[0].process.exit(1)
+    await supervisor.refresh_once()
+
+    crash = [event for event in harness.events() if event.kind == "crash"]
+    assert len(crash) == 1
+    assert "restart" in harness.kinds()
+    # Nothing signals an already-exited child: the handle is simply dropped.
+    assert harness.launcher.terminated == []
+    assert supervisor._health["alpha"].failures == 0
 
 
 async def test_a_child_that_exits_is_a_crash_and_is_restarted(tmp_path: Path) -> None:
@@ -1379,66 +1465,50 @@ def test_boot_with_the_kill_switch_starts_nothing(tmp_path: Path) -> None:
 
 def test_apply_settings_persists_and_reschedules(tmp_path: Path) -> None:
     profiles = [profile_config(name) for name in ("alpha", "beta", "gamma")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=2, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     supervisor = harness.supervisor
     supervisor.bootstrap()
-    assert harness.records()["gamma"].state == "queued"
+    assert {record.state for record in harness.records().values()} == {"running"}
 
-    updated = supervisor.apply_settings(max_running_profiles=3, snapshot_interval_seconds=15)
+    updated = supervisor.apply_settings(snapshot_interval_seconds=15)
 
-    assert updated.max_running_profiles == 3
     assert updated.snapshot_interval_seconds == 15
     assert supervisor.settings is updated
     persisted = json.loads(harness.store.get_setting(SETTINGS_KEY) or "{}")
-    assert persisted["max_running_profiles"] == 3
     assert persisted["snapshot_interval_seconds"] == 15
     assert {record.state for record in harness.records().values()} == {"running"}
     assert "settings_updated" in harness.kinds()
-
-    supervisor.apply_settings(max_running_profiles=1)
-
-    records = harness.records()
-    assert records["alpha"].state == "running"
-    assert records["beta"].state == "queued"
-    assert records["beta"].state_reason == "queued: fleet cap reached (1 of 1 slots in use)"
-    assert not supervisor.is_running("beta")
-    assert harness.launcher.terminated
 
 
 def test_boot_applies_the_persisted_settings_over_the_file(tmp_path: Path) -> None:
     harness = make_harness(
         tmp_path,
         profiles=[profile_config("alpha")],
-        platform={"max_running_profiles": 3, "snapshot_interval_seconds": 30},
+        platform={"snapshot_interval_seconds": 30},
     )
-    harness.store.set_setting(SETTINGS_KEY, json.dumps({"max_running_profiles": 5}))
+    harness.store.set_setting(SETTINGS_KEY, json.dumps({"snapshot_interval_seconds": 45}))
 
     harness.supervisor.bootstrap()
 
-    assert harness.supervisor.settings.max_running_profiles == 5
-    assert harness.supervisor.settings.snapshot_interval_seconds == 30
+    assert harness.supervisor.settings.snapshot_interval_seconds == 45
 
 
 def test_boot_lets_the_environment_win_over_the_persisted_settings(tmp_path: Path) -> None:
     harness = make_harness(
         tmp_path,
         profiles=[profile_config("alpha")],
-        platform={"max_running_profiles": 3, "snapshot_interval_seconds": 30},
+        platform={"snapshot_interval_seconds": 30},
         env={
             **BASE_ENV,
-            "TB_MAX_RUNNING_PROFILES": "2",
+            "TB_SNAPSHOT_INTERVAL_SECONDS": "15",
             "TB_PROFILE_API_PORT_BASE": "9000",
         },
     )
-    harness.store.set_setting(SETTINGS_KEY, json.dumps({"max_running_profiles": 5}))
+    harness.store.set_setting(SETTINGS_KEY, json.dumps({"snapshot_interval_seconds": 45}))
 
     harness.supervisor.bootstrap()
 
-    assert harness.supervisor.settings.max_running_profiles == 2
+    assert harness.supervisor.settings.snapshot_interval_seconds == 15
     assert harness.supervisor.settings.profile_api_port_base == 9000
     assert harness.records()["alpha"].api_port == 9000
 
@@ -1452,13 +1522,13 @@ def test_boot_reads_the_ambient_environment_when_no_mapping_is_injected(
     process environment, and it must still see the overrides: comparing the
     document against a baseline loaded with ``env=None`` -- which *also* means
     "read ``os.environ``" -- would always produce an empty difference and
-    silently drop ``TB_MAX_RUNNING_PROFILES``.
+    silently drop ``TB_SNAPSHOT_INTERVAL_SECONDS``.
     """
-    monkeypatch.setenv("TB_MAX_RUNNING_PROFILES", "2")
+    monkeypatch.setenv("TB_SNAPSHOT_INTERVAL_SECONDS", "15")
     state_dir = tmp_path / "realtime"
     state_dir.mkdir(parents=True, exist_ok=True)
     config_dir = tmp_path / "config"
-    write_documents(config_dir, [profile_config("alpha")], {"max_running_profiles": 12})
+    write_documents(config_dir, [profile_config("alpha")], {"snapshot_interval_seconds": 120})
     store = StateStore(state_dir / "state.db")
     _OPEN_STORES.append(store)
     supervisor = Supervisor(
@@ -1473,7 +1543,7 @@ def test_boot_reads_the_ambient_environment_when_no_mapping_is_injected(
 
     supervisor.bootstrap()
 
-    assert supervisor.settings.max_running_profiles == 2
+    assert supervisor.settings.snapshot_interval_seconds == 15
 
 
 def test_persisted_settings_row_is_read_defensively(tmp_path: Path) -> None:
@@ -1482,7 +1552,7 @@ def test_persisted_settings_row_is_read_defensively(tmp_path: Path) -> None:
 
     harness.supervisor.bootstrap()
 
-    assert harness.supervisor.settings.max_running_profiles == 6
+    assert harness.supervisor.settings.snapshot_interval_seconds == 60
 
 
 # ---------------------------------------------------------------------------
@@ -1490,11 +1560,7 @@ def test_persisted_settings_row_is_read_defensively(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 async def test_status_and_helpers_report_the_fleet(tmp_path: Path) -> None:
     profiles = [profile_config("alpha"), profile_config("beta")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=1, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     supervisor = harness.supervisor
     await supervisor.start()
     await supervisor.refresh_once()
@@ -1503,14 +1569,10 @@ async def test_status_and_helpers_report_the_fleet(tmp_path: Path) -> None:
     assert status["running"] is True
     assert status["bootstrapped"] is True
     assert status["profiles_total"] == 2
-    assert status["profiles_running"] == 1
-    assert status["profiles_healthy"] == 1
-    assert status["profiles_queued"] == 1
+    assert status["profiles_running"] == 2
+    assert status["profiles_healthy"] == 2
     assert status["profiles_error"] == 0
     assert status["profiles_blocked"] == 0
-    assert status["slots_used"] == 1
-    assert status["slots_total"] == 1
-    assert status["max_running_profiles"] == 1
     assert status["snapshot_interval_seconds"] == 60
     assert status["kill_switch_engaged"] is False
     assert status["state_dir"] == str(harness.state_dir)
@@ -1521,9 +1583,9 @@ async def test_status_and_helpers_report_the_fleet(tmp_path: Path) -> None:
 
     harness.clock.advance(90)
     assert supervisor.uptime_seconds() == 90.0
-    assert supervisor.healthy_count() == 1
+    assert supervisor.healthy_count() == 2
     assert supervisor.metrics_for("alpha") == METRICS
-    assert supervisor.metrics_for("beta") is None
+    assert supervisor.metrics_for("beta") == METRICS
     assert supervisor.latest_snapshots() == {}
     assert [record.id for record in supervisor.profiles()] == ["alpha", "beta"]
 
@@ -1565,21 +1627,21 @@ async def test_start_profile_is_idempotent(tmp_path: Path) -> None:
 
 
 async def test_stop_of_a_profile_without_a_worker_still_records_the_reason(tmp_path: Path) -> None:
-    harness = make_harness(
-        tmp_path,
-        profiles=[profile_config("alpha")],
-        settings=PlatformSettings(max_running_profiles=0),
-    )
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
     supervisor = harness.supervisor
     supervisor.bootstrap()
-    assert harness.records()["alpha"].state == "queued"
+    supervisor.stop_profile("alpha")
+    assert harness.records()["alpha"].state == "stopped"
+    assert not supervisor.is_running("alpha")
+    stops = harness.kinds().count("stop")
 
     supervisor.stop_profile("alpha", reason="maintenance")
 
     record = harness.records()["alpha"]
     assert record.state == "stopped"
     assert record.state_reason == "maintenance"
-    assert harness.kinds().count("stop") == 0
+    # No worker was alive, so this pass journals no second stop.
+    assert harness.kinds().count("stop") == stops
 
 
 async def test_the_kill_switch_refuses_an_explicit_start(tmp_path: Path) -> None:
@@ -1612,17 +1674,13 @@ async def test_a_disabled_profile_cannot_be_started(tmp_path: Path) -> None:
     assert harness.records()["beta"].state_reason == "disabled"
 
 
-async def test_an_explicit_start_is_not_taken_away_by_the_cap(tmp_path: Path) -> None:
+async def test_an_explicit_start_restarts_a_profile_the_operator_stopped(tmp_path: Path) -> None:
     profiles = [profile_config("alpha"), profile_config("beta")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=PlatformSettings(max_running_profiles=1, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     supervisor = harness.supervisor
     supervisor.bootstrap()
-    assert supervisor.is_running("alpha")
-    assert harness.records()["beta"].state == "queued"
+    supervisor.stop_profile("beta")
+    assert not supervisor.is_running("beta")
 
     supervisor.start_profile("beta")
     supervisor.schedule()
@@ -1668,13 +1726,13 @@ def test_an_invalid_platform_document_falls_back_to_the_caller_settings(tmp_path
     harness = make_harness(
         tmp_path,
         profiles=[profile_config("alpha")],
-        platform={"max_running_profiles": "not a number"},
-        settings=PlatformSettings(max_running_profiles=4, worker_start_stagger_seconds=0),
+        platform={"snapshot_interval_seconds": "not a number"},
+        settings=PlatformSettings(snapshot_interval_seconds=30),
     )
 
     harness.supervisor.bootstrap()
 
-    assert harness.supervisor.settings.max_running_profiles == 4
+    assert harness.supervisor.settings.snapshot_interval_seconds == 30
 
 
 def test_an_unreadable_platform_document_is_ignored(tmp_path: Path) -> None:
@@ -1685,7 +1743,7 @@ def test_an_unreadable_platform_document_is_ignored(tmp_path: Path) -> None:
 
     harness.supervisor.bootstrap()
 
-    assert harness.supervisor.settings.max_running_profiles == 6
+    assert harness.supervisor.settings.snapshot_interval_seconds == 60
     assert harness.supervisor.is_running("alpha")
 
 
@@ -1695,7 +1753,7 @@ def test_a_malformed_platform_document_is_ignored(tmp_path: Path) -> None:
 
     harness.supervisor.bootstrap()
 
-    assert harness.supervisor.settings.max_running_profiles == 6
+    assert harness.supervisor.settings.snapshot_interval_seconds == 60
 
 
 def test_the_strategy_path_falls_back_to_the_repository_directory(tmp_path: Path) -> None:
@@ -1724,198 +1782,11 @@ def test_the_strategy_path_falls_back_to_the_repository_directory(tmp_path: Path
 
 
 # ---------------------------------------------------------------------------
-# Gentle fleet boot: the stagger gate
-# ---------------------------------------------------------------------------
-def test_the_stagger_boots_the_fleet_one_worker_per_interval(tmp_path: Path) -> None:
-    """The regression test of the production incident: a cold start is gradual.
-
-    Four eligible profiles and three slots. The candidates are ordered by
-    priority descending then id ascending, so the fourth one is ``omega``. The
-    first pass spawns exactly one worker; every other candidate is queued with the
-    gradual-start reason, because a staggered profile holds no worker yet and so
-    consumes no slot; and the gate then admits exactly one more worker per
-    ``worker_start_stagger_seconds`` interval -- no more, no less. Only the last
-    pass, once the three slots are occupied, gives ``omega`` the fleet-cap reason.
-    """
-    profiles = [profile_config(name) for name in ("alpha", "beta", "gamma", "omega")]
-    harness = make_harness(tmp_path, profiles=profiles, settings=staggered_settings())
-    supervisor = harness.supervisor
-
-    supervisor.bootstrap()
-
-    assert harness.spawned_ids() == ["alpha"]
-    records = harness.records()
-    assert records["alpha"].state == "running"
-    for name in ("beta", "gamma"):
-        assert records[name].state == "queued"
-        assert records[name].state_reason == (
-            "queued: starting workers gradually (1 of 3 slots in use)"
-        )
-    assert records["omega"].state == "queued"
-    assert records["omega"].state_reason == (
-        "queued: starting workers gradually (1 of 3 slots in use)"
-    )
-    assert harness.kinds().count("cap_reached") == 0
-    # A staggered profile holds no worker, so the pass journals no stop.
-    assert "stop" not in harness.kinds()
-
-    harness.clock.advance(10)
-    supervisor.schedule()
-
-    assert harness.spawned_ids() == ["alpha", "beta"]
-    assert harness.records()["gamma"].state_reason == (
-        "queued: starting workers gradually (2 of 3 slots in use)"
-    )
-
-    harness.clock.advance(9)
-    supervisor.schedule()
-
-    assert harness.spawned_ids() == ["alpha", "beta"]
-    assert not supervisor.is_running("gamma")
-    assert harness.records()["gamma"].state_reason == (
-        "queued: starting workers gradually (2 of 3 slots in use)"
-    )
-
-    harness.clock.advance(1)
-    supervisor.schedule()
-
-    assert harness.spawned_ids() == ["alpha", "beta", "gamma"]
-    assert harness.records()["omega"].state_reason == (
-        "queued: fleet cap reached (3 of 3 slots in use)"
-    )
-    assert harness.kinds().count("cap_reached") == 1
-
-
-def test_a_zero_stagger_keeps_the_immediate_boot(tmp_path: Path) -> None:
-    """``worker_start_stagger_seconds = 0`` is the historical behaviour exactly."""
-    profiles = [profile_config(name) for name in ("alpha", "beta", "gamma", "omega")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=staggered_settings(worker_start_stagger_seconds=0),
-    )
-
-    harness.supervisor.bootstrap()
-
-    assert harness.spawned_ids() == ["alpha", "beta", "gamma"]
-    records = harness.records()
-    assert records["omega"].state == "queued"
-    assert records["omega"].state_reason == "queued: fleet cap reached (3 of 3 slots in use)"
-    assert all("gradually" not in (record.state_reason or "") for record in records.values())
-
-
-def test_the_stagger_delays_promotions_without_reordering_them(tmp_path: Path) -> None:
-    """The started ids are the priority-DESC/id-ASC prefix, one per pass."""
-    profiles = [
-        profile_config("c-low", priority=50),
-        profile_config("a-low", priority=50),
-        profile_config("e-high", priority=100),
-        profile_config("b-low", priority=50),
-        profile_config("d-high", priority=100),
-    ]
-    harness = make_harness(tmp_path, profiles=profiles, settings=staggered_settings())
-    supervisor = harness.supervisor
-
-    supervisor.bootstrap()
-    assert harness.spawned_ids() == ["d-high"]
-
-    harness.clock.advance(10)
-    supervisor.schedule()
-    assert harness.spawned_ids() == ["d-high", "e-high"]
-
-    harness.clock.advance(10)
-    supervisor.schedule()
-    assert harness.spawned_ids() == ["d-high", "e-high", "a-low"]
-    assert [record.id for record in supervisor.profiles() if record.state == "running"] == [
-        "d-high",
-        "e-high",
-        "a-low",
-    ]
-
-    harness.clock.advance(10)
-    supervisor.schedule()
-
-    assert harness.spawned_ids() == ["d-high", "e-high", "a-low"]
-    assert harness.records()["b-low"].state_reason == (
-        "queued: fleet cap reached (3 of 3 slots in use)"
-    )
-
-
-def test_apply_settings_opens_and_re_arms_the_stagger_gate(tmp_path: Path) -> None:
-    profiles = [profile_config(name) for name in ("alpha", "beta", "gamma", "omega")]
-    harness = make_harness(tmp_path, profiles=profiles, settings=staggered_settings())
-    supervisor = harness.supervisor
-    supervisor.bootstrap()
-    assert harness.spawned_ids() == ["alpha"]
-
-    updated = supervisor.apply_settings(worker_start_stagger_seconds=0)
-
-    assert updated.worker_start_stagger_seconds == 0
-    assert supervisor.settings.worker_start_stagger_seconds == 0
-    document = json.loads(harness.store.get_setting(SETTINGS_KEY) or "{}")
-    assert document == supervisor.settings.model_dump()
-    assert document["worker_start_stagger_seconds"] == 0
-    assert harness.spawned_ids() == ["alpha", "beta", "gamma"]
-    assert "settings_updated" in harness.kinds()
-
-    supervisor.apply_settings(worker_start_stagger_seconds=5)
-
-    assert supervisor.settings.worker_start_stagger_seconds == 5
-    assert (
-        json.loads(harness.store.get_setting(SETTINGS_KEY) or "{}")["worker_start_stagger_seconds"]
-        == 5
-    )
-
-    # The gate is armed again: freeing a slot promotes one worker per interval.
-    supervisor.stop_profile("gamma")
-    supervisor.schedule()
-
-    assert not supervisor.is_running("omega")
-    assert harness.records()["omega"].state_reason == (
-        "queued: starting workers gradually (2 of 3 slots in use)"
-    )
-
-    harness.clock.advance(4)
-    supervisor.schedule()
-    assert not supervisor.is_running("omega")
-
-    harness.clock.advance(1)
-    supervisor.schedule()
-    assert supervisor.is_running("omega")
-
-
-def test_raising_the_cap_still_starts_one_worker_per_pass(tmp_path: Path) -> None:
-    """A wider cap does not open the gate: the fleet keeps growing gradually."""
-    profiles = [profile_config(name) for name in ("alpha", "bravo", "charlie", "delta", "echo")]
-    harness = make_harness(tmp_path, profiles=profiles, settings=staggered_settings())
-    supervisor = harness.supervisor
-    supervisor.bootstrap()
-    assert harness.spawned_ids() == ["alpha"]
-
-    harness.clock.advance(10)
-    updated = supervisor.apply_settings(max_running_profiles=5)
-
-    assert updated.max_running_profiles == 5
-    assert harness.spawned_ids() == ["alpha", "bravo"]
-    assert json.loads(harness.store.get_setting(SETTINGS_KEY) or "{}")["max_running_profiles"] == 5
-    records = harness.records()
-    for name in ("charlie", "delta", "echo"):
-        assert records[name].state == "queued"
-        assert records[name].state_reason == (
-            "queued: starting workers gradually (2 of 5 slots in use)"
-        )
-
-
-# ---------------------------------------------------------------------------
 # The history read pass (the read model of the monitoring pages)
 # ---------------------------------------------------------------------------
 async def test_history_for_returns_the_rows_of_the_last_successful_read(tmp_path: Path) -> None:
     profiles = [profile_config("alpha"), profile_config("beta"), profile_config("gamma")]
-    harness = make_harness(
-        tmp_path,
-        profiles=profiles,
-        settings=staggered_settings(max_running_profiles=2, worker_start_stagger_seconds=0),
-    )
+    harness = make_harness(tmp_path, profiles=profiles)
     supervisor = harness.supervisor
     supervisor.bootstrap()
     assert supervisor.history_for("alpha") is None
@@ -1929,10 +1800,13 @@ async def test_history_for_returns_the_rows_of_the_last_successful_read(tmp_path
     assert trade_rows == [TRADE_ROW, OPEN_TRADE_ROW]
     assert [row["trade_id"] for row in trade_rows] == [11, 11]
     assert trade_rows[-1]["is_open"] is True
-    assert harness.api.trade_limits == [HISTORY_TRADE_LIMIT, HISTORY_TRADE_LIMIT]
+    assert harness.api.trade_limits == [
+        HISTORY_TRADE_LIMIT,
+        HISTORY_TRADE_LIMIT,
+        HISTORY_TRADE_LIMIT,
+    ]
     assert supervisor.history_for("beta") == ([DAILY_ROW], [TRADE_ROW, OPEN_TRADE_ROW])
-    # Beyond the cap: the worker never ran, so there is nothing to read.
-    assert supervisor.history_for("gamma") is None
+    # The worker of ``gamma`` never ran: there is nothing to read for it.
     assert supervisor.history_for("ghost") is None
 
     supervisor.stop_profile("alpha")

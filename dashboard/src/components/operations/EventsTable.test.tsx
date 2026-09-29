@@ -21,15 +21,15 @@ const EVENTS: EventItem[] = [
     level: "info",
     kind: "profile_started",
     profile_id: "alpha",
-    message: "Alpha started on an engine slot.",
+    message: "Alpha started its worker.",
   }),
   eventItem({
     id: "11",
     timestamp: "2026-09-27T11:58:00Z",
     level: "warning",
-    kind: "cap_reached",
+    kind: "profile_refused",
     profile_id: null,
-    message: "The fleet cap is reached; the profile is queued.",
+    message: "A live profile was refused: the live gate is closed.",
   }),
   eventItem({
     id: "10",
@@ -79,10 +79,34 @@ describe("EventsTable", () => {
     expect(rows).toHaveLength(4);
     expect(rows[1]).toHaveTextContent("2026-09-27 11:59:00 UTC");
     expect(rows[1]).toHaveTextContent("profile_started");
-    expect(rows[1]).toHaveTextContent("Alpha started on an engine slot.");
+    expect(rows[1]).toHaveTextContent("Alpha started its worker.");
     expect(rows[2]).toHaveTextContent("platform");
     expect(rows[3]).toHaveTextContent("crash");
     expect(screen.getByRole("link", { name: "alpha" })).toHaveAttribute("href", "/profiles/alpha");
+  });
+
+  it("renders a legacy cap_reached kind as a plain unknown kind, never a crash", () => {
+    // The engine can no longer emit `cap_reached`, but the journal still holds
+    // the rows an older version wrote: they must render as their own kind.
+    render(
+      <EventsTable
+        events={[
+          eventItem({
+            id: "9",
+            timestamp: "2026-09-27T11:50:00Z",
+            level: "warning",
+            kind: "cap_reached",
+            profile_id: null,
+            message: "A legacy row of an older engine.",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("cap_reached")).toBeInTheDocument();
+    expect(screen.getByText("A legacy row of an older engine.")).toBeInTheDocument();
+    expect(screen.getByText("Warning")).toBeInTheDocument();
+    expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(2);
   });
 
   it("marks the level of every row next to its wording", () => {

@@ -31,7 +31,7 @@ describe("fallback payloads", () => {
     expect(EMPTY_ACCOUNT.equity_curve).toEqual([]);
     expect(EMPTY_ACCOUNT.performance.portfolio_value).toBe(0);
     expect(EMPTY_ACCOUNT.performance.profiles_total).toBe(0);
-    expect(EMPTY_ACCOUNT.performance.engine_slots_total).toBe(0);
+    expect(EMPTY_ACCOUNT.performance.profiles_running).toBe(0);
     expect(EMPTY_ACCOUNT.performance.window).toBe(EMPTY_ACCOUNT.window);
   });
 
@@ -42,8 +42,7 @@ describe("fallback payloads", () => {
 });
 
 /**
- * The view model of `GET /api/health` mirrors the wire names: the slot pair is
- * `engine_slots_used`/`engine_slots_total` and the fleet size is
+ * The view model of `GET /api/health` mirrors the wire names: the fleet size is
  * `profiles_running`. The literal below is typed, so a rename on the wire side
  * breaks this test at compile time instead of blanking a KPI.
  */
@@ -53,26 +52,27 @@ describe("HealthStatus", () => {
     version: "2026.8",
     uptime_seconds: 60,
     profiles_running: 2,
-    engine_slots_used: 2,
-    engine_slots_total: 4,
     live_trading_enabled: false,
     kill_switch_engaged: false,
     generated_at: "2026-09-27T12:00:00Z",
   };
 
-  it("carries the three counters the wire publishes", () => {
+  it("carries the counters the wire publishes", () => {
     expect(Object.keys(health)).toEqual([
       "status",
       "version",
       "uptime_seconds",
       "profiles_running",
-      "engine_slots_used",
-      "engine_slots_total",
       "live_trading_enabled",
       "kill_switch_engaged",
       "generated_at",
     ]);
     expect(health.profiles_running).toBe(2);
-    expect(health.engine_slots_total).toBe(4);
+  });
+
+  it("carries no engine-slot capacity any more", () => {
+    expect(Object.keys(health)).not.toContain("engine_slots_used");
+    expect(Object.keys(health)).not.toContain("engine_slots_total");
+    expect(Object.keys(EMPTY_ACCOUNT.performance)).not.toContain("engine_slots_used");
   });
 });
