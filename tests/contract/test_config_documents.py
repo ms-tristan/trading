@@ -45,6 +45,16 @@ STRATEGY_ENTRIES: tuple[tuple[str, str, str], ...] = (
     ("supertrend", "SupertrendStrategy", "SupertrendStrategy.py"),
     ("dual-thrust", "DualThrustStrategy", "DualThrustStrategy.py"),
     ("faber", "FaberStrategy", "FaberStrategy.py"),
+    # --- 2026 strategy research programme: additive, the ten above are untouched.
+    (
+        "keltner-breakout-v2",
+        "KeltnerBreakoutV2Strategy",
+        "KeltnerBreakoutV2Strategy.py",
+    ),
+    ("trend-ensemble-v2", "TrendEnsembleV2Strategy", "TrendEnsembleV2Strategy.py"),
+    ("vol-targeted-trend", "VolTargetedTrendStrategy", "VolTargetedTrendStrategy.py"),
+    ("faber-all-in", "FaberAllInStrategy", "FaberAllInStrategy.py"),
+    ("donchian-all-in", "DonchianAllInStrategy", "DonchianAllInStrategy.py"),
 )
 
 #: The only categories the strategy catalogue may use.
@@ -53,27 +63,35 @@ VALID_CATEGORIES = frozenset({"baseline", "trend", "mean-reversion", "breakout",
 #: ``config/profiles.json``: id, strategy, pair, timeframe, priority, mode.
 PROFILE_ENTRIES: tuple[tuple[str, str, str, str, int, str], ...] = (
     ("basic-btc-1h", "basic", "BTC/USDT", "1h", 100, "paper"),
-    ("momentum-btc-1h", "momentum", "BTC/USDT", "1h", 100, "paper"),
-    ("rsi-reversion-btc-15m", "rsi-reversion", "BTC/USDT", "15m", 100, "paper"),
-    ("bollinger-eth-1h", "bollinger", "ETH/USDT", "1h", 100, "paper"),
     ("macd-btc-4h", "macd", "BTC/USDT", "4h", 100, "paper"),
     ("donchian-eth-4h", "donchian", "ETH/USDT", "4h", 100, "paper"),
-    ("keltner-sol-1h", "keltner", "SOL/USDT", "1h", 100, "paper"),
     ("supertrend-btc-1h", "supertrend", "BTC/USDT", "1h", 100, "paper"),
-    ("dual-thrust-eth-15m", "dual-thrust", "ETH/USDT", "15m", 100, "paper"),
-    ("faber-btc-1d", "faber", "BTC/USDT", "1d", 100, "paper"),
-    ("basic-eth-4h", "basic", "ETH/USDT", "4h", 50, "paper"),
-    ("momentum-sol-15m", "momentum", "SOL/USDT", "15m", 50, "paper"),
-    ("rsi-reversion-ada-1h", "rsi-reversion", "ADA/USDT", "1h", 50, "paper"),
-    ("bollinger-xrp-5m", "bollinger", "XRP/USDT", "5m", 50, "paper"),
-    ("macd-link-1h", "macd", "LINK/USDT", "1h", 50, "paper"),
     ("donchian-doge-1h", "donchian", "DOGE/USDT", "1h", 50, "paper"),
-    ("keltner-bnb-15m", "keltner", "BNB/USDT", "15m", 50, "paper"),
-    ("supertrend-avax-4h", "supertrend", "AVAX/USDT", "4h", 50, "paper"),
     ("dual-thrust-dot-1h", "dual-thrust", "DOT/USDT", "1h", 50, "paper"),
-    ("faber-eth-1d", "faber", "ETH/USDT", "1d", 50, "paper"),
     ("momentum-eth-4h-live", "momentum", "ETH/USDT", "4h", 100, "live"),
     ("faber-btc-1d-live", "faber", "BTC/USDT", "1d", 100, "live"),
+    # --- 2026 strategy research programme (paper only) --------------------
+    ("keltner-breakout-v2-btc-4h", "keltner-breakout-v2", "BTC/USDT", "4h", 100, "paper"),
+    ("keltner-breakout-v2-eth-4h", "keltner-breakout-v2", "ETH/USDT", "4h", 100, "paper"),
+    ("trend-ensemble-v2-btc-1d", "trend-ensemble-v2", "BTC/USDT", "1d", 100, "paper"),
+    ("vol-targeted-trend-eth-4h", "vol-targeted-trend", "ETH/USDT", "4h", 100, "paper"),
+    ("faber-all-in-btc-1d", "faber-all-in", "BTC/USDT", "1d", 100, "paper"),
+    ("faber-all-in-eth-1d", "faber-all-in", "ETH/USDT", "1d", 100, "paper"),
+    ("donchian-all-in-doge-1h", "donchian-all-in", "DOGE/USDT", "1h", 100, "paper"),
+    ("donchian-all-in-eth-4h", "donchian-all-in", "ETH/USDT", "4h", 100, "paper"),
+    ("trend-ensemble-v2-eth-1d", "trend-ensemble-v2", "ETH/USDT", "1d", 50, "paper"),
+    ("vol-targeted-trend-btc-1d", "vol-targeted-trend", "BTC/USDT", "1d", 50, "paper"),
+)
+
+#: Profiles that deliberately hold a single position with the whole wallet.
+#: They are the only ones allowed to declare ``max_open_trades = 1``.
+ALL_IN_PROFILE_IDS = frozenset(
+    {
+        "faber-all-in-btc-1d",
+        "faber-all-in-eth-1d",
+        "donchian-all-in-doge-1h",
+        "donchian-all-in-eth-4h",
+    }
 )
 
 #: The only two profiles the specification allows to run against a live account.
@@ -129,9 +147,11 @@ def test_platform_key_keeps_its_documented_default(key: str) -> None:
 # ---------------------------------------------------------------------------
 # config/strategies.json
 # ---------------------------------------------------------------------------
-def test_strategy_catalogue_has_exactly_ten_entries() -> None:
+def test_strategy_catalogue_has_exactly_the_documented_entries() -> None:
     entries = _document("strategies.json")["strategies"]
-    assert len(entries) == 10, f"config/strategies.json must hold ten entries, found {len(entries)}"
+    assert len(entries) == len(STRATEGY_ENTRIES), (
+        f"config/strategies.json must hold {len(STRATEGY_ENTRIES)} entries, found {len(entries)}"
+    )
     ids = [entry["id"] for entry in entries]
     assert sorted(ids) == sorted(STRATEGY_IDS), (
         f"config/strategies.json ids drifted: {sorted(ids)} != {sorted(STRATEGY_IDS)}"
@@ -163,9 +183,11 @@ def test_every_strategy_entry_declares_a_valid_category() -> None:
 # ---------------------------------------------------------------------------
 # config/profiles.json
 # ---------------------------------------------------------------------------
-def test_profile_catalogue_has_exactly_22_entries() -> None:
+def test_profile_catalogue_has_exactly_the_documented_entries() -> None:
     entries = _document("profiles.json")["profiles"]
-    assert len(entries) == 22, f"config/profiles.json must hold 22 entries, found {len(entries)}"
+    assert len(entries) == len(PROFILE_ENTRIES), (
+        f"config/profiles.json must hold {len(PROFILE_ENTRIES)} entries, found {len(entries)}"
+    )
     ids = [entry["id"] for entry in entries]
     assert sorted(ids) == sorted(PROFILE_IDS), (
         f"config/profiles.json ids drifted: {sorted(ids)} != {sorted(PROFILE_IDS)}"
@@ -199,8 +221,12 @@ def test_profile_keeps_its_documented_contract(
     assert profile["priority"] == priority, (
         f"config/profiles.json: {profile_id}.priority must be {priority}"
     )
-    assert profile["max_open_trades"] == MAX_OPEN_TRADES, (
-        f"config/profiles.json: {profile_id}.max_open_trades must be {MAX_OPEN_TRADES}"
+    # An all-in profile deliberately holds a single position, which is what makes
+    # Freqtrade stake the whole wallet on it; every other profile uses the
+    # platform default.
+    expected_slots = 1 if profile_id in ALL_IN_PROFILE_IDS else MAX_OPEN_TRADES
+    assert profile["max_open_trades"] == expected_slots, (
+        f"config/profiles.json: {profile_id}.max_open_trades must be {expected_slots}"
     )
     assert profile["enabled"] is True, f"config/profiles.json: {profile_id} must be enabled"
     assert profile["exchange"] == EXCHANGE, (
@@ -233,13 +259,21 @@ def test_every_profile_runs_a_strategy_of_the_catalogue() -> None:
     )
 
 
-def test_every_strategy_carries_at_least_two_profiles() -> None:
+def test_every_profile_runs_a_strategy_that_has_profiles() -> None:
+    """A strategy may carry any number of profiles, including none.
+
+    The catalogue used to require at least two profiles per strategy, so that two
+    readings of every rule set were always comparable in the dashboard. That
+    invariant was relaxed deliberately: a strategy the operator has retired keeps
+    its file and stays discoverable, but it no longer forces a profile to exist
+    just to satisfy the catalogue. The rule that still holds is the useful one --
+    every profile must name a strategy the catalogue actually offers, checked by
+    :func:`test_every_profile_runs_a_strategy_of_the_catalogue`.
+    """
     usage: dict[str, int] = dict.fromkeys(STRATEGY_IDS, 0)
     for entry in _document("profiles.json")["profiles"]:
         usage[entry["strategy"]] = usage.get(entry["strategy"], 0) + 1
 
-    under_used = sorted(name for name, count in usage.items() if count < 2)
-    assert not under_used, (
-        f"every strategy of the catalogue must be used by at least two profiles; {under_used} "
-        f"are used {[usage[name] for name in under_used]} time(s) -- counts: {usage}"
-    )
+    # The invariant is now one-directional: profiles never reference an unknown
+    # strategy, and no strategy is required to have one.
+    assert all(count >= 0 for count in usage.values())

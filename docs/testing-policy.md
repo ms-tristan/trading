@@ -80,7 +80,7 @@ coverage command to remember, and a run that drops below 80 % exits non-zero.
 | Engine | `trading_platform/engine/poller.py` | minute-rounded snapshots, "no invented snapshot for a stopped profile", the health rule (`UNHEALTHY_THRESHOLD` / `UNHEALTHY_PING_THRESHOLD` / `WORKER_STARTUP_GRACE_SECONDS`), engine events |
 | API | `trading_platform/api/**` | every route with `fastapi.testclient.TestClient`, `401` on a missing operator token, `403` on a wrong one, ranking stability, `404`/`409`/`422` cases |
 | CLI | `trading_platform/__main__.py` | `realtime run`, `realtime provision` (token read from the environment, never argv), `realtime status`, `strategies list` |
-| Strategies | `user_data/strategies/*.py` | each of the ten strategies resolved by freqtrade's own `StrategyResolver`, indicators + entry/exit trends run over a deterministic seeded OHLCV frame, the entry column is only `0`/`1`, no NaN in the signal columns, at least one entry signal, the declared timeframe is in freqtrade's own supported set |
+| Strategies | `user_data/strategies/*.py` | each shipped strategy resolved by freqtrade's own `StrategyResolver`, indicators + entry/exit trends run over a deterministic seeded OHLCV frame, the entry column is only `0`/`1`, no NaN in the signal columns, at least one entry signal, the declared timeframe is in freqtrade's own supported set |
 
 **Hard rule: the suite never spawns a real `freqtrade` process and never talks to
 a real exchange.** The process launcher and the REST client are injected

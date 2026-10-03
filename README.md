@@ -14,8 +14,8 @@ repository does not re-implement exchange connectivity, order management,
 and aggregates what they report.
 
 ```
- 22 profiles in the catalogue   ->  one freqtrade worker per enabled profile
- (20 paper + 2 live)                (no cap, no queue)
+ 18 profiles in the catalogue   ->  one freqtrade worker per enabled profile
+ (16 paper + 2 live)                (no cap, no queue)
 ```
 
 ## Contents
@@ -23,7 +23,7 @@ and aggregates what they report.
 1. [Quick start](#1-quick-start)
 2. [Architecture](#2-architecture)
 3. [Profiles](#3-profiles)
-4. [The ten strategies](#4-the-ten-strategies)
+4. [The strategies](#4-the-strategies)
 5. [Run modes: paper and live](#5-run-modes-paper-and-live)
 6. [Documented commands](#6-documented-commands)
 7. [Environment variables](#7-environment-variables)
@@ -133,7 +133,7 @@ few operational knobs (exchange, `max_open_trades`, `priority`, `enabled`).
 Profiles come from two places, and the state database is the single source of
 truth at run time:
 
-* the **declarative catalogue** `config/profiles.json` (22 entries: 20 paper and
+* the **declarative catalogue** `config/profiles.json` (18 entries: 16 paper and
   2 live), applied to a running engine with `POST /api/catalogue/apply` (or
   `python -m trading_platform realtime provision`). Applying it is an idempotent
   upsert: catalogue-owned profiles are created or refreshed, operator-created
@@ -172,7 +172,7 @@ when the fleet is full.
 
 ---
 
-## 4. The ten strategies
+## 4. The strategies
 
 Every strategy is an ordinary freqtrade `IStrategy` (interface version 3, spot,
 long only) living in `user_data/strategies/`. `config/strategies.json` carries
@@ -191,6 +191,19 @@ reference, risk notes).
 | `supertrend` | `SupertrendStrategy.py` | entry on the Supertrend(10, 3.0) flip to uptrend, exit on the flip back |
 | `dual-thrust` | `DualThrustStrategy.py` | breakout of `open ± 0.5 ×` the previous 4-candle range |
 | `faber` | `FaberStrategy.py` | long while the close is above SMA(200) (Faber's tactical allocation) |
+
+Five further strategies were added by the 2026 research programme — three improved
+versions of the worst-performing rules and two full-size variants of the best
+long-run trend profiles. They are additive: the ten above keep running, so an
+improvement can be measured against a live baseline.
+
+| id | file | rule in one line |
+| --- | --- | --- |
+| `keltner-breakout-v2` | `KeltnerBreakoutV2Strategy.py` | first close above `EMA(20) + 3 × ATR(10)` in an uptrend, trailed by Supertrend |
+| `trend-ensemble-v2` | `TrendEnsembleV2Strategy.py` | hold while two of SMA(50/100/200) agree with price and SMA(50) rises |
+| `vol-targeted-trend` | `VolTargetedTrendStrategy.py` | trade the SMA(200) trend only while realised volatility is below its median |
+| `faber-all-in` | `FaberAllInStrategy.py` | `faber`'s rule, resized for a single all-in position |
+| `donchian-all-in` | `DonchianAllInStrategy.py` | `donchian`'s breakout, resized, with an ATR chandelier exit |
 
 `docs/strategies.md` documents each one: logic, parameters, suitable timeframes
 and risk notes.
@@ -356,7 +369,7 @@ make realtime
 
 # 3. inspect it from another shell
 make status
-make provision                 # dry run of the 22-profile catalogue
+make provision                 # dry run of the 18-profile catalogue
 .venv/bin/python -m trading_platform strategies list
 
 # 4. dashboard, outside Docker
@@ -408,7 +421,7 @@ docker compose -f deploy/docker-compose.yml up -d --build --wait
 **Why that holds on a first boot.** The container starts, the supervisor opens
 `/app/data/realtime/state.db`; if that file carries a foreign schema (the
 deployment this platform replaced left one behind) it is archived as
-`state.db.legacy-<UTC timestamp>` and a fresh database is created. The 22-profile
+`state.db.legacy-<UTC timestamp>` and a fresh database is created. The 18-profile
 catalogue is then seeded, the fleet scheduler starts **every enabled profile in
 the same pass** and spawns one `freqtrade trade` worker for each — there is no
 fleet cap and no queue. `/api/health` answers as soon as the API is
@@ -460,7 +473,7 @@ runbook is in `docs/operations.md`.
 | Document | Content |
 | --- | --- |
 | `docs/architecture.md` | supervisor/fleet design, the full state-database schema, port allocation, the snapshot model, the health and restart policy, the live-trading safety gates |
-| `docs/strategies.md` | the ten strategies: logic, parameters, suitable timeframes, risk notes |
+| `docs/strategies.md` | the strategies: logic, parameters, suitable timeframes, risk notes |
 | `docs/operations.md` | the runbook: compose commands, health checks, provisioning, the worker crash-loop fix, the kill switch, log locations, reading the state database |
 | `docs/testing-policy.md` | the enforceable test and coverage policy (the gates quoted above) |
 | `deploy/README.md` | the deployment: containers, volumes, nginx, TLS, fail2ban, automatic deploys |

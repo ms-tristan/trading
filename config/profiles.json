@@ -7,46 +7,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "momentum-btc-1h",
-      "name": "Momentum BTC 1h",
-      "strategy": "momentum",
-      "timeframe": "1h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["BTC/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "rsi-reversion-btc-15m",
-      "name": "RSI reversion BTC 15m",
-      "strategy": "rsi-reversion",
-      "timeframe": "15m",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["BTC/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "bollinger-eth-1h",
-      "name": "Bollinger ETH 1h",
-      "strategy": "bollinger",
-      "timeframe": "1h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -59,7 +22,9 @@
       "timeframe": "4h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -72,20 +37,9 @@
       "timeframe": "4h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "keltner-sol-1h",
-      "name": "Keltner SOL 1h",
-      "strategy": "keltner",
-      "timeframe": "1h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["SOL/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -98,101 +52,12 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "dual-thrust-eth-15m",
-      "name": "Dual Thrust ETH 15m",
-      "strategy": "dual-thrust",
-      "timeframe": "15m",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["ETH/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "faber-btc-1d",
-      "name": "Faber BTC 1d",
-      "strategy": "faber",
-      "timeframe": "1d",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["BTC/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 100,
-      "enabled": true
-    },
-    {
-      "id": "basic-eth-4h",
-      "name": "Basic ETH 4h",
-      "strategy": "basic",
-      "timeframe": "4h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["ETH/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "momentum-sol-15m",
-      "name": "Momentum SOL 15m",
-      "strategy": "momentum",
-      "timeframe": "15m",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["SOL/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "rsi-reversion-ada-1h",
-      "name": "RSI reversion ADA 1h",
-      "strategy": "rsi-reversion",
-      "timeframe": "1h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["ADA/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "bollinger-xrp-5m",
-      "name": "Bollinger XRP 5m",
-      "strategy": "bollinger",
-      "timeframe": "5m",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["XRP/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "macd-link-1h",
-      "name": "MACD LINK 1h",
-      "strategy": "macd",
-      "timeframe": "1h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["LINK/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
       "enabled": true
     },
     {
@@ -202,33 +67,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["DOGE/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "keltner-bnb-15m",
-      "name": "Keltner BNB 15m",
-      "strategy": "keltner",
-      "timeframe": "15m",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["BNB/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "supertrend-avax-4h",
-      "name": "Supertrend AVAX 4h",
-      "strategy": "supertrend",
-      "timeframe": "4h",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["AVAX/USDT"],
+      "pairs": [
+        "DOGE/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -241,20 +82,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["DOT/USDT"],
-      "initial_capital": 1000.0,
-      "max_open_trades": 2,
-      "priority": 50,
-      "enabled": true
-    },
-    {
-      "id": "faber-eth-1d",
-      "name": "Faber ETH 1d",
-      "strategy": "faber",
-      "timeframe": "1d",
-      "mode": "paper",
-      "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "DOT/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -267,7 +97,9 @@
       "timeframe": "4h",
       "mode": "live",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 250.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -280,10 +112,162 @@
       "timeframe": "1d",
       "mode": "live",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 250.0,
       "max_open_trades": 2,
       "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "keltner-breakout-v2-btc-4h",
+      "name": "Keltner breakout v2 BTC 4h",
+      "strategy": "keltner-breakout-v2",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "keltner-breakout-v2-eth-4h",
+      "name": "Keltner breakout v2 ETH 4h",
+      "strategy": "keltner-breakout-v2",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "trend-ensemble-v2-btc-1d",
+      "name": "Trend ensemble v2 BTC 1d",
+      "strategy": "trend-ensemble-v2",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "vol-targeted-trend-eth-4h",
+      "name": "Vol targeted trend ETH 4h",
+      "strategy": "vol-targeted-trend",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "faber-all-in-btc-1d",
+      "name": "Faber all-in BTC 1d",
+      "strategy": "faber-all-in",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "faber-all-in-eth-1d",
+      "name": "Faber all-in ETH 1d",
+      "strategy": "faber-all-in",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "donchian-all-in-doge-1h",
+      "name": "Donchian all-in DOGE 1h",
+      "strategy": "donchian-all-in",
+      "timeframe": "1h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "DOGE/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "donchian-all-in-eth-4h",
+      "name": "Donchian all-in ETH 4h",
+      "strategy": "donchian-all-in",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "trend-ensemble-v2-eth-1d",
+      "name": "Trend ensemble v2 ETH 1d",
+      "strategy": "trend-ensemble-v2",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 50,
+      "enabled": true
+    },
+    {
+      "id": "vol-targeted-trend-btc-1d",
+      "name": "Vol targeted trend BTC 1d",
+      "strategy": "vol-targeted-trend",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 50,
       "enabled": true
     }
   ]

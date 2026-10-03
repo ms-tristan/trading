@@ -1,0 +1,600 @@
+{
+  "_note": "Verified citations only. 'verified' records HOW the bibliographic record and findings were confirmed. Items marked unverified DO NOT have their findings relied upon in REVIEW.md.",
+  "verified_papers": [
+    {
+      "id": "moskowitz2012tsmom",
+      "authors": "Moskowitz, Tobias J.; Ooi, Yao Hua; Pedersen, Lasse Heje",
+      "year": 2012,
+      "title": "Time series momentum",
+      "venue": "Journal of Financial Economics",
+      "volume": 104,
+      "issue": 2,
+      "pages": "228-250",
+      "doi": "10.1016/j.jfineco.2011.11.003",
+      "urls": [
+        "https://doi.org/10.1016/j.jfineco.2011.11.003",
+        "https://www.aqr.com/Insights/Research/Journal-Article/Time-Series-Momentum"
+      ],
+      "verified": "OpenAlex record + AQR abstract page fetched (HTTP 200)",
+      "finding": "58 futures/forwards; persistence in returns for 1-12 months, partial reversal at longer horizons; diversified TSMOM portfolio has abnormal returns with low factor exposure; performs best in extreme markets.",
+      "caveats": "Full text (Elsevier) 403. Per-lookback t-stats and the 40% target-vol constant NOT directly verified from primary text. Abstract text verified."
+    },
+    {
+      "id": "huang2020tsmomisthere",
+      "authors": "Huang, Dashan; Li, Jiangyuan; Wang, Liyao; Zhou, Guofu",
+      "year": 2020,
+      "title": "Time series momentum: Is it there?",
+      "venue": "Journal of Financial Economics",
+      "volume": 135,
+      "issue": 3,
+      "pages": "774-794",
+      "doi": "10.1016/j.jfineco.2019.08.004",
+      "urls": [
+        "https://doi.org/10.1016/j.jfineco.2019.08.004",
+        "https://scholars.hkbu.edu.hk/en/publications/time-series-momentum-is-it-there-2/"
+      ],
+      "verified": "HKBU Pure page fetched (HTTP 200) with verbatim abstract + full bibliographic detail; OpenAlex confirms vol/issue/pages",
+      "finding_verbatim": "asset-by-asset time series regressions reveal little evidence of TSM, both in- and out-of-sample... the TSM strategy is profitable, but its performance is virtually the same as that of a similar strategy that is based on historical sample mean and does not require predictability. Overall, the evidence on TSM is weak, particularly for the large cross section of assets.",
+      "significance": "PRIMARY REPLICATION CHALLENGE to TSMOM. On a long-only single asset this implies a 12-month-sign rule may be indistinguishable from always-long."
+    },
+    {
+      "id": "kim2016volscaling",
+      "authors": "Kim, Abby Y.; Tse, Yiuman; Wald, John K.",
+      "year": 2016,
+      "title": "Time series momentum and volatility scaling",
+      "venue": "Journal of Financial Markets",
+      "volume": 30,
+      "pages": "103-124",
+      "doi": "10.1016/j.finmar.2016.05.003",
+      "urls": [
+        "https://doi.org/10.1016/j.finmar.2016.05.003"
+      ],
+      "verified": "OpenAlex record (92 citations, correct vol/pages, correct authors)",
+      "finding": "Argument (per title and citing literature): volatility scaling, not the momentum signal, drives most of TSMOM profitability. ABSTRACT BODY NOT RETRIEVED.",
+      "caveats": "Do not quote specific numbers from this paper; abstract text inaccessible."
+    },
+    {
+      "id": "liu2022commonriskfactors",
+      "authors": "Liu, Yukun; Tsyvinski, Aleh; Wu, Xi",
+      "year": 2022,
+      "title": "Common Risk Factors in Cryptocurrency",
+      "venue": "The Journal of Finance",
+      "volume": 77,
+      "issue": 2,
+      "pages": "1133-1177",
+      "doi": "10.1111/jofi.13119",
+      "urls": [
+        "https://www.nber.org/papers/w25882",
+        "https://onlinelibrary.wiley.com/doi/abs/10.1111/jofi.13119"
+      ],
+      "verified": "NBER page fetched (HTTP 200) with verbatim abstract; published-version record confirmed on the same page",
+      "finding": "Three factors (crypto market, size, momentum) capture cross-sectional expected crypto returns.",
+      "corrections": [
+        "Lookbacks actually tested: 1,2,3,4,8,16,50,100 WEEKS. Only 1-4 week significant; 8/16/50/100 week NOT significant.",
+        "Long-short Q5-Q1 weekly excess returns: 1wk 2.7% (t=1.994); 2wk 3.3% (t=2.442); 3wk 4.1% (t=2.742); 4wk 2.5% (t=2.002).",
+        "Footnote 7 states THREE-week momentum is the main measure (largest long-short spread); CMOM is built on 3-week.",
+        "The popular claim '1-week momentum is strongest in crypto' is NOT supported. Correct statement: live horizon is 1-4 weeks, peaking at 3 weeks."
+      ],
+      "caveats": "Weak t-stats (2.0-2.7); sample 2014-2018 only; survivorship-controlled but short and single-regime. This is a LONG-SHORT cross-sectional result, not evidence a long-only spot bot can harvest it.",
+      "do_not_cite_for": "1-week short-term reversal magnitude. UNVERIFIED - the NBER/JoF abstracts do not advertise a reversal result and Wiley full text was 403."
+    },
+    {
+      "id": "liu2021risksreturns",
+      "authors": "Liu, Yukun; Tsyvinski, Aleh",
+      "year": 2021,
+      "title": "Risks and Returns of Cryptocurrency",
+      "venue": "The Review of Financial Studies",
+      "volume": 34,
+      "issue": 6,
+      "pages": "2689-2727",
+      "doi": "10.1093/rfs/hhaa113",
+      "urls": [
+        "https://doi.org/10.1093/rfs/hhaa113"
+      ],
+      "verified": "Semantic Scholar record (943 citations) confirms title/authors/venue; abstract states 'strong time-series momentum effect' and attention proxies forecast returns",
+      "finding_verbatim": "there is a strong time-series momentum effect, and proxies for investor attention strongly forecast future cryptocurrency returns."
+    },
+    {
+      "id": "grobys2019cryptomomentum",
+      "authors": "Grobys, Klaus; Sapkota, Niranjan",
+      "year": 2019,
+      "title": "Cryptocurrencies and momentum",
+      "venue": "Economics Letters",
+      "volume": 180,
+      "pages": "6-10",
+      "doi": "10.1016/j.econlet.2019.03.028",
+      "urls": [
+        "https://ideas.repec.org/a/eee/ecolet/v180y2019icp6-10.html"
+      ],
+      "verified": "OpenAlex record + RePEc reference listing (confirmed as a reference within Zaremba et al. 2021)",
+      "finding_verbatim": "Contrary to earlier studies our findings do not indicate any evidence of significant momentum payoffs, supporting the view that the cryptocurrency market is far more efficient than suggested in earlier studies.",
+      "significance": "DIRECT CONTRADICTION to Liu/Tsyvinski/Wu on an overlapping 2014-2018 sample. 143 coins. Unresolved dispute."
+    },
+    {
+      "id": "grobys2025illusion",
+      "authors": "Grobys, Klaus; Shahzad, Syed Jawad Hussain",
+      "year": 2025,
+      "title": "Cryptocurrency Momentum: Is It an Illusion?",
+      "venue": "International Journal of Finance & Economics",
+      "doi": "10.1002/ijfe.70036",
+      "urls": [
+        "https://doi.org/10.1002/ijfe.70036"
+      ],
+      "verified": "OpenAlex record with full abstract",
+      "finding_verbatim": "The empirical evidence suggests that the realised variances of cryptocurrency momentum strategies are governed by power laws. The statistical tests derived from block bootstraps indicate that the population mean and variance of the momentum factor realised variances are statistically not defined... we might not be able to realise these risk premiums.",
+      "caveats": "EXTREME CLAIM from a small group with a series of such papers. NOT mainstream consensus. Weight accordingly."
+    },
+    {
+      "id": "grobys2025moments",
+      "authors": "Grobys, Klaus; Kolari, James W.; Sandretto, Davide; Shahzad, Syed Jawad Hussain; Aijo, Janne Jaakko",
+      "year": 2025,
+      "title": "Cryptocurrency momentum has (not) its moments",
+      "venue": "Financial Markets and Portfolio Management",
+      "volume": 39,
+      "issue": 4,
+      "pages": "443-476",
+      "doi": "10.1007/s11408-025-00474-9",
+      "urls": [
+        "https://doi.org/10.1007/s11408-025-00474-9"
+      ],
+      "verified": "OpenAlex record with abstract; RePEc citation record confirms vol(4) 443-476",
+      "finding_verbatim": "cryptocurrency momentum is subject to severe crashes. Even a single cryptocurrency can cause insignificant momentum portfolio returns... volatility management is a useful tool for mitigating cryptocurrency momentum crashes... cryptocurrency momentum appears to be a phenomenon associated with large-cap cryptocurrencies."
+    },
+    {
+      "id": "harvey2018voltargeting",
+      "authors": "Harvey, Campbell R.; Hoyle, Edward; Korgaonkar, Russell; Rattray, Sandy; Sargaison, Matthew; Van Hemert, Otto",
+      "year": 2018,
+      "title": "The Impact of Volatility Targeting",
+      "venue": "The Journal of Portfolio Management",
+      "volume": 45,
+      "issue": 1,
+      "pages": "14-33",
+      "doi": "10.3905/jpm.2018.45.1.014",
+      "urls": [
+        "https://doi.org/10.3905/jpm.2018.45.1.014"
+      ],
+      "verified": "Semantic Scholar full abstract retrieved (78 citations)",
+      "finding_verbatim": "this result only holds for risk assets, such as equity and credit... In contrast, for bonds, currencies, and commodities, the impact of volatility targeting on the Sharpe ratio is negligible. However, the impact of volatility targeting goes beyond the Sharpe ratio: it reduces the likelihood of extreme returns across all asset classes.",
+      "significance": "The ROBUST benefit is TAIL REDUCTION across all asset classes; Sharpe improvement is conditional on risk-asset status."
+    },
+    {
+      "id": "cederburg2020volmanaged",
+      "authors": "Cederburg, Scott; O'Doherty, Michael S.; Wang, Feifei; Yan, Xuemin Sterling",
+      "year": 2020,
+      "title": "On the performance of volatility-managed portfolios",
+      "venue": "Journal of Financial Economics",
+      "volume": 138,
+      "issue": 1,
+      "pages": "95-117",
+      "doi": "10.1016/j.jfineco.2020.04.015",
+      "urls": [
+        "https://doi.org/10.1016/j.jfineco.2020.04.015"
+      ],
+      "verified": "OpenAlex record (169 citations, correct authors/venue/year). Finding confirmed VERBATIM via Wang & Yan (2021), a traceable peer-reviewed citing source.",
+      "finding_verbatim_via_wang_yan_2021": "Cederburg et al. (2020) show that the trading strategies implied by the spanning regressions of Moreira and Muir (2017) are not implementable in real time and reasonable out-of-sample versions do not outperform simple investments in the original, unmanaged portfolios.",
+      "caveats": "Own abstract not retrievable (repository 403 / HTML). Finding sourced from a citing paper's description, not from the paper itself."
+    },
+    {
+      "id": "wang2021downside",
+      "authors": "Wang, Feifei; Yan, Xuemin Sterling",
+      "year": 2021,
+      "title": "Downside risk and the performance of volatility-managed portfolios",
+      "venue": "Journal of Banking & Finance",
+      "volume": 131,
+      "article": 106198,
+      "doi": "10.1016/j.jbankfin.2021.106198",
+      "urls": [
+        "https://doi.org/10.1016/j.jbankfin.2021.106198",
+        "https://www.lehigh.edu/~xuy219/research/Downside.pdf"
+      ],
+      "verified": "FULL TEXT PDF downloaded and text-extracted locally (18 pages). Abstract and introduction read directly.",
+      "findings_verbatim": [
+        "strategies scaled by downside volatility exhibit significantly better performance than strategies scaled by total volatility",
+        "our decomposition results indicate that the positive alphas of total volatility-managed portfolios stem primarily from volatility timing. The small, and sometimes even negative contribution from return timing suggests that total volatility is largely unrelated to future returns.",
+        "For total volatility-managed strategies, the return-timing component is positive among just two of the nine equity factors and 42 of the 94 anomalies."
+      ],
+      "significance": "KEY DECOMPOSITION. Vol scaling gives you VOLATILITY TIMING (reliable, from vol clustering) = risk reduction. It does NOT reliably give RETURN TIMING = alpha. Downside-vol scaling has a genuine return-timing component (89/94 anomalies positive)."
+    },
+    {
+      "id": "moreira2017volmanaged",
+      "authors": "Moreira, Alan; Muir, Tyler",
+      "year": 2017,
+      "title": "Volatility-Managed Portfolios",
+      "venue": "The Journal of Finance",
+      "volume": 72,
+      "issue": 4,
+      "pages": "1611-1644",
+      "doi": "10.1111/jofi.12513",
+      "urls": [
+        "https://doi.org/10.1111/jofi.12513"
+      ],
+      "verified": "Cited-and-described verbatim in Wang & Yan (2021) full text, which restates the scaling form as c_(sigma) / sigma_hat^2_(t-1) * f_t",
+      "finding": "Volatility-scaled equity factors produce significantly positive alphas relative to unscaled counterparts (9 factors)."
+    },
+    {
+      "id": "hurst2017century",
+      "authors": "Hurst, Brian; Ooi, Yao Hua; Pedersen, Lasse Heje",
+      "year": 2017,
+      "title": "A Century of Evidence on Trend-Following Investing",
+      "venue": "The Journal of Portfolio Management",
+      "volume": 44,
+      "issue": 1,
+      "pages": "15-29",
+      "doi": "10.3905/jpm.2017.44.1.015",
+      "urls": [
+        "https://doi.org/10.3905/jpm.2017.44.1.015",
+        "https://doi.org/10.2139/ssrn.2993026"
+      ],
+      "verified": "OpenAlex record with full abstract (182 citations)",
+      "finding_verbatim": "in each decade since 1880, time-series momentum has delivered positive average returns with low correlations to traditional asset classes. Further, time-series momentum has performed well in 8 out of 10 of the largest crisis periods over the century",
+      "caveats": "AQR-authored research on AQR's own strategy. Multi-asset, LONG-SHORT futures portfolio - the crisis-alpha property relies on diversification and a short leg, neither available to a long-only single-pair spot bot."
+    },
+    {
+      "id": "faber2007taa",
+      "authors": "Faber, Mebane T.",
+      "year": 2007,
+      "title": "A Quantitative Approach to Tactical Asset Allocation",
+      "venue": "The Journal of Wealth Management",
+      "volume": 9,
+      "issue": 4,
+      "pages": "69-79",
+      "doi": "10.3905/jwm.2007.674809",
+      "urls": [
+        "https://doi.org/10.3905/jwm.2007.674809"
+      ],
+      "verified": "Widely cited; the 10-month SMA rule is the paper's well-known content. NOT independently fetched in this session.",
+      "finding": "Hold asset when close > 10-month SMA (approx SMA(200) daily), else move to cash; evaluated monthly."
+    },
+    {
+      "id": "bajgrowicz2012techrevisited",
+      "authors": "Bajgrowicz, Pierre; Scaillet, Olivier",
+      "year": 2012,
+      "title": "Technical trading revisited: False discoveries, persistence tests, and transaction costs",
+      "venue": "Journal of Financial Economics",
+      "volume": 106,
+      "issue": 3,
+      "pages": "473-491",
+      "doi": "10.1016/j.jfineco.2012.06.001",
+      "urls": [
+        "https://ideas.repec.org/p/chf/rpseri/rp0805.html",
+        "https://ideas.repec.org/a/eee/jfinec/v106y2012i3p473-491.html"
+      ],
+      "verified": "RePEc/IDEAS working-paper page fetched (HTTP 200) with verbatim abstract; published-version record confirmed on the same page",
+      "finding_verbatim": "Persistence tests show that an investor would never have been able to select ex ante the future best-performing rules. Moreover, even the in-sample performance is completely offset by the introduction of transaction costs. Overall, our results seriously call into question the economic value of technical trading rules.",
+      "significance": "THE METHODOLOGICAL KILL-SHOT. Two independent failure mechanisms: no ex-ante rule selection ability, and costs wipe out even in-sample gains. DJIA daily 1897-2008, FDR for data snooping."
+    },
+    {
+      "id": "park2007survey",
+      "authors": "Park, Cheol-Ho; Irwin, Scott H.",
+      "year": 2007,
+      "title": "What Do We Know About The Profitability Of Technical Analysis?",
+      "venue": "Journal of Economic Surveys",
+      "volume": 21,
+      "issue": 4,
+      "pages": "786-826",
+      "doi": "10.1111/j.1467-6419.2007.00519.x",
+      "urls": [
+        "https://ideas.repec.org/a/bla/jecsur/v21y2007i4p786-826.html"
+      ],
+      "verified": "RePEc/IDEAS reference listing; verbatim findings reported consistently across sources",
+      "finding_verbatim": "Among a total of 95 modern studies, 56 studies find positive results regarding technical trading strategies, 20 studies obtain negative results, and 19 studies indicate mixed results... most empirical studies are subject to various problems in their testing procedures, e.g. data snooping, ex post selection of trading rules or search technologies, and difficulties in estimation of risk and transaction costs.",
+      "calibration": "The count looks pro-TA but the authors themselves say it is not conclusive. Cite as 'methodologically compromised', not 'TA works'."
+    },
+    {
+      "id": "hudson2021technical",
+      "authors": "Hudson, Robert; Urquhart, Andrew",
+      "year": 2021,
+      "title": "Technical trading and cryptocurrencies",
+      "venue": "Annals of Operations Research",
+      "volume": 297,
+      "issue": 1,
+      "pages": "191-220",
+      "doi": "10.1007/s10479-019-03357-1",
+      "urls": [
+        "https://centaur.reading.ac.uk/85715/",
+        "https://ideas.repec.org/a/spr/annopr/v297y2021i1d10.1007_s10479-019-03357-1.html"
+      ],
+      "verified": "RePEc reference listing + University of Reading Centaur repository record",
+      "finding_verbatim": "there is no predictability for Bitcoin in the out-of-sample period, although predictability remains in other cryptocurrency markets.",
+      "details": "~15,000 TA rules, 5 classes, 2 BTC markets + 3 other coins. In-sample profitability survives data-snooping procedures; breakeven transaction costs 'substantially higher than those typically found in cryptocurrency markets'.",
+      "correction": "The brief cited 'Hudson, McGroarty & Urquhart 2020'. The actual paper is Hudson & Urquhart (2021), TWO authors - no McGroarty co-author."
+    },
+    {
+      "id": "corbet2019technical",
+      "authors": "Corbet, Shaen; Eraslan, Veysel; Lucey, Brian; Sensoy, Ahmet",
+      "year": 2019,
+      "title": "The effectiveness of technical trading rules in cryptocurrency markets",
+      "venue": "Finance Research Letters",
+      "volume": 31,
+      "pages": "32-37",
+      "doi": "10.1016/j.frl.2019.04.027",
+      "urls": [
+        "https://ideas.repec.org/a/eee/finlet/v31y2019icp32-37.html"
+      ],
+      "verified": "RePEc/IDEAS page fetched (HTTP 200) with verbatim abstract",
+      "finding_verbatim": "Overall, our results provide significant support for the moving average strategies. In particular, variable-length moving average rule performs the best with buy signals generating higher returns than sell signals.",
+      "caveats": "One of the FEW papers with a positive result on the LONG side (relevant to us). BUT: short letter, no formal data-snooping correction, contradicted out-of-sample for BTC by Hudson & Urquhart (2021). 'Buy signals beat sell signals' on a rising asset is close to tautological (drift confound)."
+    },
+    {
+      "id": "zaremba2021upordown",
+      "authors": "Zaremba, Adam; Bilgin, Mehmet Huseyin; Long, Huaigang; Mercik, Aleksander; Szczygielski, Jan J.",
+      "year": 2021,
+      "title": "Up or down? Short-term reversal, momentum, and liquidity effects in cryptocurrency markets",
+      "venue": "International Review of Financial Analysis",
+      "volume": 78,
+      "issue": "C",
+      "doi": "10.1016/j.irfa.2021.101908",
+      "urls": [
+        "https://ideas.repec.org/a/eee/finana/v78y2021ics1057521921002349.html"
+      ],
+      "verified": "RePEc/IDEAS page fetched (HTTP 200) with full verbatim abstract",
+      "finding_verbatim": "Based on daily prices of more than 3600 coins, we document that the cryptocurrencies with low last day's return significantly outperform their counterparts with high last day's return... We argue that the daily reversals result from the illiquidity of the vast majority of traded cryptocurrencies. In consequence, the pattern is cross-sectionally dependent on liquidity, and the handful of largest and most tradeable coins exhibit daily momentum rather than a reversal.",
+      "significance": "MOST DECISION-RELEVANT FINDING FOR A LIQUID LONG-ONLY PLATFORM. Reversal is an illiquidity artefact; our universe (liquid majors) is exactly where it INVERTS to momentum. Strongest argument against a dip-buying core."
+    },
+    {
+      "id": "fieberg2024constraints",
+      "authors": "Fieberg, Christian; Liedtke, Gerrit; Zaremba, Adam",
+      "year": 2024,
+      "title": "Cryptocurrency anomalies and economic constraints",
+      "venue": "International Review of Financial Analysis",
+      "volume": 94,
+      "issue": "C",
+      "doi": "10.1016/j.irfa.2024.103218",
+      "urls": [
+        "https://doi.org/10.1016/j.irfa.2024.103218",
+        "https://ideas.repec.org/a/eee/finana/v94y2024ics1057521924001509.html"
+      ],
+      "verified": "RePEc citation listing (confirmed as citing Zaremba 2021)",
+      "finding": "size/volume anomalies originate from micro-cap coins of negligible economic importance; momentum prevails in larger cryptocurrencies but incurs substantial trading costs and extracts alphas largely from SHORT positions.",
+      "significance": "Two kills: (1) surviving large-cap anomalies are momentum not reversal; (2) their alpha comes from the short leg we lack."
+    },
+    {
+      "id": "caporale2019overreactions",
+      "authors": "Caporale, Guglielmo Maria; Plastun, Alex",
+      "year": 2019,
+      "title": "Price overreactions in the cryptocurrency market",
+      "venue": "Journal of Economic Studies",
+      "volume": 46,
+      "issue": 5,
+      "pages": "1137-1155",
+      "doi": "10.1108/JES-09-2018-0310",
+      "urls": [
+        "https://ideas.repec.org/a/eme/jespps/jes-09-2018-0310.html",
+        "https://ideas.repec.org/a/eee/finana/v78y2021ics1057521921002349.html"
+      ],
+      "verified": "RePEc reference listing (confirmed as reference #62 within Zaremba et al. 2021)",
+      "finding_verbatim": "The results suggest that a strategy based on counter-movements after overreactions is not profitable, whilst one based on inertia appears to be profitable but produces outcomes not statistically different from the random ones. Therefore, the overreactions detected in the cryptocurrency market do not give rise to exploitable profit opportunities (possibly because of transaction costs).",
+      "significance": "DETECTS overreaction as real, but NEITHER the contrarian NOR the momentum trade is exploitable. Directly answers the overreaction question."
+    },
+    {
+      "id": "borgards2020prevalence",
+      "authors": "Borgards, Oliver; Czudaj, Robert L.",
+      "year": 2020,
+      "title": "The prevalence of price overreactions in the cryptocurrency market",
+      "venue": "Journal of International Financial Markets, Institutions & Money",
+      "volume": 65,
+      "issue": "C",
+      "doi": "10.1016/j.intfin.2020.101195",
+      "urls": [
+        "https://ideas.repec.org/a/eee/intfin/v65y2020ics1042443120300780.html"
+      ],
+      "verified": "RePEc citation listing (confirmed as citing Zaremba 2021)"
+    },
+    {
+      "id": "wen2022intraday",
+      "authors": "Wen, Zhuzhu; Bouri, Elie; Xu, Yahua; Zhao, Yang",
+      "year": 2022,
+      "title": "Intraday return predictability in the cryptocurrency markets: Momentum, reversal, or both",
+      "venue": "North American Journal of Economics and Finance",
+      "volume": 62,
+      "article": 101733,
+      "doi": "10.1016/j.najef.2022.101733",
+      "urls": [
+        "https://m2.mtmt.hu/api/publication/33003705",
+        "https://doi.org/10.1016/j.najef.2022.101733"
+      ],
+      "verified": "Abstract mirror page retrieved",
+      "finding": "BTC high-frequency 2013-03-03 to 2020-05-31. BOTH intraday momentum and intraday reversal exist. Predictability is CONDITIONAL - changes with large intraday price jumps, FOMC announcements, liquidity, COVID-19. Intraday reversal 'unique to the cryptocurrency market', attributed to overreaction to non-fundamental information and overconfidence. Also in ETH, LTC, XRP.",
+      "caveats": "INTRADAY high-frequency only. Does NOT transfer to 1h/4h/1d. This is the only paper supporting the regime/magnitude-conditioning hypothesis."
+    },
+    {
+      "id": "christoffersen2006direction",
+      "authors": "Christoffersen, Peter F.; Diebold, Francis X.",
+      "year": 2006,
+      "title": "Financial Asset Returns, Direction-of-Change Forecasting, and Volatility Dynamics",
+      "venue": "Management Science",
+      "volume": 52,
+      "issue": 8,
+      "pages": "1273-1287",
+      "doi": "10.1287/mnsc.1060.0520",
+      "urls": [
+        "https://www.nber.org/papers/w10009",
+        "https://ideas.repec.org/a/inm/ormnsc/v52y2006i8p1273-1287.html"
+      ],
+      "verified": "NBER working paper page + RePEc journal record",
+      "findings": [
+        "volatility dependence produces sign dependence, so long as expected returns are nonzero",
+        "it is statistically possible to have sign dependence without conditional mean dependence",
+        "sign dependence is not likely to be found via analysis of sign autocorrelations, runs tests, or traditional market timing tests",
+        "sign dependence is NOT LIKELY TO BE FOUND IN VERY HIGH-FREQUENCY (e.g., daily) or very low-frequency (e.g., annual) returns; instead, it is more likely to be found at INTERMEDIATE return horizons"
+      ],
+      "significance": "THE FORMAL KILL FOR SQUEEZE BREAKOUTS. Volatility predicts MAGNITUDE, not DIRECTION, and direction-predictability is explicitly NOT expected at daily frequency (our timeframes).",
+      "additional_findings": [
+        "VERBATIM: 'because the optimal probability forecast is driven entirely by the volatility, we have that ..., is therefore DRIVEN BY THE VOLATILITY OF VOLATILITY.'",
+        "VERBATIM: 'one does not expect strong sign forecastability for very high frequency returns such as daily, because expected daily returns are negligible.'",
+        "CRITICAL IMPLICATION: a 'squeeze' measures a low volatility LEVEL, which is NOT the same quantity as low volatility-OF-volatility. The theory says sign-forecast strength is driven by vol-of-vol. So a squeeze measures the WRONG VARIABLE for the mechanism it claims to exploit.",
+        "The 'leverage effect' runs DIRECTION -> VOLATILITY, not volatility -> direction. Citing it as support for a squeeze breakout inverts the causality."
+      ]
+    },
+    {
+      "id": "mueller2024seasonality",
+      "authors": "Mueller, Lukas",
+      "year": 2024,
+      "title": "Revisiting seasonality in cryptocurrencies",
+      "venue": "Finance Research Letters",
+      "volume": 64,
+      "issue": "C",
+      "doi": "10.1016/j.frl.2024.105429",
+      "urls": [
+        "https://ideas.repec.org/a/eee/finlet/v64y2024ics1544612324004598.html"
+      ],
+      "verified": "RePEc/IDEAS record. NOTE: the brief cited article number 105413; the correct DOI suffix is 105429.",
+      "finding_verbatim": "The evidence on seasonality in cryptocurrency returns is not robust. Although the positive Monday effect for Bitcoin is internally valid, it does not persist in data after 2015. We do not find robust evidence of return abnormalities but of lower trading activity on weekends. This finding is robust across 500 different coins. We also find that the Monday effect in the cross-section of coins is typically negative, but the confidence intervals remain wide.",
+      "significance": "REFUTATION of tradeable crypto seasonality. BTC Monday is POSITIVE (not negative as the brief assumed) and dies after 2015. The only robust fact is lower weekend VOLUME - not a directional edge."
+    },
+    {
+      "id": "baur2019bitcoin",
+      "authors": "Baur, Dirk G.; Cahill, Daniel; Godfrey, Keith; Liu, Zhangxin (Frank)",
+      "year": 2019,
+      "title": "Bitcoin time-of-day, day-of-week and month-of-year effects in returns and trading volume",
+      "venue": "Finance Research Letters",
+      "volume": 31,
+      "issue": "C",
+      "pages": "78-92",
+      "doi": "10.1016/j.frl.2019.04.023",
+      "urls": [
+        "https://ideas.repec.org/a/eee/finlet/v31y2019icp78-92.html"
+      ],
+      "verified": "RePEc/IDEAS journal record",
+      "finding_verbatim": "we find time-specific anomalies in returns BUT NO PERSISTENT EFFECTS ACROSS TIME. In contrast, we find persistent differences in trading activity across all exchanges with lower activity during local evening hours and on weekends.",
+      "details": "15 million+ observations from SEVEN global continuously-traded BTC exchanges.",
+      "significance": "Independent confirmation (vs Mueller 2024) that return anomalies do not persist; only the activity pattern does."
+    },
+    {
+      "id": "caporale2019dayofweek",
+      "authors": "Caporale, Guglielmo Maria; Plastun, Alex",
+      "year": 2019,
+      "title": "The day of the week effect in the cryptocurrency market",
+      "venue": "Finance Research Letters",
+      "volume": 31,
+      "issue": "C",
+      "doi": "10.1016/j.frl.2018.11.012",
+      "urls": [
+        "https://bura.brunel.ac.uk/handle/2438/17208"
+      ],
+      "verified": "Brunel open-access repository record",
+      "finding_verbatim": "Most crypto currencies (LiteCoin, Ripple, Dash) are found not to exhibit this anomaly. The only exception is BitCoin, for which returns on Mondays are significantly HIGHER than those on the other days... however, most of these results are not significantly different from the random ones and therefore cannot be seen as conclusive evidence against market efficiency.",
+      "significance": "Self-refuting: claims 'exploitable profit opportunities' then concedes they are not distinguishable from random. BTC Monday is POSITIVE."
+    },
+    {
+      "id": "zatwarnicki2023rsi",
+      "authors": "Zatwarnicki, M.; Zatwarnicki, K.; Stolarski, P.",
+      "year": 2023,
+      "title": "Effectiveness of the Relative Strength Index Signals in Timing the Cryptocurrency Market",
+      "venue": "Sensors",
+      "volume": 23,
+      "issue": 3,
+      "article": 1664,
+      "doi": "10.3390/s23031664",
+      "urls": [
+        "https://ouci.dntb.gov.ua/en/works/4yEoKNg4/"
+      ],
+      "verified": "OUCI (Open Ukrainian Citation Index) record; Scopus/WoS indexed. MDPI direct fetch returned 403.",
+      "finding_verbatim": "the results show that the RSI as a momentum indicator in the cryptocurrency market involves high risk. Using alternative RSI applications can allow traders to gain an advantage...",
+      "calibration": "Naive RSI found HIGH RISK; only non-standard variants claimed to help. MDPI venue, moderate. NOT evidence that RSI(14) oversold recovery works."
+    },
+    {
+      "id": "zatwarnicki2025timing",
+      "authors": "Zatwarnicki, M.; Zatwarnicki, K.; Stolarski, P.",
+      "year": 2025,
+      "title": "Timing Usage of Technical Analysis in the Cryptocurrency Market",
+      "venue": "Applied Sciences",
+      "volume": 15,
+      "issue": 23,
+      "article": 12802,
+      "doi": "10.3390/app152312802",
+      "urls": [
+        "https://doi.org/10.3390/app152312802"
+      ],
+      "finding": "Introduces a Rolling Strategy-Hold Ratio (RSHR) because 'many traders fail to test their strategies adequately, limiting evaluations to selected time periods and risking overfitting.'",
+      "use": "Recommended methodology for our own validation."
+    },
+    {
+      "id": "lim2019deepmomentum",
+      "authors": "Lim, Bryan Y.; Zohren, Stefan; Roberts, Stephen",
+      "year": 2019,
+      "title": "Enhancing Time-Series Momentum Strategies Using Deep Neural Networks",
+      "venue": "The Journal of Financial Data Science",
+      "volume": 1,
+      "issue": 3,
+      "pages": "24-42",
+      "doi": "10.3905/jfds.2019.1.015",
+      "urls": [
+        "https://doi.org/10.3905/jfds.2019.1.015"
+      ],
+      "verified": "OpenAlex record with full abstract (99 citations)",
+      "finding_verbatim": "Backtesting on a portfolio of 88 continuous futures contracts, the authors demonstrate that the Sharpe-optimized long short-term memory improved traditional methods by more than two times in the absence of transactions costs and continued outperforming when considering transaction costs up to 2-3 bps.",
+      "significance": "CRITICAL COST BENCHMARK: an ML trend model's edge EVAPORATED above 2-3 bps. Our platform pays ~15 bps/side (30 bps round trip) = 5-10x higher. Strongest argument for slow timeframes / low turnover."
+    },
+    {
+      "id": "molyboga2020voltargeting",
+      "authors": "Molyboga, Marat",
+      "year": 2020,
+      "title": "Portfolio management of Commodity Trading Advisors with volatility-targeting",
+      "venue": "The Journal of Investment Strategies",
+      "doi": "10.21314/jois.2020.116",
+      "urls": [
+        "https://doi.org/10.21314/jois.2020.116"
+      ],
+      "verified": "Semantic Scholar record with abstract",
+      "finding_verbatim": "I find a consistent and statistically significant improvement in the out-of-sample returns that ranges between 0.53% and 0.80% per annum, on average.",
+      "calibration": "Modest effect size (0.5-0.8%/yr) - useful reality check on the magnitude of vol-targeting benefits."
+    },
+    {
+      "id": "bollerslev2009vrp",
+      "authors": "Bollerslev, Tim; Tauchen, George; Zhou, Hao",
+      "year": 2009,
+      "title": "Expected Stock Returns and Variance Risk Premia",
+      "venue": "The Review of Financial Studies",
+      "volume": 22,
+      "issue": 11,
+      "pages": "4463-4492",
+      "doi": "10.1093/rfs/hhp008",
+      "urls": [
+        "https://doi.org/10.1093/rfs/hhp008"
+      ],
+      "verified": "Citation supplied by the volatility research thread; VRP literature is well established. NOT independently fetched in this session.",
+      "finding": "The variance risk premium predicts stock returns.",
+      "why_set_aside": "Estimated at monthly/quarterly horizons and requires OPTION-IMPLIED variance - a volatility-derivatives feed, NOT computable from spot OHLCV. Outside platform constraints on BOTH the input (implied vs realised) and the horizon.",
+      "significance": "Honest counterweight. Explains why 'volatility predicts returns' claims circulate: where well-supported, the predictor is implied variance at multi-month horizons. Do not port into a 1h/4h/1d OHLCV system."
+    }
+  ],
+  "unverified_do_not_cite": [
+    {
+      "label": "AUT / Auckland Centre for Financial Research - 'Time Series and Cross-Sectional Momentum in the Cryptocurrency Market'",
+      "url": "https://acfr.aut.ac.nz/__data/assets/pdf_file/0009/918729/Time_Series_and_Cross_Sectional_Momentum_in_the_Cryptocurrency_Market_with_IA.pdf",
+      "status": "UNVERIFIED - Cloudflare HTTP 403. Authors, year, and contents unknown.",
+      "unverified_snippet_do_not_use": "Every long-short portfolio with a holding period of less than a week yields a negative mean return."
+    },
+    {
+      "label": "Carter, John - TTM Squeeze",
+      "status": "Practitioner indicator, NOT peer-reviewed. Source is the book 'Mastering the Trade' (McGraw-Hill). A widely circulated Barchart PDF returned HTTP 202 with no body - contents NOT verified. NO peer-reviewed, data-snooping-corrected backtest of the TTM Squeeze was found."
+    },
+    {
+      "label": "'Popularity versus Profitability: Evidence from Bollinger Bands', Journal of Portfolio Management 43(4), p.152",
+      "doi": "10.3905/jpm.2017.43.4.152",
+      "status": "UNVERIFIED - SSRN 403, PM Research redirects to institutional login. Abstract and findings NOT retrieved. Do not cite."
+    },
+    {
+      "label": "Liu/Tsyvinski/Wu (2022) '1-week short-term reversal' magnitude",
+      "status": "UNVERIFIED - the NBER and JoF abstracts describe the three-factor (market/size/momentum) result and do not advertise a reversal finding. Wiley full text was 403. The paper is real; this specific claim is not."
+    },
+    {
+      "label": "Moskowitz et al. (2012) per-lookback t-statistics and the '40% annualised target volatility' constant",
+      "status": "PRIMARY TEXT NOT RETRIEVED (Elsevier/AQR 403). The concept (ex-ante vol scaling to a constant target) is independently corroborated by Kim/Tse/Wald (2016) and the wider vol-management literature, but the specific numbers are widely-repeated rather than directly verified here."
+    },
+    {
+      "label": "Cederburg et al. (2020) abstract",
+      "status": "NOT RETRIEVED (repository returned 403/HTML). The finding is quoted VERBATIM from Wang & Yan (2021), a peer-reviewed citing source, rather than asserted from the original."
+    },
+    {
+      "label": "Kim, Tse & Wald (2016) abstract body",
+      "status": "NOT RETRIEVED. Citation verified via OpenAlex (JFM vol 30, 103-124, 92 citations). The 'volatility scaling drives most of TSMOM profitability' claim is stated as the paper's argument, not as a verified quote."
+    },
+    {
+      "label": "Zenodo deposit 'Time-Series Momentum in Cryptocurrency Markets: A Pre and Post Spot Bitcoin ETF Analysis' (2025)",
+      "url": "https://zenodo.org/records/19671502",
+      "status": "NOT PEER-REVIEWED. Indicative only."
+    }
+  ]
+}

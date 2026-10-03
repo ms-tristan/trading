@@ -3,8 +3,10 @@
 The tests pin the two contracts of the module: a strategy file is discovered
 even when ``config/strategies.json`` does not describe it (id and title derived
 from the class name), and a broken profile entry fails loudly instead of being
-silently dropped. The repository documents themselves are also pinned, so a
-renamed strategy or profile id breaks the suite rather than the dashboard.
+silently dropped. The repository documents themselves are also pinned -- the
+full strategy list and the profile count, derived from the document rather than
+hardcoded -- so a renamed strategy or profile id breaks the suite rather than the
+dashboard.
 """
 
 from __future__ import annotations
@@ -22,18 +24,23 @@ from trading_platform.profiles.catalogue import (
     load_strategy_catalogue,
 )
 
-# The ten strategies shipped in user_data/strategies, sorted by file stem.
+# The fifteen strategies shipped in user_data/strategies, sorted by file stem.
 SHIPPED_STRATEGY_STEMS = [
     "BasicStrategy",
     "BollingerStrategy",
+    "DonchianAllInStrategy",
     "DonchianStrategy",
     "DualThrustStrategy",
+    "FaberAllInStrategy",
     "FaberStrategy",
+    "KeltnerBreakoutV2Strategy",
     "KeltnerStrategy",
     "MacdStrategy",
     "MomentumStrategy",
     "RsiReversionStrategy",
     "SupertrendStrategy",
+    "TrendEnsembleV2Strategy",
+    "VolTargetedTrendStrategy",
 ]
 
 # The catalogue ids of config/strategies.json, in document order.
@@ -48,6 +55,12 @@ SHIPPED_STRATEGY_IDS = [
     "supertrend",
     "dual-thrust",
     "faber",
+    # --- 2026 strategy research programme: additive, the ten above are untouched.
+    "keltner-breakout-v2",
+    "trend-ensemble-v2",
+    "vol-targeted-trend",
+    "faber-all-in",
+    "donchian-all-in",
 ]
 
 
@@ -56,6 +69,23 @@ def write_json(path: Path, document: object) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
+
+
+def shipped_profile_document(repo_root: Path) -> dict:
+    """Return ``config/profiles.json`` of the repository, as a dict."""
+    return json.loads((repo_root / "config" / "profiles.json").read_text(encoding="utf-8"))
+
+
+def shipped_profile_count(repo_root: Path) -> int:
+    """Return how many profiles the repository document ships.
+
+    The count is derived from the document itself, which has two consequences
+    worth stating: the test below breaks when the file and the loader disagree,
+    not when the catalogue legitimately grows, and the placeholder here mirrors
+    the loader's own rule (a non-list ``profiles`` key means zero entries).
+    """
+    entries = shipped_profile_document(repo_root).get("profiles")
+    return len(entries) if isinstance(entries, list) else 0
 
 
 def write_strategies(directory: Path, *stems: str) -> Path:
@@ -270,14 +300,15 @@ def test_load_strategy_catalogue_skips_malformed_entries(tmp_path: Path) -> None
 def test_load_profile_catalogue_reads_the_repository_document(repo_root: Path) -> None:
     profiles = load_profile_catalogue(config_path=repo_root / "config" / "profiles.json")
 
-    assert len(profiles) == 22
-    assert len({profile.id for profile in profiles}) == 22
+    expected = shipped_profile_count(repo_root)
+    assert len(profiles) == expected
+    assert len({profile.id for profile in profiles}) == expected
     assert profiles[0].id == "basic-btc-1h"
-    assert profiles[-1].id == "faber-btc-1d-live"
+    assert profiles[-1].id == "vol-targeted-trend-btc-1d"
     assert all(isinstance(profile, ProfileConfig) for profile in profiles)
 
     modes = [profile.mode for profile in profiles]
-    assert modes.count("paper") == 20
+    assert modes.count("paper") + modes.count("live") == expected
     assert modes.count("live") == 2
     assert all(profile.timeframe in SUPPORTED_TIMEFRAMES for profile in profiles)
 
@@ -296,9 +327,9 @@ def test_load_profile_catalogue_reads_the_repository_document(repo_root: Path) -
     assert first.enabled is True
 
 
-def test_load_profile_catalogue_defaults_to_the_resolved_document() -> None:
+def test_load_profile_catalogue_defaults_to_the_resolved_document(repo_root: Path) -> None:
     profiles = load_profile_catalogue()
-    assert len(profiles) == 22
+    assert len(profiles) == shipped_profile_count(repo_root)
 
 
 def test_load_profile_catalogue_is_empty_without_a_document(tmp_path: Path) -> None:

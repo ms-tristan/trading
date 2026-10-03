@@ -129,6 +129,71 @@
       "timeframes": ["1d"],
       "reference": "Mebane Faber, A Quantitative Approach to Tactical Asset Allocation (2007) - https://papers.ssrn.com/sol3/papers.cfm?abstract_id=962461",
       "risk_notes": "Wide, slow signals: it gives back a large part of a move before the average is crossed."
+    },
+    {
+      "id": "keltner-breakout-v2",
+      "class_name": "KeltnerBreakoutV2Strategy",
+      "file": "KeltnerBreakoutV2Strategy.py",
+      "category": "breakout",
+      "title": "Keltner breakout v2",
+      "summary": "Volatility breakout that trails the trend instead of exiting at the midline.",
+      "description": "The improved reading of the Keltner breakout: a close above EMA(20) plus three ATR(10) opens a long position, and the position is trailed out by a Supertrend band rather than closed back at the channel midline. The higher band multiple and the requirement that the breakout clears the band by a margin over the round-trip cost together cut the trade count by an order of magnitude, which is what the diagnostic showed the v1 lacked.",
+      "indicators": ["Keltner channel(20, 3)", "ATR(10)", "EMA(200)", "Supertrend(10, 3)"],
+      "timeframes": ["4h", "1h"],
+      "reference": "Keltner channel, Chester Keltner - https://en.wikipedia.org/wiki/Keltner_channel",
+      "risk_notes": "A breakout system by construction: it wins on a minority of trades and needs its winners to run, so a long flat market produces a run of small losses."
+    },
+    {
+      "id": "trend-ensemble-v2",
+      "class_name": "TrendEnsembleV2Strategy",
+      "file": "TrendEnsembleV2Strategy.py",
+      "category": "trend",
+      "title": "Multi-horizon trend ensemble",
+      "summary": "Holds while a majority of the 50/100/200-period averages agree with price.",
+      "description": "A regime filter rather than a signal generator: three moving-average horizons vote, and the position is held while at least two of them agree with price and the fastest is rising. Combining horizons is materially more robust than tuning one crossover, and the low turnover is deliberate because the diagnosed failure mode of the shipped trend profiles was cost, not signal quality.",
+      "indicators": ["SMA(50)", "SMA(100)", "SMA(200)"],
+      "timeframes": ["1d", "4h"],
+      "reference": "Moskowitz, Ooi & Pedersen, Time Series Momentum (JFE 105(2), 2012) - https://doi.org/10.1016/j.jfineco.2011.11.003",
+      "risk_notes": "It is in the market through a large part of a decline before the slowest average turns; the majority rule softens but does not remove drawdown."
+    },
+    {
+      "id": "vol-targeted-trend",
+      "class_name": "VolTargetedTrendStrategy",
+      "file": "VolTargetedTrendStrategy.py",
+      "category": "trend",
+      "title": "Volatility-targeted trend",
+      "summary": "Trades the long trend only while realised volatility stays below its own median.",
+      "description": "Direction comes from the 200-period trend; a rolling volatility overlay decides whether the strategy is allowed to be exposed at all. It refuses to open when realised volatility is above its trailing median and stands aside when volatility breaks its 75th percentile, which is where trend rules take their worst whipsaws. Both thresholds are rolling and therefore use only information available at the time.",
+      "indicators": ["SMA(200)", "realised volatility(72)", "volatility median(500)", "volatility q75(500)"],
+      "timeframes": ["4h", "1d"],
+      "reference": "Harvey et al., The Impact of Volatility Targeting (JPM 45(1), 2018) - https://doi.org/10.3905/jpm.2018.45.1.014",
+      "risk_notes": "Presented as drawdown control, not as an alpha claim: the volatility literature supports tail reduction far more strongly than it supports a higher Sharpe ratio."
+    },
+    {
+      "id": "faber-all-in",
+      "class_name": "FaberAllInStrategy",
+      "file": "FaberAllInStrategy.py",
+      "category": "allocation",
+      "title": "Faber trend allocation, full size",
+      "summary": "The Faber 200-period allocation rule sized for a single all-in slot.",
+      "description": "The same entry and exit as the shipped Faber allocation, sized to run alone in a profile that holds one position at a time so the whole wallet is committed. Only the risk envelope differs from the shipped profile: the stop is tightened from twenty-five to twelve percent because at full size the wider stop means a quarter of the account on a single trade.",
+      "indicators": ["SMA(200)"],
+      "timeframes": ["1d"],
+      "reference": "Mebane Faber, A Quantitative Approach to Tactical Asset Allocation (2007) - https://papers.ssrn.com/sol3/papers.cfm?abstract_id=962461",
+      "risk_notes": "Full-size exposure: a single trade can move the whole account, and the stop is a disaster brake rather than the primary exit."
+    },
+    {
+      "id": "donchian-all-in",
+      "class_name": "DonchianAllInStrategy",
+      "file": "DonchianAllInStrategy.py",
+      "category": "breakout",
+      "title": "Donchian breakout, full size",
+      "summary": "The Donchian channel breakout with an ATR chandelier, sized all-in.",
+      "description": "The shipped Donchian breakout sized to run alone in a one-position profile. The exit is a chandelier stop measured in ATR rather than a fixed percentage, because a percentage stop cannot be right across assets whose volatility differs by a factor of three, and because a full-size position needs its risk expressed relative to the asset rather than to the account. The entry signal is unchanged from the shipped rule so the two remain comparable.",
+      "indicators": ["Donchian channel(20)", "Donchian channel(10)", "ATR(14)"],
+      "timeframes": ["1h", "4h"],
+      "reference": "Donchian channel breakout, Richard Donchian - https://en.wikipedia.org/wiki/Donchian_channel",
+      "risk_notes": "Full-size trend following accepts deep drawdowns by design; the ATR trail bounds a single loss but not a long adverse trend."
     }
   ]
 }
