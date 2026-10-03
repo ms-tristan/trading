@@ -41,6 +41,14 @@ user_data/strategies/*
 !user_data/strategies/MacdStrategy.py
 !user_data/strategies/RsiReversionStrategy.py
 !user_data/strategies/SupertrendStrategy.py
+# Added by the 2026 strategy research programme. Every strategy file must be
+# un-ignored explicitly, because the "user_data/strategies/*" pattern above
+# excludes everything else in the directory.
+!user_data/strategies/KeltnerBreakoutV2Strategy.py
+!user_data/strategies/TrendEnsembleV2Strategy.py
+!user_data/strategies/VolTargetedTrendStrategy.py
+!user_data/strategies/FaberAllInStrategy.py
+!user_data/strategies/DonchianAllInStrategy.py
 *.log
 logs/
 freqtrade-*.log
