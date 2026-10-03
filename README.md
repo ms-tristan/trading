@@ -14,8 +14,8 @@ repository does not re-implement exchange connectivity, order management,
 and aggregates what they report.
 
 ```
- 32 profiles in the catalogue   ->  one freqtrade worker per enabled profile
- (30 paper + 2 live)                (no cap, no queue)
+ 18 profiles in the catalogue   ->  one freqtrade worker per enabled profile
+ (16 paper + 2 live)                (no cap, no queue)
 ```
 
 ## Contents
@@ -133,7 +133,7 @@ few operational knobs (exchange, `max_open_trades`, `priority`, `enabled`).
 Profiles come from two places, and the state database is the single source of
 truth at run time:
 
-* the **declarative catalogue** `config/profiles.json` (32 entries: 30 paper and
+* the **declarative catalogue** `config/profiles.json` (18 entries: 16 paper and
   2 live), applied to a running engine with `POST /api/catalogue/apply` (or
   `python -m trading_platform realtime provision`). Applying it is an idempotent
   upsert: catalogue-owned profiles are created or refreshed, operator-created
@@ -369,7 +369,7 @@ make realtime
 
 # 3. inspect it from another shell
 make status
-make provision                 # dry run of the 32-profile catalogue
+make provision                 # dry run of the 18-profile catalogue
 .venv/bin/python -m trading_platform strategies list
 
 # 4. dashboard, outside Docker
@@ -421,7 +421,7 @@ docker compose -f deploy/docker-compose.yml up -d --build --wait
 **Why that holds on a first boot.** The container starts, the supervisor opens
 `/app/data/realtime/state.db`; if that file carries a foreign schema (the
 deployment this platform replaced left one behind) it is archived as
-`state.db.legacy-<UTC timestamp>` and a fresh database is created. The 32-profile
+`state.db.legacy-<UTC timestamp>` and a fresh database is created. The 18-profile
 catalogue is then seeded, the fleet scheduler starts **every enabled profile in
 the same pass** and spawns one `freqtrade trade` worker for each — there is no
 fleet cap and no queue. `/api/health` answers as soon as the API is

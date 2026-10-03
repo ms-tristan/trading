@@ -84,7 +84,7 @@ The deploy pipeline asserts exactly these numbers after a deploy:
 
 ## 3. Provisioning the profile catalogue
 
-`config/profiles.json` is the declarative catalogue (32 entries: 30 paper, 2
+`config/profiles.json` is the declarative catalogue (18 entries: 16 paper, 2
 live). Applying it is an **idempotent upsert**: catalogue-owned profiles are
 created or refreshed, operator-created profiles are never touched, and a live
 entry whose gates are unmet is reported in `refused_live` instead of being

@@ -7,11 +7,13 @@ supervisor passes that directory to every worker as `--strategy-path`, and the
 worker's generated configuration names the class, so a strategy is a *file* to
 this platform — nothing in the platform's own code knows a strategy by heart.
 
-> **Sections 1 to 12 document the ten original strategies**, which are unchanged
-> and still run. The five added by the 2026 research programme — three improved
-> versions of the worst performers and two full-size variants of the best
-> long-run trend profiles — are documented in [§13](#13-the-research-programme-fifteen-strategies-since-2026),
-> with the evidence behind them in `research/README.md`.
+> **Sections 1 to 12 document the ten original strategies.** All fifteen strategy
+> files still ship, but not all of them have a running profile: the five added by
+> the 2026 research programme are documented in
+> [§13](#13-the-research-programme-fifteen-strategies-since-2026), and the fourteen
+> profiles retired by the operator cleanup are listed in
+> [§14](#14-retired-profiles). The evidence behind the additions is in
+> `research/README.md`.
 
 ## Where a strategy is described
 
@@ -73,21 +75,28 @@ same class then runs on that grid — which is exactly how one strategy is compa
 on two grids side by side. The catalogue's `timeframes` field lists the grids the
 strategy is intended for, and the shipped profile catalogue runs it on these:
 
-| id | catalogue `timeframes` | profiles in `config/profiles.json` |
-| --- | --- | --- |
-| `basic` | 1h, 4h | `basic-btc-1h`, `basic-eth-4h` |
-| `momentum` | 15m, 1h, 4h | `momentum-btc-1h`, `momentum-sol-15m`, `momentum-eth-4h-live` |
-| `rsi-reversion` | 15m, 1h | `rsi-reversion-btc-15m`, `rsi-reversion-ada-1h` |
-| `bollinger` | 5m, 15m, 1h | `bollinger-eth-1h`, `bollinger-xrp-5m` |
-| `macd` | 1h, 4h | `macd-btc-4h`, `macd-link-1h` |
-| `donchian` | 1h, 4h | `donchian-eth-4h`, `donchian-doge-1h` |
-| `keltner` | 15m, 1h | `keltner-sol-1h`, `keltner-bnb-15m` |
-| `supertrend` | 1h, 4h | `supertrend-btc-1h`, `supertrend-avax-4h` |
-| `dual-thrust` | 15m, 1h | `dual-thrust-eth-15m`, `dual-thrust-dot-1h` |
-| `faber` | 1d | `faber-btc-1d`, `faber-btc-1d-live` |
+| id | profiles in `config/profiles.json` |
+| --- | --- |
+| `basic` | `basic-btc-1h` |
+| `momentum` | `momentum-eth-4h-live` |
+| `rsi-reversion` | (none — retired, see §14) |
+| `bollinger` | (none — retired, see §14) |
+| `macd` | `macd-btc-4h` |
+| `donchian` | `donchian-eth-4h` `donchian-doge-1h` |
+| `keltner` | (none — retired, see §14) |
+| `supertrend` | `supertrend-btc-1h` |
+| `dual-thrust` | `dual-thrust-dot-1h` |
+| `faber` | `faber-btc-1d-live` |
+| `keltner-breakout-v2` | `keltner-breakout-v2-btc-4h` `keltner-breakout-v2-eth-4h` |
+| `trend-ensemble-v2` | `trend-ensemble-v2-btc-1d` `trend-ensemble-v2-eth-1d` |
+| `vol-targeted-trend` | `vol-targeted-trend-eth-4h` `vol-targeted-trend-btc-1d` |
+| `faber-all-in` | `faber-all-in-btc-1d` `faber-all-in-eth-1d` |
+| `donchian-all-in` | `donchian-all-in-doge-1h` `donchian-all-in-eth-4h` |
 
-Every strategy has at least two profiles, so two readings of the same rule set
-are always comparable in the dashboard. Each profile starts from the same capital
+Not every strategy has a profile: a strategy the operator has retired keeps its
+file and stays discoverable without forcing a profile to exist (see §14). Where a
+strategy does carry two profiles, two readings of the same rule set are comparable
+in the dashboard. Each profile starts from the same capital
 (1000 USDT paper, 250 USDT live), so the comparison is meaningful.
 
 > **What these strategies are, and what they are not.** They are faithful
@@ -603,3 +612,46 @@ None of the fifteen strategies carries an out-of-sample validation claim, and a
 green paper P&L is not evidence of an edge. See `research/README.md` §6 for the
 threats to validity, which include survivorship bias in the research data and a
 single-regime out-of-sample window.
+
+---
+
+## 14. Retired profiles
+
+The catalogue was pruned on two operator criteria applied to the **live paper
+ledger**: a profile that never opened a position, and a profile that closed two or
+more positions with a win rate below 50 %. Fourteen profiles were retired this way
+and their **strategy files remain** — the rules are still discoverable, still
+tested by `tests/strategies/`, and can be given a profile again at any time.
+
+| strategy | profiles retired |
+| --- | --- |
+| `basic` | `basic-eth-4h` |
+| `bollinger` | `bollinger-eth-1h`, `bollinger-xrp-5m` |
+| `dual-thrust` | `dual-thrust-eth-15m` |
+| `faber` | `faber-btc-1d`, `faber-eth-1d` |
+| `keltner` | `keltner-bnb-15m`, `keltner-sol-1h` |
+| `macd` | `macd-link-1h` |
+| `momentum` | `momentum-btc-1h`, `momentum-sol-15m` |
+| `rsi-reversion` | `rsi-reversion-btc-15m`, `rsi-reversion-ada-1h` |
+| `supertrend` | `supertrend-avax-4h` |
+
+Two consequences are worth stating explicitly, because both are deliberate:
+
+* **a strategy may now carry no profile at all.** The catalogue previously required
+  at least two profiles per strategy, so that two readings of every rule set stayed
+  comparable in the dashboard. That invariant was relaxed with this cleanup; the
+  rule that still holds is the useful one — every *profile* must name a strategy
+  the catalogue offers. `bollinger`, `keltner` and `rsi-reversion` therefore keep
+  their files with no profile;
+* **the live profiles were not touched.** `momentum-eth-4h-live` and
+  `faber-btc-1d-live` have no closed trade because a live profile is gated and
+  starts blocked, which is not a performance signal; removing them would have
+  ended live trading. `donchian-doge-1h` was also kept: it showed a 0 % win rate on
+  **two** live trades, which is too small a sample to act on, and the same rule is
+  one of the better long-run performers (two-year Sharpe 0.43).
+
+> **Retirement is a decision about the live ledger, not a verdict on the rule.**
+> Several retired profiles sit on rules whose *gross* edge was positive and whose
+> losses were dominated by fees at the wrong timeframe — `dual-thrust-eth-15m` is
+> the clearest case (§13.1). The v2 strategies in §13 are the response to that,
+> and they run on grids where the cost per candle is survivable.
