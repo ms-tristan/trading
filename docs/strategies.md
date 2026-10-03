@@ -1,11 +1,17 @@
 # Strategies
 
-The platform ships **ten** trading strategies. Every one of them is an ordinary
-[freqtrade](https://www.freqtrade.io) `IStrategy` (interface version 3, spot,
-long only), living in its own file under `user_data/strategies/`. The supervisor
-passes that directory to every worker as `--strategy-path`, and the worker's
-generated configuration names the class, so a strategy is a *file* to this
-platform — nothing in the platform's own code knows a strategy by heart.
+The platform ships **fifteen** trading strategies. Every one of them is an
+ordinary [freqtrade](https://www.freqtrade.io) `IStrategy` (interface version 3,
+spot, long only), living in its own file under `user_data/strategies/`. The
+supervisor passes that directory to every worker as `--strategy-path`, and the
+worker's generated configuration names the class, so a strategy is a *file* to
+this platform — nothing in the platform's own code knows a strategy by heart.
+
+> **Sections 1 to 12 document the ten original strategies**, which are unchanged
+> and still run. The five added by the 2026 research programme — three improved
+> versions of the worst performers and two full-size variants of the best
+> long-run trend profiles — are documented in [§13](#13-the-research-programme-fifteen-strategies-since-2026),
+> with the evidence behind them in `research/README.md`.
 
 ## Where a strategy is described
 
@@ -27,7 +33,7 @@ below always document the code, and quote the catalogue's own `summary`,
 its title is derived from the class name and its description stays empty. See
 [§12](#12-adding-a-strategy-the-two-file-recipe).
 
-## Common properties of all ten
+## Common properties of all fifteen
 
 * exactly one class per file, whose name equals the file stem (`class
   BasicStrategy(IStrategy)` in `BasicStrategy.py`) — that is how freqtrade's
@@ -55,6 +61,11 @@ its title is derived from the class name and its description stays empty. See
 | `supertrend` | `SupertrendStrategy.py` | Supertrend trailing stop | 15m | `-0.10` | `0: 0.10, 720: 0.05, 2880: 0.0` |
 | `dual-thrust` | `DualThrustStrategy.py` | Dual Thrust range breakout | 5m | `-0.06` | `0: 0.02, 30: 0.01, 60: 0.0` |
 | `faber` | `FaberStrategy.py` | Faber trend allocation | 1d | `-0.25` | `0: 1.0` |
+| `keltner-breakout-v2` | `KeltnerBreakoutV2Strategy.py` | Keltner breakout v2 | 4h | `-0.10` | `0: 1.0` |
+| `trend-ensemble-v2` | `TrendEnsembleV2Strategy.py` | Multi-horizon trend ensemble | 1d | `-0.15` | `0: 1.0` |
+| `vol-targeted-trend` | `VolTargetedTrendStrategy.py` | Volatility-targeted trend | 4h | `-0.12` | `0: 1.0` |
+| `faber-all-in` | `FaberAllInStrategy.py` | Faber trend allocation, full size | 1d | `-0.12` | `0: 1.0` |
+| `donchian-all-in` | `DonchianAllInStrategy.py` | Donchian breakout, full size | 1h | `-0.15` | `0: 1.0` |
 
 **The class `timeframe` is a default, not a constraint.** A profile declares its
 own timeframe, the supervisor writes it into the generated configuration, and the
@@ -506,3 +517,89 @@ python -m trading_platform realtime provision --api-url http://127.0.0.1:8080
 ```
 
 Nothing else changes: no file of the platform's own code names a strategy.
+
+---
+
+## 13. The research programme: fifteen strategies since 2026
+
+The catalogue holds **fifteen** strategies, not ten. The five added entries came
+out of a research programme whose full write-up, data and experiments live in
+`research/` (see `research/README.md`). The ten originals above are **untouched
+and still running** — the additions are deliberately additive so that any
+improvement can be measured against a live baseline rather than only in a
+backtest.
+
+### 13.1 What the diagnosis found
+
+Replaying the shipped rules over two years of candles (`research/diagnose.py`)
+attributed the losses to three defects rather than to bad ideas:
+
+* **too much turnover for the volatility.** On BNB 15m a round trip costs about
+  **1.0 ATR** — more than an average candle's whole range. `dual-thrust-eth-15m`
+  paid 488% of its account in fees to earn a gross +388%;
+* **exits that are already true on the entry candle.** Both losing mean-reversion
+  rules exit on the channel midline, which after an entry is satisfied on the next
+  candle, so the reversion they exist to capture never has room to happen. This is
+  why `bollinger` shows a 54.7% win rate with a 0.53 profit factor;
+* **entries that are states, not events.** `momentum` enters while `roc > 0`,
+  which stays true for dozens of candles, so it re-enters right after every exit
+  (494 entries on BTC 1h, median hold 5 bars).
+
+Every losing profile has a negative per-trade t-statistic, so these are real
+effects and not small-sample noise.
+
+### 13.2 The added strategies
+
+| id | file | replicates / replaces | entry | exit | timeframe |
+| --- | --- | --- | --- | --- | --- |
+| `keltner-breakout-v2` | `KeltnerBreakoutV2Strategy.py` | `keltner` | first close above `EMA(20) + 3 × ATR(10)`, in an uptrend, clearing the band by `0.3 × ATR` | Supertrend(10, 3) trail | 4h |
+| `trend-ensemble-v2` | `TrendEnsembleV2Strategy.py` | `basic` | at least two of SMA(50/100/200) below price, and SMA(50) rising | that majority lost, or SMA(50) turns down | 1d |
+| `vol-targeted-trend` | `VolTargetedTrendStrategy.py` | new | price above SMA(200) **and** realised volatility below its trailing median | price below SMA(200), or volatility above its 75th percentile | 4h |
+| `faber-all-in` | `FaberAllInStrategy.py` | `faber`, resized | identical to `faber` | identical to `faber` | 1d |
+| `donchian-all-in` | `DonchianAllInStrategy.py` | `donchian`, resized | identical to `donchian` | Donchian(10) exit or a 1.8-ATR chandelier | 1h |
+
+All five follow the same contract as the ten originals (§Common properties):
+interface version 3, `can_short = False`, `process_only_new_candles = True`, an
+explicit `startup_candle_count`, a `volume > 0` guard on every signal, and a module
+docstring naming the public source of the idea.
+
+### 13.3 The evidence
+
+Out-of-sample (the most recent 40% of history, 10 pairs), against buy-and-hold on
+the same window:
+
+| strategy | mean Sharpe | mean edge vs buy&hold | windows beating buy&hold | mean maxDD |
+| --- | --- | --- | --- | --- |
+| `keltner-breakout-v2` | **+0.23** | **+21.1%** | **86.7%** | -12.2% |
+| `vol-targeted-trend` | -0.04 | +15.6% | 73.3% | -23.2% |
+| `trend-ensemble-v2` | -0.21 | +8.9% | 56.7% | -34.9% |
+
+`keltner-breakout-v2` on 4h is the strongest result of the programme: pooled
+across ten pairs it makes **123 trades at a mean +3.09% log return each
+(t = 3.41)**, it is positive in bull, bear **and** chop, and its three sequential
+walk-forward folds are all positive. Its edge is also smooth in its main
+parameter (band width), which is the difference between a real effect and a
+fitted one.
+
+### 13.4 The all-in profiles
+
+`faber-all-in` and `donchian-all-in` exist to be run with `max_open_trades = 1`:
+Freqtrade's `"unlimited"` staking then commits the **whole wallet** to the single
+open position and compounds it, instead of splitting the wallet across two slots.
+
+They were chosen on the **two-year backtest Sharpe**, not on the live leaderboard —
+at a few days old the live ranking is not yet informative, and two of its "top
+four" are among the worst profiles over two years. Only the risk envelope changes
+relative to the shipped rule: the stop is tightened (`-0.25` → `-0.12` for Faber,
+`-0.08` → `-0.15` plus an ATR chandelier for Donchian), because at full size the
+shipped stops would risk a quarter of the account on one trade.
+
+> **The all-in profiles are riskier by construction.** A stop sweep showed that
+> these strategies' own signals, not their stops, drive the drawdown, so the
+> tightened stop is a disaster brake and **not** a drawdown solution. Roughly
+> double the half-size drawdown figures in §4 of `research/README.md`.
+
+None of the fifteen strategies carries an out-of-sample validation claim, and a
+green paper P&L is not evidence of an edge. See `research/README.md` §6 for the
+threats to validity, which include survivorship bias in the research data and a
+single-regime out-of-sample window.

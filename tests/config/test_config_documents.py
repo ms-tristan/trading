@@ -35,7 +35,7 @@ PROFILE_FIELDS = (
     "enabled",
 )
 
-#: (id, class_name, file, category) of the ten catalogue strategies, in order.
+#: (id, class_name, file, category) of the fifteen catalogue strategies, in order.
 EXPECTED_STRATEGIES = (
     ("basic", "BasicStrategy", "BasicStrategy.py", "baseline"),
     ("momentum", "MomentumStrategy", "MomentumStrategy.py", "trend"),
@@ -47,9 +47,20 @@ EXPECTED_STRATEGIES = (
     ("supertrend", "SupertrendStrategy", "SupertrendStrategy.py", "trend"),
     ("dual-thrust", "DualThrustStrategy", "DualThrustStrategy.py", "breakout"),
     ("faber", "FaberStrategy", "FaberStrategy.py", "allocation"),
+    # --- 2026 strategy research programme: additive, the ten above are untouched.
+    (
+        "keltner-breakout-v2",
+        "KeltnerBreakoutV2Strategy",
+        "KeltnerBreakoutV2Strategy.py",
+        "breakout",
+    ),
+    ("trend-ensemble-v2", "TrendEnsembleV2Strategy", "TrendEnsembleV2Strategy.py", "trend"),
+    ("vol-targeted-trend", "VolTargetedTrendStrategy", "VolTargetedTrendStrategy.py", "trend"),
+    ("faber-all-in", "FaberAllInStrategy", "FaberAllInStrategy.py", "allocation"),
+    ("donchian-all-in", "DonchianAllInStrategy", "DonchianAllInStrategy.py", "breakout"),
 )
 
-#: (id, strategy, pair, timeframe) of the ten priority-100 paper profiles, in order.
+#: (id, strategy, pair, timeframe) of the fourteen priority-100 paper profiles, in order.
 EXPECTED_PAPER_HIGH = (
     ("basic-btc-1h", "basic", "BTC/USDT", "1h"),
     ("momentum-btc-1h", "momentum", "BTC/USDT", "1h"),
@@ -61,9 +72,18 @@ EXPECTED_PAPER_HIGH = (
     ("supertrend-btc-1h", "supertrend", "BTC/USDT", "1h"),
     ("dual-thrust-eth-15m", "dual-thrust", "ETH/USDT", "15m"),
     ("faber-btc-1d", "faber", "BTC/USDT", "1d"),
+    # --- 2026 strategy research programme (paper only) --------------------
+    ("keltner-breakout-v2-btc-4h", "keltner-breakout-v2", "BTC/USDT", "4h"),
+    ("keltner-breakout-v2-eth-4h", "keltner-breakout-v2", "ETH/USDT", "4h"),
+    ("trend-ensemble-v2-btc-1d", "trend-ensemble-v2", "BTC/USDT", "1d"),
+    ("vol-targeted-trend-eth-4h", "vol-targeted-trend", "ETH/USDT", "4h"),
+    ("faber-all-in-btc-1d", "faber-all-in", "BTC/USDT", "1d"),
+    ("faber-all-in-eth-1d", "faber-all-in", "ETH/USDT", "1d"),
+    ("donchian-all-in-doge-1h", "donchian-all-in", "DOGE/USDT", "1h"),
+    ("donchian-all-in-eth-4h", "donchian-all-in", "ETH/USDT", "4h"),
 )
 
-#: (id, strategy, pair, timeframe) of the ten priority-50 paper profiles, in order.
+#: (id, strategy, pair, timeframe) of the twelve priority-50 paper profiles, in order.
 EXPECTED_PAPER_LOW = (
     ("basic-eth-4h", "basic", "ETH/USDT", "4h"),
     ("momentum-sol-15m", "momentum", "SOL/USDT", "15m"),
@@ -75,6 +95,9 @@ EXPECTED_PAPER_LOW = (
     ("supertrend-avax-4h", "supertrend", "AVAX/USDT", "4h"),
     ("dual-thrust-dot-1h", "dual-thrust", "DOT/USDT", "1h"),
     ("faber-eth-1d", "faber", "ETH/USDT", "1d"),
+    # --- 2026 strategy research programme (paper only) --------------------
+    ("trend-ensemble-v2-eth-1d", "trend-ensemble-v2", "ETH/USDT", "1d"),
+    ("vol-targeted-trend-btc-1d", "vol-targeted-trend", "BTC/USDT", "1d"),
 )
 
 #: (id, strategy, pair, timeframe) of the two live profiles, in order.
@@ -82,6 +105,21 @@ EXPECTED_LIVE = (
     ("momentum-eth-4h-live", "momentum", "ETH/USDT", "4h"),
     ("faber-btc-1d-live", "faber", "BTC/USDT", "1d"),
 )
+
+#: The four profiles that deliberately hold one position at a time, so that
+#: Freqtrade stakes the whole wallet on it. They are the only profiles allowed
+#: to declare ``max_open_trades = 1``; every other profile uses two slots.
+ALL_IN_PROFILE_IDS = frozenset(
+    {
+        "faber-all-in-btc-1d",
+        "faber-all-in-eth-1d",
+        "donchian-all-in-doge-1h",
+        "donchian-all-in-eth-4h",
+    }
+)
+
+#: ``max_open_trades`` of every profile outside :data:`ALL_IN_PROFILE_IDS`.
+DEFAULT_MAX_OPEN_TRADES = 2
 
 
 def read_document(repo_root: Path, name: str) -> dict:
@@ -101,11 +139,11 @@ def build_strategies(repo_root: Path) -> list[models.StrategyMeta]:
 # ---------------------------------------------------------------------------
 # strategies.json
 # ---------------------------------------------------------------------------
-def test_catalogue_lists_the_ten_documented_strategies(repo_root: Path) -> None:
+def test_catalogue_lists_the_documented_strategies(repo_root: Path) -> None:
     document = read_document(repo_root, "strategies.json")
     assert set(document) == {"strategies"}
     entries = document["strategies"]
-    assert len(entries) == 10
+    assert len(entries) == len(EXPECTED_STRATEGIES)
     assert [
         (entry["id"], entry["class_name"], entry["file"], entry["category"]) for entry in entries
     ] == list(EXPECTED_STRATEGIES)
@@ -114,7 +152,7 @@ def test_catalogue_lists_the_ten_documented_strategies(repo_root: Path) -> None:
 def test_every_strategy_entry_is_complete_and_loads(repo_root: Path) -> None:
     document = read_document(repo_root, "strategies.json")
     strategies = build_strategies(repo_root)
-    assert len(strategies) == 10
+    assert len(strategies) == len(EXPECTED_STRATEGIES)
     for entry, meta in zip(document["strategies"], strategies, strict=True):
         assert set(entry) == set(STRATEGY_FIELDS)
         assert meta.class_name.endswith("Strategy")
@@ -150,11 +188,12 @@ def test_metadata_is_not_the_platform_default(repo_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # profiles.json
 # ---------------------------------------------------------------------------
-def test_catalogue_lists_the_twenty_two_documented_profiles(repo_root: Path) -> None:
+def test_catalogue_lists_the_documented_profiles(repo_root: Path) -> None:
     document = read_document(repo_root, "profiles.json")
+    expected = len(EXPECTED_PAPER_HIGH) + len(EXPECTED_PAPER_LOW) + len(EXPECTED_LIVE)
     assert set(document) == {"profiles"}
-    assert len(document["profiles"]) == 22
-    assert len(build_profiles(repo_root)) == 22
+    assert len(document["profiles"]) == expected
+    assert len(build_profiles(repo_root)) == expected
 
 
 def test_every_profile_entry_carries_every_field(repo_root: Path) -> None:
@@ -167,8 +206,12 @@ def test_profile_identifiers_and_pairs(repo_root: Path) -> None:
     profiles = build_profiles(repo_root)
     assert len({profile.id for profile in profiles}) == len(profiles)
     for profile in profiles:
+        # An all-in profile deliberately holds a single position, which is what
+        # makes Freqtrade stake the whole wallet on it; every other profile uses
+        # the platform default of two slots.
+        expected_slots = 1 if profile.id in ALL_IN_PROFILE_IDS else DEFAULT_MAX_OPEN_TRADES
         assert profile.enabled is True
-        assert profile.max_open_trades == 2
+        assert profile.max_open_trades == expected_slots
         assert profile.exchange == "binance"
         assert profile.pairs
         assert all(pair.endswith("/USDT") and pair.count("/") == 1 for pair in profile.pairs)
@@ -199,7 +242,7 @@ def test_only_two_profiles_trade_live(repo_root: Path) -> None:
     for profile in live:
         assert profile.priority == 100
         assert profile.initial_capital == 250.0
-    assert len(profiles) - len(live) == 20
+    assert len(profiles) - len(live) == len(EXPECTED_PAPER_HIGH) + len(EXPECTED_PAPER_LOW)
 
 
 def test_no_profile_uses_an_unknown_mode_priority_or_capital(repo_root: Path) -> None:

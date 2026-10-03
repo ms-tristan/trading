@@ -40,6 +40,12 @@ STRATEGY_CASES = [
     ("SupertrendStrategy", "1h"),
     ("DualThrustStrategy", "15m"),
     ("FaberStrategy", "1d"),
+    # Added by the 2026 research programme; the ten above are unchanged.
+    ("KeltnerBreakoutV2Strategy", "4h"),
+    ("TrendEnsembleV2Strategy", "1d"),
+    ("VolTargetedTrendStrategy", "4h"),
+    ("FaberAllInStrategy", "1d"),
+    ("DonchianAllInStrategy", "1h"),
 ]
 
 CANDLE_COUNT = 600

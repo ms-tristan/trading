@@ -57,7 +57,7 @@ from trading_platform.engine.supervisor import (
 )
 from trading_platform.metrics import build_health, build_profile_view
 from trading_platform.models import PROFILE_STATES, ProfileConfig, ProfileMetrics, format_ts
-from trading_platform.paths import STRATEGIES_DIR
+from trading_platform.paths import CONFIG_DIR, STRATEGIES_DIR
 from trading_platform.profiles.store import StateStore
 
 #: The fake clock starts here, so every recorded timestamp is predictable.
@@ -770,7 +770,7 @@ def test_priority_then_id_orders_the_fleet(tmp_path: Path) -> None:
 # The fleet has no cap and no queue: every enabled profile runs
 # ---------------------------------------------------------------------------
 def test_every_enabled_paper_profile_runs_and_none_is_ever_queued(tmp_path: Path) -> None:
-    """The real 22-profile catalogue: 20 paper profiles run, 2 live are blocked.
+    """The real repository catalogue: every paper profile runs, live is blocked.
 
     This is the invariant the removal of the fleet cap bought: no profile waits
     for a slot any more, so every enabled profile is running in one pass. The two
@@ -778,7 +778,17 @@ def test_every_enabled_paper_profile_runs_and_none_is_ever_queued(tmp_path: Path
     unset) and are ``blocked`` -- never queued, never running. The assertions read
     the *store*, not the supervisor's in-memory records, because the store is what
     the API and the dashboard see.
+
+    The counts are read from the shipped ``profiles.json``, so a catalogue that
+    grows does not need this test edited; only a loader that drops (or invents) a
+    profile makes it fail.
     """
+    profiles_document = json.loads((CONFIG_DIR / "profiles.json").read_text(encoding="utf-8"))
+    catalogue = profiles_document["profiles"]
+    total = len(catalogue)
+    live_total = sum(1 for entry in catalogue if entry["mode"] == "live")
+    assert 0 < live_total < total, "the shipped catalogue holds paper and live profiles alike"
+
     state_dir = tmp_path / "realtime"
     state_dir.mkdir(parents=True, exist_ok=True)
     strategies_dir = tmp_path / "strategies"
@@ -803,11 +813,11 @@ def test_every_enabled_paper_profile_runs_and_none_is_ever_queued(tmp_path: Path
         supervisor.schedule()
 
     rows = store.list_profiles()
-    assert len(rows) == 22
+    assert len(rows) == total
     paper = [row for row in rows if row.mode == "paper"]
     live = [row for row in rows if row.mode == "live"]
-    assert len(paper) == 20
-    assert len(live) == 2
+    assert len(paper) == total - live_total
+    assert len(live) == live_total
     assert [row.id for row in paper if row.state != "running"] == []
     assert [row.id for row in live if row.state != "blocked"] == []
     assert [row.id for row in rows if row.state == "queued"] == []

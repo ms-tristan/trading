@@ -7,7 +7,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -20,7 +22,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -33,7 +37,9 @@
       "timeframe": "15m",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -46,7 +52,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -59,7 +67,9 @@
       "timeframe": "4h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -72,7 +82,9 @@
       "timeframe": "4h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -85,7 +97,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["SOL/USDT"],
+      "pairs": [
+        "SOL/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -98,7 +112,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -111,7 +127,9 @@
       "timeframe": "15m",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -124,7 +142,9 @@
       "timeframe": "1d",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -137,7 +157,9 @@
       "timeframe": "4h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -150,7 +172,9 @@
       "timeframe": "15m",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["SOL/USDT"],
+      "pairs": [
+        "SOL/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -163,7 +187,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ADA/USDT"],
+      "pairs": [
+        "ADA/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -176,7 +202,9 @@
       "timeframe": "5m",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["XRP/USDT"],
+      "pairs": [
+        "XRP/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -189,7 +217,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["LINK/USDT"],
+      "pairs": [
+        "LINK/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -202,7 +232,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["DOGE/USDT"],
+      "pairs": [
+        "DOGE/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -215,7 +247,9 @@
       "timeframe": "15m",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["BNB/USDT"],
+      "pairs": [
+        "BNB/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -228,7 +262,9 @@
       "timeframe": "4h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["AVAX/USDT"],
+      "pairs": [
+        "AVAX/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -241,7 +277,9 @@
       "timeframe": "1h",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["DOT/USDT"],
+      "pairs": [
+        "DOT/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -254,7 +292,9 @@
       "timeframe": "1d",
       "mode": "paper",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 1000.0,
       "max_open_trades": 2,
       "priority": 50,
@@ -267,7 +307,9 @@
       "timeframe": "4h",
       "mode": "live",
       "exchange": "binance",
-      "pairs": ["ETH/USDT"],
+      "pairs": [
+        "ETH/USDT"
+      ],
       "initial_capital": 250.0,
       "max_open_trades": 2,
       "priority": 100,
@@ -280,10 +322,162 @@
       "timeframe": "1d",
       "mode": "live",
       "exchange": "binance",
-      "pairs": ["BTC/USDT"],
+      "pairs": [
+        "BTC/USDT"
+      ],
       "initial_capital": 250.0,
       "max_open_trades": 2,
       "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "keltner-breakout-v2-btc-4h",
+      "name": "Keltner breakout v2 BTC 4h",
+      "strategy": "keltner-breakout-v2",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "keltner-breakout-v2-eth-4h",
+      "name": "Keltner breakout v2 ETH 4h",
+      "strategy": "keltner-breakout-v2",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "trend-ensemble-v2-btc-1d",
+      "name": "Trend ensemble v2 BTC 1d",
+      "strategy": "trend-ensemble-v2",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "vol-targeted-trend-eth-4h",
+      "name": "Vol targeted trend ETH 4h",
+      "strategy": "vol-targeted-trend",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "faber-all-in-btc-1d",
+      "name": "Faber all-in BTC 1d",
+      "strategy": "faber-all-in",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "faber-all-in-eth-1d",
+      "name": "Faber all-in ETH 1d",
+      "strategy": "faber-all-in",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "donchian-all-in-doge-1h",
+      "name": "Donchian all-in DOGE 1h",
+      "strategy": "donchian-all-in",
+      "timeframe": "1h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "DOGE/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "donchian-all-in-eth-4h",
+      "name": "Donchian all-in ETH 4h",
+      "strategy": "donchian-all-in",
+      "timeframe": "4h",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 1,
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "id": "trend-ensemble-v2-eth-1d",
+      "name": "Trend ensemble v2 ETH 1d",
+      "strategy": "trend-ensemble-v2",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "ETH/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 50,
+      "enabled": true
+    },
+    {
+      "id": "vol-targeted-trend-btc-1d",
+      "name": "Vol targeted trend BTC 1d",
+      "strategy": "vol-targeted-trend",
+      "timeframe": "1d",
+      "mode": "paper",
+      "exchange": "binance",
+      "pairs": [
+        "BTC/USDT"
+      ],
+      "initial_capital": 1000.0,
+      "max_open_trades": 2,
+      "priority": 50,
       "enabled": true
     }
   ]

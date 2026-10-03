@@ -21,7 +21,15 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: The ten freqtrade strategy modules shipped by the platform.
+#: The freqtrade strategy modules shipped by the platform.
+#:
+#: The first ten are the original reference catalogue documented in
+#: ``docs/strategies.md``. The five that follow were added by the strategy
+#: research programme (``research/``): three improved replacements for the
+#: worst-performing rules, plus two full-size variants of the best long-run
+#: trend profiles. They are additive on purpose -- the original ten are left
+#: untouched and keep running, so the improvement is measurable against a
+#: live baseline rather than only in a backtest.
 STRATEGY_FILES: tuple[str, ...] = (
     "BasicStrategy.py",
     "BollingerStrategy.py",
@@ -33,6 +41,12 @@ STRATEGY_FILES: tuple[str, ...] = (
     "MomentumStrategy.py",
     "RsiReversionStrategy.py",
     "SupertrendStrategy.py",
+    # --- 2026 strategy research programme ---------------------------------
+    "KeltnerBreakoutV2Strategy.py",
+    "TrendEnsembleV2Strategy.py",
+    "VolTargetedTrendStrategy.py",
+    "FaberAllInStrategy.py",
+    "DonchianAllInStrategy.py",
 )
 
 #: The three declarative documents of ``config/``; nothing else may live there.
@@ -159,15 +173,16 @@ def test_specification_directory_exists(relative_path: str) -> None:
     assert path.is_dir(), f"{relative_path} is not a directory"
 
 
-def test_user_data_holds_only_the_readme_and_the_ten_strategies() -> None:
+def test_user_data_holds_only_the_readme_and_the_shipped_strategies() -> None:
     expected = {"README.md", "strategies"}
     expected |= {f"strategies/{name}" for name in STRATEGY_FILES}
 
     found = _tree_entries(REPO_ROOT / "user_data")
 
     assert found == expected, (
-        "user_data/ must contain exactly README.md and the ten specified strategy "
-        f"files; unexpected: {sorted(found - expected)}, missing: {sorted(expected - found)}"
+        "user_data/ must contain exactly README.md and the strategy files the "
+        f"catalogue specifies; unexpected: {sorted(found - expected)}, "
+        f"missing: {sorted(expected - found)}"
     )
 
 
