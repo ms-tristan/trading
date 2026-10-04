@@ -484,7 +484,12 @@ def _snapshot_from_row(row: sqlite3.Row) -> ProfileSnapshot:
         open_trades=int(row["open_trades"] or 0),
         closed_trades=int(row["closed_trades"] or 0),
         win_rate=finite_float(row["win_rate"]),
-        profit_factor=finite_float(row["profit_factor"]),
+        # ``NULL`` in the nullable REAL column means "no losing trade yet / not
+        # measurable" and must survive the round trip: ``0.0`` is the factor of a
+        # profile that lost every trade, not a stand-in for a missing one.
+        profit_factor=(
+            None if row["profit_factor"] is None else finite_float(row["profit_factor"])
+        ),
         max_drawdown_pct=finite_float(row["max_drawdown_pct"]),
         healthy=bool(row["healthy"]),
     )
@@ -1062,7 +1067,11 @@ class StateStore:
                 int(snapshot.open_trades),
                 int(snapshot.closed_trades),
                 finite_float(snapshot.win_rate),
-                finite_float(snapshot.profit_factor),
+                # A ``None`` factor is stored as SQL ``NULL``, not as ``0.0``:
+                # the nullable REAL column carries the two meanings apart, so a
+                # profile that never lost a trade does not read back as one that
+                # lost every trade.
+                None if snapshot.profit_factor is None else finite_float(snapshot.profit_factor),
                 finite_float(snapshot.max_drawdown_pct),
                 int(bool(snapshot.healthy)),
             ),

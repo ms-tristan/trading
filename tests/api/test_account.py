@@ -192,9 +192,49 @@ def test_account_window_restricts_the_equity_curve(tmp_path: Path) -> None:
     last_week = client.get("/api/account?window=7d").json()["combined"]["equity_curve"]
     everything = client.get("/api/account?window=all").json()["combined"]["equity_curve"]
 
-    assert [point["value"] for point in last_week] == [1100.0, 2250.0]
+    # ``paper-two`` and ``live-one`` have no row at the first point of the
+    # window, so they contribute their initial capital (1,000.0 and 200.0) to
+    # the 1,100.0 of ``paper-one`` instead of vanishing from the fleet total.
+    assert [point["value"] for point in last_week] == [2300.0, 2250.0]
     assert everything == last_week
     assert everything[0]["t"] < everything[1]["t"]
+
+
+def test_account_serves_the_drawdown_as_a_ratio(tmp_path: Path) -> None:
+    """Every ``*_pct`` field is a 0..1 ratio: a 0.78 % drawdown is 0.0078."""
+    client, _supervisor, _store = _make_engine(
+        tmp_path,
+        profiles=[_profile("paper-one")],
+        snapshots=[_snapshot("paper-one", 1000.0, max_drawdown_pct=0.0078)],
+    )
+
+    paper = client.get("/api/account?window=all").json()["paper"]
+    profiles = client.get("/api/profiles").json()["profiles"]
+
+    assert paper["max_drawdown_pct"] == pytest.approx(0.0078)
+    assert profiles[0]["max_drawdown_pct"] == pytest.approx(0.0078)
+
+
+def test_account_serves_a_flawless_profile_as_null_and_excludes_it(tmp_path: Path) -> None:
+    """A profile that never lost a trade reports ``null``, not the all-losses 0.0."""
+    client, _supervisor, _store = _make_engine(
+        tmp_path,
+        profiles=[_profile("flawless"), _profile("measured")],
+        snapshots=[
+            _snapshot("flawless", 1100.0, closed_trades=5, profit_factor=None),
+            _snapshot("measured", 900.0, closed_trades=5, profit_factor=2.0),
+        ],
+    )
+
+    combined = client.get("/api/account?window=all").json()["combined"]
+    profiles = client.get("/api/profiles").json()["profiles"]
+
+    by_id = {profile["id"]: profile for profile in profiles}
+    assert by_id["flawless"]["profit_factor"] is None
+    assert by_id["measured"]["profit_factor"] == pytest.approx(2.0)
+    # The flawless profile is excluded from the pool, which would otherwise be
+    # diluted towards 1.0 by a stand-in zero.
+    assert combined["profit_factor"] == pytest.approx(2.0)
 
 
 def test_account_refuses_an_unknown_window(tmp_path: Path) -> None:

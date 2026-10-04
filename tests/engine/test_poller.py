@@ -453,9 +453,26 @@ async def test_tick_writes_one_snapshot_per_running_profile(tmp_path: Path) -> N
     assert snapshot.closed_trades == 10
     assert snapshot.win_rate == 0.6
     assert snapshot.profit_factor == 1.8
-    assert snapshot.max_drawdown_pct == 12.34
+    # ``max_drawdown`` is a ratio in freqtrade 2026.8: the snapshot stores the
+    # 0..1 ratio the API publishes, never a percentage.
+    assert snapshot.max_drawdown_pct == pytest.approx(0.1234)
     assert snapshot.healthy is True
     assert harness.poller.snapshots_written == 1
+
+
+async def test_tick_stores_a_null_profit_factor_as_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flawless record stays "not measurable" instead of becoming ``0.0``."""
+    monkeypatch.setitem(PROFIT, "profit_factor", None)
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    await harness.supervisor.start()
+
+    await harness.poller.tick()
+
+    snapshot = harness.snapshots("alpha")[0]
+    assert snapshot.profit_factor is None
+    assert snapshot.max_drawdown_pct == pytest.approx(0.1234)
 
 
 async def test_tick_reads_the_documented_endpoints(tmp_path: Path) -> None:

@@ -8,10 +8,11 @@ the entries to the bullish regime; the histogram cross itself times the entry.
 
 import talib.abstract as ta
 from freqtrade.strategy import IStrategy
+from market_regime import BtcRegimeGateMixin
 from pandas import DataFrame
 
 
-class MacdStrategy(IStrategy):
+class MacdStrategy(BtcRegimeGateMixin, IStrategy):
     """Enter when the MACD(12, 26, 9) histogram crosses above zero while close > EMA(200)."""
 
     INTERFACE_VERSION = 3
@@ -27,7 +28,10 @@ class MacdStrategy(IStrategy):
     startup_candle_count = 210
 
     stoploss = -0.10
-    minimal_roi = {"0": 0.10, "480": 0.05, "1440": 0.0}
+    # The single rung is unreachable, so the ROI ladder is disabled: the trade is
+    # closed by the exit signal or by the stoploss, never by a time-decaying target,
+    # which no longer truncates the right tail of a trend move.
+    minimal_roi = {"0": 1.0}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -47,7 +51,8 @@ class MacdStrategy(IStrategy):
         dataframe["enter_tag"] = ""
         dataframe.loc[buy_signal & (dataframe["volume"] > 0), "enter_long"] = 1
         dataframe.loc[buy_signal & (dataframe["volume"] > 0), "enter_tag"] = "macd_hist_cross_up"
-        return dataframe
+        # Hand the signals to the next class of the MRO: the BTC regime gate filters them.
+        return super().populate_entry_trend(dataframe, metadata)
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         histogram = dataframe["macdhist"]

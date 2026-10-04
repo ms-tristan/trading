@@ -15,6 +15,18 @@ Two rules are enforced here rather than at the edges:
   cannot parse. :func:`finite_float` is therefore mandatory on every value that
   comes from Freqtrade, and the models sanitise non-finite floats once more as
   a safety net.
+
+Two conventions are part of the wire contract and are documented here because
+every model obeys them:
+
+* every field whose name ends in ``_pct`` (``profit_pct``,
+  ``max_drawdown_pct``) carries a **0..1 ratio**, never a percentage: the
+  dashboard multiplies by ``100`` for display, so a percentage on the wire would
+  be rendered a hundred times too large;
+* ``profit_factor`` is **nullable**. Freqtrade serialises ``Infinity`` as JSON
+  ``null`` when a profile has not lost a trade yet, so ``None`` means "not
+  measurable" and is never collapsed to ``0.0``, which keeps its real
+  "every trade lost" meaning.
 """
 
 from __future__ import annotations
@@ -179,15 +191,16 @@ def normalise_win_rate(value: Any) -> float:
 
 
 def normalise_drawdown_pct(value: Any) -> float:
-    """Return a drawdown as a non-negative percentage.
+    """Return the magnitude Freqtrade published for a drawdown.
 
-    Freqtrade reports drawdowns either as a negative ratio (``-0.12``) or as a
-    percentage (``-12.0``); both become ``12.0``.
+    The result is the **0..1 ratio** every ``*_pct`` field of the platform
+    carries, so it is never rescaled: ``-0.25`` stays ``0.25`` and ``-12.0``
+    stays ``12.0``. The sign is dropped because a drawdown is a magnitude, and a
+    non-finite value becomes ``0.0``. Freqtrade 2026.8 answers
+    ``GET /profit``'s ``max_drawdown`` as a ratio already, which is exactly what
+    :func:`~trading_platform.engine.client.FreqtradeClient.fetch_all` stores.
     """
-    magnitude = abs(finite_float(value, 0.0))
-    if magnitude <= 1.0:
-        magnitude *= 100.0
-    return magnitude
+    return abs(finite_float(value, 0.0))
 
 
 def window_start(window: str, now: datetime | None = None) -> datetime | None:
@@ -285,7 +298,10 @@ class ProfileSnapshot(_Model):
     open_trades: int = 0
     closed_trades: int = 0
     win_rate: float = 0.0
-    profit_factor: float = 0.0
+    #: ``None`` when the worker has not lost a trade yet: Freqtrade publishes
+    #: ``Infinity`` for such a record and serialises it as JSON ``null``.
+    profit_factor: float | None = None
+    #: The worst drawdown of the profile as a 0..1 ratio (never a percentage).
     max_drawdown_pct: float = 0.0
     healthy: bool = True
 
@@ -302,7 +318,10 @@ class ProfileMetrics(_Model):
     open_trades: int = 0
     closed_trades: int = 0
     win_rate: float = 0.0
-    profit_factor: float = 0.0
+    #: ``None`` means "no losing trade yet / not measurable"; ``0.0`` means every
+    #: trade lost. The two are never conflated.
+    profit_factor: float | None = None
+    #: The worst drawdown of the profile as a 0..1 ratio (never a percentage).
     max_drawdown_pct: float = 0.0
     best_pair: str | None = None
     starting_capital: float = 0.0
@@ -397,7 +416,11 @@ class ProfileView(_Model):
     open_trades: int = 0
     closed_trades: int = 0
     win_rate: float = 0.0
-    profit_factor: float = 0.0
+    #: ``None`` means "no losing trade yet / not measurable"; ``0.0`` means every
+    #: trade lost. The two are never conflated.
+    profit_factor: float | None = None
+    #: The worst drawdown of the profile as a 0..1 ratio (never a percentage):
+    #: the dashboard multiplies it by ``100`` for display.
     max_drawdown_pct: float = 0.0
     best_pair: str | None = None
     uptime_seconds: float = 0.0
@@ -454,7 +477,12 @@ class AccountPerformance(_Model):
     open_trades: int = 0
     closed_trades: int = 0
     win_rate: float = 0.0
-    profit_factor: float = 0.0
+    #: The pooled factor of the scope, over the profiles that define one;
+    #: ``None`` when no profile of the scope defines one. ``0.0`` still means
+    #: "every trade lost" and is never used as a stand-in for "not measurable".
+    profit_factor: float | None = None
+    #: The worst profile drawdown of the scope, as a **0..1 ratio** (the API
+    #: publishes every ``*_pct`` field as a ratio; the dashboard scales it).
     max_drawdown_pct: float = 0.0
     sharpe: float = 0.0
     profiles_total: int = 0

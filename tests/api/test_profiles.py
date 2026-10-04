@@ -5,10 +5,19 @@ is pinned from both sides here: the rank is assigned once over both modes and
 ``?mode=``/``?sort=``/``?limit=`` only reorder or truncate without ever changing
 it. The mutations cover the documented refusals (``404``, ``409``, ``422``) as
 well as the defaults an operator profile is created with.
+
+Most tests run against a stubbed process layer, because they describe the read
+model. The ones that describe what an edit *does* to a worker -- a PATCH of a
+config-affecting field restarts it, a PATCH of ``name``/``priority`` does not --
+run against the real :class:`~trading_platform.engine.supervisor.Supervisor` with
+a recording launcher: the claim is precisely that a second child is spawned from
+a regenerated configuration file.
 """
 
 from __future__ import annotations
 
+import json
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,6 +29,8 @@ from fastapi.testclient import TestClient
 from trading_platform.api.app import create_app
 from trading_platform.api.security import OPERATOR_TOKEN_HEADER
 from trading_platform.config import ENV_OPERATOR_TOKEN, PlatformSettings
+from trading_platform.engine.config_builder import profile_config_path
+from trading_platform.engine.supervisor import Supervisor
 from trading_platform.models import (
     ProfileConfig,
     ProfileSnapshot,
@@ -82,6 +93,28 @@ class _StubSupervisor:
     def restart_profile(self, profile_id: str) -> None:
         self.alive.add(profile_id)
         self.calls.append(("restart", profile_id))
+
+    def apply_config_change(self, profile_id: str, changed_fields: Iterable[str]) -> bool:
+        """Mirror the engine: a config-affecting edit of a running profile restarts it.
+
+        The set is spelled out here rather than imported, so a change to the
+        engine's ``CONFIG_AFFECTING_FIELDS`` that the routes rely on shows up as a
+        mismatch between this double and the real engine.
+        """
+        self.calls.append(("apply_config_change", profile_id))
+        affecting = {
+            "strategy",
+            "timeframe",
+            "mode",
+            "exchange",
+            "pairs",
+            "initial_capital",
+            "max_open_trades",
+        }
+        if not affecting.intersection(changed_fields) or not self.is_running(profile_id):
+            return False
+        self.restart_profile(profile_id)
+        return True
 
     def apply_settings(self, *, snapshot_interval_seconds: int | None = None) -> PlatformSettings:
         changes: dict[str, int] = {}
@@ -283,6 +316,139 @@ def _create_body(**overrides: Any) -> dict[str, Any]:
     }
     body.update(overrides)
     return body
+
+
+# ---------------------------------------------------------------------------
+# A real engine, for the routes that are supposed to reach a worker
+# ---------------------------------------------------------------------------
+#: The strategy metadata document of the temporary deployments built below.
+LIVE_STRATEGIES_DOCUMENT: dict[str, Any] = {
+    "strategies": [
+        {"id": "basic", "class_name": "BasicStrategy", "file": "BasicStrategy.py"},
+        {"id": "momentum", "class_name": "MomentumStrategy", "file": "MomentumStrategy.py"},
+    ]
+}
+
+#: Environment of those deployments: the Freqtrade binary is pinned, so the
+#: recorded command line does not depend on the machine running the suite.
+LIVE_ENV: dict[str, str] = {"TB_FREQTRADE_BIN": sys.executable}
+
+
+class _FakeProcess:
+    """A child handle: a pid, ``poll``, ``terminate``, ``kill`` and ``wait``."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        """Return the exit status, or ``None`` while the child is alive."""
+        return self.returncode
+
+    def terminate(self) -> None:
+        """Record SIGTERM; the fake child exits with Freqtrade's status 130."""
+        if self.returncode is None:
+            self.returncode = 130
+
+    def kill(self) -> None:
+        """Record SIGKILL."""
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Return the exit status without ever blocking."""
+        return 0 if self.returncode is None else self.returncode
+
+
+class _RecordingLauncher:
+    """A ``ProcessLauncher`` double that records the children it would start."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.processes: list[_FakeProcess] = []
+        self.terminated: list[_FakeProcess] = []
+        self._pid = 6000
+
+    def spawn(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        log_path: Path,
+    ) -> _FakeProcess:
+        """Record the command line and return a fresh fake child."""
+        self._pid += 1
+        process = _FakeProcess(self._pid)
+        self.calls.append(list(argv))
+        self.processes.append(process)
+        return process
+
+    def terminate(self, process: _FakeProcess, *, grace_seconds: float = 0.0) -> None:
+        """Record the stop and terminate the fake child."""
+        self.terminated.append(process)
+        process.terminate()
+
+    def running(self) -> list[_FakeProcess]:
+        """Return the children that are still alive."""
+        return [process for process in self.processes if process.poll() is None]
+
+
+def _write_live_documents(config_dir: Path) -> None:
+    """Write the three configuration documents of a temporary deployment."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "platform.json").write_text("{}", encoding="utf-8")
+    (config_dir / "profiles.json").write_text(json.dumps({"profiles": []}), encoding="utf-8")
+    (config_dir / "strategies.json").write_text(
+        json.dumps(LIVE_STRATEGIES_DOCUMENT), encoding="utf-8"
+    )
+
+
+def _make_live_engine(
+    tmp_path: Path,
+    *,
+    profiles: Sequence[ProfileConfig] = (),
+) -> tuple[TestClient, Supervisor, StateStore, _RecordingLauncher]:
+    """Build a client over a real engine whose children are only recorded.
+
+    The stub above keeps the process layer out of the read-model tests; this
+    helper is the opposite: the supervisor is the real one, so a route that is
+    supposed to reach a worker really regenerates its configuration and respawns
+    it. Nothing is started for real -- the launcher records, and the port probe
+    answers "free" instead of binding a socket.
+    """
+    state_dir = tmp_path / "realtime"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    config_dir = tmp_path / "config"
+    _write_live_documents(config_dir)
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+
+    store = StateStore(state_dir / "state.db")
+    store.bootstrap()
+    for profile in profiles:
+        store.upsert_profile(profile, source="catalogue", state="stopped")
+    settings = PlatformSettings()
+    launcher = _RecordingLauncher()
+    supervisor = Supervisor(
+        store=store,
+        settings=settings,
+        state_dir=state_dir,
+        config_dir=config_dir,
+        strategies_dir=strategies_dir,
+        launcher=launcher,
+        env=dict(LIVE_ENV),
+        clock=utc_now,
+        port_probe=lambda port: True,
+    )
+    app = create_app(
+        supervisor=supervisor,
+        settings=settings,
+        state_dir=state_dir,
+        start_engine=False,
+    )
+    app.state.strategy_catalogue = _catalogue()
+    supervisor.bootstrap()
+    return TestClient(app), supervisor, store, launcher
 
 
 @pytest.fixture(autouse=True)
@@ -792,6 +958,86 @@ def test_patch_with_an_unknown_field_is_ignored(tmp_path: Path) -> None:
     stored = store.get_profile("alpha")
     assert stored is not None
     assert (stored.strategy, stored.mode) == ("basic", "paper")
+
+
+def test_patch_of_a_running_profile_restarts_it_on_a_regenerated_config(tmp_path: Path) -> None:
+    """A config-affecting edit really reaches the worker.
+
+    ``write_freqtrade_config`` has exactly one caller, inside the start path, so
+    without the restart the database and the dashboard would show the new values
+    while the running worker kept trading the old ones. The second spawn is the
+    proof, and the regenerated file is what it was spawned from.
+    """
+    client, supervisor, _store, launcher = _make_live_engine(tmp_path, profiles=[_profile("alpha")])
+    assert len(launcher.calls) == 1
+
+    response = client.patch(
+        "/api/profiles/alpha",
+        json={"initial_capital": 250.0, "max_open_trades": 1, "pairs": ["SOL/USDT"]},
+        headers={OPERATOR_TOKEN_HEADER: TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert len(launcher.calls) == 2
+    assert launcher.terminated == [launcher.processes[0]]
+    config = json.loads(
+        profile_config_path(tmp_path / "realtime", "alpha").read_text(encoding="utf-8")
+    )
+    assert config["dry_run_wallet"] == 250.0
+    assert config["max_open_trades"] == 1
+    assert config["exchange"]["pair_whitelist"] == ["SOL/USDT"]
+
+    # The answer is the refreshed view of the same, still running, profile.
+    profile = response.json()["profile"]
+    assert profile["id"] == "alpha"
+    assert profile["initial_capital"] == 250.0
+    assert profile["max_open_trades"] == 1
+    assert profile["pairs"] == ["SOL/USDT"]
+    assert profile["state"] == "running"
+    assert supervisor.is_running("alpha")
+    assert [event.kind for event in _store.list_events()].count("restart") == 1
+    assert [event.kind for event in _store.list_events()].count("profile_updated") == 1
+
+
+def test_patch_of_a_display_only_field_never_restarts_the_worker(tmp_path: Path) -> None:
+    """``name`` and ``priority`` change the row and the dashboard, not the child."""
+    client, supervisor, _store, launcher = _make_live_engine(tmp_path, profiles=[_profile("alpha")])
+    assert len(launcher.calls) == 1
+
+    response = client.patch(
+        "/api/profiles/alpha",
+        json={"name": "Renamed", "priority": 7},
+        headers={OPERATOR_TOKEN_HEADER: TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert len(launcher.calls) == 1
+    assert launcher.terminated == []
+    assert supervisor.is_running("alpha")
+    profile = response.json()["profile"]
+    assert profile["name"] == "Renamed"
+    assert profile["priority"] == 7
+
+
+def test_patch_never_starts_a_stopped_profile(tmp_path: Path) -> None:
+    """An edit of a stopped profile is an edit: nothing is spawned."""
+    client, supervisor, _store, launcher = _make_live_engine(
+        tmp_path, profiles=[_profile("idle", enabled=False)]
+    )
+    assert launcher.calls == []
+
+    response = client.patch(
+        "/api/profiles/idle",
+        json={"pairs": ["SOL/USDT"]},
+        headers={OPERATOR_TOKEN_HEADER: TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert launcher.calls == []
+    assert not supervisor.is_running("idle")
+    profile = response.json()["profile"]
+    assert profile["pairs"] == ["SOL/USDT"]
+    assert profile["state"] == "stopped"
 
 
 # ---------------------------------------------------------------------------

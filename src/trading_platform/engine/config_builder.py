@@ -19,6 +19,23 @@ that location, and a value in the document would fight the flag).
 The generated document carries the REST API password of the profile and, for a
 live profile, the exchange key and secret: :func:`write_freqtrade_config`
 therefore persists it with mode ``0o600``.
+
+The document also pins the order handling of every worker: ``order_types``
+makes the stoploss a **market** order and raises ``stoploss_on_exchange`` for a
+live profile, so a supervisor stop, error, kill or profile delete never leaves a
+position naked on the exchange. :data:`PROTECTIONS` publishes the risk controls
+of the fleet (``StoplossGuard``, ``MaxDrawdown``, ``CooldownPeriod``) in the
+shape Freqtrade documents for a strategy class. It is deliberately *not* written
+into the generated document as a top-level ``protections`` key: Freqtrade 2026.8
+-- the version of the deployed base image -- aborts the boot of a worker whose
+configuration carries that key::
+
+    freqtrade.configuration.deprecated_settings.process_temporary_deprecated_settings
+    -> ConfigurationError: DEPRECATED: Setting 'protections' in the configuration
+       is deprecated.
+
+A worker that cannot boot protects nothing, so the constant is exported for the
+strategy side instead of being emitted here.
 """
 
 from __future__ import annotations
@@ -27,8 +44,9 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -43,11 +61,14 @@ __all__ = [
     "FREQTRADE_MODE_LIVE",
     "FREQTRADE_MODE_PAPER",
     "GENERATED_CONFIG_MODE",
+    "MAX_API_PORT",
+    "PROTECTIONS",
     "TIMEFRAME_THROTTLE_SECONDS",
     "TRADES_DB_FILENAME",
     "allocate_api_port",
     "build_freqtrade_argv",
     "build_freqtrade_config",
+    "port_is_available",
     "profile_config_path",
     "profile_data_dir",
     "profile_db_url",
@@ -91,6 +112,49 @@ TRADES_DB_FILENAME = "tradesv3.sqlite"
 #: Live stake amount divider for a profile without open-trade slot.
 _MINIMUM_TRADE_SLOTS = 1
 
+#: Highest port number a profile REST API may be allocated: the TCP ceiling.
+#: The port scan wraps around at this value instead of running past it.
+MAX_API_PORT = 65535
+
+#: Loopback address every worker REST API binds to.
+_API_HOST = "127.0.0.1"
+
+#: Seconds between two on-exchange stoploss updates of a live worker.
+STOPLOSS_ON_EXCHANGE_INTERVAL_SECONDS = 60
+
+#: Fleet risk controls, in the order they are evaluated, in the shape Freqtrade
+#: documents for the ``protections`` attribute of a strategy class.
+#:
+#: * ``StoplossGuard`` stops trading after four stoploss exits within 60 candles
+#:   of the profile timeframe, globally (``only_per_pair`` is ``False``);
+#: * ``MaxDrawdown`` stops trading for 120 candles once the last 20 trades drew
+#:   down more than 20 percent;
+#: * ``CooldownPeriod`` waits five candles after any exit before re-entering.
+#:
+#: The constant is the shared definition of the fleet risk controls; it is not
+#: written into the generated configuration because Freqtrade 2026.8 refuses to
+#: boot a worker configured that way (see the module docstring).
+PROTECTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "method": "StoplossGuard",
+        "lookback_period_candles": 60,
+        "trade_limit": 4,
+        "stop_duration_candles": 60,
+        "only_per_pair": False,
+    },
+    {
+        "method": "MaxDrawdown",
+        "lookback_period_candles": 200,
+        "trade_limit": 20,
+        "max_allowed_drawdown": 0.2,
+        "stop_duration_candles": 120,
+    },
+    {
+        "method": "CooldownPeriod",
+        "stop_duration_candles": 5,
+    },
+)
+
 
 def throttle_for_timeframe(timeframe: str) -> int:
     """Return the process throttle in seconds for ``timeframe``.
@@ -130,6 +194,36 @@ def _stake_amount(profile: ProfileRecord, *, paper: bool) -> str | float:
     return round(float(profile.initial_capital) / slots, 8)
 
 
+def _order_types(*, paper: bool) -> dict[str, Any]:
+    """Return the ``order_types`` block of a generated configuration.
+
+    The mapping always names the four keys Freqtrade requires (``entry``,
+    ``exit``, ``stoploss``, ``stoploss_on_exchange``) plus the strategy default
+    refresh interval, so the strategy resolver never raises "Order-types mapping
+    is incomplete". Entry and exit stay **limit** orders, which keeps
+    ``_validate_price_config`` satisfied because the generated ``entry_pricing``
+    and ``exit_pricing`` sides are ``"same"``.
+
+    Only the two safety-relevant values differ:
+
+    * ``stoploss`` is a **market** order for paper and live alike: a limit
+      stoploss can sit unfilled while the market runs through it, which is the
+      opposite of what a stop is for;
+    * ``stoploss_on_exchange`` is ``True`` for a live profile, so the exchange
+      keeps the stop (no strategy sets ``stoploss_on_exchange`` and Freqtrade
+      defaults it to ``False``). Every supervisor stop, error, kill or profile
+      delete would otherwise leave the position naked. A paper profile keeps
+      ``False``: nothing is really placed, and its behaviour must not change.
+    """
+    return {
+        "entry": "limit",
+        "exit": "limit",
+        "stoploss": "market",
+        "stoploss_on_exchange": not paper,
+        "stoploss_on_exchange_interval": STOPLOSS_ON_EXCHANGE_INTERVAL_SECONDS,
+    }
+
+
 def build_freqtrade_config(
     profile: ProfileRecord,
     settings: PlatformSettings,
@@ -144,13 +238,26 @@ def build_freqtrade_config(
     """Render the complete Freqtrade configuration of ``profile``.
 
     The returned document is a plain JSON-serialisable mapping and carries every
-    key Freqtrade 2026.8 requires. The paper/live differences are:
+    key Freqtrade 2026.8 requires: ``max_open_trades``, ``stake_currency``,
+    ``stake_amount``, ``tradable_balance_ratio``, ``fiat_display_currency``,
+    ``dry_run`` (``dry_run_wallet`` for a paper profile), ``trading_mode``,
+    ``margin_mode``, ``timeframe``, ``strategy``, ``unfilledtimeout``,
+    ``order_types``, ``entry_pricing``, ``exit_pricing``, ``exchange``,
+    ``pairlists``, ``api_server``, ``initial_state``, ``internals`` and
+    ``bot_name``. The paper/live differences are:
 
     * ``dry_run`` is ``True`` for a paper profile, ``False`` for a live one;
     * ``dry_run_wallet`` is present for a paper profile only (a live profile
       must never see a simulated wallet);
     * ``stake_amount`` is ``"unlimited"`` for a paper profile and the initial
-      capital divided by the open-trade slots for a live one.
+      capital divided by the open-trade slots for a live one;
+    * ``order_types["stoploss_on_exchange"]`` is ``True`` for a live profile
+      and ``False`` for a paper one (see :func:`_order_types`).
+
+    ``protections`` is **not** emitted: Freqtrade 2026.8 aborts the boot of a
+    worker whose configuration carries that key (see the module docstring).
+    :data:`PROTECTIONS` is the exportable definition of the fleet risk controls
+    for the strategy side.
 
     ``exchange_key``/``exchange_secret`` are written as given: the caller passes
     the credentials of a live profile and leaves them empty for paper trading.
@@ -181,6 +288,7 @@ def build_freqtrade_config(
             "exit_timeout_count": 0,
             "unit": "minutes",
         },
+        "order_types": _order_types(paper=paper),
         "entry_pricing": {
             "price_side": "same",
             "use_order_book": True,
@@ -266,9 +374,85 @@ def profile_data_dir(state_dir: Path, profile_id: str) -> Path:
     return profile_runtime_dir(state_dir, profile_id) / "data"
 
 
-def allocate_api_port(index: int, settings: PlatformSettings) -> int:
-    """Return the REST API port of the profile at position ``index``."""
-    return settings.profile_api_port_base + index
+def allocate_api_port(
+    index: int,
+    settings: PlatformSettings,
+    *,
+    reserved: Collection[int] = (),
+    is_available: Callable[[int], bool] | None = None,
+) -> int:
+    """Return an API port for the profile at position ``index``.
+
+    ``base + index`` (``base`` is :attr:`PlatformSettings.profile_api_port_base`)
+    is the *preferred* port -- a profile keeps the deterministic port it is
+    documented to use -- but it is only returned when nothing else owns it. The
+    scan then walks up to :data:`MAX_API_PORT` and wraps around from ``base`` to
+    the port just below the preferred one, returning the first candidate that is
+    neither ``reserved`` nor refused by ``is_available``.
+
+    ``reserved`` names the ports of the other profiles (a port already stored in
+    the state database or about to be written for a sibling), and
+    ``is_available`` is the liveness probe (normally :func:`port_is_available`):
+    the fleet map has drifted before, and a worker that cannot bind its REST
+    port hangs before its trading loop and is walked to a permanent error. Both
+    default to "nothing to avoid", so the plain call still returns ``base +
+    index`` exactly.
+
+    When every candidate is taken the preferred port is returned as the
+    documented last resort: a duplicated port is a diagnosable worker error,
+    while an exception here would abort the whole scheduling pass.
+
+    >>> from trading_platform.config import PlatformSettings
+    >>> allocate_api_port(3, PlatformSettings(profile_api_port_base=8101))
+    8104
+    >>> allocate_api_port(3, PlatformSettings(profile_api_port_base=8101), reserved={8104})
+    8105
+    """
+    preferred = _preferred_api_port(index, settings)
+    taken = {int(port) for port in reserved}
+    for candidate in _api_port_candidates(preferred, settings):
+        if candidate in taken:
+            continue
+        if is_available is not None and not is_available(candidate):
+            continue
+        return candidate
+    return preferred
+
+
+def _preferred_api_port(index: int, settings: PlatformSettings) -> int:
+    """Return the deterministic (preferred) port of the profile at ``index``."""
+    return int(settings.profile_api_port_base) + int(index)
+
+
+def _api_port_candidates(preferred: int, settings: PlatformSettings) -> list[int]:
+    """Return the candidate ports of ``preferred`` in allocation order.
+
+    The order is the preferred port, every port above it up to
+    :data:`MAX_API_PORT`, then the wrap-around range from the configured base to
+    the port just below the preferred one. Only real TCP ports (``1`` to
+    :data:`MAX_API_PORT`) are candidates, so a base close to the ceiling cannot
+    produce a port the operating system would refuse.
+    """
+    base = max(1, int(settings.profile_api_port_base))
+    above = range(preferred, MAX_API_PORT + 1)
+    wrapped = range(base, min(preferred, MAX_API_PORT + 1))
+    return [port for port in (*above, *wrapped) if 1 <= port <= MAX_API_PORT]
+
+
+def port_is_available(port: int) -> bool:
+    """Return whether ``port`` can be bound on the loopback interface.
+
+    The probe binds a TCP socket to ``127.0.0.1:<port>`` without listening and
+    closes it again. A port already held -- by a stray worker, by another
+    service, or by a supervisor that never reaped its child -- refuses the bind,
+    which is exactly the drift :func:`allocate_api_port` has to see.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((_API_HOST, int(port)))
+    except OSError:
+        return False
+    return True
 
 
 def resolve_freqtrade_binary(env: Mapping[str, str] | None = None) -> list[str]:

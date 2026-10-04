@@ -59,6 +59,26 @@ is restarted, or when the operator stops a profile or a profile reaches the
 terminal state `error`, the next pass reconciles the fleet again. A profile that
 is not running is restarted only when it is proven gone (§2).
 
+### The schedule/start critical section
+
+`schedule()` is reachable from **two threads**: the supervisor's event loop, and
+FastAPI's thread pool through the mutating routes (`POST /api/profiles`,
+`PATCH /api/profiles/{id}`, `POST /api/profiles/{id}/actions`,
+`POST /api/catalogue/apply` all reconcile the fleet on the spot). Both paths used
+to run the same check-then-act sequence — "is this profile already running?" then
+"spawn it" — with no lock around it, and the gap between the check and the spawn
+is 17-25 ms because the port is allocated, the credentials are generated and the
+configuration file is written in between.
+
+Two concurrent starts therefore spawned **two workers for one profile while only
+one of them was tracked**: the untracked twin kept trading, was never polled and
+never restarted, and the kill switch could not stop it — the switch walks the
+tracked process map only. The whole schedule/start path (`schedule()`,
+`start_profile()` and the private `_start()` that owns the existence check, the
+port allocation, the configuration write and the spawn) now runs inside a single
+lock, so those calls are serialised: the second caller observes the worker the
+first one started and does nothing.
+
 On `SIGTERM`/`SIGINT` the supervisor terminates every child gracefully (SIGTERM,
 then SIGKILL after 15 s) before exiting, so a container stop never leaves an
 orphan freqtrade process behind.
@@ -108,12 +128,22 @@ generated): `GET /ping`, `/balance`, `/profit`, `/count`, `/status`, `/show_conf
 freqtrade 2026.8 returns and derives one metric itself:
 
 ```
-portfolio_value = balance.total          (stake-currency valuation, holdings included)
+portfolio_value = balance.total_bot      (the equity the bot manages, holdings included)
 cash            = balance.<stake>.free
 positions_value = portfolio_value - cash
 profit_abs      = profit.profit_all_coin
 profit_pct      = (portfolio_value - initial_capital) / initial_capital
 ```
+
+`portfolio_value` deliberately reads **`total_bot`**, not `total`: `/balance`'s
+`total` and `free` describe the **whole exchange wallet**, which is not the
+bot's money. A live bot staked with 250 USDT on a 5,000 USDT account would report
+roughly +1,900 % profit if the platform measured that account against the
+profile's `initial_capital`; `total_bot` is the equity the worker actually
+manages, so the percentage describes the profile. Dry-run is unaffected —
+freqtrade's simulated wallet is the bot's wallet, so `total_bot` and `total` are
+the same number there, and paper profiles keep reporting exactly what they
+reported before.
 
 `profit_pct` is computed **by the platform**, not taken from freqtrade: freqtrade
 measures its own percentage against its tradable balance, while the platform
@@ -223,13 +253,22 @@ still lets the readers of another connection work while the poller writes.
 | `open_trades` | INTEGER | trades currently open |
 | `closed_trades` | INTEGER | trades closed since the profile started |
 | `win_rate` | REAL | share of winning closed trades |
-| `profit_factor` | REAL | gross profit / gross loss |
-| `max_drawdown_pct` | REAL | worst drawdown reported by the worker |
+| `profit_factor` | REAL | gross profit / gross loss; `NULL` when the profile has not lost a trade yet (see §9) |
+| `max_drawdown_pct` | REAL | worst drawdown reported by the worker, stored as a **0..1 ratio** |
 | `healthy` | INTEGER | `1` when the last poll of this profile succeeded |
 
 Primary key: **`(profile_id, ts)`**. Index: **`idx_profile_snapshots_ts`** on
 `profile_snapshots(ts)` — the cross-profile time series the aggregated equity
 curve reads.
+
+**`max_drawdown_pct` is stored as a ratio.** Freqtrade 2026.8's `/api/v1/profit`
+publishes `max_drawdown` as a *relative* drawdown — a ratio, not a percentage —
+so the client stores its magnitude unchanged: a true 0.78 % drawdown is the row
+value `0.0078`, and nothing multiplies it by 100 anywhere between the worker and
+the database. Rows written by an earlier revision hold the old percent value
+(`0.7793` for that same drawdown); the next poll — 60 s later — replaces them
+through the `(profile_id, ts)` primary key, so **no data migration exists and
+none is needed**. §9 documents what the API serves from that column.
 
 ### 3.3 `settings` — platform settings
 
@@ -336,17 +375,39 @@ The poller (`src/trading_platform/engine/poller.py`) runs every
    value actually changed — so `blocked`, `stopped` and `error` profiles appear
    in the history when something happened to them and stay silent otherwise;
 3. **never invent a snapshot for a stopped profile.** No row is written for the
-   minutes in which a profile was not running, and no value is carried forward.
-   The equity curves of the dashboard therefore show gaps for the periods a
-   profile was down, which is the honest reading — a flat line would claim the
-   capital was still being managed;
+   minutes in which a profile was not running, so the profile's own history and
+   its sparkline keep the gaps of the periods it was down — a flat line there
+   would claim the capital was still being managed;
 4. record the engine events of the interval (`start`, `stop`, `crash`,
    `restart`, `error`, `kill_switch`, `legacy_db_archived`) in `events`.
 
+### The combined equity curve carries the last known value forward
+
 The aggregated equity curve of `GET /api/account` is built from
 `profile_snapshots` over the requested window (`24h`, `7d`, `30d`, `all`) — the
-reason the `idx_profile_snapshots_ts` index exists. Retention follows
-`equity_retention_days` in `config/platform.json`.
+reason the `idx_profile_snapshots_ts` index exists. That curve is the sum of the
+**whole fleet**, so a profile with no row at a given minute contributes its
+**last known portfolio value** until it reports again, instead of being dropped
+from that minute's total. A profile that has not reported at all yet contributes
+its `initial_capital`, so it never vanishes from the total either, and the first
+point of a window starts from the value each profile had just before the window
+opened.
+
+The distinction with point 3 matters. Summing only the profiles that happen to
+own a row at a timestamp silently removes a missing profile's *entire* equity
+from that point of the curve: one profile failing a single read produced a fake
+cliff of about **-33 %** on a 1,000 USDT fleet, and the same discontinuity
+corrupted the reported Sharpe ratio, which is computed from the point-to-point
+returns of that curve. Carrying the last known value forward removes both the
+fake cliffs and the returns they injected.
+
+### Retention
+
+Retention is the `equity_retention_days` setting of `config/platform.json`
+(**90** days by default). It is enforced at run time by the **supervisor's hourly
+prune pass**, which deletes the `profile_snapshots` rows older than that window.
+The setting used to be documented but never executed, so the state database grew
+without bound.
 
 ---
 
@@ -361,8 +422,9 @@ worker, so the list is exhaustive on purpose: `max_open_trades`,
 `stake_currency`, `stake_amount`, `tradable_balance_ratio` (`0.99`),
 `fiat_display_currency`, `dry_run`, `dry_run_wallet` (paper profiles only),
 `trading_mode` (`"spot"`), `margin_mode` (`""`), `timeframe`, `unfilledtimeout`,
-`entry_pricing`, `exit_pricing`, `exchange`, `pairlists` (`StaticPairList`),
-`api_server`, `initial_state` (`"running"`), `internals`, `bot_name`.
+`entry_pricing`, `exit_pricing`, `order_types`, `exchange`, `pairlists`
+(`StaticPairList`), `api_server`, `initial_state` (`"running"`), `internals`,
+`bot_name`.
 
 Points an operator or a debugger should know:
 
@@ -370,6 +432,30 @@ Points an operator or a debugger should know:
   and `dry_run_wallet = initial_capital` — the profile's starting cash *is* the
   freqtrade dry-run wallet. A `live` profile gets `dry_run: false` and reaches
   `stake_amount` through the normal `max_open_trades` sizing;
+* **`order_types` is explicit, and the stoploss is a market order.** The block
+  names `entry`, `exit`, `stoploss` and `stoploss_on_exchange` rather than
+  relying on freqtrade's defaults. `entry` and `exit` stay limit orders (the
+  generated `entry_pricing`/`exit_pricing` sides are `"same"`, which is what
+  freqtrade's price validation requires); `stoploss` is a **market** order,
+  because a limit stop can sit unfilled while the market runs through it, which
+  is the opposite of what a stop exists for;
+* **`stoploss_on_exchange` is enabled for live profiles only.** No shipped
+  strategy sets it and freqtrade defaults it to `False`, so without this a live
+  worker keeps its stop in its own process: every supervisor stop, error, kill
+  or profile delete would leave the position **naked on the exchange**. Paper
+  profiles keep `False` — freqtrade evaluates the stoploss locally in dry-run
+  whatever the flag says, so nothing about their behaviour changes;
+* **the fleet risk controls are published as `PROTECTIONS`.** The constant holds
+  the three protections that make a pause possible — `StoplossGuard` (stop
+  trading after repeated stop-outs inside a lookback window), `MaxDrawdown` (stop
+  after the account gives back more than the allowed drawdown) and
+  `CooldownPeriod` (wait a few candles after an exit before re-entering) — in the
+  shape freqtrade validates for a strategy class, and `tests/engine/` pins both
+  the values and that shape. It is deliberately **not** written into the generated
+  document as a top-level `protections` key: freqtrade 2026.8 rejects that key as
+  deprecated and refuses to boot the worker, and a worker that cannot boot
+  protects nothing. A strategy declaring the constant is what arms the controls;
+  the generated document never pretends they are armed when they are not;
 * **each worker gets its own REST credentials.** `api_server` is enabled, bound
   to `127.0.0.1` on the profile's allocated port, with a generated
   `username`/`password` pair, a `jwt_secret_key` of at least 32 characters
@@ -387,18 +473,40 @@ Points an operator or a debugger should know:
 
 ## 6. Port allocation
 
-Every profile owns a **deterministic private REST port**:
+Every profile owns a private REST port on the container's loopback. The
+**preferred** port is the documented one:
 
 ```
-api_port = profile_api_port_base + index
+preferred_port = profile_api_port_base + index
 ```
 
 where `profile_api_port_base` defaults to **8101**
 (`TB_PROFILE_API_PORT_BASE`) and `index` is the profile's position in the
-**catalogue list sorted by `id` ascending** — not in the scheduling order, not in
-creation order. The rule is therefore stable across restarts, across deploy
-rounds and across machines, and it never depends on which profiles happen to be
-running: a profile always keeps the port it already had.
+**profile list sorted by `id` ascending** — not in the scheduling order, not in
+creation order. The preferred port is therefore stable across restarts, across
+deploy rounds and across machines, and it never depends on which profiles happen
+to be running: a profile keeps the port it already had.
+
+It is only **taken when it is actually free**, because the live map had drifted:
+10 of 19 insertion indexes collided with a port another profile was already
+using, and a colliding worker cannot bind — it hangs *before* its trading loop,
+is never polled and has its profile walked to a permanent `error`. The allocator
+therefore
+
+1. tries the preferred port;
+2. then scans upward to port **65535**, and wraps around from the base to the
+   port just below the preferred one;
+3. and returns the first candidate that is **neither reserved by another
+   profile** — a port already stored in the state database, or about to be
+   written for a sibling in the same scheduling pass — **nor refused by the
+   loopback probe**, which binds and immediately closes a TCP socket on
+   `127.0.0.1:<port>` (`port_is_available`).
+
+When every candidate is taken, the preferred port is returned as the documented
+last resort: a duplicated port is a diagnosable worker error, while raising there
+would abort the whole scheduling pass. Called with neither the reserved set nor
+the probe, `allocate_api_port` still returns `base + index` exactly, which is
+what the unit tests and the CLI rely on.
 
 All of those ports are bound by the generated configuration to
 **`127.0.0.1` inside the container** (`api_server.listen_ip_address`) and are
@@ -470,7 +578,9 @@ Three further rules complete the model:
   (created by `POST /api/kill-switch {"engaged": true}`), every worker is stopped,
   every running profile becomes `stopped` with the reason `kill_switch`, and no
   worker starts while the file is present — including after a container restart,
-  because the file lives in the `trading-state` volume;
+  because the file lives in the `trading-state` volume. Every worker the
+  supervisor started is in its tracked process map, because the schedule/start
+  path of §1 is one critical section, so the switch cannot leave a twin running;
 * **the supervisor cannot trade.** It never places an order; starting a live
   profile only means spawning a freqtrade worker configured with the credentials
   of the environment.
@@ -507,6 +617,66 @@ pinned to the constant `0`, for wire compatibility with an older dashboard.
 `POST /api/settings` accepts `snapshot_interval_seconds` only; what an operator
 writes there is what `GET /api/settings` renders as effective, and it is what the
 engine acts on (§3.3).
+
+### A config-affecting edit restarts the worker
+
+The generated configuration of §5 is rebuilt from the profile's row every time a
+worker starts, so a `PATCH /api/profiles/{id}` that changes a field the
+configuration carries must reach the **worker**, not only the database and the
+dashboard. Those *config-affecting* fields are the pair list, `initial_capital`,
+`max_open_trades`, the strategy and the timeframe: the first three change what the
+running worker trades, the last two change what it **is**. Editing one of them on
+a **running** profile restarts that profile's worker, so the configuration it
+runs is the one the operator just wrote. The previous behaviour left such an edit
+silently inert — the database and the dashboard showed the new value while the
+worker went on trading the old one.
+
+A purely descriptive edit (`name`, `priority`, `enabled`) restarts nothing:
+`enabled = false` stops the worker through the scheduler, and the other two are
+read models. A profile that is not running needs no restart at all; it is stored
+and its next start builds the new configuration. Both the `profile_updated` and
+the `restart` row of such an edit land in the `events` table (§3.4).
+
+### The wire convention: every `*_pct` field is a ratio
+
+The JSON API publishes **every field whose name ends in `_pct`**
+(`profit_pct`, `max_drawdown_pct`) and **`win_rate`** as a **0..1 ratio**, never
+as an already-multiplied percentage. `dashboard/src/lib/types.ts` documents
+exactly that convention and multiplies by 100 for display, so the dashboard needs
+no change for it — and nothing on the engine side multiplies a ratio by 100
+either:
+
+* `profit_pct` is `(portfolio_value - initial_capital) / initial_capital` (§2);
+* `max_drawdown_pct` is the magnitude Freqtrade published. Freqtrade 2026.8's
+  `/api/v1/profit` answers `max_drawdown` as a **relative** drawdown — a positive
+  ratio, so a true 0.78 % drawdown arrives as `0.0078` — and the client stores
+  that magnitude unchanged and serves it unchanged (§3.2);
+* `win_rate` is the share of winning closed trades, read as a 0..1 ratio, with an
+  input above 1 treated as a percentage (`100` → `1.0`).
+
+One earlier revision multiplied the drawdown by 100 on the way into the state
+database and normalised it again on the way out: the API served `77.93` for that
+0.78 % drawdown, the dashboard rendered `7,793.30 %`, and — because only the
+values above 1.0 escaped the heuristic — the profiles with a real drawdown above
+1 % were left alone and `aggregate_account`'s `max()` picked the **smallest**
+drawdown as the fleet's worst. The ranking is now the true maximum, because every
+value it compares is the same ratio.
+
+### `profit_factor` is nullable: `null` means "no losing trade yet"
+
+Freqtrade computes `profit_factor` as gross profit over gross loss, so a profile
+that has not lost a trade yet publishes `Infinity` — which is not valid JSON, and
+which freqtrade serialises as `null`. The client reads that as `None`, not as
+`0.0`: `0.0` is the honest factor of a profile that lost **every** trade, and
+collapsing the two rendered a flawless record as the worst possible one.
+
+`profit_factor` is therefore `float | None` on `ProfileMetrics`,
+`ProfileSnapshot` and `ProfileView`, and the fleet aggregation **excludes** the
+undefined factors instead of counting them as zero. That is what stops one
+flawless profile from dragging the fleet factor down: before the fix the fleet
+published 1.4858 while the defined factors weighted to 1.6839. `null` from
+`GET /api/account` means the whole selection has no measurable factor — never a
+zero, and never an error.
 
 ### The profile view: `sparkline`, `slot`, `worker_port`
 

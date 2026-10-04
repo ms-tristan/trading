@@ -12,6 +12,7 @@ exit.
 import numpy as np
 import talib.abstract as ta
 from freqtrade.strategy import IStrategy
+from market_regime import BtcRegimeGateMixin
 from pandas import DataFrame
 
 RANGE_WINDOW = 4
@@ -19,7 +20,7 @@ BUY_MULTIPLIER = 0.5
 SELL_MULTIPLIER = 0.5
 
 
-class DualThrustStrategy(IStrategy):
+class DualThrustStrategy(BtcRegimeGateMixin, IStrategy):
     """Enter above open + 0.5 * range, exit below open - 0.5 * range over the last 4 candles."""
 
     INTERFACE_VERSION = 3
@@ -35,8 +36,10 @@ class DualThrustStrategy(IStrategy):
     startup_candle_count = 10
 
     stoploss = -0.06
-    # Short horizon: an intraday range breakout is expected to work within hours.
-    minimal_roi = {"0": 0.03, "60": 0.015, "180": 0.0}
+    # The single rung is unreachable, so the ROI ladder is disabled: this short-horizon
+    # breakout is closed by the exit signal or by the stoploss, never by a
+    # time-decaying target, which no longer truncates the right tail of the move.
+    minimal_roi = {"0": 1.0}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # Every component of the range is measured on the previous N candles only.
@@ -60,7 +63,8 @@ class DualThrustStrategy(IStrategy):
         dataframe["enter_tag"] = ""
         dataframe.loc[breakout_up & (dataframe["volume"] > 0), "enter_long"] = 1
         dataframe.loc[breakout_up & (dataframe["volume"] > 0), "enter_tag"] = "dual_thrust_up"
-        return dataframe
+        # Hand the signals to the next class of the MRO: the BTC regime gate filters them.
+        return super().populate_entry_trend(dataframe, metadata)
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         breakout_down = dataframe["close"] < dataframe["sell_line"]

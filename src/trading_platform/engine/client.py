@@ -15,6 +15,23 @@ Two behaviours matter as much as the endpoints themselves:
   because Freqtrade reports ``Infinity`` for ``profit_factor`` as soon as a
   profile has never lost a trade, and ``Infinity`` is not valid JSON.
 
+Three published values are read with a meaning of their own rather than as a bare
+number:
+
+* ``portfolio_value`` is the equity the **bot** manages (``/balance``'s
+  ``total_bot``), never the whole exchange wallet (``total``): a live bot staked
+  with 250 USDT on a 5,000 USDT account would otherwise report roughly +1,900 %
+  profit. A dry-run wallet *is* the bot's wallet, so paper profiles are
+  unaffected;
+* ``max_drawdown_pct`` is stored as the **0..1 ratio** Freqtrade published
+  (``max_drawdown`` is a ratio in freqtrade 2026.8), never as a percentage: every
+  ``*_pct`` field of the JSON API is a ratio, and the dashboard scales it. Rows
+  written by an earlier revision hold the old percentage; the next 60 s poll
+  overwrites them, so no migration is needed;
+* ``profit_factor`` is ``float | None``: freqtrade serialises ``Infinity`` as
+  JSON ``null`` for a flawless record, and ``None`` -- never ``0.0``, the factor
+  of a profile that lost every trade -- is what the platform stores.
+
 The record readers (:meth:`FreqtradeClient.daily_records`,
 :meth:`FreqtradeClient.trade_records` and
 :meth:`FreqtradeClient.open_trade_records`) follow a third rule: the *request*
@@ -200,15 +217,20 @@ class FreqtradeClient:
         ``balance``, ``profit``, ``count`` and ``status`` are read in that order
         and combined into a :class:`~trading_platform.models.ProfileMetrics`:
 
-        * ``portfolio_value`` is the wallet total;
+        * ``portfolio_value`` is the equity the **bot** manages
+          (``balance.total_bot``), never the whole exchange wallet
+          (``balance.total``), so a live profile measures its own funds instead
+          of the operator's account;
         * ``cash`` is the free amount of the stake currency, absent currency
           meaning no free balance;
-        * ``positions_value`` is the wallet total minus that cash;
+        * ``positions_value`` is that bot-managed equity minus that cash;
         * ``realized_profit_abs`` is the closed-trade profit and
           ``unrealized_profit_abs`` the remainder of the total profit;
-        * ``win_rate`` and ``max_drawdown_pct`` are normalised (Freqtrade
-          reports both as ratios) and ``profit_factor`` becomes ``0.0`` when
-          Freqtrade reports ``Infinity``;
+        * ``win_rate`` is normalised (Freqtrade reports a ratio),
+          ``max_drawdown_pct`` keeps the magnitude Freqtrade published -- which
+          is the 0..1 ratio every ``*_pct`` field of the API carries -- and
+          ``profit_factor`` becomes ``None`` when Freqtrade publishes no usable
+          factor, instead of the ``0.0`` that means "every trade lost";
         * ``starting_capital`` is informational only: the platform computes
           ``profit_pct`` itself from the configured initial capital.
         """
@@ -219,7 +241,7 @@ class FreqtradeClient:
         # authoritative open-trade number stays ``count["current"]``.
         _open_positions = await self.status()
 
-        portfolio_value = finite_float(balance.get("total"))
+        portfolio_value = _bot_equity(balance)
         cash = _free_balance(balance, str(balance.get("stake") or ""))
         profit_abs = finite_float(profit.get("profit_all_coin"))
         realized_profit_abs = finite_float(profit.get("profit_closed_coin"))
@@ -234,7 +256,11 @@ class FreqtradeClient:
             open_trades=int(finite_float(count.get("current"))),
             closed_trades=int(finite_float(profit.get("closed_trade_count"))),
             win_rate=normalise_win_rate(profit.get("winrate")),
-            profit_factor=finite_float(profit.get("profit_factor")),
+            profit_factor=_profit_factor(profit.get("profit_factor")),
+            # ``max_drawdown`` is a ratio in freqtrade 2026.8 and is stored as
+            # one; the snapshot rows of an older revision still hold the old
+            # percentage, and the next 60 s poll overwrites them in place, so no
+            # migration is required.
             max_drawdown_pct=normalise_drawdown_pct(profit.get("max_drawdown")),
             best_pair=str(best_pair) if best_pair else None,
             starting_capital=finite_float(balance.get("starting_capital")),
@@ -291,6 +317,39 @@ def _free_balance(balance: dict[str, Any], stake_currency: str) -> float:
         if str(entry.get("currency") or "") == stake_currency:
             return finite_float(entry.get("free"))
     return 0.0
+
+
+def _bot_equity(balance: dict[str, Any]) -> float:
+    """Return the equity the worker manages, never the whole exchange wallet.
+
+    ``/balance`` publishes two totals: ``total`` values the entire exchange
+    account -- the operator's funds included -- while ``total_bot`` values what
+    the worker's own stake and open positions are worth. Measuring a profile
+    against the wallet would report a live bot staked with 250 USDT on a
+    5,000 USDT account as roughly +1,900 % profit, so ``total_bot`` is the number
+    that describes the profile. Freqtrade 2026.8 always publishes it; the
+    ``total`` fallback only serves a payload that predates the key (a dry-run
+    wallet *is* the bot's wallet, so both totals are the same number there and
+    paper profiles are unaffected either way).
+    """
+    managed = _usable_number(balance.get("total_bot"))
+    if managed is not None:
+        return managed
+    return finite_float(balance.get("total"))
+
+
+def _profit_factor(value: Any) -> float | None:
+    """Return the ``profit_factor`` Freqtrade published, or ``None`` when it is none.
+
+    A JSON ``null``, an absent key and a non-finite value all mean exactly the
+    same thing -- Freqtrade serialises the ``Infinity`` of a profile that has not
+    lost a trade yet as ``null``, and the very first poll of a worker answers no
+    key at all -- and all of them answer ``None``. ``0.0`` is deliberately never
+    used as that stand-in: it is the honest factor of a profile that lost every
+    trade, so collapsing the two would render a flawless record as the worst one
+    and drag the fleet factor down.
+    """
+    return _usable_number(value)
 
 
 # ---------------------------------------------------------------------------

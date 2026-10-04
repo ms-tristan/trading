@@ -49,6 +49,10 @@ user_data/strategies/*
 !user_data/strategies/VolTargetedTrendStrategy.py
 !user_data/strategies/FaberAllInStrategy.py
 !user_data/strategies/DonchianAllInStrategy.py
+# Shared support module of the strategies -- the causal BTC 200-day regime gate the
+# six unfiltered trend and breakout profiles mix in. The pattern above excludes it
+# like any other file of the directory, so it must be un-ignored too.
+!user_data/strategies/market_regime.py
 *.log
 logs/
 freqtrade-*.log

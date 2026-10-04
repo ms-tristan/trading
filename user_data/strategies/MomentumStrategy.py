@@ -11,10 +11,11 @@ freqtrade "MomentumStrategy" tutorial profile.
 
 import talib.abstract as ta
 from freqtrade.strategy import IStrategy
+from market_regime import BtcRegimeGateMixin
 from pandas import DataFrame
 
 
-class MomentumStrategy(IStrategy):
+class MomentumStrategy(BtcRegimeGateMixin, IStrategy):
     """Enter while ROC(12) is positive inside an EMA(50) > EMA(200) trend with ADX(14) > 20."""
 
     INTERFACE_VERSION = 3
@@ -30,7 +31,10 @@ class MomentumStrategy(IStrategy):
     startup_candle_count = 210
 
     stoploss = -0.10
-    minimal_roi = {"0": 0.12, "480": 0.06, "1440": 0.0}
+    # The single rung is unreachable, so the ROI ladder is disabled: the trade is
+    # closed by the exit signal, the trailing stop or the stoploss, never by a
+    # time-decaying target, which no longer truncates the right tail of the move.
+    minimal_roi = {"0": 1.0}
 
     # A momentum trade is protected by a trailing stop once it has moved far enough.
     trailing_stop = True
@@ -56,7 +60,8 @@ class MomentumStrategy(IStrategy):
         dataframe["enter_tag"] = ""
         dataframe.loc[momentum_up & (dataframe["volume"] > 0), "enter_long"] = 1
         dataframe.loc[momentum_up & (dataframe["volume"] > 0), "enter_tag"] = "momentum_up"
-        return dataframe
+        # Hand the signals to the next class of the MRO: the BTC regime gate filters them.
+        return super().populate_entry_trend(dataframe, metadata)
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # The trailing stop protects the profit; the signal exits the trade when the

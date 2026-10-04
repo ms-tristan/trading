@@ -16,8 +16,13 @@ user_data/
     ├── KeltnerStrategy.py    # EMA(20) +/- 2 * ATR(10) breakout
     ├── SupertrendStrategy.py # Supertrend(10, 3.0) direction flip
     ├── DualThrustStrategy.py # 4-candle range breakout on both sides of the open
-    └── FaberStrategy.py      # 200-period trend filter (Mebane Faber)
+    ├── FaberStrategy.py      # 200-period trend filter (Mebane Faber)
+    └── market_regime.py      # shared causal BTC 200-day regime gate (support module)
 ```
+
+The list above is not exhaustive: `config/strategies.json` is the authority on the
+shipped catalogue, and the 2026 research programme added five more strategy files.
+`market_regime.py` is not one of them — see *Support modules* below.
 
 ## Adding a strategy: the two-file recipe
 
@@ -50,6 +55,53 @@ you edit:
 Nothing else is needed: no registration call, no import, no restart of the
 realtime image, no change to `config/strategies.json` schema.
 
+## Support modules
+
+Not every `*.py` file in `user_data/strategies/` is a strategy. A module that is
+shared *by* the strategies — `market_regime.py`, which exposes the
+`BtcRegimeGateMixin` the six unfiltered trend and breakout profiles mix in — is a
+support module, and the file discovery would otherwise advertise its stem as a
+bogus `market-regime` strategy in `GET /api/strategies`, in the dashboard and in
+the CLI.
+
+A support module is therefore declared by file stem in `SUPPORT_MODULES` of
+`src/trading_platform/profiles/catalogue.py`, which `discover_strategy_files()`
+skips. Adding one is a three-file recipe: create the module in
+`user_data/strategies/`, add its stem to that set, and un-ignore it explicitly in
+`.gitignore` (`!user_data/strategies/market_regime.py`) — the directory is ignored
+wholesale and every shipped file is re-included one by one, so a module that is
+not un-ignored never reaches the repository. A support module:
+
+* is imported by the strategies that need it with a plain absolute import
+  (`from market_regime import BtcRegimeGateMixin`), which works because
+  freqtrade injects the strategy directory into `sys.path` while it executes a
+  strategy module;
+* must never define a class whose `__module__` matches a strategy file stem, so
+  freqtrade's resolver can never mistake it for a strategy;
+* is covered by its own test module, not by the strategy loading test.
+
+A mixin is applied cooperatively: the strategy declares it *before* `IStrategy`
+(`class MyStrategy(BtcRegimeGateMixin, IStrategy)`) and its own
+`populate_entry_trend` ends with
+
+```python
+    return super().populate_entry_trend(dataframe, metadata)
+```
+
+so the signals it just wrote are handed up the MRO to the mixin, which filters
+them and returns the dataframe. Without that call the strategy method shadows the
+mixin entirely and the filter silently never runs.
+
+The gate itself is deliberately conservative: it reads `BTC/USDT` on the `1d`
+timeframe, shifts the daily regime by one full day before using it (a daily
+candle is only complete at its close, so reading it unshifted would be
+lookahead), and closes the gate — blocks every entry — whenever that daily frame
+is missing, empty or shorter than 201 candles. A fresh live profile therefore
+starts with no entries until 201 daily BTC candles exist. `informative_pairs()`
+declares that daily pair, which is what makes the gate reachable in DRY_RUN and
+LIVE at all: there the data provider only serves the whitelist pairs on the
+strategy timeframe plus the declared informative pairs.
+
 ## Timeframes
 
 A strategy class declares a default `timeframe` — for the ten shipped
@@ -71,7 +123,10 @@ loads each file through freqtrade's own `StrategyResolver`.
   or the reference implementation the logic comes from).
 * **`import talib.abstract as ta`** — indicators come from TA-Lib, never from
   `qtpylib` or hand-rolled rolling windows.
-* **Exactly one class, named exactly like the file stem.**
+* **Exactly one class, named exactly like the file stem.** (For a support module
+  the contract is inverted: it must define no class named like its own stem, must
+  be listed in `SUPPORT_MODULES` and must document how it is mixed in — see
+  *Support modules* above.)
 * **`INTERFACE_VERSION = 3`**, **`can_short = False`**,
   **`process_only_new_candles = True`**, **`use_exit_signal = True`**.
 * **Explicit `startup_candle_count`**, at least the longest indicator period

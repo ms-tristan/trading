@@ -3,28 +3,33 @@
 Nothing here starts a real ``freqtrade`` process and nothing opens a socket: the
 :class:`ProcessLauncher` is replaced by :class:`RecordingLauncher` (which records
 the command line, the environment and the pid, and never forks) and the REST
-client by :class:`FakeFreqtradeApi`. The state store, on the other hand, is a
-real SQLite file under ``tmp_path``, because keeping it in sync with the fleet is
-exactly what the supervisor is for.
+client by :class:`FakeFreqtradeApi`. The port probe of the allocator is injected
+as well -- :func:`free_port` for the whole harness, a refusing double for the
+collision tests -- so no test binds a TCP port either. The state store, on the
+other hand, is a real SQLite file under ``tmp_path``, because keeping it in sync
+with the fleet is exactly what the supervisor is for.
 
 The clock is injected as well, so the restart backoff and the five-restarts-in-
 fifteen-minutes escalation are driven by hand instead of by ``sleep``. It is also
-the startup-grace clock: a freshly spawned worker is not judged on reads it could
-not answer yet (``WORKER_STARTUP_GRACE_SECONDS``), so the death tests move it
-past the window first. There is no fleet cap and no queue: every eligible
-candidate starts in the same scheduling pass.
+the startup-grace clock -- a freshly spawned worker is not judged on reads it
+could not answer yet (``WORKER_STARTUP_GRACE_SECONDS``), so the death tests move
+it past the window first -- and the pace of the hourly snapshot sweep. There is
+no fleet cap and no queue: every eligible candidate starts in the same scheduling
+pass.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
 import sqlite3
 import stat
 import sys
+import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -42,12 +47,14 @@ from trading_platform.engine.config_builder import (
     profile_runtime_dir,
 )
 from trading_platform.engine.supervisor import (
+    CONFIG_AFFECTING_FIELDS,
     HISTORY_TRADE_LIMIT,
     KILL_SWITCH_FILENAME,
     MAX_RESTARTS_IN_WINDOW,
     RESTART_BACKOFF_SECONDS,
     RESTART_WINDOW_SECONDS,
     SETTINGS_KEY,
+    SNAPSHOT_PRUNE_INTERVAL_SECONDS,
     TERMINATE_GRACE_SECONDS,
     UNHEALTHY_PING_THRESHOLD,
     UNHEALTHY_THRESHOLD,
@@ -56,7 +63,14 @@ from trading_platform.engine.supervisor import (
     Supervisor,
 )
 from trading_platform.metrics import build_health, build_profile_view
-from trading_platform.models import PROFILE_STATES, ProfileConfig, ProfileMetrics, format_ts
+from trading_platform.models import (
+    PROFILE_STATES,
+    ProfileConfig,
+    ProfileMetrics,
+    ProfileSnapshot,
+    format_ts,
+    utc_now,
+)
 from trading_platform.paths import CONFIG_DIR, STRATEGIES_DIR
 from trading_platform.profiles.store import StateStore
 
@@ -66,6 +80,30 @@ START_TIME = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 #: Default environment of a harness: it pins the Freqtrade binary so that the
 #: recorded command line does not depend on the machine running the suite.
 BASE_ENV: dict[str, str] = {"TB_FREQTRADE_BIN": sys.executable}
+
+#: How long the gated spawn waits for a second arrival before it goes on alone.
+#:
+#: The concurrency test needs the *negative* case to be observable: a launcher
+#: whose spawn blocks until a second ``schedule`` reaches it releases both calls
+#: when the fleet lock is missing, and times out on its own when the lock holds
+#: the second pass back. The value is generous enough for a loaded machine and
+#: short enough to keep the suite fast.
+SPAWN_GATE_TIMEOUT_SECONDS = 1.0
+
+#: The fields whose edit forces a restart, spelled out independently of the
+#: module so a silent edit of :data:`CONFIG_AFFECTING_FIELDS` fails here.
+RESTART_FIELDS = (
+    "strategy",
+    "timeframe",
+    "mode",
+    "exchange",
+    "pairs",
+    "initial_capital",
+    "max_open_trades",
+)
+
+#: The fields an edit of which never touches a running worker.
+DISPLAY_ONLY_FIELDS = ("name", "priority", "enabled")
 
 #: The strategy metadata document written into the temporary config directory.
 STRATEGIES_DOCUMENT: dict[str, Any] = {
@@ -209,13 +247,28 @@ class SpawnCall:
 
 
 class RecordingLauncher:
-    """A :class:`ProcessLauncher` double that never starts a process."""
+    """A :class:`ProcessLauncher` double that never starts a process.
 
-    def __init__(self, *, fail_with: OSError | None = None) -> None:
+    ``spawn_gate`` turns the double into a *blocking* one: every ``spawn`` call
+    announces itself on ``spawn_started`` and then waits on the gate, so a test
+    can hold a spawn in flight while a second thread calls
+    :meth:`Supervisor.schedule`. Without the fleet lock the second pass reaches
+    ``spawn`` as well and the gate releases both calls; with the lock the second
+    pass never gets there and the gate simply times out.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_with: OSError | None = None,
+        spawn_gate: threading.Barrier | None = None,
+    ) -> None:
         self.calls: list[SpawnCall] = []
         self.terminated: list[FakeProcess] = []
         self.grace_seconds: list[float] = []
         self.fail_with = fail_with
+        self.spawn_gate = spawn_gate
+        self.spawn_started = threading.Event()
         self._pid = 5000
 
     def spawn(
@@ -229,6 +282,13 @@ class RecordingLauncher:
         """Record the call and return a fake child handle."""
         if self.fail_with is not None:
             raise self.fail_with
+        self.spawn_started.set()
+        if self.spawn_gate is not None:
+            # A barrier that releases means a second spawn arrived -- the
+            # regression; a barrier that times out means the fleet lock held the
+            # second scheduling pass back, so this spawn goes on alone.
+            with contextlib.suppress(threading.BrokenBarrierError):
+                self.spawn_gate.wait(timeout=SPAWN_GATE_TIMEOUT_SECONDS)
         self._pid += 1
         process = FakeProcess(argv, self._pid)
         self.calls.append(
@@ -470,6 +530,17 @@ def profile_config(profile_id: str, **overrides: Any) -> ProfileConfig:
     return ProfileConfig.model_validate(document)
 
 
+def free_port(_port: int) -> bool:
+    """The default probe of the harness: every port is free, nothing is bound.
+
+    Production binds a loopback socket (``config_builder.port_is_available``);
+    the suite injects this decision function instead, so a test never depends on
+    what the machine running it happens to have bound. The collision tests pass
+    their own refusing double.
+    """
+    return True
+
+
 def write_documents(
     config_dir: Path,
     profiles: Sequence[ProfileConfig] = (),
@@ -494,11 +565,14 @@ def make_harness(
     launcher: RecordingLauncher | None = None,
     api: FakeFreqtradeApi | None = None,
     seed_store: bool = True,
+    port_probe: Callable[[int], bool] | None = None,
 ) -> Harness:
     """Build a supervisor whose children and REST calls are entirely faked.
 
     The default settings are the documented platform defaults; no setting bounds
-    how many profiles may run any more.
+    how many profiles may run any more. The port probe defaults to
+    :func:`free_port`, so the fleet keeps the deterministic ``base + index``
+    ports and no test opens a socket.
     """
     state_dir = tmp_path / "realtime"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -525,6 +599,7 @@ def make_harness(
         client_factory=resolved_api,
         env=resolved_env,
         clock=resolved_clock,
+        port_probe=free_port if port_probe is None else port_probe,
     )
     return Harness(
         supervisor=supervisor,
@@ -648,6 +723,7 @@ def test_bootstrap_archives_a_legacy_database(tmp_path: Path) -> None:
         client_factory=FakeFreqtradeApi(),
         env=dict(BASE_ENV),
         clock=FakeClock(),
+        port_probe=free_port,
     )
     supervisor.bootstrap()
 
@@ -805,6 +881,7 @@ def test_every_enabled_paper_profile_runs_and_none_is_ever_queued(tmp_path: Path
         client_factory=FakeFreqtradeApi(),
         env=dict(BASE_ENV),
         clock=FakeClock(),
+        port_probe=free_port,
     )
 
     supervisor.bootstrap()
@@ -873,6 +950,7 @@ def test_the_queued_state_is_unreachable(tmp_path: Path) -> None:
         client_factory=FakeFreqtradeApi(),
         env=dict(BASE_ENV),
         clock=FakeClock(),
+        port_probe=free_port,
     )
 
     supervisor.bootstrap()
@@ -928,6 +1006,225 @@ def test_api_ports_follow_the_id_sorted_catalogue(tmp_path: Path) -> None:
     assert records["alpha"].api_port == 9000
     assert records["mu"].api_port == 9001
     assert records["zeta"].api_port == 9002
+
+
+def test_api_ports_stay_deterministic_when_a_probe_is_injected(tmp_path: Path) -> None:
+    """The liveness probe only *skips* a candidate; a free fleet keeps its map."""
+    profiles = [profile_config("beta"), profile_config("alpha")]
+    probes: list[int] = []
+
+    def probe(port: int) -> bool:
+        probes.append(port)
+        return True
+
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(profile_api_port_base=9000),
+        port_probe=probe,
+    )
+    harness.supervisor.bootstrap()
+
+    records = harness.records()
+    assert records["alpha"].api_port == 9000
+    assert records["beta"].api_port == 9001
+    assert probes == [9000, 9001]
+
+
+def test_a_refused_preferred_port_is_skipped_and_stored(tmp_path: Path) -> None:
+    """A port the machine already holds is not given to a worker.
+
+    A worker that cannot bind its REST port hangs before its trading loop, so the
+    allocator walks on to the next free candidate -- and the port it really got is
+    the one the store keeps and the generated configuration listens on.
+    """
+    held = {9000}
+    probes: list[int] = []
+
+    def probe(port: int) -> bool:
+        probes.append(port)
+        return port not in held
+
+    harness = make_harness(
+        tmp_path,
+        profiles=[profile_config("alpha")],
+        settings=PlatformSettings(profile_api_port_base=9000),
+        port_probe=probe,
+    )
+    harness.supervisor.bootstrap()
+
+    record = harness.records()["alpha"]
+    assert probes == [9000, 9001]
+    assert record.api_port == 9001
+    config = json.loads(profile_config_path(harness.state_dir, "alpha").read_text(encoding="utf-8"))
+    assert config["api_server"]["listen_port"] == record.api_port
+    assert harness.spawned_ids() == ["alpha"]
+
+
+def test_a_port_held_by_another_profile_is_skipped(tmp_path: Path) -> None:
+    """A port stored for a sibling is reserved, so the fleet never shares one.
+
+    ``beta`` already holds 9000 -- the preferred slot of ``alpha``, the first id
+    of the fleet -- so ``alpha`` takes the next free port, and ``beta`` is then
+    moved off the port ``alpha`` owns.
+    """
+    profiles = [profile_config("alpha"), profile_config("beta")]
+    harness = make_harness(
+        tmp_path,
+        profiles=profiles,
+        settings=PlatformSettings(profile_api_port_base=9000),
+    )
+    for profile in profiles:
+        harness.store.upsert_profile(profile, source="catalogue", state="stopped")
+    harness.store.set_profile_runtime("beta", api_port=9000)
+
+    harness.supervisor.bootstrap()
+
+    records = harness.records()
+    assert records["alpha"].api_port == 9001
+    assert records["beta"].api_port == 9002
+    assert len({records["alpha"].api_port, records["beta"].api_port}) == 2
+
+
+# ---------------------------------------------------------------------------
+# Fleet safety: the scheduling path is serialised
+# ---------------------------------------------------------------------------
+def test_concurrent_schedules_spawn_exactly_one_tracked_child(tmp_path: Path) -> None:
+    """Two concurrent starts of one profile leave exactly one child, tracked.
+
+    ``schedule`` is reachable from the event loop and from FastAPI's threadpool.
+    Without the fleet lock both calls pass the ``is_running`` test while the
+    first spawn is still in flight, so two children are started while only the
+    second is registered in ``_processes``: the untracked twin keeps trading, is
+    never polled and is never stopped by the kill switch, which walks
+    ``_processes`` only. The gated launcher makes the window observable -- it
+    releases a second spawn immediately when one arrives, and times out when the
+    lock holds the second pass back.
+    """
+    gate = threading.Barrier(2, timeout=SPAWN_GATE_TIMEOUT_SECONDS)
+    launcher = RecordingLauncher(spawn_gate=gate)
+    harness = make_harness(tmp_path, launcher=launcher)
+    harness.store.upsert_profile(profile_config("alpha"), source="catalogue", state="stopped")
+    supervisor = harness.supervisor
+    failures: list[BaseException] = []
+
+    def run_schedule() -> None:
+        try:
+            supervisor.schedule()
+        except BaseException as exc:  # pragma: no cover - a thread must not die silently
+            failures.append(exc)
+
+    first = threading.Thread(target=run_schedule)
+    second = threading.Thread(target=run_schedule)
+    first.start()
+    assert launcher.spawn_started.wait(timeout=SPAWN_GATE_TIMEOUT_SECONDS * 10)
+    second.start()
+    first.join(timeout=SPAWN_GATE_TIMEOUT_SECONDS * 10)
+    second.join(timeout=SPAWN_GATE_TIMEOUT_SECONDS * 10)
+
+    assert failures == []
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(launcher.calls) == 1
+    assert list(supervisor._processes) == ["alpha"]
+    # Every live child of the fleet is the child the supervisor tracks.
+    assert launcher.running() == [supervisor._processes["alpha"]]
+    assert supervisor.is_running("alpha")
+    assert harness.records()["alpha"].state == "running"
+
+
+# ---------------------------------------------------------------------------
+# Editing a profile reaches its worker
+# ---------------------------------------------------------------------------
+def test_the_config_affecting_field_set_is_pinned() -> None:
+    """The two field sets are the documented contract, spelled out here."""
+    documented = frozenset(RESTART_FIELDS)
+    assert documented == CONFIG_AFFECTING_FIELDS
+    assert documented.isdisjoint(DISPLAY_ONLY_FIELDS)
+
+
+@pytest.mark.parametrize("field", RESTART_FIELDS)
+def test_apply_config_change_restarts_a_running_profile(tmp_path: Path, field: str) -> None:
+    """A config-affecting edit of a running profile respawns its worker."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    assert len(harness.launcher.calls) == 1
+
+    restarted = supervisor.apply_config_change("alpha", {field: "changed"})
+
+    assert restarted is True
+    assert len(harness.launcher.calls) == 2
+    assert harness.spawned_ids() == ["alpha", "alpha"]
+    assert harness.kinds().count("restart") == 1
+    assert supervisor.is_running("alpha")
+
+
+def test_apply_config_change_regenerates_the_worker_configuration(tmp_path: Path) -> None:
+    """The regenerated file carries the new values, which is the point of the restart."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    changes: dict[str, Any] = {
+        "pairs": ["SOL/USDT"],
+        "initial_capital": 250.0,
+        "max_open_trades": 5,
+    }
+    harness.store.update_profile_fields("alpha", changes)
+
+    assert supervisor.apply_config_change("alpha", changes) is True
+
+    config = json.loads(profile_config_path(harness.state_dir, "alpha").read_text(encoding="utf-8"))
+    assert config["exchange"]["pair_whitelist"] == ["SOL/USDT"]
+    assert config["dry_run_wallet"] == 250.0
+    assert config["max_open_trades"] == 5
+
+
+@pytest.mark.parametrize("field", DISPLAY_ONLY_FIELDS)
+def test_apply_config_change_leaves_a_display_only_edit_alone(tmp_path: Path, field: str) -> None:
+    """``name``, ``priority`` and ``enabled`` never touch the worker."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    spawns = len(harness.launcher.calls)
+
+    assert supervisor.apply_config_change("alpha", {field: "changed"}) is False
+
+    assert len(harness.launcher.calls) == spawns
+    assert harness.launcher.terminated == []
+    assert harness.kinds().count("restart") == 0
+    assert supervisor.is_running("alpha")
+
+
+def test_apply_config_change_ignores_an_empty_or_unknown_field_set(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    spawns = len(harness.launcher.calls)
+
+    assert supervisor.apply_config_change("alpha", []) is False
+    assert supervisor.apply_config_change("alpha", {"unknown": 1}) is False
+    assert supervisor.apply_config_change("ghost", {"pairs": ["SOL/USDT"]}) is False
+
+    assert len(harness.launcher.calls) == spawns
+    assert supervisor.is_running("alpha")
+
+
+def test_apply_config_change_never_starts_a_stopped_profile(tmp_path: Path) -> None:
+    """An edit of a stopped profile stays an edit: the worker starts later."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    supervisor.stop_profile("alpha")
+    spawns = len(harness.launcher.calls)
+
+    assert supervisor.apply_config_change("alpha", {"pairs": ["SOL/USDT"]}) is False
+
+    assert len(harness.launcher.calls) == spawns
+    assert not supervisor.is_running("alpha")
+    record = harness.records()["alpha"]
+    assert record.state == "stopped"
+    assert record.state_reason == "operator_stop"
 
 
 def test_operator_stop_survives_the_scheduler(tmp_path: Path) -> None:
@@ -1549,6 +1846,7 @@ def test_boot_reads_the_ambient_environment_when_no_mapping_is_injected(
         launcher=RecordingLauncher(),
         client_factory=FakeFreqtradeApi(),
         clock=FakeClock(),
+        port_probe=free_port,
     )
 
     supervisor.bootstrap()
@@ -1783,6 +2081,7 @@ def test_the_strategy_path_falls_back_to_the_repository_directory(tmp_path: Path
         client_factory=FakeFreqtradeApi(),
         env=dict(BASE_ENV),
         clock=FakeClock(),
+        port_probe=free_port,
     )
 
     supervisor.bootstrap()
@@ -1859,6 +2158,67 @@ async def test_a_failing_history_read_never_restarts_a_healthy_worker(tmp_path: 
     await supervisor.refresh_once()
 
     assert supervisor.history_for("alpha") == ([DAILY_ROW], [TRADE_ROW, OPEN_TRADE_ROW])
+
+
+# ---------------------------------------------------------------------------
+# Snapshot retention: the state database stays bounded
+# ---------------------------------------------------------------------------
+async def test_the_poll_cycle_prunes_the_snapshots_outside_the_retention_window(
+    tmp_path: Path,
+) -> None:
+    """The documented retention is really enforced, at most once per interval.
+
+    The cutoff belongs to the store (``equity_retention_days`` against the wall
+    clock), while the pace of the sweep belongs to the supervisor's injected
+    clock: the first cycle prunes, and a row that goes stale straight afterwards
+    survives the *next* cycle of the same hour. That second assertion is what
+    pins the interval -- and not merely that the sweep is called.
+    """
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    assert supervisor.snapshots_pruned == 0
+
+    harness.store.record_snapshot(
+        ProfileSnapshot(profile_id="alpha", ts=format_ts(utc_now() - timedelta(days=91)))
+    )
+
+    await supervisor.refresh_once()
+
+    assert harness.store.list_snapshots("alpha") == []
+    assert supervisor.snapshots_pruned == 1
+
+    stale = ProfileSnapshot(
+        profile_id="alpha",
+        ts=format_ts(utc_now() - timedelta(days=91)),
+        portfolio_value=900.0,
+        cash=900.0,
+    )
+    harness.store.record_snapshot(stale)
+
+    await supervisor.refresh_once()
+
+    assert [row.ts for row in harness.store.list_snapshots("alpha")] == [stale.ts]
+    assert supervisor.snapshots_pruned == 1
+
+    harness.clock.advance(SNAPSHOT_PRUNE_INTERVAL_SECONDS)
+    await supervisor.refresh_once()
+
+    assert harness.store.list_snapshots("alpha") == []
+    assert supervisor.snapshots_pruned == 2
+
+
+async def test_a_poll_cycle_with_nothing_to_prune_stays_silent(tmp_path: Path) -> None:
+    """A fresh snapshot is retained, and the counter does not move."""
+    harness = make_harness(tmp_path, profiles=[profile_config("alpha")])
+    supervisor = harness.supervisor
+    supervisor.bootstrap()
+    harness.store.record_snapshot(ProfileSnapshot(profile_id="alpha", ts=format_ts(utc_now())))
+
+    await supervisor.refresh_once()
+
+    assert len(harness.store.list_snapshots("alpha")) == 1
+    assert supervisor.snapshots_pruned == 0
 
 
 # ---------------------------------------------------------------------------

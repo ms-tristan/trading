@@ -123,6 +123,29 @@ The division of labour is deliberate:
 `docs/architecture.md` documents the design in full, including the state-database
 schema and the health/restart policy.
 
+### The risk-reporting contract
+
+The aggregated API publishes **ratios, not percentages**, and it distinguishes
+"no losing trade yet" from "all losses":
+
+* every field whose name ends in `_pct` (`profit_pct`, `max_drawdown_pct`) and
+  `win_rate` is a **0..1 ratio** on the wire; the dashboard multiplies by 100 for
+  display and the engine never multiplies twice. `max_drawdown_pct` is the
+  magnitude freqtrade published — freqtrade 2026.8 answers `max_drawdown` as a
+  relative drawdown — stored and served unchanged, so the fleet's worst drawdown
+  is the true maximum and not the smallest of a mix of units;
+* `profit_factor` is **nullable**: `null` means the profile has not lost a trade
+  yet (freqtrade serialises the `Infinity` of a flawless record as `null`) and is
+  excluded from the fleet pool, while `0.0` keeps its real meaning of a record
+  that lost every trade;
+* the combined equity curve carries each profile's **last known portfolio value**
+  across the minutes it did not report, instead of dropping that profile's equity
+  from the total: one failed read used to fake a -33 % cliff on a 1,000 USDT
+  fleet and corrupt the reported Sharpe ratio.
+
+`GET /api/account` and `GET /api/profiles` obey that contract, and
+`dashboard/src/lib/types.ts` documents it on the consumer side.
+
 ---
 
 ## 3. Profiles
@@ -205,6 +228,35 @@ improvement can be measured against a live baseline.
 | `faber-all-in` | `FaberAllInStrategy.py` | `faber`'s rule, resized for a single all-in position |
 | `donchian-all-in` | `DonchianAllInStrategy.py` | `donchian`'s breakout, resized, with an ATR chandelier exit |
 
+### ROI policy and the BTC regime gate
+
+`minimal_roi` is freqtrade's profit ladder: a trade is closed as soon as it is in
+profit by at least the rung in force. **Twelve of the fifteen strategies** — the
+six original trend and breakout rules (`basic`, `momentum`, `macd`, `donchian`,
+`supertrend`, `dual-thrust`) and the six research-written ones — set their only
+rung to `{0: 1.0}`, a +100 % target no ordinary trade reaches. That disables the
+ladder: the position is closed by its exit signal or by the stoploss, so a
+time-decaying terminal rung can no longer cut a trend's right tail at *any*
+non-negative profit while the stoploss stays uncapped. The three mean-reversion
+strategies (`bollinger`, `keltner`, `rsi-reversion`) genuinely need a target, so
+they keep a ladder and their terminal rung carries the **previous tier's value**
+instead of falling to `0.0`; removing it altogether regresses on the measured
+profiles.
+
+Those same six trend and breakout strategies share a **causal BTC 200-day regime
+gate** (`user_data/strategies/market_regime.py`): entries are suppressed while
+BTC/USDT on the daily grid closes at or below its 200-day average. The gate reads
+the daily frame through `self.dp.get_pair_dataframe("BTC/USDT", "1d")`, shifts
+that daily regime by **one full day** before forward-filling it onto the signal
+frame — a daily candle is only complete at its close, so the unshifted value
+would be lookahead — and **fails closed** (no entries) when the frame is missing
+or empty. It declares the informative pair so the frame exists in dry-run and
+live, and it needs 201 daily candles before it can open anything on a fresh
+start. The six strategies that already carry a regime filter of their own
+(`keltner-breakout-v2`, `trend-ensemble-v2`, `vol-targeted-trend`, `faber`,
+`faber-all-in`, `donchian-all-in`) deliberately do not use it: measured over the
+same two-year window, it hurts them.
+
 `docs/strategies.md` documents each one: logic, parameters, suitable timeframes
 and risk notes.
 
@@ -234,7 +286,7 @@ at request time.
 | Capital | `dry_run_wallet = initial_capital` (the profile's starting cash) | `initial_capital` is only the reference the platform measures profit against |
 | Credentials | none | `TB_LIVE_EXCHANGE_KEY` / `TB_LIVE_EXCHANGE_SECRET` from the environment |
 | Extra gate | none | `TB_ALLOW_LIVE_TRADING` must equal exactly `I_UNDERSTAND_THE_RISK` |
-| Default catalogue | 20 profiles, 1000 USDT each | 2 profiles, 250 USDT each |
+| Default catalogue | 16 profiles, 1000 USDT each | 2 profiles, 250 USDT each |
 
 A live profile is **never started** unless the acknowledgement variable holds the
 exact sentence *and* both exchange credentials are present in the environment.
@@ -472,9 +524,9 @@ runbook is in `docs/operations.md`.
 
 | Document | Content |
 | --- | --- |
-| `docs/architecture.md` | supervisor/fleet design, the full state-database schema, port allocation, the snapshot model, the health and restart policy, the live-trading safety gates |
-| `docs/strategies.md` | the strategies: logic, parameters, suitable timeframes, risk notes |
-| `docs/operations.md` | the runbook: compose commands, health checks, provisioning, the worker crash-loop fix, the kill switch, log locations, reading the state database |
+| `docs/architecture.md` | supervisor/fleet design, the full state-database schema, port allocation, the snapshot model, the ratio/nullable-`profit_factor` wire contract, the health and restart policy, the generated configuration, the live-trading safety gates |
+| `docs/strategies.md` | the strategies: logic, parameters, suitable timeframes, risk notes, the shipped ROI ladders and the shared causal BTC 200-day regime gate |
+| `docs/operations.md` | the runbook: compose commands, health checks, provisioning, the worker crash-loop fix, profile edits and worker restarts, worker ports, the kill switch, the retention prune, the worker risk controls, log locations, reading the state database |
 | `docs/testing-policy.md` | the enforceable test and coverage policy (the gates quoted above) |
 | `deploy/README.md` | the deployment: containers, volumes, nginx, TLS, fail2ban, automatic deploys |
 

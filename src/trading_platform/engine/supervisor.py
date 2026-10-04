@@ -22,7 +22,7 @@ interval; that is also where the health policy is applied and where the daily
 and trade history of every answering worker is read, for the monitoring read
 model.
 
-Seven rules are worth stating because they are easy to get wrong:
+Eleven rules are worth stating because they are easy to get wrong:
 
 * a worker the supervisor stopped itself (operator stop, kill switch, restart,
   shutdown) is **never** reported as a crash -- the process handle is dropped
@@ -38,6 +38,25 @@ Seven rules are worth stating because they are easy to get wrong:
 * every eligible candidate starts in the same scheduling pass -- there is no
   fleet cap, no slot accounting and no gate that holds a profile back, so no
   profile is ever left waiting for a slot;
+* the whole scheduling path is serialised by one re-entrant fleet lock
+  (:meth:`Supervisor.schedule`, :meth:`Supervisor.start_profile`,
+  :meth:`Supervisor.stop_profile`, :meth:`Supervisor.restart_profile`,
+  :meth:`Supervisor.apply_config_change`,
+  :meth:`Supervisor.engage_kill_switch`,
+  :meth:`Supervisor.release_kill_switch`): the pass is reachable from the event
+  loop *and* from FastAPI's threadpool, and without the lock the window between
+  the "is it running?" test and the "here is its process" write lets two starts
+  spawn a tracked child plus an untracked twin that no poll and no kill switch
+  (which iterates ``self._processes``) can reach;
+* a worker REST port is **preferred, not imposed**: the id-sorted index still
+  gives the documented ``base + index``, but a port already stored for another
+  profile or already held on the machine is skipped, because a worker that
+  cannot bind its port hangs before its trading loop;
+* the generated configuration is the worker's only copy of its settings, so
+  editing a field that is written into it (``strategy``, ``timeframe``,
+  ``mode``, ``exchange``, ``pairs``, ``initial_capital``,
+  ``max_open_trades``) restarts a running worker instead of leaving the process
+  on the values the dashboard no longer shows;
 * the restart budget is a sliding window: at most
   :data:`MAX_RESTARTS_IN_WINDOW` restarts inside
   :data:`RESTART_WINDOW_SECONDS`, with the backoff saturating at 45 s. Once the
@@ -54,6 +73,10 @@ Seven rules are worth stating because they are easy to get wrong:
   restarted. Restarting a live worker is not a cheap decision: it wipes its
   in-memory state, and a fleet restarted in a loop never gets the chance to
   finish its warm-up;
+* the poll cycle prunes the snapshots outside
+  :attr:`~trading_platform.config.PlatformSettings.equity_retention_days` at
+  most once every :data:`SNAPSHOT_PRUNE_INTERVAL_SECONDS`, so the state database
+  stays bounded without a second timer;
 * nothing that reaches a log line or an event ever carries the REST password of
   a worker or an exchange credential -- the generated configuration file is the
   only place a credential is written, and it is written with mode ``0o600``.
@@ -66,7 +89,8 @@ import logging
 import os
 import secrets
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -106,6 +130,7 @@ from .config_builder import (
     allocate_api_port,
     build_freqtrade_argv,
     build_freqtrade_config,
+    port_is_available,
     profile_config_path,
     profile_data_dir,
     profile_db_url,
@@ -117,6 +142,7 @@ from .config_builder import (
 
 __all__ = [
     "API_PASSWORD_BYTES",
+    "CONFIG_AFFECTING_FIELDS",
     "CONTAINER_STRATEGIES_DIR",
     "EVENT_BLOCKED_LIVE",
     "EVENT_CATALOGUE_APPLIED",
@@ -143,6 +169,7 @@ __all__ = [
     "RESTART_BACKOFF_SECONDS",
     "RESTART_WINDOW_SECONDS",
     "SETTINGS_KEY",
+    "SNAPSHOT_PRUNE_INTERVAL_SECONDS",
     "TERMINATE_GRACE_SECONDS",
     "UNHEALTHY_PING_THRESHOLD",
     "UNHEALTHY_THRESHOLD",
@@ -193,6 +220,32 @@ API_PASSWORD_BYTES = 24
 
 #: Closed trades read per profile and per poll cycle, for the trade read model.
 HISTORY_TRADE_LIMIT = 50
+
+#: Minimum delay between two snapshot prunes of the poll cycle, in seconds.
+#:
+#: The retention itself is :attr:`PlatformSettings.equity_retention_days`; this
+#: interval only decides how often the sweep runs, so a one-minute poll does not
+#: issue a ``DELETE`` on every tick. The clock is injected, so the interval is
+#: driven by hand in the tests.
+SNAPSHOT_PRUNE_INTERVAL_SECONDS: float = 3600.0
+
+#: Profile fields whose change makes the generated worker configuration stale.
+#:
+#: Every one of them is written into the file the worker was started from, so a
+#: running worker has to be restarted to pick the new value up. The fields
+#: outside this set (``name``, ``priority``, ``enabled``) only change the
+#: database and the dashboard, so editing them leaves the worker alone.
+CONFIG_AFFECTING_FIELDS: frozenset[str] = frozenset(
+    {
+        "strategy",
+        "timeframe",
+        "mode",
+        "exchange",
+        "pairs",
+        "initial_capital",
+        "max_open_trades",
+    }
+)
 
 #: Reason recorded on a profile the operator stopped.
 REASON_OPERATOR_STOP = "operator_stop"
@@ -376,6 +429,7 @@ class Supervisor:
         client_factory: Callable[..., FreqtradeClient] | None = None,
         env: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
+        port_probe: Callable[[int], bool] | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -390,6 +444,23 @@ class Supervisor:
             FreqtradeClient if client_factory is None else client_factory
         )
         self._clock: Callable[[], datetime] = utc_now if clock is None else clock
+        # The liveness probe of a candidate port: production binds a socket on
+        # the loopback interface, a test injects a decision function.
+        self._port_probe: Callable[[int], bool] = (
+            port_is_available if port_probe is None else port_probe
+        )
+
+        #: Serialises the whole scheduling path. ``schedule`` is reachable from
+        #: the event loop *and* from FastAPI's threadpool, and the lock closes
+        #: the check-then-act window between the ``is_running`` test and the
+        #: ``_processes`` write of :meth:`_start`: without it two concurrent
+        #: starts spawn two children while only one is tracked, and the
+        #: untracked twin keeps trading where no poll and no kill switch
+        #: (which iterates ``self._processes``) can reach it. It is re-entrant
+        #: because ``schedule`` reaches ``_start``, ``release_kill_switch``
+        #: reaches ``schedule`` and ``apply_config_change`` reaches
+        #: ``restart_profile`` on one and the same thread.
+        self._fleet_lock = threading.RLock()
 
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._clients: dict[str, FreqtradeClient] = {}
@@ -405,6 +476,10 @@ class Supervisor:
         self._running = False
         self._started_at: datetime | None = None
         self._last_poll_at: datetime | None = None
+        #: When the snapshots were pruned last; ``None`` until the first sweep.
+        self._last_prune_at: datetime | None = None
+        #: Snapshot rows deleted by this supervisor, published for the operator.
+        self.snapshots_pruned: int = 0
 
     # -- clock -------------------------------------------------------------
     def now(self) -> datetime:
@@ -496,30 +571,38 @@ class Supervisor:
         While the kill switch is engaged the method only makes sure that nothing
         runs: it never rewrites a state, so the journal keeps reporting the kill
         switch as the reason the fleet is down.
-        """
-        profiles = self.store.list_profiles()
-        if self.kill_switch_engaged():
-            for record in profiles:
-                if self.is_running(record.id):
-                    self._stop_worker(
-                        record.id,
-                        reason=REASON_KILL_SWITCH,
-                        event_kind=EVENT_STOP,
-                        level="warning",
-                    )
-            return
 
-        for record in self._candidates(profiles):
-            if self.is_running(record.id):
-                continue
-            if not self._consume_backoff(record.id):
-                continue
-            if self._refuse_live(record):
-                continue
-            self._start(record, event_kind=EVENT_START)
-        for record in profiles:
-            if not record.enabled:
-                self._apply_disabled(record)
+        The whole pass holds :attr:`_fleet_lock`, and so does every other entry
+        point of the fleet state: the pass is reachable from the event loop *and*
+        from FastAPI's threadpool, and the gap between the ``is_running`` test
+        below and the ``self._processes[profile_id] = process`` write of
+        :meth:`_start` is where two concurrent starts used to spawn a tracked
+        child plus an untracked twin.
+        """
+        with self._fleet_lock:
+            profiles = self.store.list_profiles()
+            if self.kill_switch_engaged():
+                for record in profiles:
+                    if self.is_running(record.id):
+                        self._stop_worker(
+                            record.id,
+                            reason=REASON_KILL_SWITCH,
+                            event_kind=EVENT_STOP,
+                            level="warning",
+                        )
+                return
+
+            for record in self._candidates(profiles):
+                if self.is_running(record.id):
+                    continue
+                if not self._consume_backoff(record.id):
+                    continue
+                if self._refuse_live(record):
+                    continue
+                self._start(record, event_kind=EVENT_START)
+            for record in profiles:
+                if not record.enabled:
+                    self._apply_disabled(record)
 
     def start_profile(self, profile_id: str) -> None:
         """Start one profile now, whatever the operator did to it before.
@@ -527,16 +610,17 @@ class Supervisor:
         The explicit action clears an operator stop, an ``error`` state and the
         restart budget of the profile, then starts a worker if none is alive.
         """
-        record = self.store.get_profile(profile_id)
-        if record is None:
-            logger.warning("ignoring start of the unknown profile %r", profile_id)
-            return
-        self._operator_stops.discard(profile_id)
-        self._reset_health(profile_id)
-        if self.is_running(profile_id):
-            return
-        if self._start(record, event_kind=EVENT_START):
-            self._operator_starts.add(profile_id)
+        with self._fleet_lock:
+            record = self.store.get_profile(profile_id)
+            if record is None:
+                logger.warning("ignoring start of the unknown profile %r", profile_id)
+                return
+            self._operator_stops.discard(profile_id)
+            self._reset_health(profile_id)
+            if self.is_running(profile_id):
+                return
+            if self._start(record, event_kind=EVENT_START):
+                self._operator_starts.add(profile_id)
 
     def stop_profile(self, profile_id: str, reason: str = REASON_OPERATOR_STOP) -> None:
         """Stop one profile and keep it stopped across the next scheduling passes.
@@ -545,32 +629,61 @@ class Supervisor:
         scheduler does not start it again by itself, so the operator decision
         survives until :meth:`start_profile` or :meth:`restart_profile`.
         """
-        record = self.store.get_profile(profile_id)
-        if record is None:
-            logger.warning("ignoring stop of the unknown profile %r", profile_id)
-            return
-        self._operator_stops.add(profile_id)
-        self._reset_health(profile_id)
-        if self._stop_worker(profile_id, reason=reason, event_kind=EVENT_STOP):
-            return
-        self._set_state(record, STATE_STOPPED, reason)
+        with self._fleet_lock:
+            record = self.store.get_profile(profile_id)
+            if record is None:
+                logger.warning("ignoring stop of the unknown profile %r", profile_id)
+                return
+            self._operator_stops.add(profile_id)
+            self._reset_health(profile_id)
+            if self._stop_worker(profile_id, reason=reason, event_kind=EVENT_STOP):
+                return
+            self._set_state(record, STATE_STOPPED, reason)
 
     def restart_profile(self, profile_id: str) -> None:
         """Stop and start one profile again, clearing its failure history.
 
         This is the operator recovery path of a profile in state ``error``: the
         restart budget is reset, so a fixed worker gets its full set of retries
-        back.
+        back. It is also what :meth:`apply_config_change` calls after an edit of
+        a config-affecting field, so the worker reloads the file it was started
+        from.
         """
-        record = self.store.get_profile(profile_id)
-        if record is None:
-            logger.warning("ignoring restart of the unknown profile %r", profile_id)
-            return
-        self._operator_stops.discard(profile_id)
-        self._reset_health(profile_id)
-        self._terminate_worker(profile_id)
-        if self._start(record, event_kind=EVENT_RESTART):
-            self._operator_starts.add(profile_id)
+        with self._fleet_lock:
+            record = self.store.get_profile(profile_id)
+            if record is None:
+                logger.warning("ignoring restart of the unknown profile %r", profile_id)
+                return
+            self._operator_stops.discard(profile_id)
+            self._reset_health(profile_id)
+            self._terminate_worker(profile_id)
+            if self._start(record, event_kind=EVENT_RESTART):
+                self._operator_starts.add(profile_id)
+
+    def apply_config_change(self, profile_id: str, changed_fields: Iterable[str]) -> bool:
+        """Restart the worker of ``profile_id`` when an edit made its config stale.
+
+        ``write_freqtrade_config`` has exactly one caller -- :meth:`_start` --
+        so a profile edited while it runs keeps trading the configuration it was
+        spawned from: the database and the dashboard show the new values, the
+        worker still uses the old ones. Every field of
+        :data:`CONFIG_AFFECTING_FIELDS` is written into that generated file, so a
+        change to one of them restarts the worker; the fields outside the set
+        (``name``, ``priority``, ``enabled``) leave it alone.
+
+        Returns whether a restart was requested. The method never writes a
+        profile field itself -- the caller owns the write -- and it never starts
+        a profile that holds no worker: a stopped profile picks the new values up
+        from the store when it is next started, so restarting it here would turn
+        an edit into an unrequested start.
+        """
+        with self._fleet_lock:
+            if not CONFIG_AFFECTING_FIELDS.intersection(changed_fields):
+                return False
+            if not self.is_running(profile_id):
+                return False
+            self.restart_profile(profile_id)
+            return True
 
     def is_running(self, profile_id: str) -> bool:
         """Whether a live worker process is held for ``profile_id``."""
@@ -691,33 +804,40 @@ class Supervisor:
         While the file exists nothing starts, including after a container
         restart, because the file lives in the state volume next to the
         database.
+
+        The whole emergency stop holds :attr:`_fleet_lock`, so a scheduling pass
+        cannot spawn a worker between the file being written and the fleet being
+        walked: every child the supervisor holds is stopped, and none is left
+        behind the switch.
         """
-        path = self.kill_switch_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-        for health in self._health.values():
-            health.retry_at = None
-        stopped = self._stop_all_workers(
-            reason=REASON_KILL_SWITCH,
-            event_kind=EVENT_STOP,
-            level="warning",
-        )
-        self.store.record_event(
-            "warning",
-            EVENT_KILL_SWITCH,
-            f"kill switch engaged: {stopped} worker(s) stopped; "
-            f"no profile starts while {KILL_SWITCH_FILENAME} exists",
-        )
+        with self._fleet_lock:
+            path = self.kill_switch_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+            for health in self._health.values():
+                health.retry_at = None
+            stopped = self._stop_all_workers(
+                reason=REASON_KILL_SWITCH,
+                event_kind=EVENT_STOP,
+                level="warning",
+            )
+            self.store.record_event(
+                "warning",
+                EVENT_KILL_SWITCH,
+                f"kill switch engaged: {stopped} worker(s) stopped; "
+                f"no profile starts while {KILL_SWITCH_FILENAME} exists",
+            )
 
     def release_kill_switch(self) -> None:
         """Remove the kill-switch file and resume scheduling immediately."""
-        self.kill_switch_path().unlink(missing_ok=True)
-        self.store.record_event(
-            "info",
-            EVENT_KILL_SWITCH,
-            f"kill switch released: {KILL_SWITCH_FILENAME} removed, scheduling resumed",
-        )
-        self.schedule()
+        with self._fleet_lock:
+            self.kill_switch_path().unlink(missing_ok=True)
+            self.store.record_event(
+                "info",
+                EVENT_KILL_SWITCH,
+                f"kill switch released: {KILL_SWITCH_FILENAME} removed, scheduling resumed",
+            )
+            self.schedule()
 
     # -- polling -----------------------------------------------------------
     async def refresh_once(self) -> None:
@@ -727,6 +847,10 @@ class Supervisor:
         one the test suite drives by hand. It never waits for a worker: every
         read is a bounded REST call, and a worker that does not answer is
         counted, not blocked on.
+
+        The cycle ends with the snapshot sweep of :meth:`_prune_snapshots`, which
+        is rate limited by :data:`SNAPSHOT_PRUNE_INTERVAL_SECONDS` and keeps the
+        state database bounded without a second timer.
         """
         if not self._bootstrapped:
             self.bootstrap()
@@ -737,6 +861,34 @@ class Supervisor:
         self.schedule()
         await self._close_discarded_clients()
         self._last_poll_at = self.now()
+        self._prune_snapshots()
+
+    def _prune_snapshots(self) -> None:
+        """Delete the snapshots outside the retention window, at most hourly.
+
+        The retention is the documented
+        :attr:`~trading_platform.config.PlatformSettings.equity_retention_days`
+        of the effective settings; the sweep runs once every
+        :data:`SNAPSHOT_PRUNE_INTERVAL_SECONDS` and journals the count at info
+        level only when it really removed rows, so an idle state database stays
+        silent. A failing tick is the poller's problem, not this method's.
+        """
+        now = self.now()
+        if (
+            self._last_prune_at is not None
+            and (now - self._last_prune_at).total_seconds() < SNAPSHOT_PRUNE_INTERVAL_SECONDS
+        ):
+            return
+        self._last_prune_at = now
+        removed = self.store.prune_snapshots(retention_days=self.settings.equity_retention_days)
+        if not removed:
+            return
+        self.snapshots_pruned += removed
+        logger.info(
+            "pruned %d snapshot row(s) older than %d day(s)",
+            removed,
+            int(self.settings.equity_retention_days),
+        )
 
     # -- settings ----------------------------------------------------------
     def _platform_config_path(self) -> Path:
@@ -922,7 +1074,13 @@ class Supervisor:
         return True
 
     def _start(self, record: ProfileRecord, *, event_kind: str, level: str = "info") -> bool:
-        """Generate the configuration of ``record`` and spawn its worker."""
+        """Generate the configuration of ``record`` and spawn its worker.
+
+        The caller must already hold :attr:`_fleet_lock`: this is the second
+        half of the check-then-act pair whose first half is the ``is_running``
+        test of :meth:`schedule`, and it is only atomic with respect to the other
+        fleet entry points while the lock is held across both.
+        """
         profile_id = record.id
         if self.kill_switch_engaged():
             self._set_state(record, STATE_STOPPED, REASON_KILL_SWITCH)
@@ -1353,18 +1511,41 @@ class Supervisor:
         return self._catalogue
 
     def _api_port_for(self, profile_id: str) -> int:
-        """Return the deterministic port of a profile.
+        """Return the REST port of a profile: preferred when free, else the next one.
 
         The index is the position of the profile in the **id-sorted** list of
-        every profile of the store, so a profile keeps its port across boots,
-        promotions and deploys.
+        every profile of the store, so a collision-free fleet keeps exactly the
+        deterministic ports it is documented to use, across boots, promotions and
+        deploys. The id-sorted index is only the *preferred* slot: the live map
+        has drifted before, and a worker that cannot bind its port hangs before
+        its trading loop and is walked to a permanent error, so a port already
+        stored for another profile or already held on the machine is skipped.
         """
         identifiers = sorted(record.id for record in self.store.list_profiles())
         try:
             index = identifiers.index(profile_id)
         except ValueError:  # pragma: no cover - the caller just read the profile
             index = 0
-        return allocate_api_port(index, self.settings)
+        return allocate_api_port(
+            index,
+            self.settings,
+            reserved=self._reserved_ports(profile_id),
+            is_available=self._port_probe,
+        )
+
+    def _reserved_ports(self, profile_id: str) -> set[int]:
+        """Return the ports of the *other* profiles, which ``profile_id`` must avoid.
+
+        The profile's own stored port is deliberately not reserved: it is the
+        port it should keep, and the liveness probe is what decides whether it is
+        free again (the supervisor terminated its previous worker before it
+        restarts it).
+        """
+        return {
+            int(record.api_port)
+            for record in self.store.list_profiles()
+            if record.id != profile_id and record.api_port
+        }
 
     @staticmethod
     def _api_username(profile_id: str) -> str:
