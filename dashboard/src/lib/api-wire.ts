@@ -16,7 +16,9 @@
  *   documented default (`0`, `""`, `[]`, `null`) instead of throwing, so a
  *   partially deployed API still renders an empty but well-formed page. No
  *   mapper can emit `NaN` or `Infinity`: every number goes through
- *   {@link asNumber}.
+ *   {@link asNumber}, and every *optional* measurement (the `null` the API
+ *   publishes for an undefined `profit_factor`) goes through
+ *   {@link asOptionalNumber}, which answers `null` and never `0`.
  * * **no invented measurement.** When the API publishes no counterpart for a
  *   view-model field, the mapper leaves it empty and says so in a comment: the
  *   strategy `pairs`/`open_trades` scalar and the dashboard refresh interval are
@@ -280,6 +282,20 @@ export function asNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+/**
+ * Read an optional finite number: the number itself, or `null` when the field is
+ * absent, `null` or not a finite number.
+ *
+ * This is the reader of the measurements the API may publish as `null` because
+ * they are undefined - `profit_factor` is `null` while no losing trade has
+ * closed, because `Infinity` has no JSON encoding. `null` must stay `null` and
+ * never become `0`, which would claim the opposite measurement (all losses); the
+ * components render it as an em dash.
+ */
+export function asOptionalNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 /** Read a string, or `fallback`. */
 export function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
@@ -372,7 +388,8 @@ export function toProfileView(raw: unknown): ProfileView {
     open_trades: asNumber(row.open_trades),
     closed_trades: asNumber(row.closed_trades),
     win_rate: asNumber(row.win_rate),
-    profit_factor: asNumber(row.profit_factor),
+    // `null` when no losing trade has closed yet: an undefined factor, not `0`.
+    profit_factor: asOptionalNumber(row.profit_factor),
     max_drawdown_pct: asNumber(row.max_drawdown_pct),
     engine_slot: typeof row.slot === "number" ? row.slot : null,
     api_port: typeof row.worker_port === "number" ? row.worker_port : null,
@@ -471,7 +488,8 @@ export function toAccountPerformance(raw: unknown, window: ApiWindow): AccountPe
     open_trades: asNumber(scope.open_trades),
     closed_trades: asNumber(scope.closed_trades),
     win_rate: asNumber(scope.win_rate),
-    profit_factor: asNumber(scope.profit_factor),
+    // `null` when the scope measured none (no losing trade yet): not `0`.
+    profit_factor: asOptionalNumber(scope.profit_factor),
     max_drawdown_pct: asNumber(scope.max_drawdown_pct),
     profiles_total: asNumber(scope.profiles_total),
     profiles_running: profilesRunning,
@@ -536,7 +554,10 @@ export function toStrategyView(raw: unknown): StrategyView {
     open_trades: 0,
     closed_trades: 0,
     win_rate: asNumber(row.win_rate),
-    profit_factor: 0,
+    // The API publishes no strategy-level factor: an omitted measurement is
+    // *undefined*, so it stays `null` (an em dash) instead of a `0` that would
+    // claim every trade lost.
+    profit_factor: null,
     sparkline: [],
   };
   // Catalogue metadata: carried through so a strategy card renders the same

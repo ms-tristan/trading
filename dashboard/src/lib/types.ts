@@ -80,7 +80,8 @@ export interface ProfileView {
   closed_trades: number;
   /** 0..1 ratio. */
   win_rate: number;
-  profit_factor: number;
+  /** Profit factor, or `null` when the API measured none (no losing trade yet): undefined renders as an em dash. */
+  profit_factor: number | null;
   /** 0..1 ratio. */
   max_drawdown_pct: number;
   /**
@@ -149,7 +150,8 @@ export interface AccountPerformance {
   closed_trades: number;
   /** 0..1 ratio. */
   win_rate: number;
-  profit_factor: number;
+  /** Profit factor, or `null` when the API measured none (no losing trade yet): undefined renders as an em dash. */
+  profit_factor: number | null;
   /** 0..1 ratio. */
   max_drawdown_pct: number;
   profiles_total: number;
@@ -193,7 +195,8 @@ export interface StrategyView {
   closed_trades: number;
   /** 0..1 ratio. */
   win_rate: number;
-  profit_factor: number;
+  /** Profit factor, or `null` when the API measured none (no losing trade yet): undefined renders as an em dash. */
+  profit_factor: number | null;
   sparkline: number[];
   /** Freqtrade class name of the strategy, when the catalogue declares one. */
   class_name?: string;
@@ -379,7 +382,9 @@ export const EMPTY_ACCOUNT: AccountResponse = {
     open_trades: 0,
     closed_trades: 0,
     win_rate: 0,
-    profit_factor: 0,
+    // No measurement exists for the fallback payload: `0` would read as
+    // "all losses", so the honest value here is the undefined one.
+    profit_factor: null,
     max_drawdown_pct: 0,
     profiles_total: 0,
     profiles_running: 0,

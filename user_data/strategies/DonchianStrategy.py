@@ -10,10 +10,11 @@ volatility expansion takes the trade out before the fixed stoploss is reached.
 
 import talib.abstract as ta
 from freqtrade.strategy import IStrategy
+from market_regime import BtcRegimeGateMixin
 from pandas import DataFrame
 
 
-class DonchianStrategy(IStrategy):
+class DonchianStrategy(BtcRegimeGateMixin, IStrategy):
     """Enter on a close above the previous 20-candle high; exit on the 10-candle low or ATR."""
 
     INTERFACE_VERSION = 3
@@ -29,7 +30,10 @@ class DonchianStrategy(IStrategy):
     startup_candle_count = 25
 
     stoploss = -0.08
-    minimal_roi = {"0": 0.20, "1440": 0.10, "2880": 0.0}
+    # The single rung is unreachable, so the ROI ladder is disabled: the trade is
+    # closed by the exit signal or by the stoploss, never by a time-decaying target,
+    # which no longer truncates the right tail of a breakout move.
+    minimal_roi = {"0": 1.0}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
@@ -48,7 +52,8 @@ class DonchianStrategy(IStrategy):
         dataframe["enter_tag"] = ""
         dataframe.loc[breakout & (dataframe["volume"] > 0), "enter_long"] = 1
         dataframe.loc[breakout & (dataframe["volume"] > 0), "enter_tag"] = "donchian_breakout"
-        return dataframe
+        # Hand the signals to the next class of the MRO: the BTC regime gate filters them.
+        return super().populate_entry_trend(dataframe, metadata)
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # The 10-candle low ends the breakout; the ATR chandelier ends it when

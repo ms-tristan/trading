@@ -29,7 +29,10 @@ class RsiReversionStrategy(IStrategy):
     startup_candle_count = 210
 
     stoploss = -0.10
-    minimal_roi = {"0": 0.06, "240": 0.03, "720": 0.0}
+    # Mean reversion needs a target, so the ladder stays -- but the terminal rung now
+    # carries the previous tier's value instead of decaying to zero, which used to
+    # close the trade at any non-negative profit once its timestamp had passed.
+    minimal_roi = {"0": 0.06, "240": 0.03, "720": 0.03}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)

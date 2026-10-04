@@ -10,6 +10,7 @@ final upper band and back to -1 when it loses the final lower band.
 import numpy as np
 import talib.abstract as ta
 from freqtrade.strategy import IStrategy
+from market_regime import BtcRegimeGateMixin
 from pandas import DataFrame
 
 SUPERTREND_PERIOD = 10
@@ -65,7 +66,7 @@ def supertrend_direction(
     return direction
 
 
-class SupertrendStrategy(IStrategy):
+class SupertrendStrategy(BtcRegimeGateMixin, IStrategy):
     """Enter on the Supertrend(10, 3.0) flip to uptrend; exit on the flip to downtrend."""
 
     INTERFACE_VERSION = 3
@@ -81,7 +82,10 @@ class SupertrendStrategy(IStrategy):
     startup_candle_count = 30
 
     stoploss = -0.10
-    minimal_roi = {"0": 0.10, "720": 0.05, "2880": 0.0}
+    # The single rung is unreachable, so the ROI ladder is disabled: the trade is
+    # closed by the exit signal or by the stoploss, never by a time-decaying target,
+    # which no longer truncates the right tail of a trend move.
+    minimal_roi = {"0": 1.0}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         average_range = ta.ATR(dataframe, timeperiod=SUPERTREND_PERIOD)
@@ -102,7 +106,8 @@ class SupertrendStrategy(IStrategy):
         dataframe["enter_tag"] = ""
         dataframe.loc[flip_up & (dataframe["volume"] > 0), "enter_long"] = 1
         dataframe.loc[flip_up & (dataframe["volume"] > 0), "enter_tag"] = "supertrend_flip_up"
-        return dataframe
+        # Hand the signals to the next class of the MRO: the BTC regime gate filters them.
+        return super().populate_entry_trend(dataframe, metadata)
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         previous_direction = dataframe["supertrend_direction"].shift(1)

@@ -170,6 +170,57 @@ still a run-time setting: a shorter interval gives finer equity curves and more
 REST traffic per worker. It is also the poll cadence the health rule of §5 is
 counted in.
 
+### Worker REST ports: the preferred slot, then the first free port
+
+Every profile owns a private freqtrade REST port on the container's loopback. The
+**preferred** port is still the documented one — `profile_api_port_base` (8101)
+plus the profile's index in the **id-sorted** profile list — so a profile keeps
+the port it is documented to use across restarts and deploys. That preferred port
+is only taken when nothing else owns it: the allocator first tries it, then scans
+up to port 65535 and wraps around from the base to the port just below the
+preferred one, and returns the first candidate that is **neither the port of
+another profile** (already stored in the state database, or about to be written
+for a sibling in the same pass) **nor bound on loopback** by anything else.
+
+Why the rule is not just `base + index`: the live fleet map had drifted, and 10
+of 19 insertion indexes collided with a port another profile was already using.
+A worker that cannot bind its REST port hangs before its trading loop, the
+supervisor cannot read it, and the profile is walked to a permanent `error` —
+with no trading and no obvious cause in the profile's own log. Allocating a port
+that is actually free removes that failure mode; the preferred port is only
+reused when it is genuinely available, so the documented map does not drift any
+further.
+
+What to check when a port is in doubt:
+
+```bash
+# the port each profile is using right now
+docker exec trading-realtime python -c "
+import sqlite3
+con = sqlite3.connect('/app/data/realtime/state.db')
+for row in con.execute('SELECT id, api_port, state FROM profiles ORDER BY api_port'):
+    print(row)
+"
+
+# which of the worker ports are actually bound on loopback (same probe the allocator uses)
+docker exec trading-realtime python -c "
+import sqlite3, socket
+con = sqlite3.connect('/app/data/realtime/state.db')
+for profile_id, port in con.execute('SELECT id, api_port FROM profiles ORDER BY api_port'):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(('127.0.0.1', port))
+            print(profile_id, port, 'free')
+        except OSError:
+            print(profile_id, port, 'bound')
+"
+```
+
+The `worker_port` field of `GET /api/profiles` is the same value while the
+profile runs, and `null` when it does not. Two profiles must never report the
+same port; if they do, one of them is failing to bind and will appear in the
+`error` state with the worker log as the evidence.
+
 ---
 
 ## 5. The worker crash loop, and why workers are no longer restarted on a slow read
@@ -270,6 +321,44 @@ gap between rows, the worker is answering `/ping` but failing its reads: read
 `/app/data/realtime/logs/<id>.log` (§7) for the underlying failure instead of
 restarting the fleet again.
 
+### When an edit restarts a worker
+
+`PATCH /api/profiles/{id}` writes its fields into the state database, and the
+worker's generated `config.json` is rebuilt from that row — so an edit that
+changes a **config-affecting** field has to reach the worker, not only the
+dashboard:
+
+* **config-affecting** — a field the generated freqtrade configuration carries:
+  the pair list, the initial capital, the open-trade cap, the strategy and the
+  timeframe. A running profile's worker is **restarted** so that the new value is
+  the one it actually trades;
+* **descriptive only** — `name`, `priority`, `enabled`. Nothing is restarted:
+  `name` and `priority` are read by the dashboard and the scheduler, and
+  disabling a profile stops its worker on the next scheduling pass.
+
+A profile that is not running needs no restart: it is simply stored, and its next
+start builds the configuration from the updated row.
+
+The restart is visible in the journal, and the order of the rows is the whole
+story:
+
+```bash
+# what happened to one profile, newest first
+docker exec trading-realtime python -c "
+import sqlite3
+con = sqlite3.connect('/app/data/realtime/state.db')
+for row in con.execute(\"SELECT ts, level, kind, message FROM events WHERE profile_id = 'basic-btc-1h' ORDER BY ts DESC LIMIT 10\"):
+    print(row)
+"
+```
+
+The newest rows are a `profile_updated` event naming the fields the `PATCH`
+wrote, then a `restart` event for the same profile whose message carries the new
+port and pid of the worker — the same message any other restart emits. If you
+change a config-affecting field and the journal shows the `profile_updated` row
+but **no** `restart` row, the worker is still trading the configuration it was
+started with: that is exactly the silent staleness this rule exists to prevent.
+
 ---
 
 ## 6. Kill switch
@@ -305,8 +394,33 @@ Semantics to rely on:
 * releasing it removes the file and resumes scheduling; every enabled profile
   that is not stopped by the operator starts again on the next pass, and stopped
   profiles stay stopped until they are started;
+* **every worker the supervisor started is tracked, so the kill switch cannot
+  miss one.** The whole schedule/start path is one critical section, so a start
+  requested from the event loop and a start requested from the API thread pool
+  can no longer interleave — that race used to spawn a second worker for the same
+  profile that the supervisor did not track (the "is it running?" check and the
+  spawn were tens of milliseconds apart). The kill switch walks the tracked
+  process map, and every process the supervisor spawned is in it: engaging the
+  switch stops **all** of them, including the one a concurrent start was
+  creating;
 * the state is reported by `GET /api/settings` (`kill_switch_engaged`) and by
   `GET /api/health` (`kill_switch_engaged`).
+
+Verify the guarantee after engaging:
+
+```bash
+# every profile must be stopped, with the kill-switch reason
+curl -fsS http://127.0.0.1:3030/api/profiles | python3 -c "
+import json, sys
+for profile in json.load(sys.stdin)['profiles']:
+    print(profile['id'], profile['state'], profile['state_reason'])
+"
+```
+
+A profile still reported `running` (or a worker that keeps writing to its log
+after the switch) would mean an untracked process. The `kill_switch` rows of the
+event journal (§7, §8) are the engine's own record that the switch was engaged
+and that nothing may start.
 
 ---
 
@@ -427,6 +541,35 @@ A file named `state.db.legacy-<timestamp>` in the same directory is the **archiv
 foreign database** of a previous platform: it was renamed, never parsed, and it
 can be deleted once it has been inspected.
 
+### The retention prune
+
+`profile_snapshots` is the table that grows fastest: the poller writes one row per
+running profile per minute. Retention is the `equity_retention_days` setting of
+`config/platform.json` (**90** days by default), and the supervisor now enforces
+it at run time with an **hourly prune pass** that deletes the snapshot rows older
+than that window. The setting used to be a documented default that nothing
+executed, so the file grew without bound — 29 MB and 164k snapshot rows in seven
+days.
+
+```bash
+# the age of the history, and the size of the file
+docker exec trading-realtime python -c "
+import os, sqlite3
+con = sqlite3.connect('/app/data/realtime/state.db')
+print('rows:  ', con.execute('SELECT COUNT(*) FROM profile_snapshots').fetchone()[0])
+print('oldest:', con.execute('SELECT MIN(ts) FROM profile_snapshots').fetchone()[0])
+print('newest:', con.execute('SELECT MAX(ts) FROM profile_snapshots').fetchone()[0])
+print('bytes: ', os.path.getsize('/app/data/realtime/state.db'))
+"
+```
+
+The oldest timestamp should stay inside `equity_retention_days`; a `MIN(ts)` well
+beyond that window means the prune pass is not running, and the supervisor log is
+where to look. The prune touches `profile_snapshots` only: the profile rows,
+their trades and their daily profit rows are kept, so a longer
+`equity_retention_days` buys a longer equity history and costs disk, nothing
+else.
+
 ---
 
 ## 9. Troubleshooting
@@ -444,6 +587,10 @@ can be deleted once it has been inspected.
 | the container restarts in a loop | read `docker compose -f deploy/docker-compose.yml logs --tail 100 trading-realtime`; a foreign `state.db` is archived automatically, so a loop usually means a bad `config/platform.json` or a missing catalogue file |
 | `3031` answers but `/api/*` is stale | the dashboard proxies to `http://trading-realtime:8080` over the compose network; check that `trading-realtime` is healthy |
 | no new snapshots | the snapshot interval is longer than expected (`GET /api/settings`) or the supervisor is stopped; snapshots only exist for profiles that were running |
+| a profile stops opening trades while its worker stays `running` and healthy | a protection has locked the pair or the bot (`StoplossGuard`, `MaxDrawdown`, `CooldownPeriod`): read the locks of that worker and its log before restarting it (§11) |
+| a worker cannot bind its REST port and its profile walks to `error` | two profiles were handed the same port. The allocator prefers the id-sorted slot but only when it is free, so check the stored `api_port` values and what is bound on loopback (§4) |
+| a `PATCH` on a running profile seems to have changed nothing | the worker is still trading the configuration it was started with: the journal must show a `restart` row after the `profile_updated` row (§5) |
+| the state database keeps growing | the snapshot history is pruned hourly to `equity_retention_days`, so check `MIN(ts)` of `profile_snapshots` and the supervisor log if the file only grows (§8) |
 | a worker keeps dying on a slow grid | the generated config throttles per timeframe (4h/1d → 60 s); check the worker log for exchange rate limits |
 
 ---
@@ -478,3 +625,92 @@ platform's schema, or a `user_version` that is neither `1` nor `2`, is still
 incompatible: the boot archives it as `state.db.legacy-<timestamp>` and starts
 fresh — the previous file is recoverable from the volume, and the event journal
 records the archive.
+
+---
+
+## 11. The risk controls of a worker
+
+The generated freqtrade configuration carries the platform's stop handling, and
+`engine/config_builder.py` publishes the fleet risk controls that can pause a
+pair or the whole bot.
+
+### Order handling: a market stoploss, and an exchange stop for live profiles
+
+* `order_types` is written explicitly instead of relying on freqtrade's defaults:
+  `entry` and `exit` stay limit orders (the generated `entry_pricing` /
+  `exit_pricing` sides are `same`, which is what freqtrade's price validation
+  requires) and `stoploss` is a **market** order — a limit stop can sit unfilled
+  while the market runs through it, which is the opposite of what a stop is for;
+* `stoploss_on_exchange` is **`true` for a live profile and `false` for a paper
+  one**. No shipped strategy sets it and freqtrade defaults it to `false`, so
+  without this a live worker keeps its stop inside its own process: a supervisor
+  stop, a crash, a kill switch or a profile delete would leave the position
+  **naked on the exchange** until the worker came back. Paper profiles keep
+  `false`: freqtrade evaluates the stoploss locally in dry-run whatever the flag
+  says, so their behaviour is unchanged.
+
+```bash
+# the order handling one profile is actually running with
+docker exec trading-realtime python -c "
+import json
+config = json.load(open('/app/data/realtime/profiles/momentum-eth-4h-live/config.json'))
+print(json.dumps(config['order_types'], indent=2))
+"
+```
+
+### The protections that can pause a pair or the bot
+
+`engine/config_builder.py` exports `PROTECTIONS`, the three freqtrade protections
+of the fleet and the parameters they run with:
+
+| Protection | Parameters | What it does |
+| --- | --- | --- |
+| `StoplossGuard` | `lookback_period_candles` 60, `trade_limit` 4, `stop_duration_candles` 60, `only_per_pair` false | four stoploss exits inside 60 candles of the profile timeframe lock **every** pair of that profile for 60 candles |
+| `MaxDrawdown` | `lookback_period_candles` 200, `trade_limit` 20, `max_allowed_drawdown` 0.2, `stop_duration_candles` 120 | once the last 20 trades drew down more than 20 %, the bot opens no new trade for 120 candles |
+| `CooldownPeriod` | `stop_duration_candles` 5 | after any exit, the pair waits five candles before the next entry |
+
+The block is declared in the shape freqtrade validates for a **strategy class**,
+and `tests/engine/` pins both its values and that shape. It is deliberately
+**not** written into the generated `config.json`: freqtrade 2026.8 treats a
+top-level `protections` key as deprecated and aborts the boot of the worker with
+`DEPRECATED: Setting 'protections' in the configuration is deprecated.` — and a
+worker that cannot boot protects nothing. The declaration is therefore what arms
+a protection: `PROTECTIONS` is the platform's definition of the three controls,
+and a worker whose strategy does not declare them runs without a protection lock,
+exactly as every worker did before this change. Nothing in the generated document
+pretends otherwise.
+
+**What a pause looks like.** A protection that fires locks a pair, or the whole
+bot, until its stop duration has elapsed. The worker keeps running, keeps
+polling the exchange and keeps managing the positions it already holds — it just
+opens no new trade, so a locked profile looks idle rather than broken. The
+evidence is in the worker's own log:
+
+```bash
+# the protection lines of one profile
+docker exec trading-realtime sh -c 'grep -iE "protection|locking|lock|cooldown" /app/data/realtime/logs/basic-btc-1h.log | tail -20'
+```
+
+and in the worker's own REST API, which lists the locks that are active right
+now (its port, user and password come from the profile's row in the state
+database):
+
+```bash
+docker exec trading-realtime python -c "
+import base64, json, sqlite3, urllib.request
+con = sqlite3.connect('/app/data/realtime/state.db')
+port, user, password = con.execute(
+    \"SELECT api_port, api_username, api_password FROM profiles WHERE id = 'basic-btc-1h'\"
+).fetchone()
+request = urllib.request.Request(f'http://127.0.0.1:{port}/api/v1/locks')
+token = base64.b64encode(f'{user}:{password}'.encode()).decode()
+request.add_header('Authorization', f'Basic {token}')
+print(json.dumps(json.load(urllib.request.urlopen(request)), indent=2))
+"
+```
+
+A profile that stops opening trades while its worker stays `running` and healthy
+is a locked one, not a dead one: read the locks before restarting anything. The
+lock expires on its own when its stop duration elapses, and a lock that keeps
+coming back is the market telling you the rule is being stopped out repeatedly —
+which is information, not a bug.

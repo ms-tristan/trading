@@ -136,13 +136,17 @@ def test_normalise_win_rate(value: object, expected: float) -> None:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (-0.12, 12.0),
-        (0.12, 12.0),
-        (-12.5, 12.5),
-        (12.5, 12.5),
-        (1.0, 100.0),
+        # The magnitude Freqtrade published, never rescaled: a drawdown is a
+        # 0..1 ratio on the wire, exactly like every other ``*_pct`` field.
+        (-0.25, 0.25),
+        (0.25, 0.25),
+        (-12.0, 12.0),
+        (12.0, 12.0),
+        (0.7793, 0.7793),
+        (1.0, 1.0),
         (0.0, 0.0),
         (float("nan"), 0.0),
+        (float("inf"), 0.0),
         (None, 0.0),
     ],
 )
@@ -231,6 +235,24 @@ def test_models_sanitise_non_finite_floats() -> None:
     assert snapshot.positions_value == 0.0
     assert snapshot.profit_factor == 0.0
     assert snapshot.max_drawdown_pct == 0.0
+
+
+def test_profile_snapshot_profit_factor_is_nullable() -> None:
+    """A flawless record stays ``None`` through a round trip, never ``0.0``."""
+    snapshot = models.ProfileSnapshot(profile_id="p1")
+    assert snapshot.profit_factor is None
+    assert snapshot.model_dump()["profit_factor"] is None
+    restored = models.ProfileSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert restored.profit_factor is None
+    # ``0.0`` still means "every trade lost" and is preserved as such.
+    assert models.ProfileSnapshot(profile_id="p1", profit_factor=0.0).profit_factor == 0.0
+
+
+def test_every_shape_carrying_a_profit_factor_is_nullable() -> None:
+    """The three API shapes default to "not measurable", not to "all losses"."""
+    assert models.ProfileMetrics().profit_factor is None
+    assert models.ProfileView(id="p1").profit_factor is None
+    assert models.AccountPerformance(scope="paper").profit_factor is None
 
 
 def test_every_document_shape_serialises_to_strict_json() -> None:

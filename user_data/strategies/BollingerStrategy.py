@@ -29,7 +29,10 @@ class BollingerStrategy(IStrategy):
     startup_candle_count = 210
 
     stoploss = -0.10
-    minimal_roi = {"0": 0.05, "240": 0.025, "720": 0.0}
+    # Mean reversion needs a target, so the ladder stays -- but the terminal rung now
+    # carries the previous tier's value instead of decaying to zero, which used to
+    # close the trade at any non-negative profit once its timestamp had passed.
+    minimal_roi = {"0": 0.05, "240": 0.025, "720": 0.025}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         bollinger = ta.BBANDS(dataframe, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)

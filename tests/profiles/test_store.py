@@ -639,6 +639,23 @@ def test_snapshot_round_trip_preserves_every_column(store: StateStore) -> None:
     assert store.latest_snapshots() == {"alpha-btc-1h": snapshot}
 
 
+def test_snapshot_round_trip_preserves_a_null_profit_factor(store: StateStore) -> None:
+    """``None`` ("no losing trade yet") is stored as NULL, never as ``0.0``."""
+    store.upsert_profile(make_profile())
+    snapshot = ProfileSnapshot(
+        profile_id="alpha-btc-1h", ts="2026-01-02T03:04:00Z", profit_factor=None
+    )
+
+    store.record_snapshot(snapshot)
+
+    stored = store.list_snapshots("alpha-btc-1h")
+    assert stored[0].profit_factor is None
+    assert store.latest_snapshots()["alpha-btc-1h"].profit_factor is None
+    # A measured all-losses factor keeps its own, different meaning.
+    store.record_snapshot(snapshot.model_copy(update={"profit_factor": 0.0}))
+    assert store.list_snapshots("alpha-btc-1h")[0].profit_factor == 0.0
+
+
 def test_record_snapshot_replaces_the_row_of_the_same_minute(store: StateStore) -> None:
     store.upsert_profile(make_profile())
     timestamp = format_ts(utc_now() - timedelta(minutes=1))

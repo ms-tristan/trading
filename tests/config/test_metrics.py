@@ -82,7 +82,7 @@ def view(
     open_trades: int = 0,
     closed_trades: int = 0,
     win_rate: float = 0.0,
-    profit_factor: float = 0.0,
+    profit_factor: float | None = 0.0,
     drawdown: float = 0.0,
     name: str | None = None,
 ) -> models.ProfileView:
@@ -194,17 +194,35 @@ def test_build_profile_view_normalises_freqtrade_values() -> None:
         snapshot(
             win_rate=55.0,
             max_drawdown_pct=-0.25,
-            profit_factor=float("inf"),
+            profit_factor=None,
             open_trades=2.0,
             closed_trades=3.0,
         ),
         None,
     )
     assert built.win_rate == pytest.approx(0.55)
-    assert built.max_drawdown_pct == pytest.approx(25.0)
-    assert built.profit_factor == 0.0
+    # The stored value is the 0..1 ratio the API publishes, so it is passed
+    # through untouched -- no magnitude heuristic, no rescaling.
+    assert built.max_drawdown_pct == pytest.approx(-0.25)
+    # A profile with no losing trade yet is "not measurable", not "all losses".
+    assert built.profit_factor is None
     assert built.open_trades == 2
     assert built.closed_trades == 3
+
+
+def test_build_profile_view_passes_the_stored_drawdown_ratio_through() -> None:
+    """A stored 0.0078 (the ratio of a 0.78 % drawdown) is served as 0.0078."""
+    built = metrics.build_profile_view(record(), snapshot(max_drawdown_pct=0.0078), None)
+    assert built.max_drawdown_pct == pytest.approx(0.0078)
+
+
+def test_build_profile_view_reports_a_null_profit_factor_without_a_snapshot() -> None:
+    assert metrics.build_profile_view(record(), None, None).profit_factor is None
+
+
+def test_build_profile_view_keeps_a_measured_zero_profit_factor() -> None:
+    built = metrics.build_profile_view(record(), snapshot(profit_factor=0.0), None)
+    assert built.profit_factor == 0.0
 
 
 def test_build_profile_view_always_uses_the_platform_profit_pct() -> None:
@@ -481,13 +499,54 @@ def test_aggregate_account_win_rate_and_profit_factor_without_trades() -> None:
     assert account.profit_factor == pytest.approx(3.0)
 
 
+def test_aggregate_account_passes_a_drawdown_ratio_through() -> None:
+    """The stored ratio is served unchanged -- a 0.25 drawdown is not 25.0."""
+    account = metrics.aggregate_account([view("a", drawdown=0.25)], {}, scope="paper", now=NOW)
+    assert account.max_drawdown_pct == pytest.approx(0.25)
+
+
+def test_aggregate_account_reports_the_worst_drawdown_ratio() -> None:
+    """The fleet figure is the LARGEST true ratio, and the ranking is not inverted."""
+    account = metrics.aggregate_account(
+        [view("a", drawdown=0.0078), view("b", drawdown=0.05)], {}, scope="combined", now=NOW
+    )
+    assert account.max_drawdown_pct == pytest.approx(0.05)
+
+
+def test_aggregate_account_ignores_profiles_without_a_profit_factor() -> None:
+    """A flawless profile is excluded, not counted as the all-losses factor."""
+    views = [
+        view("flawless", profit_factor=None, closed_trades=5),
+        view("measured", profit_factor=2.0, closed_trades=5),
+    ]
+    account = metrics.aggregate_account(views, {}, scope="paper", now=NOW)
+    assert account.profit_factor == pytest.approx(2.0)
+
+
+def test_aggregate_account_profit_factor_keeps_a_measured_zero() -> None:
+    """A real ``0.0`` ("every trade lost") still counts in the pool."""
+    views = [
+        view("a", profit_factor=3.0, closed_trades=9),
+        view("b", profit_factor=0.0, closed_trades=1),
+    ]
+    account = metrics.aggregate_account(views, {}, scope="paper", now=NOW)
+    assert account.profit_factor == pytest.approx(2.7)
+
+
+def test_aggregate_account_profit_factor_is_null_when_none_is_defined() -> None:
+    undefined = metrics.aggregate_account(
+        [view("a", profit_factor=None), view("b", profit_factor=None)], {}, scope="paper", now=NOW
+    )
+    assert undefined.profit_factor is None
+
+
 def test_aggregate_account_of_nothing() -> None:
     account = metrics.aggregate_account([], {}, scope="live", now=NOW)
     assert account.portfolio_value == 0.0
     assert account.initial_capital == 0.0
     assert account.profit_pct == 0.0
     assert account.win_rate == 0.0
-    assert account.profit_factor == 0.0
+    assert account.profit_factor is None
     assert account.sharpe == 0.0
     assert account.best_profile is None
     assert account.worst_profile is None
@@ -513,9 +572,79 @@ def test_aggregate_account_combines_the_equity_curve_per_timestamp() -> None:
         "2026-09-27T17:31:00Z",
         "2026-09-27T17:32:00Z",
     ]
-    assert [point.value for point in account.equity_curve] == [1000.0, 1510.0, 505.0]
+    # Every profile is in every point: ``b`` has no row at 17:30, so it
+    # contributes its 1,000.0 initial capital, and ``a`` keeps its last known
+    # 1,010.0 at 17:32 after its own rows end.
+    assert [point.value for point in account.equity_curve] == [2000.0, 1510.0, 1515.0]
     assert account.profiles_healthy == 2
     assert account.sharpe != 0.0
+
+
+def test_combined_equity_curve_carries_a_missing_minute_forward() -> None:
+    """A read that failed for one minute keeps the profile's last known value."""
+    views = [view("a", capital=1000.0), view("b", capital=1000.0)]
+    snapshots = {
+        "a": [
+            snapshot("a", ts="2026-09-27T17:30:00Z", portfolio_value=1000.0),
+            snapshot("a", ts="2026-09-27T17:31:00Z", portfolio_value=990.0),
+            snapshot("a", ts="2026-09-27T17:32:00Z", portfolio_value=1010.0),
+        ],
+        "b": [
+            snapshot("b", ts="2026-09-27T17:30:00Z", portfolio_value=500.0),
+            snapshot("b", ts="2026-09-27T17:32:00Z", portfolio_value=510.0),
+        ],
+    }
+    account = metrics.aggregate_account(views, snapshots, scope="combined", now=NOW)
+    assert [point.t for point in account.equity_curve] == [
+        "2026-09-27T17:30:00Z",
+        "2026-09-27T17:31:00Z",
+        "2026-09-27T17:32:00Z",
+    ]
+    # ``b`` measured nothing at 17:31 and is carried forward at 500.0.
+    assert [point.value for point in account.equity_curve] == [1500.0, 1490.0, 1520.0]
+
+
+def test_combined_equity_curve_never_fakes_a_cliff_on_a_missing_read() -> None:
+    """The measured defect: one missing minute faked a 1,000 USDT cliff."""
+    views = [view("a", capital=1000.0, value=2000.0), view("b", capital=1000.0, value=1000.0)]
+    snapshots = {
+        "a": [
+            snapshot("a", ts="2026-09-27T17:30:00Z", portfolio_value=2000.0),
+            snapshot("a", ts="2026-09-27T17:32:00Z", portfolio_value=2000.0),
+        ],
+        "b": [
+            snapshot("b", ts="2026-09-27T17:30:00Z", portfolio_value=1000.0),
+            snapshot("b", ts="2026-09-27T17:31:00Z", portfolio_value=1000.0),
+            snapshot("b", ts="2026-09-27T17:32:00Z", portfolio_value=1000.0),
+        ],
+    }
+    account = metrics.aggregate_account(views, snapshots, scope="combined", now=NOW)
+    assert [point.value for point in account.equity_curve] == [3000.0, 3000.0, 3000.0]
+    # The corrupt cliff also used to corrupt the Sharpe of a flat fleet.
+    assert account.sharpe == 0.0
+
+
+def test_combined_equity_curve_includes_a_profile_without_any_snapshot() -> None:
+    views = [view("a", capital=1000.0, value=1100.0), view("b", capital=400.0, value=400.0)]
+    snapshots = {"a": [snapshot("a", ts="2026-09-27T17:31:00Z", portfolio_value=1100.0)]}
+    account = metrics.aggregate_account(views, snapshots, scope="combined", now=NOW)
+    # ``b`` was never measured, so it contributes its 400.0 initial capital
+    # instead of vanishing from the fleet total.
+    assert [point.value for point in account.equity_curve] == [1500.0]
+
+
+def test_combined_equity_curve_seeds_the_window_from_the_snapshot_before_it() -> None:
+    views = [view("a", capital=1000.0), view("b", capital=1000.0)]
+    snapshots = {
+        # ``a`` only ever measured 1,250.0, and before the window opened.
+        "a": [snapshot("a", ts="2026-09-20T10:00:00Z", portfolio_value=1250.0)],
+        # ``b`` is what the timeline of the window holds.
+        "b": [snapshot("b", ts="2026-09-27T17:31:00Z", portfolio_value=800.0)],
+    }
+    account = metrics.aggregate_account(views, snapshots, scope="combined", window="24h", now=NOW)
+    assert [point.t for point in account.equity_curve] == ["2026-09-27T17:31:00Z"]
+    # ``a`` opens the window at the state it really was in, not at its capital.
+    assert [point.value for point in account.equity_curve] == [2050.0]
 
 
 def test_aggregate_account_window_filters_the_curve_only() -> None:

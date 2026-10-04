@@ -18,6 +18,7 @@ import pytest
 
 from trading_platform.models import SUPPORTED_TIMEFRAMES, ProfileConfig, StrategyMeta
 from trading_platform.profiles.catalogue import (
+    SUPPORT_MODULES,
     StrategyCatalogue,
     discover_strategy_files,
     load_profile_catalogue,
@@ -100,7 +101,7 @@ def write_strategies(directory: Path, *stems: str) -> Path:
 # File discovery
 # ---------------------------------------------------------------------------
 def test_discover_strategy_files_returns_sorted_stems(tmp_path: Path) -> None:
-    directory = write_strategies(tmp_path, "ZetaStrategy", "alpha", "BetaStrategy")
+    directory = write_strategies(tmp_path, "ZetaStrategy", "alpha", "BetaStrategy", "market_regime")
     (directory / "__init__.py").write_text("", encoding="utf-8")
     (directory / "_helpers.py").write_text("", encoding="utf-8")
     (directory / "notes.txt").write_text("", encoding="utf-8")
@@ -109,13 +110,27 @@ def test_discover_strategy_files_returns_sorted_stems(tmp_path: Path) -> None:
     assert discover_strategy_files(directory) == ["BetaStrategy", "ZetaStrategy", "alpha"]
 
 
+def test_discover_strategy_files_skips_support_modules(tmp_path: Path) -> None:
+    """A shared helper module is never advertised as a strategy of the catalogue."""
+    assert "market_regime" in SUPPORT_MODULES
+
+    directory = write_strategies(tmp_path, "SoloStrategy", "market_regime")
+
+    assert discover_strategy_files(directory) == ["SoloStrategy"]
+
+
 def test_discover_strategy_files_ignores_a_missing_directory(tmp_path: Path) -> None:
     assert discover_strategy_files(tmp_path / "absent") == []
 
 
 def test_discover_strategy_files_finds_the_shipped_strategies(repo_root: Path) -> None:
     directory = repo_root / "user_data" / "strategies"
-    assert discover_strategy_files(directory) == SHIPPED_STRATEGY_STEMS
+    discovered = discover_strategy_files(directory)
+
+    assert discovered == SHIPPED_STRATEGY_STEMS
+    # The BTC regime gate shipped next to the strategies is a support module, not a
+    # sixteenth strategy: it must never reach the catalogue, the API or the CLI.
+    assert "market_regime" not in discovered
 
 
 def test_discover_strategy_files_defaults_to_the_resolved_directory() -> None:

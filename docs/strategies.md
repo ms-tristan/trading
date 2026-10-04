@@ -2,7 +2,9 @@
 
 The platform ships **fifteen** trading strategies. Every one of them is an
 ordinary [freqtrade](https://www.freqtrade.io) `IStrategy` (interface version 3,
-spot, long only), living in its own file under `user_data/strategies/`. The
+spot, long only), living in its own file under `user_data/strategies/` — next to
+the one shared **support module** of that directory, `market_regime.py`, which
+holds no strategy and is documented in §15. The
 supervisor passes that directory to every worker as `--strategy-path`, and the
 worker's generated configuration names the class, so a strategy is a *file* to
 this platform — nothing in the platform's own code knows a strategy by heart.
@@ -53,21 +55,50 @@ its title is derived from the class name and its description stays empty. See
 
 | id | file | catalogue title | class timeframe | `stoploss` | `minimal_roi` |
 | --- | --- | --- | --- | --- | --- |
-| `basic` | `BasicStrategy.py` | EMA cross baseline | 5m | `-0.10` | `0: 0.08, 240: 0.04, 720: 0.0` |
-| `momentum` | `MomentumStrategy.py` | Momentum breakout | 1h | `-0.10` | `0: 0.12, 480: 0.06, 1440: 0.0` |
-| `rsi-reversion` | `RsiReversionStrategy.py` | RSI mean reversion | 15m | `-0.10` | `0: 0.06, 240: 0.03, 720: 0.0` |
-| `bollinger` | `BollingerStrategy.py` | Bollinger band reversion | 15m | `-0.10` | `0: 0.05, 240: 0.025, 720: 0.0` |
-| `macd` | `MacdStrategy.py` | MACD trend follow | 1h | `-0.10` | `0: 0.10, 480: 0.05, 1440: 0.0` |
-| `donchian` | `DonchianStrategy.py` | Donchian channel breakout | 1h | `-0.08` | `0: 0.20, 1440: 0.10, 2880: 0.0` |
-| `keltner` | `KeltnerStrategy.py` | Keltner channel breakout | 1h | `-0.10` | `0: 0.15, 720: 0.07, 2880: 0.0` |
-| `supertrend` | `SupertrendStrategy.py` | Supertrend trailing stop | 15m | `-0.10` | `0: 0.10, 720: 0.05, 2880: 0.0` |
-| `dual-thrust` | `DualThrustStrategy.py` | Dual Thrust range breakout | 5m | `-0.06` | `0: 0.02, 30: 0.01, 60: 0.0` |
+| `basic` | `BasicStrategy.py` | EMA cross baseline | 1h | `-0.10` | `0: 1.0` |
+| `momentum` | `MomentumStrategy.py` | Momentum breakout | 15m | `-0.10` | `0: 1.0` |
+| `rsi-reversion` | `RsiReversionStrategy.py` | RSI mean reversion | 15m | `-0.10` | `0: 0.06, 240: 0.03, 720: 0.03` |
+| `bollinger` | `BollingerStrategy.py` | Bollinger band reversion | 5m | `-0.10` | `0: 0.05, 240: 0.025, 720: 0.025` |
+| `macd` | `MacdStrategy.py` | MACD trend follow | 1h | `-0.10` | `0: 1.0` |
+| `donchian` | `DonchianStrategy.py` | Donchian channel breakout | 1h | `-0.08` | `0: 1.0` |
+| `keltner` | `KeltnerStrategy.py` | Keltner channel breakout | 15m | `-0.10` | `0: 0.15, 720: 0.07, 2880: 0.07` |
+| `supertrend` | `SupertrendStrategy.py` | Supertrend trailing stop | 1h | `-0.10` | `0: 1.0` |
+| `dual-thrust` | `DualThrustStrategy.py` | Dual Thrust range breakout | 15m | `-0.06` | `0: 1.0` |
 | `faber` | `FaberStrategy.py` | Faber trend allocation | 1d | `-0.25` | `0: 1.0` |
 | `keltner-breakout-v2` | `KeltnerBreakoutV2Strategy.py` | Keltner breakout v2 | 4h | `-0.10` | `0: 1.0` |
 | `trend-ensemble-v2` | `TrendEnsembleV2Strategy.py` | Multi-horizon trend ensemble | 1d | `-0.15` | `0: 1.0` |
 | `vol-targeted-trend` | `VolTargetedTrendStrategy.py` | Volatility-targeted trend | 4h | `-0.12` | `0: 1.0` |
 | `faber-all-in` | `FaberAllInStrategy.py` | Faber trend allocation, full size | 1d | `-0.12` | `0: 1.0` |
 | `donchian-all-in` | `DonchianAllInStrategy.py` | Donchian breakout, full size | 1h | `-0.15` | `0: 1.0` |
+
+**The ROI policy of those literals.** `minimal_roi` is the ladder freqtrade walks
+down as a trade ages: the trade is closed as soon as it is in profit by at least
+the rung in force. Twelve of the fifteen strategies set the *only* rung to
+`{0: 1.0}` — a +100 % target no ordinary trade reaches — so the ladder is
+effectively disabled and the position is closed by its exit signal or by the
+stoploss. That is deliberate for the six trend and breakout rules that used to
+carry a time-decaying ladder (`basic`, `momentum`, `macd`, `donchian`,
+`supertrend`, `dual-thrust`), and it is the convention the six research-written
+strategies already shipped. A terminal rung of `0.0` closes a trade at **any**
+non-negative profit once its timestamp passes: it truncates the right tail those
+rules live on, while the stoploss stays uncapped. Measured over the repository's
+two-year OHLCV cache, dropping that rung improved the profit factor of every
+measured profile.
+
+Mean reversion is the exception, because it genuinely needs a target: the three
+mean-reversion strategies keep a ladder, and only their **terminal rung is raised
+to the previous tier's value** instead of falling to `0.0`, so the trade is no
+longer closed at break-even once the last timestamp passes. `bollinger`,
+`keltner` and `rsi-reversion` above carry the resulting literals. Removing their
+ladder entirely instead of raising the floor regresses badly on the measured
+profiles, which is why this family keeps its target.
+
+**The BTC 200-day regime gate.** Six strategies — `basic`, `momentum`, `macd`,
+`donchian`, `supertrend` and `dual-thrust` — carry the shared
+`BtcRegimeGateMixin`, which suppresses every entry while BTC/USDT on the daily
+grid is below its 200-day average. These are exactly the six rules that carry no
+regime filter of their own; §15 documents the mixin, and the six research
+strategies that already filter the regime are deliberately left without it.
 
 **The class `timeframe` is a default, not a constraint.** A profile declares its
 own timeframe, the supervisor writes it into the generated configuration, and the
@@ -126,9 +157,9 @@ only exit is the opposite cross, so drawdowns can run."
 | Entry | `ema_fast` crosses **above** `ema_slow` while `rsi < 70` |
 | Exit | `ema_fast` crosses **below** `ema_slow`, or `rsi > 78` |
 | Parameters | periods 20 / 50 / 14, RSI entry ceiling 70, RSI exit floor 78, `startup_candle_count = 60` |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.08, 240: 0.04, 720: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 1.0}` (unreachable: only the exit signal or the stoploss closes the trade) |
 
-**Suitable timeframes.** The class default is 5m; the catalogue lists 1h and 4h,
+**Suitable timeframes.** The class default is 1h; the catalogue lists 1h and 4h,
 which is where the platform runs it, and where the crossover is far less noisy.
 On very short grids the rule trades often and pays the fee and the spread on
 every whipsaw.
@@ -161,16 +192,18 @@ reversal."
 | Exit | `ema_fast < ema_slow` (primary trend broken) or `roc < 0` (impulse lost) |
 | Parameters | ROC period 12, EMAs 50 / 200, ADX period 14 with threshold 20, `startup_candle_count = 210` |
 | Trailing stop | enabled: `trailing_stop_positive = 0.03` once `trailing_stop_positive_offset = 0.05` is reached (`trailing_only_offset_is_reached = True`) |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.12, 480: 0.06, 1440: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 1.0}` (unreachable: only the exit signal, the trailing stop or the stoploss closes the trade) |
 
-**Suitable timeframes.** The catalogue lists 15m, 1h and 4h; the shipped profiles
-use 1h, 15m and (live) 4h. Momentum needs trends to exist: on very short grids the
+**Suitable timeframes.** The catalogue lists 15m, 1h and 4h; the one shipped
+profile is live on 4h (`momentum-eth-4h-live`) and the 1h and 15m readings were
+retired (§14). Momentum needs trends to exist: on very short grids the
 ADX > 20 filter rejects most of the time, and on very long grids the entry arrives
 late in the move.
 
 **Risk notes.** Trend following always loses in ranges — several small losses in a
 row are the normal cost of waiting for the one large winner, which is why the
-trailing stop (3 % behind the high, armed at +5 %) matters more than the target.
+trailing stop (3 % behind the high, armed at +5 %), not a profit target, carries
+the trade: the shipped `minimal_roi` is unreachable.
 The 200-period EMA warm-up means a fresh worker produces no signal for its first
 210 candles.
 
@@ -194,12 +227,12 @@ oversold while price keeps falling; no short leg to hedge it."
 | Entry | `rsi > 30` while the previous `rsi <= 30` **and** `close > sma_slow` |
 | Exit | `rsi > 65` |
 | Parameters | RSI period 14, oversold level 30, exit level 65, SMA period 200, `startup_candle_count = 210` |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.06, 240: 0.03, 720: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.06, 240: 0.03, 720: 0.03}` (the terminal rung carries the previous tier's value) |
 
-**Suitable timeframes.** The catalogue lists 15m and 1h, which is what the
-profiles use. The rule is a pullback buyer: it belongs on liquid majors, and it
-loses its meaning on illiquid pairs, where a 30 RSI is a repricing rather than a
-dip.
+**Suitable timeframes.** The catalogue lists 15m and 1h; the two profiles that
+ran it were retired (§14), so the rule ships without a profile. The rule is a
+pullback buyer: it belongs on liquid majors, and it loses its meaning on illiquid
+pairs, where a 30 RSI is a repricing rather than a dip.
 
 **Risk notes.** Buying weakness is buying a falling knife when the weakness is
 informational: the SMA(200) filter is what separates "a dip inside an uptrend"
@@ -227,11 +260,12 @@ volatility, so a breakout trend can keep price outside the band for a long time.
 | Entry | `low <= bb_lower` **and** `rsi < 40` **and** `close > sma_slow` |
 | Exit | `close >= bb_middle` (reversion complete) or `rsi > 65` |
 | Parameters | band period 20, width 2.0 σ, RSI period 14 with entry ceiling 40, SMA period 200, `startup_candle_count = 210` |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.05, 240: 0.025, 720: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.05, 240: 0.025, 720: 0.025}` (the terminal rung carries the previous tier's value) |
 
-**Suitable timeframes.** The catalogue lists 5m, 15m and 1h; the shipped profiles
-use 5m and 1h. The 5m profile is the platform's shortest-horizon mean-reversion
-reading and the most sensitive to fees and to the spread.
+**Suitable timeframes.** The catalogue lists 5m, 15m and 1h; the profiles that
+ran it (5m and 1h) were retired (§14). The 5m reading was the platform's
+shortest-horizon mean-reversion profile and the most sensitive to fees and to the
+spread.
 
 **Risk notes.** A band touch is a *volatility* statement, not a direction: the
 RSI < 40 filter and the SMA(200) regime keep it from buying every expansion
@@ -258,7 +292,7 @@ arrive after a large part of the move and exits after the top."
 | Entry | `macdhist` crosses **above** zero while `close > ema_slow` |
 | Exit | `macdhist` crosses **below** zero |
 | Parameters | 12 / 26 / 9, EMA period 200, `startup_candle_count = 210` |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.10, 480: 0.05, 1440: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 1.0}` (unreachable: only the exit signal or the stoploss closes the trade) |
 
 **Suitable timeframes.** The catalogue lists 1h and 4h, which is what the
 profiles use. On 5m/15m the histogram crosses constantly and the strategy
@@ -290,7 +324,7 @@ ranges, producing a string of small losses before a trend appears."
 | Entry | `close > donchian_high` |
 | Exit | `close < donchian_low` (channel exit) or `close < chandelier_exit` (volatility expansion against the trade) |
 | Parameters | entry channel 20, exit channel 10, ATR period 14, chandelier multiplier 2.0, `startup_candle_count = 25` |
-| Risk | `stoploss = -0.08`, `minimal_roi = {0: 0.20, 1440: 0.10, 2880: 0.0}` |
+| Risk | `stoploss = -0.08`, `minimal_roi = {0: 1.0}` (unreachable: only the exit signal or the stoploss closes the trade) |
 
 Both channels are shifted by one candle: the breakout is compared against the
 **previous completed** channel, never against a window that already contains the
@@ -303,8 +337,9 @@ longer the grid, the fewer signals a paper ledger will collect.
 **Risk notes.** Breakout systems live on a low win rate and a few very large
 winners, and they are the family most exposed to false breakouts in ranging
 markets — the price takes out the channel, fails, and the chandelier exit closes
-the trade at a loss. The 20 % first target is deliberately far away so that a
-genuine trend is not cut short.
+the trade at a loss. The ROI ladder is disabled so that a genuine trend is not
+cut short by a time-decaying target: the trade ends on the opposite channel or on
+the chandelier exit, not on a fixed percentage.
 
 ---
 
@@ -326,11 +361,12 @@ the channel and produces frequent, low quality breakouts."
 | Entry | `close > keltner_upper` **and** `ema_fast > ema_slow` |
 | Exit | `close < keltner_middle` |
 | Parameters | EMA period 20, ATR period 10, band width 2.0 ATR, trend EMAs 50 / 200, `startup_candle_count = 210` |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.15, 720: 0.07, 2880: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.15, 720: 0.07, 2880: 0.07}` (the terminal rung carries the previous tier's value) |
 
-**Suitable timeframes.** The catalogue lists 15m and 1h, which is what the
-profiles use. The bands are volatility-scaled, so the rule adapts to the grid,
-but the EMA(50) > EMA(200) filter needs 200 candles of history before it can
+**Suitable timeframes.** The catalogue lists 15m and 1h; the two profiles that
+ran it were retired (§14), so the rule ships without a profile. The bands are
+volatility-scaled, so the rule adapts to the grid, but the EMA(50) > EMA(200)
+filter needs 200 candles of history before it can
 accept anything.
 
 **Risk notes.** The trend filter is what distinguishes this from a pure
@@ -358,7 +394,7 @@ trade frequency: too tight and it whipsaws, too wide and stops are expensive."
 | Entry | the direction **flips to +1** (previous candle −1) |
 | Exit | the direction **flips to −1** |
 | Parameters | ATR period 10, multiplier 3.0, `startup_candle_count = 30` |
-| Risk | `stoploss = -0.10`, `minimal_roi = {0: 0.10, 720: 0.05, 2880: 0.0}` |
+| Risk | `stoploss = -0.10`, `minimal_roi = {0: 1.0}` (unreachable: only the exit signal or the stoploss closes the trade) |
 
 The direction is recursive: the final upper and lower bands depend on the
 previous candle, so `supertrend_direction()` is an explicit sequential loop over
@@ -366,7 +402,7 @@ NumPy arrays (a per-row `apply` would be both slower and less readable). Unlike
 most of the other nine, the entry here is a genuine **event** — the flip — not a
 state that stays true.
 
-**Suitable timeframes.** The class default is 15m; the catalogue lists 1h and 4h,
+**Suitable timeframes.** The class default is 1h; the catalogue lists 1h and 4h,
 which is where the platform runs it, and where the band is less frequently
 whipsawed. On a 5m grid the flip count explodes and the strategy becomes a fee
 generator.
@@ -398,16 +434,17 @@ cost."
 | Entry | `close > buy_line` |
 | Exit | `close < sell_line` |
 | Parameters | range window 4, `K1 = 0.5` (buy), `K2 = 0.5` (sell), `startup_candle_count = 10` |
-| Risk | `stoploss = -0.06`, `minimal_roi = {0: 0.02, 30: 0.01, 60: 0.0}` |
+| Risk | `stoploss = -0.06`, `minimal_roi = {0: 1.0}` (unreachable: only the exit signal or the stoploss closes the trade) |
 
 The range is measured on the previous candles only (every component is shifted by
 one), and both trigger lines are anchored on the **open** of the candle being
-decided on — the one price that is known before the candle resolves. The
-`minimal_roi` is short-horizon on purpose: this is an intraday rule, and the
-position is expected to work within the hour.
+decided on — the one price that is known before the candle resolves. This is an
+intraday rule and the position is expected to work within the hour: the opposite
+trigger line closes it, and the ROI ladder is disabled rather than capping a fast
+move at a fixed percentage.
 
-**Suitable timeframes.** The class default is 5m; the catalogue lists 15m and 1h,
-which is where the platform runs it. It is the platform's highest-turnover
+**Suitable timeframes.** The class default is 15m; the catalogue lists 15m and
+1h, which is where the platform runs it. It is the platform's highest-turnover
 profile and therefore the most fee-sensitive one: on a 1h grid a single candle can
 already be the whole move.
 
@@ -655,3 +692,75 @@ Two consequences are worth stating explicitly, because both are deliberate:
 > losses were dominated by fees at the wrong timeframe — `dual-thrust-eth-15m` is
 > the clearest case (§13.1). The v2 strategies in §13 are the response to that,
 > and they run on grids where the cost per candle is survivable.
+
+---
+
+## 15. The causal BTC 200-day regime gate
+
+Six strategies — `basic`, `momentum`, `macd`, `donchian`, `supertrend` and
+`dual-thrust` — share one entry filter, `BtcRegimeGateMixin` in
+`user_data/strategies/market_regime.py`. They are exactly the six rules that
+carry no regime filter of their own: the mixin is what tells them whether the
+market itself is risk-on. It is the classic 200-day market filter of Mebane Faber
+(§10), used here as a binary risk-on/risk-off switch rather than as a position
+size.
+
+`market_regime.py` is a **support module**, not a strategy: it holds no
+`IStrategy` subclass, and `trading_platform.profiles.catalogue` lists it in
+`SUPPORT_MODULES` so the file discovery of §12 never advertises it as a bogus
+catalogue entry.
+
+**What it computes.** The mixin overrides `populate_entry_trend`, calls
+`super()`, and then forces every **risk-off** candle back to no entry — it zeroes
+`enter_long` and clears `enter_tag` (the entry reason belongs to the signal that
+was suppressed) — where the regime comes from
+
+```python
+btc = self.dp.get_pair_dataframe("BTC/USDT", "1d")
+regime = btc["close"] > btc["close"].rolling(200).mean()
+```
+
+It filters **entries only**: `populate_exit_trend` is untouched, so a position
+that was opened while BTC was risk-on is still closed by the strategy's own exit
+rule, exactly as before.
+
+**Why it is causal.** A daily candle is only complete at its close, so the
+regime of day *D* is known only once day *D* has ended. The mixin therefore
+shifts the daily regime by **one full day** and only then forward-fills it onto
+the signal frame: a candle is filtered by the regime of the previous completed
+day, never by the day it belongs to. Reading the regime unshifted would be
+lookahead — the backtest would buy the recovery of a day whose close it could not
+have known — so `tests/strategies/test_market_regime.py` pins the shift.
+
+**It fails closed.** When the daily frame is missing, empty, malformed, or too
+short — a pair the worker cannot download, a provider that answers nothing, a
+worker that has not warmed up — the gate closes: every candle is risk-off and no
+entry is opened. The gate never opens a trade it cannot justify, and a data
+provider that raises is treated as no data rather than as an error.
+
+**The warm-up.** The 200-day average needs 200 completed daily candles before the
+first regime value exists, and the one-day shift consumes one more, so a freshly
+started worker opens nothing until **201 daily candles** are available. The mixin
+declares the informative pair `("BTC/USDT", "1d")` in `informative_pairs()`,
+which is what makes freqtrade cache that frame in dry-run and in live alike; in
+those modes `get_pair_dataframe` serves only the whitelist pairs on the strategy
+timeframe plus the declared informative ones, so without that declaration the
+frame would stay empty and the gate would fail closed forever.
+
+**What it is measured to do.** Over the repository's own two-year OHLCV cache,
+all six strategies improve on return, more than halve their maximum drawdown and
+improve their Sharpe ratio with the gate on. That is also why the gate is **not**
+applied everywhere: the six strategies that already carry their own regime filter
+— `keltner-breakout-v2`, `trend-ensemble-v2`, `vol-targeted-trend`, `faber`,
+`faber-all-in` and `donchian-all-in` — lose on those measures with it added, so
+their files do not use the mixin. Adding it there would apply a second, slower
+regime condition on top of the one the strategy already implements.
+
+**What it is measured to do.** Over the repository's own two-year OHLCV cache,
+all six strategies improve on return, more than halve their maximum drawdown and
+improve their Sharpe ratio with the gate on. That is also why the gate is **not**
+applied everywhere: the six strategies that already carry their own regime filter
+— `keltner-breakout-v2`, `trend-ensemble-v2`, `vol-targeted-trend`, `faber`,
+`faber-all-in` and `donchian-all-in` — lose on those measures with it added, so
+their files do not use the mixin. Adding it there would apply a second, slower
+regime condition on top of the one the strategy already implements.

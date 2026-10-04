@@ -49,6 +49,13 @@ STRATEGY_FILES: tuple[str, ...] = (
     "DonchianAllInStrategy.py",
 )
 
+#: Helper modules of ``user_data/strategies/``: shared by the strategies, never
+#: loaded as a strategy themselves. ``market_regime.py`` holds the causal BTC
+#: 200-day regime gate the six unfiltered trend and breakout profiles mix in; it
+#: is listed in ``SUPPORT_MODULES`` of the catalogue so the file discovery does
+#: not advertise it as a bogus strategy.
+SUPPORT_MODULE_FILES: tuple[str, ...] = ("market_regime.py",)
+
 #: The three declarative documents of ``config/``; nothing else may live there.
 CONFIG_DOCUMENTS: tuple[str, ...] = (
     "platform.json",
@@ -107,7 +114,7 @@ SPECIFICATION_FILES: tuple[str, ...] = (
     "dashboard/eslint.config.mjs",
     "dashboard/postcss.config.mjs",
     "dashboard/vitest.config.ts",
-) + tuple(f"user_data/strategies/{name}" for name in STRATEGY_FILES)
+) + tuple(f"user_data/strategies/{name}" for name in STRATEGY_FILES + SUPPORT_MODULE_FILES)
 
 #: Every directory the specification layout requires.
 SPECIFICATION_DIRECTORIES: tuple[str, ...] = (
@@ -175,13 +182,13 @@ def test_specification_directory_exists(relative_path: str) -> None:
 
 def test_user_data_holds_only_the_readme_and_the_shipped_strategies() -> None:
     expected = {"README.md", "strategies"}
-    expected |= {f"strategies/{name}" for name in STRATEGY_FILES}
+    expected |= {f"strategies/{name}" for name in STRATEGY_FILES + SUPPORT_MODULE_FILES}
 
     found = _tree_entries(REPO_ROOT / "user_data")
 
     assert found == expected, (
-        "user_data/ must contain exactly README.md and the strategy files the "
-        f"catalogue specifies; unexpected: {sorted(found - expected)}, "
+        "user_data/ must contain exactly README.md, the strategy files the "
+        f"catalogue specifies and the support modules; unexpected: {sorted(found - expected)}, "
         f"missing: {sorted(expected - found)}"
     )
 

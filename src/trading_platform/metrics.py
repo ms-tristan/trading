@@ -1,12 +1,15 @@
 """Aggregation helpers: the single place where raw rows become dashboard views.
 
-Nothing else in the platform sums, ranks or averages profile data. Two
+Nothing else in the platform sums, ranks or averages profile data. Three
 conventions are implemented here and reused everywhere:
 
 * ``profit_pct`` is always ``(portfolio_value - initial_capital) /
   initial_capital`` -- a ratio, never Freqtrade's own percentage;
 * ranking is computed once, over every profile of both modes, before any
-  filtering or sorting, so a profile keeps the same rank in every widget.
+  filtering or sorting, so a profile keeps the same rank in every widget;
+* every value of a ``*_pct`` field is passed through **unchanged**: the store
+  keeps a drawdown as the 0..1 ratio Freqtrade published, and this module never
+  rescales it (the dashboard is what multiplies by ``100`` for display).
 """
 
 from __future__ import annotations
@@ -30,7 +33,6 @@ from .models import (
     StrategyView,
     finite_float,
     format_ts,
-    normalise_drawdown_pct,
     normalise_win_rate,
     utc_now,
     window_start,
@@ -182,7 +184,9 @@ def build_profile_view(
     Without a snapshot (the profile never ran, or it is queued) the profile is
     shown at its initial capital with a zero profit: inventing a measurement
     would corrupt every aggregate, and showing ``0.0`` would silently remove the
-    profile's capital from the account total.
+    profile's capital from the account total. Such a profile has no measurable
+    profit factor either, so it reports ``None`` rather than the ``0.0`` that
+    means "every trade lost".
     """
     initial_capital = finite_float(record.initial_capital, 0.0)
     if snapshot is None:
@@ -195,7 +199,7 @@ def build_profile_view(
         open_trades = 0
         closed_trades = 0
         win_rate = 0.0
-        profit_factor = 0.0
+        profit_factor: float | None = None
         max_drawdown_pct = 0.0
         best_pair = None
         last_updated = format_ts(now)
@@ -209,8 +213,14 @@ def build_profile_view(
         open_trades = _as_int(snapshot.open_trades)
         closed_trades = _as_int(snapshot.closed_trades)
         win_rate = normalise_win_rate(snapshot.win_rate)
-        profit_factor = finite_float(snapshot.profit_factor, 0.0)
-        max_drawdown_pct = normalise_drawdown_pct(snapshot.max_drawdown_pct)
+        # ``None`` stays ``None``: "no losing trade yet" is not "all losses", and
+        # a profile without a defined factor must not dilute the fleet one.
+        profit_factor = (
+            None if snapshot.profit_factor is None else finite_float(snapshot.profit_factor, 0.0)
+        )
+        # The stored value is already the 0..1 ratio the API publishes, so it is
+        # passed through untouched (no magnitude heuristic, no rescaling).
+        max_drawdown_pct = finite_float(snapshot.max_drawdown_pct, 0.0)
         best_pair = _best_pair(snapshot)
         last_updated = snapshot.ts or format_ts(now)
 
@@ -313,12 +323,21 @@ def _aggregate_win_rate(views: Sequence[ProfileView]) -> float:
     return min(max(finite_float(pooled / total, 0.0), 0.0), 1.0)
 
 
-def _aggregate_profit_factor(views: Sequence[ProfileView]) -> float:
-    """Pool per-profile profit factors, weighted by their closed trade counts."""
-    factors = [max(finite_float(view.profit_factor, 0.0), 0.0) for view in views]
-    if not factors:
-        return 0.0
-    weights = [max(0, _as_int(view.closed_trades)) for view in views]
+def _aggregate_profit_factor(views: Sequence[ProfileView]) -> float | None:
+    """Pool the per-profile profit factors that are actually defined.
+
+    A view without a factor (``None``: the profile has not lost a trade yet, or
+    it was never measured) is **excluded** instead of counted as ``0.0``, so a
+    flawless profile no longer drags the fleet factor down. The remaining
+    factors are weighted by their closed trade counts; when every one of them
+    has no closed trade, the plain mean of the defined factors is the honest
+    answer. ``None`` is returned when the scope defines no factor at all.
+    """
+    defined = [view for view in views if view.profit_factor is not None]
+    if not defined:
+        return None
+    factors = [max(finite_float(view.profit_factor, 0.0), 0.0) for view in defined]
+    weights = [max(0, _as_int(view.closed_trades)) for view in defined]
     total = sum(weights)
     if total <= 0:
         return finite_float(sum(factors) / len(factors), 0.0)
@@ -348,21 +367,74 @@ def _combined_equity_curve(
     start: datetime | None,
     initial_capital: float,
 ) -> list[EquityPoint]:
-    """Sum the portfolio value of every profile per snapshot timestamp."""
+    """Sum the fleet equity per snapshot timestamp, carrying missed minutes forward.
+
+    The timeline is the sorted union of every snapshot timestamp at or after the
+    window boundary. Every profile contributes at **every** point of that
+    timeline:
+
+    * its last known portfolio value at or before the point, so a minute whose
+      read failed no longer drops the profile's whole equity and fakes a cliff
+      (measured: -33 % / 1,000 USDT on a single failed minute, corrupting the
+      reported Sharpe);
+    * its ``initial_capital`` until its first snapshot inside the timeline, and
+      when it has no snapshot at all, so a profile never vanishes from the
+      fleet total;
+    * the value of its most recent snapshot **strictly before** the window
+      boundary at the first point of the window, so a window opens at the state
+      the profile really was in rather than at its starting capital.
+
+    An empty timeline still answers ``[]``.
+    """
     boundary = None if start is None else format_ts(start)
-    totals: dict[str, float] = {}
+    # The timestamps of the window, and the value each profile measured there.
+    window: dict[str, dict[str, float]] = {}
+    timeline: set[str] = set()
     for view in views:
         fallback = finite_float(view.initial_capital, 0.0)
+        values: dict[str, float] = {}
         for snapshot in snapshots_by_profile.get(view.id, ()):
             if boundary is not None and snapshot.ts < boundary:
                 continue
-            totals[snapshot.ts] = totals.get(snapshot.ts, 0.0) + finite_float(
-                snapshot.portfolio_value, fallback
-            )
-    return [
-        EquityPoint(t=ts, value=value, profit_pct=compute_profit_pct(value, initial_capital))
-        for ts, value in sorted(totals.items())
-    ]
+            values[snapshot.ts] = finite_float(snapshot.portfolio_value, fallback)
+            timeline.add(snapshot.ts)
+        window[view.id] = values
+    if not timeline:
+        return []
+
+    # The value every profile starts the window from: its most recent snapshot
+    # strictly *before* the boundary when it has one -- so the window opens at
+    # the state the profile really was in -- and its initial capital otherwise,
+    # which is also the answer for a profile with no snapshot at all.
+    carried: dict[str, float] = {}
+    for view in views:
+        fallback = finite_float(view.initial_capital, 0.0)
+        latest: ProfileSnapshot | None = None
+        if boundary is not None:
+            for snapshot in snapshots_by_profile.get(view.id, ()):
+                if snapshot.ts >= boundary:
+                    continue
+                if latest is None or snapshot.ts > latest.ts:
+                    latest = snapshot
+        carried[view.id] = (
+            fallback if latest is None else finite_float(latest.portfolio_value, fallback)
+        )
+
+    # One pass over the sorted timeline: a snapshot measured at a point replaces
+    # its profile's last known value from that point on, and every profile is
+    # summed at every point -- which is the forward fill of the minutes it
+    # missed.
+    points: list[EquityPoint] = []
+    for ts in sorted(timeline):
+        for view in views:
+            value = window[view.id].get(ts)
+            if value is not None:
+                carried[view.id] = value
+        total = sum(carried.get(view.id, 0.0) for view in views)
+        points.append(
+            EquityPoint(t=ts, value=total, profit_pct=compute_profit_pct(total, initial_capital))
+        )
+    return points
 
 
 def _healthy_count(
@@ -407,7 +479,9 @@ def aggregate_account(
     ``window`` restricts the equity curve to the snapshots inside it; the
     headline numbers always describe the current state of the views, because no
     windowed per-profile metric is stored. Max drawdown is the worst profile
-    drawdown, which is the risk figure an operator reacts to.
+    drawdown -- already a 0..1 ratio in the store, and passed through unchanged
+    so the API never rescales it -- which is the risk figure an operator reacts
+    to.
     """
     moment = utc_now() if now is None else now
     selected = list(views)
@@ -441,8 +515,10 @@ def aggregate_account(
         closed_trades=sum(_as_int(view.closed_trades) for view in selected),
         win_rate=_aggregate_win_rate(selected),
         profit_factor=_aggregate_profit_factor(selected),
+        # The stored value is the 0..1 ratio Freqtrade published: the worst
+        # profile is the LARGEST ratio, and it is served unchanged.
         max_drawdown_pct=max(
-            (normalise_drawdown_pct(view.max_drawdown_pct) for view in selected),
+            (finite_float(view.max_drawdown_pct, 0.0) for view in selected),
             default=0.0,
         ),
         sharpe=_sharpe(curve),

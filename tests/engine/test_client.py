@@ -602,9 +602,51 @@ async def test_fetch_all_derives_every_metric() -> None:
     assert metrics.closed_trades == 10
     assert metrics.win_rate == 0.6
     assert metrics.profit_factor == 1.8
-    assert metrics.max_drawdown_pct == pytest.approx(12.34)
+    # ``max_drawdown`` is a ratio in freqtrade 2026.8 and is stored as one: the
+    # API publishes every ``*_pct`` field as a 0..1 ratio.
+    assert metrics.max_drawdown_pct == pytest.approx(0.1234)
     assert metrics.best_pair == "BTC/USDT"
     assert metrics.starting_capital == 1000.0
+
+
+async def test_fetch_all_measures_the_bot_equity_not_the_exchange_wallet() -> None:
+    """A live bot is measured on its own funds, not on the operator's account.
+
+    ``/balance`` answers two totals: ``total`` is the whole exchange wallet,
+    ``total_bot`` is what the worker manages. A 250 USDT bot on a 5,000 USDT
+    account would report roughly +1,900 % profit against a 250 USDT profile if
+    the wallet total were used, so ``total_bot`` is the number that is kept.
+    """
+    balance = {
+        "currencies": [{"currency": "USDT", "free": 250.0, "balance": 250.0}],
+        "total": 5000.0,
+        "total_bot": 250.0,
+        "stake": "USDT",
+    }
+    metrics = await make_client({**METRICS_ROUTES, "/api/v1/balance": balance}).fetch_all()
+    assert metrics.portfolio_value == 250.0
+    assert metrics.portfolio_value != 5000.0
+    assert metrics.cash == 250.0
+    assert metrics.positions_value == 0.0
+
+
+async def test_fetch_all_keeps_the_bot_equity_of_a_dry_run_wallet() -> None:
+    """A dry-run wallet is the bot's wallet: both totals carry the same number."""
+    balance = {**BALANCE, "total_bot": BALANCE["total"]}
+    metrics = await make_client({**METRICS_ROUTES, "/api/v1/balance": balance}).fetch_all()
+    assert metrics.portfolio_value == 630.0
+
+
+async def test_fetch_all_falls_back_to_the_wallet_total_without_a_bot_total() -> None:
+    """A payload that predates ``total_bot`` keeps its documented reading."""
+    metrics = await make_client(METRICS_ROUTES).fetch_all()
+    assert "total_bot" not in BALANCE
+    assert metrics.portfolio_value == 630.0
+
+    null_bot = await make_client(
+        {**METRICS_ROUTES, "/api/v1/balance": {**BALANCE, "total_bot": None}}
+    ).fetch_all()
+    assert null_bot.portfolio_value == 630.0
 
 
 async def test_fetch_all_survives_an_empty_payload() -> None:
@@ -623,7 +665,9 @@ async def test_fetch_all_survives_an_empty_payload() -> None:
     assert metrics.open_trades == 0
     assert metrics.closed_trades == 0
     assert metrics.win_rate == 0.0
-    assert metrics.profit_factor == 0.0
+    # No ``profit_factor`` key at all: "not measurable", never the 0.0 that
+    # means every trade lost.
+    assert metrics.profit_factor is None
     assert metrics.max_drawdown_pct == 0.0
     assert metrics.best_pair is None
     assert metrics.starting_capital == 0.0
@@ -649,12 +693,52 @@ async def test_fetch_all_never_returns_a_non_finite_number() -> None:
         "/api/v1/status": OPEN_TRADES,
     }
     metrics = await make_client(routes).fetch_all()
-    assert metrics.profit_factor == 0.0
+    # ``Infinity`` is not JSON: it reaches the client as a non-finite number and
+    # becomes "not measurable", while the drawdown magnitude becomes 0.0.
+    assert metrics.profit_factor is None
     assert metrics.win_rate == 0.0
     assert metrics.max_drawdown_pct == 0.0
     # The payload must stay valid JSON for the dashboard.
     assert "Infinity" not in json.dumps(metrics.model_dump(), allow_nan=False)
     assert "NaN" not in json.dumps(metrics.model_dump(), allow_nan=False)
+
+
+async def test_fetch_all_keeps_the_drawdown_ratio_freqtrade_published() -> None:
+    """freqtrade 2026.8 answers ``max_drawdown`` as a ratio; nothing rescales it."""
+    routes = {**METRICS_ROUTES, "/api/v1/profit": {**PROFIT, "max_drawdown": -0.0078}}
+    metrics = await make_client(routes).fetch_all()
+    assert metrics.max_drawdown_pct == pytest.approx(0.0078)
+
+
+async def test_fetch_all_stores_zero_drawdown_without_the_key() -> None:
+    profit = {key: value for key, value in PROFIT.items() if key != "max_drawdown"}
+    metrics = await make_client({**METRICS_ROUTES, "/api/v1/profit": profit}).fetch_all()
+    assert metrics.max_drawdown_pct == 0.0
+
+
+async def test_fetch_all_reports_a_null_profit_factor_as_none() -> None:
+    """Freqtrade serialises the ``Infinity`` of a flawless record as JSON ``null``."""
+    routes = {**METRICS_ROUTES, "/api/v1/profit": {**PROFIT, "profit_factor": None}}
+    metrics = await make_client(routes).fetch_all()
+    assert metrics.profit_factor is None
+
+
+async def test_fetch_all_reports_a_missing_profit_factor_as_none() -> None:
+    profit = {key: value for key, value in PROFIT.items() if key != "profit_factor"}
+    metrics = await make_client({**METRICS_ROUTES, "/api/v1/profit": profit}).fetch_all()
+    assert metrics.profit_factor is None
+
+
+async def test_fetch_all_keeps_a_measured_profit_factor() -> None:
+    """A real number -- including the honest ``0.0`` of an all-losses record."""
+    measured = await make_client(
+        {**METRICS_ROUTES, "/api/v1/profit": {**PROFIT, "profit_factor": 1.6839}}
+    ).fetch_all()
+    zero = await make_client(
+        {**METRICS_ROUTES, "/api/v1/profit": {**PROFIT, "profit_factor": 0.0}}
+    ).fetch_all()
+    assert measured.profit_factor == pytest.approx(1.6839)
+    assert zero.profit_factor == 0.0
 
 
 async def test_fetch_all_reports_cash_of_the_stake_currency_only() -> None:

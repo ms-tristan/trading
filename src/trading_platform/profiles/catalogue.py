@@ -13,7 +13,10 @@ name (``MyThingStrategy`` -> ``my-thing``), its title from the class name itself
 and its description stays empty, so dropping a file into ``user_data/strategies``
 is enough to make it usable. Symmetrically, a metadata entry whose file is
 missing is still returned: a half-configured checkout must never make the
-dashboard fail, and the operator may well be about to add the file.
+dashboard fail, and the operator may well be about to add the file. The one
+exception is a helper module shared by the strategies: it is listed in
+:data:`SUPPORT_MODULES` and skipped, because it is not a strategy a profile could
+ever run.
 
 The profile loader is stricter, because a profile is what the engine actually
 runs: an entry that does not validate as a :class:`~trading_platform.models.ProfileConfig`
@@ -38,6 +41,7 @@ __all__ = [
     "PROFILES_DOCUMENT",
     "STRATEGIES_DOCUMENT",
     "STRATEGY_CATEGORY_DEFAULT",
+    "SUPPORT_MODULES",
     "StrategyCatalogue",
     "discover_strategy_files",
     "load_profile_catalogue",
@@ -52,6 +56,17 @@ PROFILES_DOCUMENT = "profiles.json"
 
 #: Category given to a strategy that has no metadata entry.
 STRATEGY_CATEGORY_DEFAULT = "baseline"
+
+#: File stems of ``user_data/strategies`` that are helper modules, not strategies.
+#:
+#: The strategy rule below is "every non-underscore ``*.py`` file is a strategy",
+#: which is what lets the operator drop a file in and see it appear. A module that
+#: is shared *by* the strategies -- ``market_regime.py`` holds the BTC regime gate
+#: the trend profiles mix in -- must therefore be named here, or its stem would be
+#: advertised as a bogus ``market-regime`` strategy by the dashboard, ``GET
+#: /api/strategies`` and the CLI, and the profile coherence check would reject a
+#: profile that no longer exists.
+SUPPORT_MODULES: frozenset[str] = frozenset({"market_regime"})
 
 #: Class-name suffix Freqtrade's resolver relies on; it is stripped to build the id.
 _STRATEGY_SUFFIX = "Strategy"
@@ -169,6 +184,8 @@ def discover_strategy_files(strategies_dir: Path | None = None) -> list[str]:
 
     Files starting with an underscore (``__init__.py``, ``_helpers.py``) are not
     strategies and are skipped, and a missing directory simply discovers nothing.
+    The stems listed in :data:`SUPPORT_MODULES` are shared helper modules rather
+    than strategies and are skipped as well.
     """
     directory = STRATEGIES_DIR if strategies_dir is None else Path(strategies_dir)
     try:
@@ -176,7 +193,9 @@ def discover_strategy_files(strategies_dir: Path | None = None) -> list[str]:
     except OSError:  # pragma: no cover - unreadable directory
         return []
     return sorted(
-        path.stem for path in candidates if path.is_file() and not path.name.startswith("_")
+        path.stem
+        for path in candidates
+        if path.is_file() and not path.name.startswith("_") and path.stem not in SUPPORT_MODULES
     )
 
 

@@ -88,10 +88,14 @@ class ProfileCreateRequest(_RequestBody):
 class ProfileUpdateRequest(_RequestBody):
     """``PATCH /api/profiles/{id}``: edit the declarative fields of a profile.
 
-    A field left out of the body is left untouched; ``strategy``, ``timeframe``
-    and ``mode`` are deliberately not writable -- changing them would silently
-    restart a worker under a different configuration, which is a delete plus a
-    create.
+    A field left out of the body is left untouched. ``strategy``, ``timeframe``
+    and ``mode`` are deliberately not writable here -- replacing the strategy or
+    the grid of a running worker is a delete plus a create, which the catalogue
+    apply (``POST /api/catalogue/apply``) owns. Editing a field that is written
+    into the generated worker configuration (``pairs``, ``initial_capital``,
+    ``max_open_trades``) restarts a running worker instead of leaving it on the
+    values the dashboard no longer shows; ``name``, ``priority`` and ``enabled``
+    only change the stored row.
     """
 
     name: str | None = None

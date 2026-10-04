@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,10 +22,13 @@ from trading_platform.engine import config_builder
 from trading_platform.engine.config_builder import (
     DEFAULT_THROTTLE_SECONDS,
     GENERATED_CONFIG_MODE,
+    MAX_API_PORT,
+    PROTECTIONS,
     TIMEFRAME_THROTTLE_SECONDS,
     allocate_api_port,
     build_freqtrade_argv,
     build_freqtrade_config,
+    port_is_available,
     profile_config_path,
     profile_data_dir,
     profile_db_url,
@@ -50,6 +54,7 @@ PAPER_CONFIG_KEYS = frozenset(
         "timeframe",
         "strategy",
         "unfilledtimeout",
+        "order_types",
         "entry_pricing",
         "exit_pricing",
         "exchange",
@@ -65,6 +70,32 @@ LIVE_CONFIG_KEYS = PAPER_CONFIG_KEYS - {"dry_run_wallet"}
 
 #: Values the builder generates fresh on every call.
 GENERATED_API_KEYS = ("jwt_secret_key", "ws_token")
+
+#: The ``order_types`` keys Freqtrade requires before it loads a strategy.
+REQUIRED_ORDER_TYPES = ("entry", "exit", "stoploss", "stoploss_on_exchange")
+
+#: The fleet risk controls, spelled out independently of the module so a silent
+#: edit of :data:`PROTECTIONS` fails here rather than in production.
+DOCUMENTED_PROTECTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "method": "StoplossGuard",
+        "lookback_period_candles": 60,
+        "trade_limit": 4,
+        "stop_duration_candles": 60,
+        "only_per_pair": False,
+    },
+    {
+        "method": "MaxDrawdown",
+        "lookback_period_candles": 200,
+        "trade_limit": 20,
+        "max_allowed_drawdown": 0.2,
+        "stop_duration_candles": 120,
+    },
+    {
+        "method": "CooldownPeriod",
+        "stop_duration_candles": 5,
+    },
+)
 
 
 def make_profile(**overrides: Any) -> ProfileRecord:
@@ -144,6 +175,13 @@ def test_paper_config_matches_the_documented_shape() -> None:
             "exit": 10,
             "exit_timeout_count": 0,
             "unit": "minutes",
+        },
+        "order_types": {
+            "entry": "limit",
+            "exit": "limit",
+            "stoploss": "market",
+            "stoploss_on_exchange": False,
+            "stoploss_on_exchange_interval": 60,
         },
         "entry_pricing": {
             "price_side": "same",
@@ -256,6 +294,108 @@ def test_stake_currency_comes_from_the_platform_settings() -> None:
         api_password="generated-password",
     )
     assert config["stake_currency"] == "EUR"
+
+
+# ---------------------------------------------------------------------------
+# Order handling and the fleet risk controls
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("mode", "stoploss_on_exchange"),
+    [("paper", False), ("live", True)],
+)
+def test_order_types_matrix(mode: str, stoploss_on_exchange: bool) -> None:
+    """Every worker stops with a market order, only a live one stops on exchange.
+
+    A strategy leaves ``stoploss_on_exchange`` at Freqtrade's ``False`` default,
+    so a supervisor stop, error, kill or profile delete used to leave the
+    position naked. The limit entry/exit keep ``_validate_price_config`` happy.
+    """
+    config = make_config(
+        make_profile(mode=mode),
+        exchange_key="live-key" if mode == "live" else "",
+        exchange_secret="live-secret" if mode == "live" else "",
+    )
+    order_types = config["order_types"]
+    assert order_types == {
+        "entry": "limit",
+        "exit": "limit",
+        "stoploss": "market",
+        "stoploss_on_exchange": stoploss_on_exchange,
+        "stoploss_on_exchange_interval": 60,
+    }
+    for key in REQUIRED_ORDER_TYPES:
+        assert key in order_types
+
+
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_order_types_carry_every_key_freqtrade_requires(mode: str) -> None:
+    constants = pytest.importorskip("freqtrade.constants")
+    order_types = make_config(make_profile(mode=mode))["order_types"]
+    assert set(constants.REQUIRED_ORDERTYPES) <= set(order_types)
+    assert set(order_types) - set(constants.REQUIRED_ORDERTYPES) == {
+        "stoploss_on_exchange_interval"
+    }
+
+
+def test_live_config_keeps_its_stake_and_credentials_while_paper_keeps_the_wallet() -> None:
+    """The order-types change must not disturb the paper/live money contract."""
+    paper = make_config(make_profile(mode="paper", initial_capital=1000.0))
+    live = make_config(
+        make_profile(mode="live", initial_capital=1000.0, max_open_trades=2),
+        exchange_key="live-key",
+        exchange_secret="live-secret",
+    )
+    assert paper["stake_amount"] == "unlimited"
+    assert paper["dry_run_wallet"] == 1000.0
+    assert paper["exchange"]["key"] == ""
+    assert paper["exchange"]["secret"] == ""
+    assert live["stake_amount"] == 500.0
+    assert "dry_run_wallet" not in live
+    assert live["exchange"]["key"] == "live-key"
+    assert live["exchange"]["secret"] == "live-secret"
+
+
+def test_protections_are_the_documented_fleet_risk_controls() -> None:
+    assert PROTECTIONS == DOCUMENTED_PROTECTIONS
+    assert config_builder.PROTECTIONS == DOCUMENTED_PROTECTIONS
+    assert [entry["method"] for entry in PROTECTIONS] == [
+        "StoplossGuard",
+        "MaxDrawdown",
+        "CooldownPeriod",
+    ]
+
+
+def test_protections_use_the_shapes_freqtrade_validates() -> None:
+    manager = pytest.importorskip("freqtrade.plugins.protectionmanager")
+    manager.ProtectionManager.validate_protections([dict(entry) for entry in PROTECTIONS])
+
+
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_generated_config_never_carries_a_top_level_protections_key(mode: str) -> None:
+    """Freqtrade 2026.8 refuses to boot a worker configured with ``protections``.
+
+    ``process_temporary_deprecated_settings`` raises ``ConfigurationError:
+    DEPRECATED: Setting 'protections' in the configuration is deprecated.`` on a
+    configuration that carries the key, and the deployed base image is
+    ``freqtradeorg/freqtrade:2026.8``. Emitting it would take the whole fleet
+    down, so the risk controls travel as :data:`PROTECTIONS` instead. This test
+    is the guard rail against re-adding the key.
+    """
+    config = make_config(make_profile(mode=mode))
+    assert "protections" not in config
+
+
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_generated_config_survives_freqtrades_deprecated_setting_pass(mode: str) -> None:
+    deprecated = pytest.importorskip("freqtrade.configuration.deprecated_settings")
+    profile = make_profile(mode=mode)
+    config = make_config(
+        profile,
+        exchange_key="live-key" if mode == "live" else "",
+        exchange_secret="live-secret" if mode == "live" else "",
+    )
+    # Raises ConfigurationError when the document carries a rejected key.
+    deprecated.process_temporary_deprecated_settings(copy.deepcopy(config))
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +519,99 @@ def test_allocate_api_port_offsets_the_configured_base() -> None:
     assert allocate_api_port(0, settings) == 8101
     assert allocate_api_port(3, settings) == 8104
     assert allocate_api_port(3, PlatformSettings(profile_api_port_base=9000)) == 9003
+
+
+def test_allocate_api_port_keeps_the_preferred_port_when_nothing_owns_it() -> None:
+    settings = PlatformSettings(profile_api_port_base=8101)
+    assert allocate_api_port(0, settings, reserved=set(), is_available=lambda port: True) == 8101
+    assert allocate_api_port(0, settings, reserved={9999}) == 8101
+
+
+def test_allocate_api_port_skips_a_reserved_preferred_port() -> None:
+    settings = PlatformSettings(profile_api_port_base=8101)
+    assert allocate_api_port(0, settings, reserved={8101}) == 8102
+    assert allocate_api_port(2, settings, reserved={8101, 8102, 8103}) == 8104
+    # A reserved port above the preferred one does not move the profile.
+    assert allocate_api_port(0, settings, reserved={8102}) == 8101
+
+
+def test_allocate_api_port_returns_the_first_candidate_the_probe_accepts() -> None:
+    settings = PlatformSettings(profile_api_port_base=8101)
+    refused = {8101, 8102, 8103}
+    seen: list[int] = []
+
+    def probe(port: int) -> bool:
+        seen.append(port)
+        return port not in refused
+
+    assert allocate_api_port(0, settings, is_available=probe) == 8104
+    assert seen == [8101, 8102, 8103, 8104]
+
+
+def test_allocate_api_port_honours_reserved_and_probe_together() -> None:
+    settings = PlatformSettings(profile_api_port_base=8101)
+
+    def probe(port: int) -> bool:
+        return port != 8102
+
+    assert allocate_api_port(0, settings, reserved={8101, 8103}, is_available=probe) == 8104
+
+
+def test_allocate_api_port_wraps_around_at_the_protocol_ceiling() -> None:
+    settings = PlatformSettings(profile_api_port_base=65533)
+    assert MAX_API_PORT == 65535
+    assert allocate_api_port(1, settings) == 65534
+    assert allocate_api_port(1, settings, reserved={65534}) == 65535
+    # Nothing above the ceiling is a candidate: the scan wraps to the base, so
+    # the profile lands just below the preferred port instead of on port 65536.
+    assert allocate_api_port(1, settings, reserved={65534, 65535}) == 65533
+
+
+def test_allocate_api_port_falls_back_to_the_preferred_port_when_everything_is_taken() -> None:
+    """Exhaustion must never raise: a scheduling pass cannot die here."""
+    settings = PlatformSettings(profile_api_port_base=8101)
+    assert allocate_api_port(0, settings, is_available=lambda port: False) == 8101
+
+
+def _hold_a_free_port(start: int = 18101) -> socket.socket:
+    """Return a bound loopback socket on the first free port at or above ``start``.
+
+    The allocation tests need a port something really holds. Binding inside a
+    fixed, non-ephemeral range keeps the port well below
+    :data:`MAX_API_PORT`, so the wrap-around cannot interfere with the assertion.
+    """
+    for port in range(start, start + 50):
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            holder.bind(("127.0.0.1", port))
+        except OSError:
+            holder.close()
+            continue
+        return holder
+    raise AssertionError("no free loopback port found")
+
+
+def test_port_is_available_is_false_for_a_port_a_socket_holds() -> None:
+    holder = _hold_a_free_port()
+    port = int(holder.getsockname()[1])
+    try:
+        assert port_is_available(port) is False
+    finally:
+        holder.close()
+    assert port_is_available(port) is True
+
+
+def test_allocate_api_port_avoids_a_port_that_is_really_bound() -> None:
+    holder = _hold_a_free_port()
+    try:
+        port = int(holder.getsockname()[1])
+        allocated = allocate_api_port(
+            0, PlatformSettings(profile_api_port_base=port), is_available=port_is_available
+        )
+        assert allocated != port
+        assert port_is_available(allocated) is True
+    finally:
+        holder.close()
 
 
 # ---------------------------------------------------------------------------

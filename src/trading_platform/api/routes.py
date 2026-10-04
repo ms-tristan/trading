@@ -111,6 +111,13 @@ Window = Literal["24h", "7d", "30d", "all"]
 ProfileAction = Literal["start", "stop", "restart"]
 
 #: Declarative fields a catalogue apply may refresh on an existing row.
+#:
+#: A change to a config-affecting field -- ``strategy``, ``timeframe``,
+#: ``mode``, ``exchange``, ``pairs``, ``initial_capital``,
+#: ``max_open_trades`` -- is written into the file the worker was started from,
+#: so the apply route restarts a running worker after the write: the process
+#: matches the dashboard instead of quietly trading the values it was spawned
+#: with. ``name``, ``priority`` and ``enabled`` never restart anything.
 CATALOGUE_MUTABLE_FIELDS: tuple[str, ...] = (
     "name",
     "strategy",
@@ -567,20 +574,32 @@ def update_profile(
     A field that is absent from the body is not written; a field sent as ``null``
     is ignored as well, so this route never clears a value by accident. The
     scheduler runs immediately, which is what stops a profile disabled here.
+
+    ``initial_capital``, ``max_open_trades`` and ``pairs`` are written into the
+    configuration file the worker was started from, so editing one of them on a
+    **running** profile restarts its worker through
+    :meth:`~trading_platform.engine.supervisor.Supervisor.apply_config_change`
+    (journaled as ``restart``): the process reloads the file instead of trading
+    the values the dashboard no longer shows. ``name``, ``priority`` and
+    ``enabled`` only change the stored row, so they leave the worker alone; a
+    stopped profile is never started by an edit. The response shape is
+    unchanged -- it is the refreshed view of the profile.
     """
     store = _store(request)
     if store.get_profile(profile_id) is None:
         raise _profile_not_found()
+    supervisor = _supervisor(request)
     fields = payload.model_dump(exclude_unset=True, exclude_none=True)
     if fields:
         store.update_profile_fields(profile_id, fields)
+        supervisor.apply_config_change(profile_id, fields)
         store.record_event(
             "info",
             EVENT_PROFILE_UPDATED,
             f"profile updated by the operator: {', '.join(sorted(fields))}",
             profile_id=profile_id,
         )
-    _supervisor(request).schedule()
+    supervisor.schedule()
     return ProfileResponse(profile=_view_of(request, profile_id))
 
 
@@ -671,7 +690,13 @@ def apply_catalogue(
       -- it ends up in ``skipped``;
     * a catalogue profile is created when missing (``created``), refreshed when a
       declarative field changed (``updated``) and left alone otherwise
-      (``skipped``), which makes a second apply a no-op;
+      (``skipped``), which makes a second apply a no-op. A refresh that changes
+      a config-affecting field (``strategy``, ``timeframe``, ``mode``,
+      ``exchange``, ``pairs``, ``initial_capital``, ``max_open_trades``)
+      restarts the worker of a **running** profile, so the process picks the new
+      configuration up instead of keeping the one it was spawned with; a
+      ``name``/``priority``/``enabled`` change never restarts anything and a
+      stopped profile is never started by an apply;
     * a live entry whose gate is unmet is never created: its id is reported in
       ``refused_live``. An existing live row is still refreshed, because the live
       gate governs starting a worker, not owning a row -- the scheduler blocks it
@@ -699,6 +724,7 @@ def apply_catalogue(
         changes = _catalogue_changes(existing, profile)
         if changes:
             store.update_profile_fields(profile.id, changes)
+            supervisor.apply_config_change(profile.id, changes)
             result.updated.append(profile.id)
         else:
             result.skipped.append(profile.id)

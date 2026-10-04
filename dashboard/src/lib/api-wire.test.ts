@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   asNumber,
+  asOptionalNumber,
   asRecord,
   asState,
   toAccountResponse,
@@ -187,6 +188,41 @@ describe("toProfileView", () => {
     expect(toProfilesResponse({}).profiles).toEqual([]);
     expect(toProfilesResponse(null).profiles).toEqual([]);
   });
+
+  it("maps a numeric profit factor unchanged and never turns it into a null", () => {
+    const [view] = toProfilesResponse({ profiles: [PROFILE] }).profiles;
+
+    expect(view.profit_factor).toBe(1.4);
+  });
+
+  it("reads a null profit factor as undefined, not as zero", () => {
+    // The API publishes `null` while no losing trade has closed: `0` would mean
+    // the opposite measurement (every trade lost), so it must survive as `null`
+    // and render as an em dash.
+    const [view] = toProfilesResponse({
+      profiles: [{ ...PROFILE, profit_factor: null }],
+    }).profiles;
+
+    expect(view.profit_factor).toBeNull();
+  });
+
+  it("reads an absent profit factor key as undefined, not as zero", () => {
+    // The key is dropped entirely, as a partially deployed API would answer.
+    const withoutProfitFactor = Object.fromEntries(
+      Object.entries(PROFILE).filter(([key]) => key !== "profit_factor"),
+    );
+    const [view] = toProfilesResponse({ profiles: [withoutProfitFactor] }).profiles;
+
+    expect(view.profit_factor).toBeNull();
+  });
+
+  it("keeps a published zero profit factor: a real zero is a measurement", () => {
+    const [view] = toProfilesResponse({
+      profiles: [{ ...PROFILE, profit_factor: 0 }],
+    }).profiles;
+
+    expect(view.profit_factor).toBe(0);
+  });
 });
 
 describe("toHealthStatus", () => {
@@ -282,6 +318,37 @@ describe("toAccountResponse", () => {
 
     expect(account.equity_curve[0].profit_usdt).toBe(500);
   });
+
+  it("reads a null combined profit factor as undefined, not as zero", () => {
+    const account = toAccountResponse(
+      { combined: { ...ACCOUNT.combined, profit_factor: null } },
+      "24h",
+    );
+
+    expect(account.performance.profit_factor).toBeNull();
+  });
+
+  it("reads an absent combined profit factor as undefined, not as zero", () => {
+    const account = toAccountResponse({ combined: { profit_abs: 12 } }, "24h");
+
+    expect(account.performance.profit_factor).toBeNull();
+  });
+
+  it("carries a numeric combined profit factor through unchanged", () => {
+    const account = toAccountResponse(
+      { combined: { ...ACCOUNT.combined, profit_factor: 1.6839 } },
+      "24h",
+    );
+
+    expect(account.performance.profit_factor).toBeCloseTo(1.6839, 6);
+  });
+
+  it("keeps a published zero combined profit factor", () => {
+    // `ACCOUNT.combined` publishes a real `0.0`: it is a measurement, not a hole.
+    const account = toAccountResponse(ACCOUNT, "24h");
+
+    expect(account.performance.profit_factor).toBe(0);
+  });
 });
 
 describe("toProfileDetail", () => {
@@ -352,6 +419,13 @@ describe("toProfileDetail", () => {
     expect(detail.open_trades).toEqual([]);
     expect(detail.strategy).toBeUndefined();
   });
+
+  it("forwards an undefined profit factor of the profile into its performance block", () => {
+    const detail = toProfileDetail({ profile: { ...PROFILE, profit_factor: null } }, "24h");
+
+    expect(detail.profile.profit_factor).toBeNull();
+    expect(detail.performance.profit_factor).toBeNull();
+  });
 });
 
 describe("toDailyBar", () => {
@@ -402,6 +476,19 @@ describe("toStrategyView", () => {
 
     const withoutAggregate = toStrategyView({ id: "donchian", title: "Donchian" });
     expect(Number.isFinite(withoutAggregate.profiles_total)).toBe(false);
+  });
+
+  it("reports an undefined strategy-level profit factor as null, never as zero", () => {
+    // The API publishes no strategy-level factor, so the honest value is the
+    // undefined one: an em dash, not a `0.00` that would claim every trade lost.
+    const view = toStrategyView({
+      id: "momentum",
+      title: "Momentum breakout",
+      profit_abs: 120.0,
+      profit_pct: 0.06,
+    });
+
+    expect(view.profit_factor).toBeNull();
   });
 });
 
@@ -511,5 +598,15 @@ describe("defensive readers", () => {
     expect(asNumber(12)).toBe(12);
     expect(asRecord([])).toEqual({});
     expect(asRecord("nope")).toEqual({});
+  });
+
+  it("reads an optional measurement as a number or as undefined, never as zero", () => {
+    expect(asOptionalNumber(1.4)).toBe(1.4);
+    expect(asOptionalNumber(0)).toBe(0);
+    expect(asOptionalNumber(null)).toBeNull();
+    expect(asOptionalNumber(undefined)).toBeNull();
+    expect(asOptionalNumber(Number.NaN)).toBeNull();
+    expect(asOptionalNumber(Number.POSITIVE_INFINITY)).toBeNull();
+    expect(asOptionalNumber("1.4")).toBeNull();
   });
 });
