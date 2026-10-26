@@ -5,7 +5,7 @@ behind the host nginx. Two containers, one public URL:
 
 | Item | Value |
 | --- | --- |
-| Public URL | <https://tristeubadingview.duckdns.org> |
+| Public URL | <https://trading.tristanmasse.space> |
 | Authentication | HTTP Basic (`auth_basic`), realm `Trading` |
 | Dashboard container | `trading-dashboard` (image `trading-dashboard:latest`), Next.js standalone server |
 | Realtime container | `trading-realtime` (image `trading-realtime:latest`), supervisor + N freqtrade workers + aggregated JSON API |
@@ -327,7 +327,7 @@ The certificate was obtained by the same method as the other domains:
 
 ```bash
 certbot certonly --webroot -w /opt/homebrew/var/www/certbot \
-  -d tristeubadingview.duckdns.org \
+  -d trading.tristanmasse.space \
   --config-dir /opt/homebrew/etc/letsencrypt \
   --non-interactive --agree-tos --keep-until-expiring --key-type ecdsa
 ```
@@ -359,14 +359,14 @@ returns `401`).
 No dedicated jail was added: the existing `[nginx-auth]` jail
 (`/opt/homebrew/etc/fail2ban/jail.local`) watches **the whole nginx error
 log** with the `nginx-http-auth` filter, so it already covers this vhost —
-that is exactly what protects `culia.duckdns.org` and `tristeub.duckdns.org`
+that is exactly what protects `culia.tristanmasse.space` and `dsh.tristanmasse.space`
 (`maxretry = 5`, `findtime = 10m`, `bantime = 1h`, banning via the pf anchor
 `com.apple/f2b/nginx-auth`, ports 80 and 443).
 
 Verified during deployment: an attempt with a wrong password produced a line
 
 ```
-user "tristeub": password mismatch, client: <ip>, server: tristeubadingview.duckdns.org, request: "GET / HTTP/2.0"
+user "tristeub": password mismatch, client: <ip>, server: trading.tristanmasse.space, request: "GET / HTTP/2.0"
 ```
 
 and the fail2ban log grew by 120 bytes within the second — so the jail does

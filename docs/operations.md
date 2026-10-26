@@ -10,7 +10,7 @@ the compose file `deploy/docker-compose.yml`.
 
 | Surface | Address |
 | --- | --- |
-| Dashboard (and `/api/*` through its rewrite) | `http://127.0.0.1:3031` and `https://tristeubadingview.duckdns.org` |
+| Dashboard (and `/api/*` through its rewrite) | `http://127.0.0.1:3031` and `https://trading.tristanmasse.space` |
 | Aggregated JSON API (debugging surface) | `http://127.0.0.1:3030` |
 | Container names | `trading-realtime`, `trading-dashboard` |
 
